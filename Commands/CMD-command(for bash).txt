@@ -1,0 +1,234 @@
+### Linux Terminal Commands Cheat Sheet
+
+#### **1. Entering the Linux Terminal**
+```bash
+bash
+```
+- Starts the Bash shell (Linux terminal).
+- If you’re using WSL or Zorin OS, open the terminal application to access the shell.
+
+---
+
+#### **2. Listing Files and Directories**
+```bash
+ls -al
+```
+- `ls`: Lists files and directories in the current location.
+- `-a`: Displays all files, including hidden ones (e.g., `.bashrc`).
+- `-l`: Provides a detailed list including permissions, owner, size, and modification date.
+
+Example output:
+```
+drwxr-xr-x  2 user user 4096 Jan 15 10:00 folder
+-rw-r--r--  1 user user 1024 Jan 15 09:50 file.txt
+```
+
+Other variations of `ls`:
+- `ls`: Simple listing of files.
+- `ls -lh`: Human-readable file sizes.
+- `ls /path/to/dir`: Lists files in a specific directory.
+
+---
+
+#### **3. Navigating Directories**
+```bash
+cd /path/to/directory
+```
+- Changes the current directory to the specified path.
+
+Examples:
+- `cd /mnt/d`: Moves to the mounted `D:` drive (in WSL or Linux systems with Windows mounts).
+- `cd ..`: Moves up one directory.
+- `cd ~`: Moves to the home directory.
+- `cd /`: Moves to the root directory.
+
+---
+
+#### **4. Checking Mounted Drives**
+```bash
+ls /mnt
+```
+- Lists mounted drives (e.g., Windows drives like `C:` or `D:` in WSL).
+- Example output:
+  ```
+  c  d
+  ```
+
+---
+
+#### **5. Viewing File Contents**
+```bash
+cat filename
+```
+- Displays the entire content of a file.
+
+Other options:
+- `less filename`: Opens the file for paginated viewing (scroll with `Space` or `q` to quit).
+- `head filename`: Shows the first 10 lines of a file.
+- `tail filename`: Shows the last 10 lines of a file.
+- `tail -f filename`: Follows a file in real-time (useful for logs).
+
+---
+
+#### **6. Copying, Moving, and Deleting Files**
+- **Copying a file**:
+  ```bash
+  cp source_file destination
+  ```
+  Example:
+  ```bash
+  cp file.txt /mnt/d
+  ```
+- **Moving or renaming a file**:
+  ```bash
+  mv source_file destination_or_new_name
+  ```
+  Example:
+  ```bash
+  mv file.txt /mnt/c/newfile.txt
+  ```
+- **Deleting a file**:
+  ```bash
+  rm filename
+  ```
+  Example:
+  ```bash
+  rm file.txt
+  ```
+- **Deleting a directory**:
+  ```bash
+  rm -r directory_name
+  ```
+
+---
+
+#### **7. Creating Files and Directories**
+- **Creating a new file**:
+  ```bash
+  touch filename
+  ```
+  Example:
+  ```bash
+  touch newfile.txt
+  ```
+- **Creating a directory**:
+  ```bash
+  mkdir directory_name
+  ```
+  Example:
+  ```bash
+  mkdir new_folder
+  ```
+
+---
+
+#### **8. Checking Current Directory**
+```bash
+pwd
+```
+- Prints the full path of the current working directory.
+
+---
+
+#### **9. Finding Files**
+```bash
+find /path/to/search -name "filename"
+```
+- Searches for files in a directory and its subdirectories.
+
+Example:
+```bash
+find /mnt/c -name "example.txt"
+```
+
+---
+
+#### **10. Viewing System Information**
+- **Disk usage**:
+  ```bash
+  df -h
+  ```
+  Displays disk space usage in a human-readable format.
+- **Memory usage**:
+  ```bash
+  free -h
+  ```
+  Shows memory usage.
+- **System information**:
+  ```bash
+  uname -a
+  ```
+  Displays detailed system information.
+
+---
+
+#### **11. Managing Processes**
+- **View running processes**:
+  ```bash
+  top
+  ```
+- **Kill a process**:
+  ```bash
+  kill PID
+  ```
+  Replace `PID` with the process ID (found via `top` or `ps` commands).
+- **List processes**:
+  ```bash
+  ps aux
+  ```
+
+---
+
+#### **12. Installing Software**
+- **Update package list**:
+  ```bash
+  sudo apt update
+  ```
+- **Install software**:
+  ```bash
+  sudo apt install package_name
+  ```
+  Example:
+  ```bash
+  sudo apt install git
+  ```
+- **Remove software**:
+  ```bash
+  sudo apt remove package_name
+  ```
+
+---
+
+#### **13. File Permissions**
+- **View file permissions**:
+  ```bash
+  ls -l
+  ```
+- **Change file permissions**:
+  ```bash
+  chmod permissions filename
+  ```
+  Example:
+  ```bash
+  chmod 755 script.sh
+  ```
+  - `755` gives the owner full permissions and others read/execute permissions.
+
+---
+
+#### **14. Networking Commands**
+- **Check IP address**:
+  ```bash
+  ip addr
+  ```
+- **Ping a server**:
+  ```bash
+  ping example.com
+  ```
+- **Check open ports**:
+  ```bash
+  netstat -tuln
+  ```
+
+---
+
