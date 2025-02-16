@@ -231,4 +231,5 @@ find /mnt/c -name "example.txt"
   ```
 
 ---
-
+#### **15. QEMU Commands**
+qemu-system-x86_64 -cdrom nyx.isom nyx.iso
