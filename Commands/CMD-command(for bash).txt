@@ -232,4 +232,11 @@ find /mnt/c -name "example.txt"
 
 ---
 #### **15. QEMU Commands**
-qemu-system-x86_64 -cdrom nyx.isom nyx.iso
+cd source
+cd kernel
+qemu-system-x86_64 -cdrom  nyx.iso
+
+
+### For Running Python File in C/C++###
+g++ boot.cpp -o boot -I"C:\Python312\Include" -L"C:\Python312" -lpython312
+.\boot.exe
