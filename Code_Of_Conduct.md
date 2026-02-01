@@ -1,41 +1,33 @@
-
----
-
-### **3. CODE_OF_CONDUCT.md**
-
-```markdown
-# Code of Conduct for Nyx OS
-
-We strive to make Nyx OS a welcoming and inclusive environment for all contributors. By participating in this project, you agree to follow this Code of Conduct.
+# Contributor Covenant Code of Conduct
 
 ## Our Pledge
 
-We are committed to making participation in this project a harassment-free experience for everyone, regardless of gender, gender identity and expression, sexual orientation, disability, physical appearance, body size, race, age, or religion. We are dedicated to providing a friendly and supportive community for all.
+In the interest of fostering an open and welcoming environment, we as contributors and maintainers pledge to make participation in our project and our community a harassment-free experience for everyone, regardless of age, body size, disability, ethnicity, sex characteristics, gender identity and expression, level of experience, education, socio-economic status, nationality, personal appearance, race, religion, or sexual identity and orientation.
 
 ## Our Standards
 
-Examples of behavior that contributes to a positive environment for our community include:
-- Be respectful and considerate of others' ideas and opinions.
-- Communicate constructively, offer feedback kindly, and listen to others.
-- Engage in friendly and open-minded discussions.
+Examples of behavior that contributes to a positive environment include:
 
-Examples of unacceptable behavior include:
-- Harassment, bullying, or discriminatory comments based on race, gender, sexual orientation, or any other personal attribute.
-- The use of sexualized or otherwise inappropriate language or imagery.
-- Disruptive or disrespectful behavior.
+* Using welcoming and inclusive language
+* Being respectful of differing viewpoints and experiences
+* Gracefully accepting constructive criticism
+* Focusing on what is best for the community
+* Showing empathy towards other community members
 
-## Our Responsibilities
+Examples of unacceptable behavior by participants include:
 
-Project maintainers are responsible for clarifying the standards of acceptable behavior and are expected to take appropriate and fair corrective action in response to any instances of unacceptable behavior.
-
-## Scope
-
-This Code of Conduct applies to all spaces managed by Nyx OS, including GitHub repositories, discussions, social media platforms, and any other venues where community members interact.
+* The use of sexualized language or imagery and unwelcome sexual attention or advances
+* Trolling, insulting/derogatory comments, and personal or political attacks
+* Public or private harassment
+* Publishing others' private information without explicit permission
+* Other conduct which could reasonably be considered inappropriate in a professional setting
 
 ## Enforcement
 
-Instances of unacceptable behavior may be reported by contacting the project maintainers at [contact@nyx-os.com]. All complaints will be reviewed and investigated promptly. Contributors who are found to be in violation of this Code of Conduct may face temporary or permanent bans from the project.
+Project maintainers are responsible for clarifying the standards of acceptable behavior and are expected to take appropriate and fair corrective action in response to any instances of unacceptable behavior.
 
 ## Attribution
 
-This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org/).
+This Code of Conduct is adapted from the [Contributor Covenant][homepage], version 1.4.
+
+[homepage]: https://www.contributor-covenant.org

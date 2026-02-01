@@ -1,1 +1,2 @@
-idea
+# Rust build outputs
+/compiler/target/*rs

@@ -1,49 +1,148 @@
-# Nyx OS
+<img width="849" height="383" alt="image" src="https://github.com/user-attachments/assets/fdf3d4da-0f6c-4186-9a69-a7a67f8a8ad0" />
 
-Nyx OS is an innovative operating system designed to push the boundaries of computing, combining advanced AI features, quantum computing compatibility, and a revolutionary file system. Nyx OS aims to provide a seamless user experience with adaptive features, cutting-edge security, and a focus on energy efficiency and sustainability.
+# ⚛️ QCLang
 
-## Features
+> **Schrödinger’s Companion** — a modern, type-safe quantum systems programming language.
 
-- **AI-Powered Core Features**
-  - Adaptive User Interface
-  - Integrated Personal AI Assistant (Clio) for task automation and predictive booting
-- **Enhanced Security and Privacy**
-  - Decentralized encryption with blockchain
-  - Disposable user accounts for isolated sessions
-  - Biometric and behavioral authentication
-- **Revolutionary File System**
-  - Time-aware versioning with rollback
-  - Self-healing filesystems
-  - Unified storage management across local and cloud systems
-- **Modular Design**
-  - Plug-and-play kernel modules
-  - Customizable subsystems for networking and file management
-- **Quantum Computing Compatibility**
-  - Future-proofed for quantum processors and hybrid quantum-classical workflows
-  - Quantum programming integration with supported frameworks (Qiskit, Cirq, etc.)
-- **Eco-Friendly Features**
-  - Dynamic energy-saving modes
-  - Carbon footprint tracking and sustainability insights
+![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+![Version](https://img.shields.io/badge/version-0.1.4-green.svg)
+![Status](https://img.shields.io/badge/status-active-success.svg)
 
-## Installation
+QCLang is a high-level programming language designed to bridge the gap between **classical systems programming** and **quantum circuit execution**.  
+It features a Rust-inspired syntax, a strict **affine type system** for quantum safety, and compilation to **OpenQASM 2.0**.
 
-To install Nyx OS, follow these steps:
+```
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Asmodeus14/Nyx.git
+      /\_/\ 
+     ( o.o )      Q U A N T U M   C A T
+      > ^ <    Schrödinger’s Companion
 
 
-Contribution
-We welcome contributions from the open-source community. If you'd like to contribute, please fork the repository, make your changes, and submit a pull request.
+````
 
-Before contributing, make sure to review our CONTRIBUTING.md for guidelines on how to submit changes and how to ensure your code follows our best practices.
+---
 
-License
-Nyx OS is licensed under the MIT License. See the LICENSE file for more details.
+## ✨ Features
 
-Community
-Join us in making Nyx OS the next generation operating system! Follow our discussions and contribute on GitHub and LinkedIn.
+- **Hybrid Control Flow**  
+  Seamlessly mix classical logic (`if`, `for`, `while`) with quantum operations.
 
-GitHub: https://github.com/Asmodeus14/Nyx
-LinkedIn: www.linkedin.com/in/abhay-singh-323b21279
+- **Quantum Safety (Affine Types)**  
+  Compile-time enforcement of the *No-Cloning Theorem*:
+  - Prevents quantum variable reassignment  
+  - Prevents use-after-measurement
+
+- **Modern, Familiar Syntax**  
+  Strong typing, structs, tuples, and type aliases inspired by Rust.
+
+- **QIR & Optimizing Backend**  
+  Generates optimized **OpenQASM 2.0** (QIR phase in progress).
+
+- **Detailed Diagnostics**  
+  Helpful compile-time errors with actionable hints.
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Rust (latest stable)
+- Cargo
+
+### Installation (from source)
+
+```bash
+git clone https://github.com/Asmodeus14/qclang.git
+cd qclang
+cargo install --path .
+````
+
+---
+
+## 📦 Releases
+
+Prebuilt binaries and versioned releases are available for download.
+
+👉 **Download from GitHub Releases:**
+[https://github.com/Asmodeus14/qclang/releases](https://github.com/Asmodeus14/qclang/releases)
+
+Each release includes:
+
+* `qclang` CLI binary
+* Release notes
+* Supported platform details
+
+> This is the recommended way to install QCLang if you don’t want to build from source.
+
+---
+
+## 🧪 Usage
+
+Compile a `.qc` file to OpenQASM:
+
+```bash
+qclang compile my_circuit.qc --show
+```
+
+Run syntax checks only:
+
+```bash
+qclang check my_circuit.qc
+```
+
+---
+
+## 📖 Syntax Example
+
+### Bell State Preparation
+
+```rust
+fn main() -> int {
+    // Initialize quantum register
+    qreg q[2] = |00>;
+
+    // Apply gates (affine: no reassignment)
+    H(q[0]);
+    CNOT(q[0], q[1]);
+
+    // Measurement consumes the qubits
+    let r1: cbit = measure(q[0]);
+    let r2: cbit = measure(q[1]);
+
+    return 0;
+}
+```
+
+See `syntax.md` for the full language specification.
+
+---
+
+## 🛠️ Project Structure
+
+* `src/lexer.rs` — Tokenizer (Logos)
+* `src/parser.rs` — Recursive descent parser
+* `src/semantics/` — Type system & ownership checks
+* `src/qir/` — Quantum Intermediate Representation
+* `src/codegen/` — OpenQASM 2.0 backend
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome!
+Please see `CONTRIBUTING.md` for guidelines.
+
+This project is especially friendly to:
+
+* Compiler enthusiasts
+* Quantum computing researchers
+* Systems programmers
+
+---
+
+## 📄 License
+
+Licensed under the **Apache License 2.0**.
+See the `LICENSE` file for details.
+
+

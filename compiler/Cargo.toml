@@ -1,0 +1,42 @@
+[package]
+name = "qclang_compiler"
+version = "0.2.2"
+edition = "2021"
+description = "A quantum systems programming language compiler"
+authors = ["QCLang Team"]
+license = "Apache-2.0"
+repository = "https://github.com/Asmodeus14/qclang"
+readme = "README.md"
+keywords = ["quantum", "compiler", "programming-language", "qasm"]
+categories = ["science", "development-tools"]
+
+[[bin]]
+name = "qclang"
+path = "src/bin/qclang.rs"
+
+[[bin]]
+name = "qclang-test"
+path = "src/main.rs"
+
+[dependencies]
+logos = "0.13"
+thiserror = "1.0"
+clap = { version = "4.4", features = ["derive", "cargo"] }
+indicatif = "0.17"
+colored = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+self_update = { version = "0.41", features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zip-deflate"] }
+
+num-complex = "0.4"   # Complex number support
+rand = "0.8"          # Random number generation
+
+
+chrono = "0.4"
+lazy_static = "1.4"
+regex = "1.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

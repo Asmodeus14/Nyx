@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# FIX: Grant permission to create releases
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rename_cmd: mv target/x86_64-unknown-linux-gnu/release/qclang qclang && tar -czf qclang-linux-x86_64.tar.gz qclang
+            asset_name: qclang-linux-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rename_cmd: cp target/x86_64-pc-windows-msvc/release/qclang.exe qclang.exe && 7z a qclang-windows-x86_64.zip qclang.exe
+            asset_name: qclang-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build
+        working-directory: compiler
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Binary
+        shell: bash
+        run: |
+          cd compiler
+          ${{ matrix.rename_cmd }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}
+          path: compiler/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  create-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/binary-ubuntu-latest/qclang-linux-x86_64.tar.gz
+            artifacts/binary-windows-latest/qclang-windows-x86_64.zip
+          body: |
+            📦 **QCLang — User Installation & Usage Guide**
+            
+            This guide explains how to install and use QCLang on Windows and Linux using prebuilt binaries.
+            **Latest stable release:** ${{ github.ref_name }}
+            
+            *Note: QCLang is a systems-level tool designed for performance and safety.*
+            
+            ---
+            
+            ### 🪟 Windows Installation
+            
+            **Step 1: Download and Extract**
+            1. Download `qclang-windows-x86_64.zip` from Assets below.
+            2. Extract the ZIP to `C:\Program Files\QCLang\`.
+            3. *Note: The binary is already named `qclang.exe` inside the zip.*
+            
+            **Step 2: Add to PATH (Permanent)**
+            To run `qclang` from any terminal, add the release folder to your System Path.
+            
+            *Method A: PowerShell (Recommended)*
+            Right-click Start → Terminal (Admin) and run:
+            ```powershell
+            $folder = "C:\Program Files\QCLang"
+            $oldPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            if ($oldPath -notlike "*$folder*") {
+                [Environment]::SetEnvironmentVariable("Path", "$oldPath;$folder", "Machine")
+                Write-Host "Success! Restart your terminal to use qclang." -ForegroundColor Green
+            }
+            ```
+            
+            **Step 3: Verify**
+            Open a new terminal window:
+            ```bash
+            qclang --version
+            ```
+            
+            ---
+            
+            ### 🐧 Linux Installation
+            
+            **Step 1: Download and Prepare**
+            ```bash
+            # Extract
+            tar -xzf qclang-linux-x86_64.tar.gz
+            
+            # Navigate (binary is already named 'qclang')
+            chmod +x qclang
+            ```
+            
+            **Step 2: Install System-Wide**
+            ```bash
+            sudo mv qclang /usr/local/bin/
+            
+            # Verify
+            qclang --version
+            ```
+            
+            ---
+            
+            ### 🧪 Basic Usage
+            
+            **1. Compile to OpenQASM**
+            Generate OpenQASM 2.0 code from your `.qc` source:
+            ```bash
+            qclang compile my_circuit.qc --show
+            ```
+            
+            **2. Semantic Check**
+            Validate your code (Affine Type checks, qubit ownership) without compiling:
+            ```bash
+            qclang check my_circuit.qc
+            ```
+            
+            **3. Auto-Update**
+            Run the interactive updater:
+            ```bash
+            qclang update
+            ```

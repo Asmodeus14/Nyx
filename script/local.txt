@@ -1,0 +1,24 @@
+
+
+# Build statically linked binary for maximum compatibility
+RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86_64-unknown-linux-gnu
+
+# Create a release directory
+mkdir -p ../dist/linux
+cp target/release/qclang ../dist/linux/qclang-linux-x86_64
+
+# Strip debugging symbols to reduce size
+strip ../dist/linux/qclang-linux-x86_64
+
+# Check size
+ls -lh ../dist/linux/qclang-linux-x86_64
+
+
+#####################################Build Name#############################################################
+
+
+# Build with corrected CLI
+cargo build --release
+
+# Install
+sudo cp target/release/qclang /usr/local/bin/
