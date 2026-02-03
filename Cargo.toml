@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "nyx-kernel",
+    "compiler",
+    "runner"
+]
+resolver = "2"
+
+[workspace.dependencies]
+# UPDATE: Remove '=' to allow upgrading to 0.11.15+
+bootloader = "0.11"

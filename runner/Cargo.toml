@@ -1,0 +1,9 @@
+[package]
+name = "runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]  
+# Enable both so the runner has access to UefiBoot and BiosBoot classes
+bootloader = { version = "0.11", features = ["uefi", "bios"] }
+ovmf-prebuilt = "0.2"

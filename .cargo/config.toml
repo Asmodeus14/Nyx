@@ -1,0 +1,3 @@
+[target.'cfg(target_os = "none")']
+runner = "cargo run -q -p runner --"
+rustflags = ["-C", "relocation-model=static"]
