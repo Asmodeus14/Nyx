@@ -30,8 +30,20 @@ impl Cmos {
     }
 
     pub fn read_rtc(&mut self) -> DateTime {
-        // Wait until RTC update is finished (Update In Progress bit)
-        while self.read_upip() {}
+        // --- HAL SAFETY CHECK ---
+        // OLD CODE: while self.read_upip() {}  <-- This froze forever if hardware was busy
+        // NEW CODE: Try 10,000 times. If still busy, abort and continue.
+        
+        let mut timeouts = 0;
+        while self.read_upip() {
+            timeouts += 1;
+            if timeouts > 100_000 {
+                // HARDWARE ERROR: CMOS is stuck!
+                // Break out to save the OS from freezing.
+                break; 
+            }
+            core::hint::spin_loop();
+        }
 
         let mut second = self.read_register(0x00);
         let mut minute = self.read_register(0x02);
@@ -42,7 +54,6 @@ impl Cmos {
         let register_b = self.read_register(0x0B);
 
         // Convert BCD to Binary if necessary
-        // (Most RTCs store time as Binary Coded Decimal: 0x59 = 59)
         if (register_b & 0x04) == 0 {
             second = (second & 0x0F) + ((second / 16) * 10);
             minute = (minute & 0x0F) + ((minute / 16) * 10);
@@ -52,7 +63,6 @@ impl Cmos {
             year = (year & 0x0F) + ((year / 16) * 10);
         }
 
-        // Adjust year (RTC usually only gives last 2 digits)
         let full_year = 2000 + year as u16;
 
         DateTime {
@@ -76,7 +86,6 @@ pub struct DateTime {
     pub year: u16,
 }
 
-// Format the time as a String (e.g., "2024-02-03 14:30:00")
 use alloc::string::String;
 use alloc::format;
 

@@ -1,5 +1,5 @@
 use crate::gui::{Painter, Color, Rect};
-use crate::time::DateTime; // Import the Time struct
+use crate::time::DateTime; 
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
@@ -14,7 +14,6 @@ const MAX_HISTORY: usize = 20;
 lazy_static::lazy_static! {
     static ref INPUT_BUFFER: Mutex<String> = Mutex::new(String::new());
     static ref HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
     static ref SERIAL1: Mutex<SerialPort> = {
         let mut serial_port = unsafe { SerialPort::new(0x3F8) };
         serial_port.init();
@@ -24,7 +23,6 @@ lazy_static::lazy_static! {
 
 pub fn handle_keyboard(c: char) {
     let mut input = INPUT_BUFFER.lock();
-    
     match c {
         '\u{8}' => { input.pop(); } 
         '\n' => {
@@ -52,15 +50,15 @@ fn execute_command(command: &str) {
     match parts[0] {
         "help" => {
             add_to_history("Available commands:");
-            add_to_history("  help     - Show this menu");
-            add_to_history("  ver      - Show OS version");
-            add_to_history("  clear    - Clear the screen");
-            add_to_history("  echo <t> - Print text");
-            add_to_history("  reboot   - Restart system");
+            add_to_history("  help   - Show this menu");
+            add_to_history("  ver    - Show OS version");
+            add_to_history("  clear  - Clear screen");
+            add_to_history("  echo   - Print text");
+            add_to_history("  reboot - Force Restart");
         },
         "ver" | "version" => {
             add_to_history("NyxOS Kernel v0.1.0");
-            add_to_history("Double Buffered Graphics Engine");
+            add_to_history("Scaled Graphics Engine (2x)");
         },
         "clear" | "cls" => {
             let mut history = HISTORY.lock();
@@ -74,10 +72,7 @@ fn execute_command(command: &str) {
         },
         "reboot" => {
             add_to_history("Rebooting...");
-            unsafe {
-                let mut p = x86_64::instructions::port::Port::<u8>::new(0x64);
-                p.write(0xFE);
-            }
+            unsafe { perform_reboot(); }
         },
         _ => {
             add_to_history(&format!("Unknown command: '{}'", parts[0]));
@@ -85,42 +80,73 @@ fn execute_command(command: &str) {
     }
 }
 
-// FIX: Now accepts 'time' and draws the status bar
+// --- NUCLEAR REBOOT STRATEGY ---
+unsafe fn perform_reboot() {
+    use x86_64::instructions::port::Port;
+    use alloc::boxed::Box;
+    use x86_64::instructions::interrupts;
+
+    // 1. DISABLE INTERRUPTS
+    // Ensure the CPU isn't distracted while we try to reset
+    interrupts::disable();
+
+    // 2. METHOD A: Port 0xCF9 (PCI Hard Reset) - Best for Modern Dell
+    // Write 0x06 (Reset + Transition)
+    let mut pcf9 = Port::<u8>::new(0xCF9);
+    pcf9.write(0x06);
+    for _ in 0..10000 { core::hint::spin_loop(); }
+
+    // 3. METHOD B: 8042 Keyboard Controller Pulse
+    let mut p64 = Port::<u8>::new(0x64);
+    p64.write(0xFE); 
+    for _ in 0..10000 { core::hint::spin_loop(); }
+
+    // 4. METHOD C: Port 0x92 (Fast A20)
+    let mut p92 = Port::<u8>::new(0x92);
+    let original = p92.read();
+    p92.write(original | 1);
+
+    // 5. METHOD D: Triple Fault
+    use x86_64::structures::idt::InterruptDescriptorTable;
+    // Fix: Use Box::leak to make the empty IDT live forever ('static)
+    // This satisfies the compiler constraints
+    let empty_idt = Box::leak(Box::new(InterruptDescriptorTable::new()));
+    empty_idt.load();
+    x86_64::instructions::interrupts::int3(); // CRASH!
+
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 pub fn draw(painter: &mut impl Painter, time: &DateTime) {
-    // 1. Clear Screen
     painter.clear(Color::BLACK);
 
-    // 2. Draw Status Bar (Blue Top Bar)
+    // Draw Status Bar
     painter.draw_rect(Rect::new(0, 0, painter.width(), 30), Color::BLUE);
-    
-    // Draw OS Name (Left)
     painter.draw_string(10, 7, "NyxOS Kernel", Color::WHITE);
 
-    // Draw Time (Right)
     let time_str = time.to_string();
-    // Calculate position: Width - (Chars * 8px) - Margin
     let time_x = painter.width() - (time_str.len() * 8) - 10;
     painter.draw_string(time_x, 7, &time_str, Color::WHITE);
 
-    // 3. Draw History
+    // Draw History
     let history = HISTORY.lock();
     let line_height = 16;
-    let start_y = 40; // Moved down to make room for status bar
+    let start_y = 40; 
     
     for (i, line) in history.iter().enumerate() {
         painter.draw_string(10, start_y + (i * line_height), line, Color::WHITE);
     }
 
-    // 4. Draw Input Line
+    // Draw Input Line
     let input_y = start_y + (history.len() * line_height);
     let input = INPUT_BUFFER.lock();
     
     painter.draw_string(10, input_y, PROMPT, Color::GREEN);
-    
     let prompt_width = PROMPT.len() * 8; 
     painter.draw_string(10 + prompt_width, input_y, &input, Color::WHITE);
 
-    // Draw Cursor
     let cursor_x = 10 + prompt_width + (input.len() * 8);
     painter.draw_rect(Rect::new(cursor_x, input_y, 8, 16), Color::WHITE);
 }

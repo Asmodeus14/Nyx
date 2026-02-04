@@ -8,7 +8,7 @@ edition = "2021"
 bootloader_api = "0.11"
 bootloader-boot-config = "0.11"
 
-# ARCH (FIX: Downgrade to 0.14 to match bootloader & fix GDT API)
+# ARCH
 x86_64 = "0.14.13"
 
 # HARDWARE
@@ -23,7 +23,9 @@ lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 # DATA
 serde = { version = "1.0.197", default-features = false, features = ["derive", "alloc"] }
 log = { version = "0.4", default-features = false }
-noto-sans-mono-bitmap = "0.2.0"
+
+# GRAPHICS (Updated to enable 32px font)
+noto-sans-mono-bitmap = { version = "0.2.0", features = ["size_32"] }
 
 [package.metadata.bootloader]
 run-args = ["-display", "none", "-serial", "stdio"]

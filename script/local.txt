@@ -22,3 +22,7 @@ cargo build --release
 
 # Install
 sudo cp target/release/qclang /usr/local/bin/
+
+--------------NYX-------------------
+cargo +nightly build --release --package nyx-kernel --target x86_64-unknown-none
+cargo +nightly run -p runner -- target/x86_64-unknown-none/release/nyx-kernel
