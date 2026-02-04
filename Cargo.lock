@@ -605,6 +605,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
+name = "futures"
+version = "0.3.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65bc07b1a8bc7c85c5f2e110c476c7389b4554ba72af57d8445ea63a576b0876"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1204,15 +1218,14 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 name = "nyx-kernel"
 version = "0.1.0"
 dependencies = [
- "bootloader-boot-config",
  "bootloader_api",
+ "futures",
  "lazy_static",
  "linked_list_allocator",
  "log",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
  "pic8259",
- "serde",
  "spin",
  "uart_16550",
  "volatile 0.2.7",
