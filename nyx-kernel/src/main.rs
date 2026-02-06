@@ -8,9 +8,7 @@ extern crate alloc;
 use bootloader_api::{entry_point, BootInfo, config::Mapping, config::BootloaderConfig};
 use x86_64::VirtAddr;
 use crate::gui::{Painter, Color};
-use crate::task::{Task, Priority};
 
-// --- MODULE REGISTRATION ---
 mod allocator;
 mod memory;
 mod gui;
@@ -22,13 +20,12 @@ mod mouse;
 mod pci;
 mod task;
 mod executor;
-mod window; // Window Manager enabled
+mod window;
+mod process;
 
-// --- GLOBAL RESOURCES ---
 pub static mut SCREEN_PAINTER: Option<gui::VgaPainter> = None;
 pub static mut BACK_BUFFER: Option<gui::BackBuffer> = None;
 
-// --- BOOT CONFIG ---
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
@@ -38,18 +35,15 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    // 1. HARDWARE FOUNDATIONS
     gdt::init();
     interrupts::init_idt();
 
-    // 2. MEMORY MANAGEMENT
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
     let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("Heap Init Failed");
 
-    // Save global MM for Phase 2 Drivers
     {
         let mut mm = crate::memory::MEMORY_MANAGER.lock();
         *mm = Some(crate::memory::MemorySystem {
@@ -58,7 +52,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         });
     }
 
-    // 3. GRAPHICS INIT
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
         unsafe {
@@ -67,109 +60,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 4. PERIPHERALS
-    init_timer(); 
-    
-    // Init PS/2 Mouse
+    init_timer();
     {
         let mut driver = crate::mouse::MouseDriver::new();
         driver.init();
     }
 
-    // 5. ASYNC SCHEDULER
-    let mut executor = executor::Executor::new();
+    // --- PHASE 2: PROCESS LIFECYCLE TEST ---
+    let user_stack_top = crate::memory::create_user_stack()
+        .expect("Failed to create user stack");
 
-    // Task A: The UI Shell + Window Manager
-    executor.spawn(Task::new(async_shell_task(), Priority::Low));
+    // SHELLCODE: Print 'H', Print 'i', then Exit.
+    // ---------------------------------------------
+    // FIX: Updated size from 40 to 41 bytes
+    let shellcode: [u8; 41] = [
+        // -- STEP 1: Print 'H' --
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // MOV RAX, 1
+        0x48, 0xC7, 0xC7, 0x48, 0x00, 0x00, 0x00, // MOV RDI, 'H'
+        0xCD, 0x80,                               // INT 0x80
+        
+        // -- STEP 2: Print 'i' --
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // MOV RAX, 1
+        0x48, 0xC7, 0xC7, 0x69, 0x00, 0x00, 0x00, // MOV RDI, 'i'
+        0xCD, 0x80,                               // INT 0x80
 
-    // Task B: The Heartbeat
-    executor.spawn(Task::new(async_heartbeat_task(), Priority::Low));
-
-    // 6. LAUNCH
-    x86_64::instructions::interrupts::enable();
-    executor.run();
-
-    loop { x86_64::instructions::hlt(); }
-}
-
-// --- TASKS ---
-
-/// The Shell Task: Handles User Input, Windows, and Rendering
-async fn async_shell_task() {
-    // --- PHASE 1.5: WINDOW MANAGER INIT ---
-    let mut window_manager = crate::window::WindowManager::new();
+        // -- STEP 3: Exit --
+        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // MOV RAX, 0
+        0xCD, 0x80                                // INT 0x80
+    ];
     
-    // Add a debug window to verify dragging
-    window_manager.add(crate::window::Window::new(
-        100, 100, 400, 300, "NyxOS Debug"
-    ));
-    
-    // Add a status window
-    window_manager.add(crate::window::Window::new(
-        600, 150, 300, 200, "System Status"
-    ));
-    // --------------------------------------
-
-    loop {
-        // 1. Drain Input Queues (Keyboard/Mouse)
-        crate::shell::update();
-        crate::mouse::update();
-
-        // 2. Render UI
-        if let Some(bb) = unsafe { BACK_BUFFER.as_mut() } {
-            let time = crate::time::CMOS.lock().read_rtc();
-            
-            // A. Draw the Shell (Background)
-            crate::shell::draw(bb, &time);
-
-            // --- PHASE 1.5: WINDOW UPDATE & DRAW ---
-            {
-                // Lock mouse state to process logic
-                let mouse = crate::mouse::MOUSE_STATE.lock();
-                window_manager.update(&mouse);
-            } 
-            
-            // Draw Windows ON TOP of shell
-            window_manager.draw(bb);
-            // ---------------------------------------
-
-            // B. Draw Software Cursor (Top Layer)
-            let mouse = crate::mouse::MOUSE_STATE.lock();
-            let color = if mouse.left_click { crate::gui::Color::RED } else { crate::gui::Color::WHITE };
-            
-            for i in 0..10 {
-                bb.draw_rect(crate::gui::Rect::new(mouse.x + i, mouse.y, 2, 2), color);
-                bb.draw_rect(crate::gui::Rect::new(mouse.x, mouse.y + i, 2, 2), color);
-                bb.draw_rect(crate::gui::Rect::new(mouse.x + i, mouse.y + i, 2, 2), color);
-            }
+    let code_addr = user_stack_top - 4096u64;
+    unsafe {
+        let code_ptr = code_addr.as_mut_ptr::<u8>();
+        for (i, byte) in shellcode.iter().enumerate() {
+            code_ptr.add(i).write(*byte);
         }
+    }
 
-        // 3. Present Frame
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            unsafe {
-                if let (Some(bb), Some(sc)) = (BACK_BUFFER.as_mut(), SCREEN_PAINTER.as_mut()) {
-                    bb.present(sc);
-                }
-            }
-        });
-
-        executor::yield_now().await;
+    unsafe {
+        if let Some(painter) = &mut SCREEN_PAINTER {
+            painter.clear(Color::BLACK);
+            painter.draw_string(20, 20, "NyxOS Phase 2: Process Lifecycle", Color::CYAN);
+            painter.draw_string(20, 40, "Running Script: Print('H') -> Print('i') -> Exit()", Color::WHITE);
+            painter.draw_string(20, 60, "Watch for the boxes below...", Color::YELLOW);
+        }
+        
+        crate::process::jump_to_userspace(code_addr.as_u64(), user_stack_top.as_u64());
     }
 }
 
-/// The Heartbeat Task: Proves Multitasking works
-async fn async_heartbeat_task() {
-    let mut last_tick = 0;
-    loop {
-        let current_tick = crate::time::get_ticks();
-        if current_tick > last_tick + 100 {
-            last_tick = current_tick;
-        }
-        executor::yield_now().await;
-    }
-}
-
-// --- HARDWARE HELPERS ---
+// Unused Rust stub
+#[no_mangle]
+extern "C" fn sample_user_program() { loop {} }
 
 fn init_timer() {
     use x86_64::instructions::port::Port;
@@ -178,14 +120,21 @@ fn init_timer() {
 
     unsafe {
         command_port.write(0x36);
-        let divisor = 11931u16; // ~100Hz frequency
+        let divisor = 11931u16; 
         data_port.write((divisor & 0xFF) as u8);
         data_port.write((divisor >> 8) as u8);
     }
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { if let Some(s) = &mut SCREEN_PAINTER { s.clear(Color::RED); } }
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    unsafe {
+        if let Some(s) = &mut SCREEN_PAINTER {
+            s.clear(Color::RED);
+            s.draw_string(20, 20, "KERNEL PANIC", Color::WHITE);
+            let msg = alloc::format!("{}", info);
+            s.draw_string(20, 50, &msg, Color::WHITE);
+        }
+    }
     loop { x86_64::instructions::hlt(); }
 }

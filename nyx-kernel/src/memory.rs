@@ -1,5 +1,5 @@
 use x86_64::{
-    structures::paging::{OffsetPageTable, PageTable, FrameAllocator, Size4KiB, PhysFrame, Mapper, Page, PageTableFlags, Translate}, // Added Translate
+    structures::paging::{OffsetPageTable, PageTable, FrameAllocator, Size4KiB, PhysFrame, Mapper, Page, PageTableFlags, Translate},
     VirtAddr, PhysAddr,
 };
 use bootloader_api::info::MemoryRegionKind;
@@ -13,8 +13,6 @@ pub struct MemorySystem {
     pub mapper: OffsetPageTable<'static>,
     pub frame_allocator: BootInfoFrameAllocator,
 }
-
-// ... (Keep init and BootInfoFrameAllocator as they were) ...
 
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table_frame = x86_64::registers::control::Cr3::read().0;
@@ -68,14 +66,12 @@ pub unsafe fn map_mmio(
 
     for (i, frame) in frame_range.enumerate() {
         let page = Page::<Size4KiB>::containing_address(virt_start + (i as u64 * 4096));
-        // Ignore errors if already mapped (identity mapping is common)
         let _ = mapper.map_to(page, frame, flags, frame_allocator);
     }
 
     Ok(virt_start)
 }
 
-// NEW: Helper to get Physical Address from Virtual Address
 pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
     let mut lock = MEMORY_MANAGER.lock();
     if let Some(mm) = lock.as_mut() {
@@ -84,4 +80,28 @@ pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
     } else {
         None
     }
+}
+
+// THE KEY FUNCTION FOR PHASE 2
+pub fn create_user_stack() -> Result<VirtAddr, &'static str> {
+    use x86_64::structures::paging::{PageTableFlags, Mapper};
+    
+    let mut system_lock = MEMORY_MANAGER.lock();
+    let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
+
+    let frame = system.frame_allocator.allocate_frame()
+        .ok_or("Frame allocation failed")?;
+
+    let stack_start = VirtAddr::new(0x2000_0000_0000);
+    let page = Page::containing_address(stack_start);
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    unsafe {
+        system.mapper.map_to(page, frame, flags, &mut system.frame_allocator)
+            .map_err(|_| "Map to failed")?
+            .flush();
+    }
+
+    Ok(stack_start + 4096u64)
 }
