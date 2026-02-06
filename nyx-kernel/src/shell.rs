@@ -9,10 +9,9 @@ use spin::Mutex;
 use uart_16550::SerialPort;
 use core::fmt::Write;
 use pc_keyboard::KeyCode;
-// ADDED THIS IMPORT:
 use x86_64::instructions::interrupts;
 
-const PROMPT: &str = "nyx@kernel:~$ ";
+const PROMPT: &str = "nyx@phase1:~$ ";
 const FONT_WIDTH: usize = 16;
 const FONT_HEIGHT: usize = 32;
 const TOP_BAR_HEIGHT: usize = 40;
@@ -21,6 +20,7 @@ const PADDING: usize = 10;
 const MAX_HISTORY_LINES: usize = 300;
 const SCREEN_WIDTH_GUESS: usize = 1920; 
 
+// --- DATA STRUCTURES ---
 pub enum InputEvent { Char(char), Key(KeyCode) }
 
 lazy_static::lazy_static! {
@@ -56,9 +56,8 @@ lazy_static::lazy_static! {
     };
 }
 
-// --- INTERRUPT HANDLERS (Called by hardware) ---
+// --- INTERRUPT HANDLERS ---
 pub fn handle_char(c: char) {
-    // We don't need without_interrupts here because we are ALREADY in an interrupt
     let mut queue = INPUT_QUEUE.lock();
     queue.push_back(InputEvent::Char(c));
 }
@@ -68,12 +67,11 @@ pub fn handle_key(key: KeyCode) {
     queue.push_back(InputEvent::Key(key));
 }
 
-// --- MAIN LOOP UPDATE (Called by kernel task) ---
+// --- MAIN LOOP ---
 pub fn update() {
     let mut events = Vec::new();
     
-    // CRITICAL FIX: Disable interrupts while locking the queue!
-    // If we don't do this, an interrupt can fire WHILE we hold the lock, causing a deadlock.
+    // 1. Drain Queue (Atomic)
     interrupts::without_interrupts(|| {
         let mut queue = INPUT_QUEUE.lock();
         while let Some(event) = queue.pop_front() {
@@ -83,14 +81,14 @@ pub fn update() {
 
     if events.is_empty() { return; }
 
-    // Now that we have the data, we can process it with interrupts enabled
+    // 2. Process Logic
     let mut state = STATE.lock();
     
     for event in events {
         match event {
             InputEvent::Char(c) => {
                 match c {
-                    '\u{8}' => { state.input_buffer.pop(); }
+                    '\u{8}' => { state.input_buffer.pop(); } // Backspace
                     '\n' => { 
                         let command = state.input_buffer.clone();
                         if !command.trim().is_empty() {
@@ -107,6 +105,8 @@ pub fn update() {
             },
             InputEvent::Key(k) => {
                 match k {
+                    KeyCode::PageUp => { state.scroll_offset += 1; },
+                    KeyCode::PageDown => { if state.scroll_offset > 0 { state.scroll_offset -= 1; } },
                     KeyCode::ArrowUp => {
                         if state.cmd_history_index > 0 {
                             state.cmd_history_index -= 1;
@@ -116,7 +116,7 @@ pub fn update() {
                         }
                     },
                     KeyCode::ArrowDown => {
-                        if state.cmd_history_index < state.command_history.len() {
+                         if state.cmd_history_index < state.command_history.len() {
                             state.cmd_history_index += 1;
                             if state.cmd_history_index == state.command_history.len() {
                                 state.input_buffer.clear();
@@ -125,8 +125,6 @@ pub fn update() {
                             }
                         }
                     },
-                    KeyCode::PageUp => { state.scroll_offset += 1; },
-                    KeyCode::PageDown => { if state.scroll_offset > 0 { state.scroll_offset -= 1; } },
                     _ => {}
                 }
             }
@@ -134,44 +132,37 @@ pub fn update() {
     }
 }
 
-fn add_log_entry(text: &str, state: &mut ShellState) {
-    let max_text_width = SCREEN_WIDTH_GUESS - (PADDING * 2);
-    let wrapped_lines = wrap_text(text, max_text_width);
-    for line in wrapped_lines.into_iter().rev() {
-        state.visual_history.insert(0, line);
-    }
-    while state.visual_history.len() > MAX_HISTORY_LINES {
-        state.visual_history.pop();
-    }
-}
-
+// --- COMMAND EXECUTION ---
 fn execute_command(command: &str, state: &mut ShellState) {
     let parts: Vec<&str> = command.trim().split_whitespace().collect();
     if parts.is_empty() { return; }
 
     match parts[0] {
         "help" => {
-            add_log_entry("  lsusb    - Init USB 3.0", state);
-            add_log_entry("  lspci    - Scan Bus", state);
-            add_log_entry("  reboot   - Restart", state);
-            add_log_entry("  clear    - Clear", state);
-            add_log_entry("NyxOS v0.5.0 (Stable Input)", state);
+            add_log_entry("NyxOS Phase 1 Commands:", state);
+            add_log_entry("  uptime   - Show System Ticks & Time", state);
+            add_log_entry("  lspci    - Scan PCI Bus", state);
+            add_log_entry("  sysinfo  - Kernel Stats", state);
+            add_log_entry("  reboot   - Restart System", state);
+            add_log_entry("  shutdown - Power Off", state);
+            add_log_entry("  panic    - Test Crash Handler", state);
+            add_log_entry("  clear    - Clear Screen", state);
         },
         "clear" => { state.visual_history.clear(); },
-        "lsusb" => {
-            add_log_entry("Initializing XHCI Driver...", state);
-            let mut xhci = crate::xhci::XhciDriver::new();
-            match xhci.init() {
-                Ok(msg) => {
-                    add_log_entry(&format!("SUCCESS: {}", msg), state);
-                },
-                Err(e) => {
-                    add_log_entry(&format!("ERROR: {}", e), state);
-                    add_log_entry("Try: qemu-system-x86_64 ... -device qemu-xhci", state);
-                }
-            }
+        "uptime" => {
+            // PHASE 1 FEATURE: System Clock
+            let ticks = crate::time::get_ticks();
+            let secs = crate::time::uptime_seconds();
+            add_log_entry(&format!("Ticks: {} (approx {:.2}s)", ticks, secs), state);
+        },
+        "sysinfo" => {
+            add_log_entry("NyxOS Kernel v0.8.2 (Phase 1)", state);
+            add_log_entry("Scheduler: Async Cooperative", state);
+            add_log_entry("Timer: PIT @ 100Hz", state);
+            add_log_entry("Input: PS/2 Ring-0 Only", state);
         },
         "lspci" => {
+            add_log_entry("Enumerating PCI Bus...", state);
             let mut pci = crate::pci::PciDriver::new();
             let devices = pci.scan();
             for dev in devices {
@@ -182,17 +173,34 @@ fn execute_command(command: &str, state: &mut ShellState) {
             add_log_entry("Rebooting...", state);
             unsafe { perform_reboot(); }
         },
+        "shutdown" => {
+            add_log_entry("Shutting down...", state);
+            unsafe { perform_shutdown(); }
+        },
+        "panic" => {
+            panic!("Manual Panic via Shell");
+        },
+        "echo" => {
+            if parts.len() > 1 {
+                add_log_entry(&parts[1..].join(" "), state);
+            }
+        },
         _ => {
-            add_log_entry(&format!("Unknown: '{}'", parts[0]), state);
+            add_log_entry(&format!("Unknown: '{}'. Type 'help'.", parts[0]), state);
         }
     }
 }
 
-unsafe fn perform_reboot() {
-    use x86_64::instructions::port::Port;
-    let mut p64 = Port::<u8>::new(0x64);
-    p64.write(0xFE); 
-    loop { x86_64::instructions::hlt(); }
+// --- UTILITIES ---
+fn add_log_entry(text: &str, state: &mut ShellState) {
+    let max_text_width = SCREEN_WIDTH_GUESS - (PADDING * 2);
+    let wrapped_lines = wrap_text(text, max_text_width);
+    for line in wrapped_lines.into_iter().rev() {
+        state.visual_history.insert(0, line);
+    }
+    while state.visual_history.len() > MAX_HISTORY_LINES {
+        state.visual_history.pop();
+    }
 }
 
 fn wrap_text(text: &str, max_width_px: usize) -> Vec<String> {
@@ -210,13 +218,47 @@ fn wrap_text(text: &str, max_width_px: usize) -> Vec<String> {
     lines
 }
 
+unsafe fn perform_reboot() {
+    use x86_64::instructions::port::Port;
+    // 1. ACPI
+    let mut pcf9 = Port::<u8>::new(0xCF9);
+    pcf9.write(0x06);
+    pcf9.write(0x0E);
+    // 2. Keyboard Pulse
+    let mut p64 = Port::<u8>::new(0x64);
+    p64.write(0xFE); 
+    // 3. Triple Fault
+    use x86_64::structures::idt::InterruptDescriptorTable;
+    let empty_idt = alloc::boxed::Box::leak(alloc::boxed::Box::new(InterruptDescriptorTable::new()));
+    empty_idt.load();
+    x86_64::instructions::interrupts::int3(); 
+    loop { x86_64::instructions::hlt(); }
+}
+
+unsafe fn perform_shutdown() {
+    use x86_64::instructions::port::Port;
+    let mut port = Port::<u16>::new(0x604);
+    port.write(0x2000);
+    let mut port_new = Port::<u16>::new(0xCF9);
+    port_new.write(0x08);
+    loop { x86_64::instructions::hlt(); }
+}
+
+pub fn print_fmt(args: fmt::Arguments) {
+    interrupts::without_interrupts(|| {
+        let mut serial = SERIAL1.lock();
+        let _ = serial.write_fmt(args);
+    });
+}
+
+// --- RENDERING ---
 pub fn draw(painter: &mut impl Painter, time: &DateTime) {
     let width = painter.width();
     let height = painter.height();
 
     painter.clear(Color::new(10, 15, 20));
 
-    // Status Bar
+    // Top Bar
     painter.draw_rect(Rect::new(0, 0, width, TOP_BAR_HEIGHT), Color::new(30, 35, 40));
     painter.draw_string(20, 8, "NyxOS Kernel", Color::CYAN);
     let time_str = time.to_string();
@@ -228,19 +270,17 @@ pub fn draw(painter: &mut impl Painter, time: &DateTime) {
     painter.draw_rect(Rect::new(0, input_y, width, INPUT_BAR_HEIGHT), Color::new(40, 45, 50));
     
     let state = STATE.lock();
-    let prompt_x = 20;
-    let input_text_y = input_y + 10;
-    
-    painter.draw_string(prompt_x, input_text_y, PROMPT, Color::GREEN);
+    painter.draw_string(20, input_y + 10, PROMPT, Color::GREEN);
     let prompt_w = PROMPT.len() * FONT_WIDTH;
-    painter.draw_string(prompt_x + prompt_w, input_text_y, &state.input_buffer, Color::WHITE);
+    painter.draw_string(20 + prompt_w, input_y + 10, &state.input_buffer, Color::WHITE);
     
+    // Cursor
     if (time.second % 2) == 0 {
-        let cursor_x = prompt_x + prompt_w + (state.input_buffer.len() * FONT_WIDTH);
-        painter.draw_rect(Rect::new(cursor_x, input_text_y + 4, 12, 24), Color::WHITE);
+        let cursor_x = 20 + prompt_w + (state.input_buffer.len() * FONT_WIDTH);
+        painter.draw_rect(Rect::new(cursor_x, input_y + 14, 12, 24), Color::WHITE);
     }
 
-    // Console Output
+    // Console History
     let output_start_y = TOP_BAR_HEIGHT + INPUT_BAR_HEIGHT + PADDING;
     let mut current_y = output_start_y;
     let mut lines_skipped = 0;
@@ -255,16 +295,4 @@ pub fn draw(painter: &mut impl Painter, time: &DateTime) {
         painter.draw_string(PADDING, current_y, line, Color::new(200, 200, 200));
         current_y += FONT_HEIGHT;
     }
-    
-    if state.scroll_offset > 0 {
-        painter.draw_string(width - 30, output_start_y, "^", Color::YELLOW);
-    }
-}
-
-pub fn print_fmt(args: fmt::Arguments) {
-    // This is safe because it uses spinlock internally for serial, but without_interrupts is good practice
-    interrupts::without_interrupts(|| {
-        let mut serial = SERIAL1.lock();
-        let _ = serial.write_fmt(args);
-    });
 }

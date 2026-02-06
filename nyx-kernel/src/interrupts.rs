@@ -21,11 +21,12 @@ lazy_static! {
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
         
+        // Timer (IRQ 0)
         idt[PIC_1_OFFSET as usize].set_handler_fn(timer_interrupt_handler);
+        // Keyboard (IRQ 1)
         idt[(PIC_1_OFFSET + 1) as usize].set_handler_fn(keyboard_interrupt_handler);
-        
-        // FIX: Uncommented Mouse Handler
-        idt[(PIC_1_OFFSET + 12) as usize].set_handler_fn(mouse_interrupt_handler);
+        // Mouse (IRQ 12) - FIX: Added this line!
+        idt[(PIC_2_OFFSET + 4) as usize].set_handler_fn(mouse_interrupt_handler);
         
         idt
     };
@@ -36,14 +37,18 @@ pub fn init_idt() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // FIX: Unmask Mouse (0xEF on Slave)
-        // Master (0xF8): Unmask Timer(0), Keyboard(1), Cascade(2)
-        // Slave (0xEF): Unmask Mouse(12)
+        
+        // FIX: Unmask Interrupts Correctly
+        // Master (0x21): 1111_1000 = 0xF8 (Enable IRQ 0=Timer, 1=Keys, 2=Cascade)
+        // Slave  (0xA1): 1110_1111 = 0xEF (Enable IRQ 12=Mouse)
         pics.write_masks(0xF8, 0xEF);
     }
 }
 
+// --- HANDLERS ---
+
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::time::tick();
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET); }
 }
 
@@ -56,6 +61,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
     let mut keyboard = KEYBOARD.lock();
     let mut port = Port::new(0x60);
+    // Standard keyboard read
     let scancode: u8 = unsafe { port.read() };
 
     if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
@@ -69,15 +75,19 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + 1); }
 }
 
-// FIX: Added Mouse Handler Function
+// FIX: Added Mouse Handler
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
-    let mut port = Port::new(0x60);
-    let byte: u8 = unsafe { port.read() };
     
-    crate::mouse::handle_interrupt(byte);
+    let mut port = Port::new(0x60);
+    let packet: u8 = unsafe { port.read() }; // CRITICAL: This line clears the buffer
+    
+    crate::mouse::handle_interrupt(packet);
 
-    unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + 12); }
+    unsafe {
+        // Notify BOTH PICs because Mouse (IRQ 12) is on the Slave Controller
+        PICS.lock().notify_end_of_interrupt(PIC_2_OFFSET + 4);
+    }
 }
 
 extern "x86-interrupt" fn breakpoint_handler(_sf: InterruptStackFrame) {}

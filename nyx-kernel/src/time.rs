@@ -1,7 +1,30 @@
 use x86_64::instructions::port::Port;
 use spin::Mutex;
+use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::string::String;
+use alloc::format;
 
-// CMOS Registers
+// GLOBAL TICK COUNTER (Increments every ~10ms)
+pub static TICKS: AtomicU64 = AtomicU64::new(0);
+
+// Called by the Timer Interrupt Handler
+pub fn tick() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+// Returns uptime in ticks
+pub fn get_ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+// Returns uptime in seconds (approximate)
+pub fn uptime_seconds() -> f64 {
+    let ticks = get_ticks();
+    // PIT is set to ~100Hz in main.rs
+    ticks as f64 / 100.0
+}
+
+// --- CMOS DRIVER (Wall Clock) ---
 const CMOS_ADDRESS: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
 
@@ -30,18 +53,11 @@ impl Cmos {
     }
 
     pub fn read_rtc(&mut self) -> DateTime {
-        // --- HAL SAFETY CHECK ---
-        // OLD CODE: while self.read_upip() {}  <-- This froze forever if hardware was busy
-        // NEW CODE: Try 10,000 times. If still busy, abort and continue.
-        
+        // Spin-wait safety check
         let mut timeouts = 0;
         while self.read_upip() {
             timeouts += 1;
-            if timeouts > 100_000 {
-                // HARDWARE ERROR: CMOS is stuck!
-                // Break out to save the OS from freezing.
-                break; 
-            }
+            if timeouts > 100_000 { break; }
             core::hint::spin_loop();
         }
 
@@ -53,7 +69,7 @@ impl Cmos {
         let mut year = self.read_register(0x09);
         let register_b = self.read_register(0x0B);
 
-        // Convert BCD to Binary if necessary
+        // Binary Coded Decimal conversion
         if (register_b & 0x04) == 0 {
             second = (second & 0x0F) + ((second / 16) * 10);
             minute = (minute & 0x0F) + ((minute / 16) * 10);
@@ -85,9 +101,6 @@ pub struct DateTime {
     pub month: u8,
     pub year: u16,
 }
-
-use alloc::string::String;
-use alloc::format;
 
 impl DateTime {
     pub fn to_string(&self) -> String {

@@ -14,7 +14,7 @@ pub struct PciDevice {
     pub device_id: u16,
     pub class_id: u8,
     pub subclass_id: u8,
-    pub prog_if: u8, // NEW: Interface type (Required for XHCI)
+    pub prog_if: u8,
 }
 
 impl PciDevice {
@@ -29,7 +29,7 @@ impl PciDevice {
                     0x00 => "USB (UHCI)",
                     0x10 => "USB (OHCI)",
                     0x20 => "USB (EHCI)",
-                    0x30 => "USB 3.0 (XHCI)", // Target
+                    0x30 => "USB 3.0 (XHCI)",
                     _ => "USB Controller",
                 },
                 _ => "Serial Bus",
@@ -66,7 +66,32 @@ impl PciDriver {
         self.data_port.read()
     }
 
-    /// Helper to get the MMIO address (Base Address Register 0)
+    // NEW: Write to PCI Configuration Space
+    pub unsafe fn write(&mut self, bus: u8, device: u8, func: u8, offset: u8, value: u32) {
+        let address = 0x80000000 
+            | ((bus as u32) << 16)
+            | ((device as u32) << 11)
+            | ((func as u32) << 8)
+            | ((offset as u32) & 0xFC);
+
+        self.address_port.write(address);
+        self.data_port.write(value);
+    }
+
+    // NEW: Enable Bus Mastering (DMA) and Memory Space (MMIO)
+    pub fn enable_bus_master(&mut self, dev: &PciDevice) {
+        unsafe {
+            let cmd_offset = 0x04;
+            let command_reg = self.read(dev.bus, dev.device, 0, cmd_offset);
+            
+            // Bit 1: Memory Space (Enable MMIO)
+            // Bit 2: Bus Master (Enable DMA)
+            let new_command = command_reg | 0x06; 
+            
+            self.write(dev.bus, dev.device, 0, cmd_offset, new_command);
+        }
+    }
+
     pub fn get_bar0(&mut self, dev: &PciDevice) -> u32 {
         unsafe { self.read(dev.bus, dev.device, 0, 0x10) }
     }
