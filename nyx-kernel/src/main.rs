@@ -22,7 +22,7 @@ mod mouse;
 mod pci;
 mod task;
 mod executor;
-mod window; // Legacy stub, kept to prevent linker errors if referenced
+mod window; // Window Manager enabled
 
 // --- GLOBAL RESOURCES ---
 pub static mut SCREEN_PAINTER: Option<gui::VgaPainter> = None;
@@ -68,23 +68,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // 4. PERIPHERALS
-    // Start the heartbeat timer (Phase 1 Requirement)
     init_timer(); 
     
-    // Init PS/2 Mouse (Phase 0/1 Requirement)
+    // Init PS/2 Mouse
     {
         let mut driver = crate::mouse::MouseDriver::new();
         driver.init();
     }
 
-    // 5. ASYNC SCHEDULER (The Heart of Phase 1)
+    // 5. ASYNC SCHEDULER
     let mut executor = executor::Executor::new();
 
-    // Task A: The UI Shell (Runs at Low Priority)
+    // Task A: The UI Shell + Window Manager
     executor.spawn(Task::new(async_shell_task(), Priority::Low));
 
-    // Task B: The Heartbeat (Runs at Low Priority)
-    // This task runs alongside the shell to prove the OS isn't blocking.
+    // Task B: The Heartbeat
     executor.spawn(Task::new(async_heartbeat_task(), Priority::Low));
 
     // 6. LAUNCH
@@ -96,8 +94,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 // --- TASKS ---
 
-/// The Shell Task: Handles User Input and Rendering
+/// The Shell Task: Handles User Input, Windows, and Rendering
 async fn async_shell_task() {
+    // --- PHASE 1.5: WINDOW MANAGER INIT ---
+    let mut window_manager = crate::window::WindowManager::new();
+    
+    // Add a debug window to verify dragging
+    window_manager.add(crate::window::Window::new(
+        100, 100, 400, 300, "NyxOS Debug"
+    ));
+    
+    // Add a status window
+    window_manager.add(crate::window::Window::new(
+        600, 150, 300, 200, "System Status"
+    ));
+    // --------------------------------------
+
     loop {
         // 1. Drain Input Queues (Keyboard/Mouse)
         crate::shell::update();
@@ -107,9 +119,21 @@ async fn async_shell_task() {
         if let Some(bb) = unsafe { BACK_BUFFER.as_mut() } {
             let time = crate::time::CMOS.lock().read_rtc();
             
+            // A. Draw the Shell (Background)
             crate::shell::draw(bb, &time);
 
-            // Draw Software Cursor (Red if clicking, White if idle)
+            // --- PHASE 1.5: WINDOW UPDATE & DRAW ---
+            {
+                // Lock mouse state to process logic
+                let mouse = crate::mouse::MOUSE_STATE.lock();
+                window_manager.update(&mouse);
+            } 
+            
+            // Draw Windows ON TOP of shell
+            window_manager.draw(bb);
+            // ---------------------------------------
+
+            // B. Draw Software Cursor (Top Layer)
             let mouse = crate::mouse::MOUSE_STATE.lock();
             let color = if mouse.left_click { crate::gui::Color::RED } else { crate::gui::Color::WHITE };
             
@@ -138,13 +162,9 @@ async fn async_heartbeat_task() {
     let mut last_tick = 0;
     loop {
         let current_tick = crate::time::get_ticks();
-        
-        // Logic check: Ensure time is moving forward
         if current_tick > last_tick + 100 {
             last_tick = current_tick;
-            // In a future phase, this could update a system status LED on screen
         }
-        
         executor::yield_now().await;
     }
 }

@@ -24,23 +24,33 @@ lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
         
-        // 1. Kernel Code Segment (Offset 0x08)
-        let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
+        // --- RING 0 (KERNEL) ---
+        let k_code = gdt.add_entry(Descriptor::kernel_code_segment());
+        let k_data = gdt.add_entry(Descriptor::kernel_data_segment());
         
-        // 2. Kernel Data Segment (Offset 0x10) - THIS WAS MISSING!
-        let data_selector = gdt.add_entry(Descriptor::kernel_data_segment());
+        // --- RING 3 (USERSPACE) ---
+        // Critical for Phase 2: These segments allow code to run with lower privileges.
+        let u_data = gdt.add_entry(Descriptor::user_data_segment());
+        let u_code = gdt.add_entry(Descriptor::user_code_segment());
         
-        // 3. TSS Segment (Offset 0x18)
-        let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
+        let tss = gdt.add_entry(Descriptor::tss_segment(&TSS));
         
-        (gdt, Selectors { code_selector, data_selector, tss_selector })
+        (gdt, Selectors { 
+            kernel_code_selector: k_code, 
+            kernel_data_selector: k_data, 
+            user_data_selector: u_data, 
+            user_code_selector: u_code, 
+            tss_selector: tss 
+        })
     };
 }
 
-struct Selectors {
-    code_selector: SegmentSelector,
-    data_selector: SegmentSelector,
-    tss_selector: SegmentSelector,
+pub struct Selectors {
+    pub kernel_code_selector: SegmentSelector,
+    pub kernel_data_selector: SegmentSelector,
+    pub user_data_selector: SegmentSelector, 
+    pub user_code_selector: SegmentSelector, 
+    pub tss_selector: SegmentSelector,
 }
 
 pub fn init() {
@@ -50,12 +60,12 @@ pub fn init() {
     GDT.0.load();
     unsafe {
         // Reload Code Segment
-        CS::set_reg(GDT.1.code_selector);
+        CS::set_reg(GDT.1.kernel_code_selector);
         
         // Reload Data Segments (Critical for Interrupts)
-        SS::set_reg(GDT.1.data_selector);
-        DS::set_reg(GDT.1.data_selector);
-        ES::set_reg(GDT.1.data_selector);
+        SS::set_reg(GDT.1.kernel_data_selector);
+        DS::set_reg(GDT.1.kernel_data_selector);
+        ES::set_reg(GDT.1.kernel_data_selector);
         
         // Load TSS
         load_tss(GDT.1.tss_selector);

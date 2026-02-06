@@ -143,14 +143,13 @@ fn execute_command(command: &str, state: &mut ShellState) {
             add_log_entry("  uptime   - Show System Ticks & Time", state);
             add_log_entry("  lspci    - Scan PCI Bus", state);
             add_log_entry("  sysinfo  - Kernel Stats", state);
-            add_log_entry("  reboot   - Restart System", state);
-            add_log_entry("  shutdown - Power Off", state);
+            add_log_entry("  reboot   - Restart System (Multiple Methods)", state);
+            add_log_entry("  shutdown - Power Off (ACPI/Halt)", state);
             add_log_entry("  panic    - Test Crash Handler", state);
             add_log_entry("  clear    - Clear Screen", state);
         },
         "clear" => { state.visual_history.clear(); },
         "uptime" => {
-            // PHASE 1 FEATURE: System Clock
             let ticks = crate::time::get_ticks();
             let secs = crate::time::uptime_seconds();
             add_log_entry(&format!("Ticks: {} (approx {:.2}s)", ticks, secs), state);
@@ -174,7 +173,7 @@ fn execute_command(command: &str, state: &mut ShellState) {
             unsafe { perform_reboot(); }
         },
         "shutdown" => {
-            add_log_entry("Shutting down...", state);
+            add_log_entry("Attempting shutdown...", state);
             unsafe { perform_shutdown(); }
         },
         "panic" => {
@@ -218,30 +217,56 @@ fn wrap_text(text: &str, max_width_px: usize) -> Vec<String> {
     lines
 }
 
+// --- SYSTEM CONTROL FUNCTIONS (UPDATED) ---
+
 unsafe fn perform_reboot() {
     use x86_64::instructions::port::Port;
-    // 1. ACPI
-    let mut pcf9 = Port::<u8>::new(0xCF9);
-    pcf9.write(0x06);
-    pcf9.write(0x0E);
-    // 2. Keyboard Pulse
+    
+    // Method 1: PS/2 Keyboard Controller Pulse (Legacy)
+    // Writing 0xFE to port 0x64 pulses the CPU reset line.
     let mut p64 = Port::<u8>::new(0x64);
     p64.write(0xFE); 
-    // 3. Triple Fault
+    
+    // Method 2: "Fast A20" Gate (System Control Port A)
+    // Bit 0 = Fast Reset. This is very effective on modern chipsets.
+    let mut p92 = Port::<u8>::new(0x92);
+    let val = p92.read();
+    p92.write(val | 1);
+
+    // Method 3: ACPI Reset (0xCF9)
+    // Write 0x06 (Reset) to PCI Configuration Access Port
+    let mut pcf9 = Port::<u8>::new(0xCF9);
+    pcf9.write(0x06);
+
+    // Method 4: Triple Fault (The Nuclear Option)
     use x86_64::structures::idt::InterruptDescriptorTable;
     let empty_idt = alloc::boxed::Box::leak(alloc::boxed::Box::new(InterruptDescriptorTable::new()));
     empty_idt.load();
     x86_64::instructions::interrupts::int3(); 
+
+    // If we are still here, the hardware is stubborn.
     loop { x86_64::instructions::hlt(); }
 }
 
 unsafe fn perform_shutdown() {
     use x86_64::instructions::port::Port;
+    
+    // 1. QEMU / Bochs Shutdown Hack
+    // This only works in emulators. Real hardware ignores port 0x604.
     let mut port = Port::<u16>::new(0x604);
     port.write(0x2000);
+    
+    // 2. Newer QEMU / VirtualBox Shutdown
     let mut port_new = Port::<u16>::new(0xCF9);
     port_new.write(0x08);
-    loop { x86_64::instructions::hlt(); }
+
+    // 3. Real Hardware Fallback
+    // Since we don't have an ACPI driver yet, we can't power off a real PC.
+    // The safest thing to do is disable interrupts and halt the CPU.
+    x86_64::instructions::interrupts::disable();
+    loop { 
+        x86_64::instructions::hlt(); 
+    }
 }
 
 pub fn print_fmt(args: fmt::Arguments) {
