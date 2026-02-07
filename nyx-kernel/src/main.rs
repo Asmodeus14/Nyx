@@ -35,9 +35,12 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    // 1. Hardware Initialization
     gdt::init();
     interrupts::init_idt();
+    interrupts::init_syscalls();
 
+    // 2. Memory Initialization
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
     let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
@@ -46,83 +49,71 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     {
         let mut mm = crate::memory::MEMORY_MANAGER.lock();
-        *mm = Some(crate::memory::MemorySystem {
-            mapper,
-            frame_allocator,
-        });
+        *mm = Some(crate::memory::MemorySystem { mapper, frame_allocator });
     }
 
+    // 3. Graphics Initialization
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
+        let width = info.width;
+        let height = info.height;
+
+        {
+            let mut wm = crate::window::WINDOW_MANAGER.lock();
+            wm.set_resolution(width, height);
+        }
+        {
+            let mut mouse = crate::mouse::MOUSE_STATE.lock();
+            mouse.screen_width = width;
+            mouse.screen_height = height;
+            mouse.x = width / 2;
+            mouse.y = height / 2;
+        }
+
         unsafe {
             SCREEN_PAINTER = Some(gui::VgaPainter { buffer: fb.buffer_mut(), info });
             BACK_BUFFER = Some(gui::BackBuffer::new(info));
         }
     }
 
-    init_timer();
+    // 4. Timer & Interrupts (THE FIX IS HERE)
+    crate::time::init(); // 1. Configure Chip to 1000Hz
+    
+    // 5. Mouse Init
     {
         let mut driver = crate::mouse::MouseDriver::new();
         driver.init();
     }
 
-    // --- PHASE 2: PROCESS LIFECYCLE TEST ---
-    let user_stack_top = crate::memory::create_user_stack()
-        .expect("Failed to create user stack");
+    // --- CRITICAL FIX: ENABLE INTERRUPTS ---
+    // This tells the CPU to start listening to the "Tick" doorbell.
+    x86_64::instructions::interrupts::enable(); 
+    // ---------------------------------------
 
-    // SHELLCODE: Print 'H', Print 'i', then Exit.
-    // ---------------------------------------------
-    // FIX: Updated size from 40 to 41 bytes
-    let shellcode: [u8; 41] = [
-        // -- STEP 1: Print 'H' --
-        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // MOV RAX, 1
-        0x48, 0xC7, 0xC7, 0x48, 0x00, 0x00, 0x00, // MOV RDI, 'H'
-        0xCD, 0x80,                               // INT 0x80
-        
-        // -- STEP 2: Print 'i' --
-        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // MOV RAX, 1
-        0x48, 0xC7, 0xC7, 0x69, 0x00, 0x00, 0x00, // MOV RDI, 'i'
-        0xCD, 0x80,                               // INT 0x80
+    // 6. Userspace Loading
+    const PAGE_COUNT: u64 = 100;
+    const PAGE_SIZE: u64 = 4096;
+    const TOTAL_MEM: u64 = PAGE_COUNT * PAGE_SIZE;
 
-        // -- STEP 3: Exit --
-        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // MOV RAX, 0
-        0xCD, 0x80                                // INT 0x80
-    ];
+    let user_base_addr = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Failed to allocate user pages");
+    const USER_BIN: &[u8] = include_bytes!("nyx-user.bin");
     
-    let code_addr = user_stack_top - 4096u64;
     unsafe {
-        let code_ptr = code_addr.as_mut_ptr::<u8>();
-        for (i, byte) in shellcode.iter().enumerate() {
+        let code_ptr = user_base_addr.as_mut_ptr::<u8>();
+        for (i, byte) in USER_BIN.iter().enumerate() {
             code_ptr.add(i).write(*byte);
         }
     }
 
+    let offset = if USER_BIN.len() > 0 && USER_BIN[0] == 0 { 0x10 } else { 0 };
+    let entry_point_addr = user_base_addr.as_u64() + offset;
+    let user_stack_top = user_base_addr + TOTAL_MEM - 64u64;
+
     unsafe {
         if let Some(painter) = &mut SCREEN_PAINTER {
             painter.clear(Color::BLACK);
-            painter.draw_string(20, 20, "NyxOS Phase 2: Process Lifecycle", Color::CYAN);
-            painter.draw_string(20, 40, "Running Script: Print('H') -> Print('i') -> Exit()", Color::WHITE);
-            painter.draw_string(20, 60, "Watch for the boxes below...", Color::YELLOW);
         }
-        
-        crate::process::jump_to_userspace(code_addr.as_u64(), user_stack_top.as_u64());
-    }
-}
-
-// Unused Rust stub
-#[no_mangle]
-extern "C" fn sample_user_program() { loop {} }
-
-fn init_timer() {
-    use x86_64::instructions::port::Port;
-    let mut command_port = Port::<u8>::new(0x43);
-    let mut data_port = Port::<u8>::new(0x40);
-
-    unsafe {
-        command_port.write(0x36);
-        let divisor = 11931u16; 
-        data_port.write((divisor & 0xFF) as u8);
-        data_port.write((divisor >> 8) as u8);
+        crate::process::jump_to_userspace(entry_point_addr, user_stack_top.as_u64());
     }
 }
 

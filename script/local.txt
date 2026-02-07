@@ -23,6 +23,20 @@ cargo build --release
 # Install
 sudo cp target/release/qclang /usr/local/bin/
 
---------------NYX-------------------
+--------------NYX- kernel-------------------
 cargo +nightly build --release --package nyx-kernel --target x86_64-unknown-none
 cargo +nightly run -p runner -- target/x86_64-unknown-none/release/nyx-kernel
+
+--------------NYX-User------------
+echo "--- 1. Building User Application ---"
+# Build the user program (release mode for small size)
+cargo build --package nyx-user --release --target x86_64-unknown-none
+
+echo "--- 2. Extracting & Moving Binary ---"
+# Extract raw machine code from the compiled ELF file
+# Note: The output goes directly into the kernel source folder
+objcopy -O binary target/x86_64-unknown-none/release/nyx-user nyx-kernel/src/nyx-user.bin
+
+echo "--- 3. Building Kernel & Bootable Image ---"
+# Build the kernel (which now includes the fresh nyx-user.bin)
+cargo build --package nyx-kernel --release --target x86_64-unknown-none

@@ -5,7 +5,8 @@ use spin::Mutex;
 use crate::gdt;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1}; 
 use crate::gui::Painter; 
-use core::arch::global_asm;
+use x86_64::VirtAddr;
+use core::arch::naked_asm;
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -13,37 +14,85 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
-// --- ASSEMBLY WRAPPER ---
-// Captures registers before passing control to Rust.
-global_asm!(r#"
-.global syscall_asm_wrapper
-syscall_asm_wrapper:
-    push rax
-    push rdi
-    push rsi
-    push rdx
-    push rcx
-    push r8
-    push r9
-    
-    // Pass Stack Pointer (RSP) to Rust as the first argument (RDI)
-    mov rdi, rsp
+static mut SYSCALL_STACK: [u8; 4096 * 5] = [0; 4096 * 5];
 
-    // Call the Rust function
-    call syscall_rust_dispatcher
+#[repr(C)]
+pub struct KernelGsData {
+    pub kernel_stack: u64, 
+    pub user_stack: u64,   
+}
 
-    pop r9
-    pop r8
-    pop rcx
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rax
-    iretq
-"#);
+static mut GS_DATA: KernelGsData = KernelGsData { kernel_stack: 0, user_stack: 0 };
 
-extern "C" {
-    fn syscall_asm_wrapper();
+#[unsafe(naked)]
+pub extern "C" fn syscall_asm_wrapper() {
+    unsafe {
+        naked_asm!(
+            "swapgs",
+            "mov gs:[8], rsp",      
+            "mov rsp, gs:[0]",      
+            
+            "push {user_data_sel}", 
+            "push gs:[8]",          
+            "push r11",             
+            "push {user_code_sel}", 
+            "push rcx",             
+            
+            "push rax",
+            "push rdi",
+            "push rsi",
+            "push rdx",
+            "push rcx",
+            "push r8",
+            "push r9",
+            
+            "mov rdi, rsp",
+            "call syscall_rust_dispatcher",
+            
+            "pop r9",
+            "pop r8",
+            "pop rcx",
+            "pop rdx",
+            "pop rsi",
+            "pop rdi",
+            "pop rax",
+            
+            "swapgs",
+            "iretq",
+            user_data_sel = const (0x18 | 3), 
+            user_code_sel = const (0x20 | 3),
+        );
+    }
+}
+
+#[no_mangle]
+extern "C" fn syscall_rust_dispatcher(stack_ptr: *mut SyscallRegisters) {
+    let regs = unsafe { &*stack_ptr };
+    let syscall_id = regs.rax; 
+    let arg1 = regs.rdi;       
+
+    match syscall_id {
+        0 => { // EXIT
+            use crate::gui::Color;
+            if let Some(painter) = unsafe { &mut crate::SCREEN_PAINTER } {
+                painter.draw_string(20, 500, "PROCESS FINISHED.", Color::RED);
+            }
+            loop { x86_64::instructions::hlt(); }
+        },
+        1 => { // PRINT
+            let char_to_print = arg1 as u8 as char;
+            crate::window::WINDOW_MANAGER.lock().console_print(char_to_print);
+        },
+        2 => { // READ_KEY
+             // FIX: Actually read from the shell buffer!
+             if let Some(c) = crate::shell::pop_char() {
+                 unsafe { (*stack_ptr).rax = c as u64; }
+             } else {
+                 unsafe { (*stack_ptr).rax = 0; }
+             }
+        },
+        _ => {}
+    }
 }
 
 lazy_static! {
@@ -55,18 +104,9 @@ lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
-        
         idt[PIC_1_OFFSET as usize].set_handler_fn(timer_interrupt_handler);
         idt[(PIC_1_OFFSET + 1) as usize].set_handler_fn(keyboard_interrupt_handler);
         idt[(PIC_2_OFFSET + 4) as usize].set_handler_fn(mouse_interrupt_handler);
-        
-        // --- SYSCALL INTERRUPT (0x80) ---
-        unsafe {
-            idt[0x80]
-                .set_handler_addr(x86_64::VirtAddr::new(syscall_asm_wrapper as u64))
-                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
-        }
-        
         idt
     };
 }
@@ -80,10 +120,55 @@ pub fn init_idt() {
     }
 }
 
-// --- HANDLERS ---
+pub fn init_syscalls() {
+    use x86_64::registers::model_specific::{Efer, EferFlags, LStar, Star, SFMask, KernelGsBase};
+    use x86_64::registers::rflags::RFlags;
+    use x86_64::structures::gdt::SegmentSelector;
+
+    unsafe {
+        let stack_top = VirtAddr::from_ptr(&SYSCALL_STACK).as_u64() + (4096 * 5);
+        GS_DATA.kernel_stack = stack_top;
+        KernelGsBase::write(VirtAddr::new(&GS_DATA as *const _ as u64));
+
+        Efer::update(|flags| {
+            flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
+        });
+
+        LStar::write(VirtAddr::new(syscall_asm_wrapper as *const () as u64));
+
+        let kernel_code = gdt::get_kernel_code_selector();
+        let kernel_data = gdt::get_kernel_data_selector();
+        let user_code = gdt::get_user_code_selector();
+        let user_data = gdt::get_user_data_selector();
+        
+        Star::write(
+            SegmentSelector(user_code),
+            SegmentSelector(user_data),
+            SegmentSelector(kernel_code),
+            SegmentSelector(kernel_data)
+        ).unwrap();
+
+        SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+    }
+}
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::time::tick();
+    
+    crate::mouse::update();
+    crate::shell::process_keys();
+
+    // Logic Update
+    {
+        let mouse_state = crate::mouse::MOUSE_STATE.lock();
+        crate::window::WINDOW_MANAGER.lock().update(&mouse_state);
+    }
+
+    // Draw Update (Limit FPS to prevent starvation)
+    if crate::time::get_ticks() % 3 == 0 {
+        crate::window::compositor_paint();
+    }
+
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET); }
 }
 
@@ -93,14 +178,23 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
             Mutex::new(Keyboard::new(ScancodeSet1::new(), layouts::Us104Key, HandleControl::Ignore));
     }
+    
     let mut keyboard = KEYBOARD.lock();
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
+    
     if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
         if let Some(key) = keyboard.process_keyevent(key_event) {
             match key {
-                DecodedKey::Unicode(character) => { crate::shell::handle_char(character); },
-                DecodedKey::RawKey(key_code) => { crate::shell::handle_key(key_code); },
+                DecodedKey::Unicode(character) => { 
+                    crate::shell::handle_char(character); 
+                },
+                DecodedKey::RawKey(k) => { 
+                    use pc_keyboard::KeyCode;
+                    if k == KeyCode::F1 {
+                        crate::shell::handle_key(0x3B); 
+                    }
+                },
             }
         }
     }
@@ -108,82 +202,35 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 }
 
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use x86_64::instructions::port::Port;
-    let mut port = Port::new(0x60);
-    let packet: u8 = unsafe { port.read() }; 
-    crate::mouse::handle_interrupt(packet);
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_2_OFFSET + 4); }
 }
 
-// --- SYSCALL DISPATCHER ---
 #[repr(C)]
 struct SyscallRegisters {
-    r9: u64, r8: u64, rcx: u64, rdx: u64,
-    rsi: u64, rdi: u64, rax: u64,
-}
-
-#[no_mangle]
-extern "C" fn syscall_rust_dispatcher(stack_ptr: *mut SyscallRegisters) {
-    use crate::gui::{Color, Rect};
-    
-    let regs = unsafe { &*stack_ptr };
-    let syscall_id = regs.rax; // RAX = Command
-    let arg1 = regs.rdi;       // RDI = Data
-
-    unsafe {
-        if let Some(painter) = &mut crate::SCREEN_PAINTER {
-            match syscall_id {
-                0 => { // SYSCALL 0: EXIT PROCESS
-                    painter.draw_rect(Rect::new(100, 400, 600, 50), Color::RED);
-                    painter.draw_string(110, 410, "PROCESS FINISHED: sys_exit(0) called.", Color::WHITE);
-                    painter.draw_string(110, 430, "System Halted safely.", Color::WHITE);
-                    // Halt the CPU permanently (since we have no other tasks yet)
-                    loop { x86_64::instructions::hlt(); }
-                },
-                1 => { // SYSCALL 1: PRINT CHARACTER
-                    let char_to_print = arg1 as u8 as char;
-                    
-                    // Draw Blue Box
-                    painter.draw_rect(Rect::new(100, 300, 600, 50), Color::DARK_BLUE);
-                    use alloc::format;
-                    let msg = format!("USER OUTPUT: '{}'", char_to_print);
-                    painter.draw_string(110, 310, &msg, Color::WHITE);
-                },
-                _ => {
-                     painter.draw_rect(Rect::new(100, 300, 600, 50), Color::RED);
-                     painter.draw_string(110, 310, "UNKNOWN SYSCALL", Color::WHITE);
-                }
-            }
-        }
-    }
+    pub r9: u64, pub r8: u64, pub rcx: u64, pub rdx: u64,
+    pub rsi: u64, pub rdi: u64, pub rax: u64,
 }
 
 extern "x86-interrupt" fn breakpoint_handler(_sf: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn page_fault_handler(sf: InterruptStackFrame, ec: PageFaultErrorCode) { 
+    use x86_64::registers::control::Cr2;
+    let fault_addr = Cr2::read();
     unsafe {
         if let Some(painter) = &mut crate::SCREEN_PAINTER {
             use crate::gui::Color;
             painter.clear(Color::RED);
-            painter.draw_string(20, 20, "PAGE FAULT", Color::WHITE);
+            painter.draw_string(20, 20, "PAGE FAULT DETECTED", Color::WHITE);
             use alloc::format;
-            let msg = format!("IP: {:#x} | Code: {:?}", sf.instruction_pointer.as_u64(), ec);
-            painter.draw_string(20, 40, &msg, Color::WHITE);
+            let msg1 = format!("IP: {:#x} | Code: {:?}", sf.instruction_pointer.as_u64(), ec);
+            let msg2 = format!("FAULT ADDR (CR2): {:#x}", fault_addr.as_u64());
+            painter.draw_string(20, 40, &msg1, Color::WHITE);
+            painter.draw_string(20, 60, &msg2, Color::WHITE);
         }
     }
     loop {} 
 }
 
-extern "x86-interrupt" fn double_fault_handler(sf: InterruptStackFrame, _err: u64) -> ! {
-    unsafe {
-        if let Some(painter) = &mut crate::SCREEN_PAINTER {
-            use crate::gui::Color;
-            painter.clear(Color::RED);
-            painter.draw_string(20, 20, "DOUBLE FAULT", Color::WHITE);
-            use alloc::format;
-            let msg = format!("IP: {:#x}", sf.instruction_pointer.as_u64());
-            painter.draw_string(20, 40, &msg, Color::WHITE);
-        }
-    }
+extern "x86-interrupt" fn double_fault_handler(_sf: InterruptStackFrame, _err: u64) -> ! {
     loop {}
 }

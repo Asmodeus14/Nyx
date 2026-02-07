@@ -3,8 +3,13 @@ members = [
     "nyx-kernel",
     "compiler",
     "runner"
-]
+, "nyx-user"]
 resolver = "2"
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
 
 [workspace.dependencies]
 # UPDATE: Remove '=' to allow upgrading to 0.11.15+

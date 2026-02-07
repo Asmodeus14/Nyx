@@ -1,0 +1,14 @@
+[package]
+name = "nyx-user"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# We need 'compiler_builtins' for some basic math if we get complex,
+# but for now, no dependencies are needed.
+
+[profile.release]
+panic = "abort"      # If we crash, just stop. Don't unwind stack.
+lto = true           # Link Time Optimization (smaller binary)
+opt-level = "z"      # Optimize for Size (tiny binaries)
+codegen-units = 1
