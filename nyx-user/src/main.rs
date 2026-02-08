@@ -30,7 +30,7 @@ pub extern "C" fn _start() -> ! {
                 '\x08' => {
                     if len > 0 { 
                         len -= 1; 
-                        // Backspace visual hack (move back, overwrite space, move back)
+                        // VISUAL FIX: Move cursor back, overwrite with space, move back again
                         print!("\x08 \x08"); 
                     }
                 },
@@ -38,13 +38,13 @@ pub extern "C" fn _start() -> ! {
                     if len < buffer.len() {
                         buffer[len] = c as u8;
                         len += 1;
-                        // FIX: Echo the character back to the screen!
+                        // ECHO FIX: Show the character!
                         print!("{}", c);
                     }
                 }
             }
         }
-        // Small delay to prevent 100% CPU usage in loop
+        // Optimization: Don't burn 100% CPU
         for _ in 0..100 { unsafe { core::arch::asm!("nop"); } }
     }
 }
@@ -59,25 +59,12 @@ fn process_command(cmd: &str) {
     };
 
     match command {
-        "help" => {
-            println!("Commands: ver, echo, clear, exit");
-        },
-        "ver" => {
-            println!("NyxOS v0.3 - GUI Edition");
-        },
-        "echo" => {
-            println!("{}", args);
-        },
-        "clear" => {
-            // "Clear" by pushing text up
-            for _ in 0..15 { print!("\n"); }
-        },
-        "exit" => {
-            syscalls::exit(0);
-        },
-        _ => {
-            print!("Unknown: '{}'\n", command);
-        }
+        "help" => { println!("Commands: ver, echo, clear, exit"); },
+        "ver" => { println!("NyxOS v0.3 - GUI Edition"); },
+        "echo" => { println!("{}", args); },
+        "clear" => { for _ in 0..15 { print!("\n"); } },
+        "exit" => { syscalls::exit(0); },
+        _ => { print!("Unknown: '{}'\n", command); }
     }
 }
 

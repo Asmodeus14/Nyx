@@ -98,6 +98,19 @@ impl MouseDriver {
         }
     }
 }
+pub fn update_from_usb(dx: i8, dy: i8, buttons: u8) {
+    let mut state = MOUSE_STATE.lock();
+    
+    let new_x = state.x as i64 + dx as i64;
+    let new_y = state.y as i64 + dy as i64;
+
+    state.x = new_x.clamp(0, (state.screen_width - 10) as i64) as usize;
+    state.y = new_y.clamp(0, (state.screen_height - 10) as i64) as usize;
+    
+    state.left_click = (buttons & 0x01) != 0;
+    state.right_click = (buttons & 0x02) != 0;
+    state.middle_click = (buttons & 0x04) != 0;
+}
 
 pub fn handle_interrupt(byte: u8) {
     MOUSE_PACKETS.fetch_add(1, Ordering::Relaxed);

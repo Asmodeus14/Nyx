@@ -19,26 +19,8 @@ pub struct PciDevice {
 
 impl PciDevice {
     pub fn to_string(&self) -> String {
-        let class_name = match self.class_id {
-            0x01 => "Mass Storage",
-            0x02 => "Network",
-            0x03 => "Display",
-            0x06 => "Bridge",
-            0x0C => match self.subclass_id {
-                0x03 => match self.prog_if {
-                    0x00 => "USB (UHCI)",
-                    0x10 => "USB (OHCI)",
-                    0x20 => "USB (EHCI)",
-                    0x30 => "USB 3.0 (XHCI)",
-                    _ => "USB Controller",
-                },
-                _ => "Serial Bus",
-            },
-            _ => "Unknown",
-        };
-
-        format!("Bus {:02x} Dev {:02x}: [{:04x}:{:04x}] {}", 
-            self.bus, self.device, self.vendor_id, self.device_id, class_name)
+        format!("Bus {:02x} Dev {:02x}: [{:04x}:{:04x}] Class {:02x}", 
+            self.bus, self.device, self.vendor_id, self.device_id, self.class_id)
     }
 }
 
@@ -66,7 +48,6 @@ impl PciDriver {
         self.data_port.read()
     }
 
-    // NEW: Write to PCI Configuration Space
     pub unsafe fn write(&mut self, bus: u8, device: u8, func: u8, offset: u8, value: u32) {
         let address = 0x80000000 
             | ((bus as u32) << 16)
@@ -78,22 +59,39 @@ impl PciDriver {
         self.data_port.write(value);
     }
 
-    // NEW: Enable Bus Mastering (DMA) and Memory Space (MMIO)
     pub fn enable_bus_master(&mut self, dev: &PciDevice) {
         unsafe {
             let cmd_offset = 0x04;
             let command_reg = self.read(dev.bus, dev.device, 0, cmd_offset);
-            
-            // Bit 1: Memory Space (Enable MMIO)
-            // Bit 2: Bus Master (Enable DMA)
+            // Enable IO, Memory (Bit 1), and Bus Master (Bit 2)
             let new_command = command_reg | 0x06; 
-            
             self.write(dev.bus, dev.device, 0, cmd_offset, new_command);
         }
     }
 
-    pub fn get_bar0(&mut self, dev: &PciDevice) -> u32 {
-        unsafe { self.read(dev.bus, dev.device, 0, 0x10) }
+    // FIX: Handle 64-bit Addresses properly
+    pub fn get_bar_address(&mut self, dev: &PciDevice, bar_index: u8) -> Option<u64> {
+        unsafe {
+            let offset = 0x10 + (bar_index * 4);
+            let bar_low = self.read(dev.bus, dev.device, 0, offset);
+            
+            // Check for valid MMIO (Bit 0 must be 0)
+            if bar_low & 0x1 != 0 { return None; } // IO Space (not supported for xHCI)
+
+            let bar_type = (bar_low >> 1) & 0x3; // Bits 1-2: Type
+            
+            let addr_low = (bar_low & 0xFFFFFFF0) as u64;
+
+            if bar_type == 0x0 { // 32-bit Address
+                Some(addr_low)
+            } else if bar_type == 0x2 { // 64-bit Address
+                let bar_high = self.read(dev.bus, dev.device, 0, offset + 4);
+                let addr_high = (bar_high as u64) << 32;
+                Some(addr_high | addr_low)
+            } else {
+                None // Reserved
+            }
+        }
     }
 
     pub fn scan(&mut self) -> Vec<PciDevice> {

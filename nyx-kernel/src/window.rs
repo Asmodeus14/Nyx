@@ -15,10 +15,11 @@ const TASKBAR_HEIGHT: usize = 40;
 const TITLE_BAR_HEIGHT: usize = 28;
 const SAFE_PADDING: usize = 40;
 const CHAR_WIDTH: usize = 8;
-const LINE_HEIGHT: usize = 18; // Slightly tighter line spacing
+const LINE_HEIGHT: usize = 18;
 
 #[derive(Clone, PartialEq)]
-pub enum WindowType { Terminal, SystemMonitor }
+// NEW: Added DebugLog type
+pub enum WindowType { Terminal, SystemMonitor, DebugLog }
 
 pub struct Window {
     pub x: usize, pub y: usize, pub w: usize, pub h: usize,
@@ -35,6 +36,8 @@ impl Window {
         let color = match w_type {
             WindowType::Terminal => Color::new(15, 15, 15),
             WindowType::SystemMonitor => Color::new(0, 0, 40),
+            // DebugLog gets a nice dark background
+            WindowType::DebugLog => Color::new(10, 10, 10),
         };
         Self {
             x, y, w, h, title: String::from(title), window_type: w_type,
@@ -47,9 +50,6 @@ impl Window {
         if self.buffer.is_empty() { self.buffer.push(String::new()); }
         
         let max_chars = (self.w - 16) / CHAR_WIDTH;
-        
-        // FIX: Calculate max lines based on actual window height
-        // Height - Header - Padding / Line Height
         let available_height = self.h.saturating_sub(TITLE_BAR_HEIGHT + 10);
         let max_lines = available_height / LINE_HEIGHT;
 
@@ -67,45 +67,38 @@ impl Window {
             }
         }
         
-        // Dynamic Scroll
         while self.buffer.len() > max_lines { self.buffer.remove(0); }
     }
 
     pub fn set_content(&mut self, lines: Vec<String>) { self.buffer = lines; }
 
     pub fn draw(&self, painter: &mut impl Painter, is_active: bool) {
-        // Shadow
         painter.draw_rect(Rect::new(self.x + 6, self.y + 6, self.w, self.h), Color::new(5, 5, 5));
 
-        // Border
         let border_color = if is_active { Color::new(200, 200, 200) } else { Color::new(60, 60, 60) };
         painter.draw_rect(Rect::new(self.x - 2, self.y - 2, self.w + 4, self.h + 4), border_color);
 
-        // Content BG
         painter.draw_rect(Rect::new(self.x, self.y, self.w, self.h), self.content_color);
 
-        // Header
         let header_color = if is_active { 
             match self.window_type {
                 WindowType::Terminal => Color::new(0, 122, 204),
                 WindowType::SystemMonitor => Color::new(0, 150, 136),
+                WindowType::DebugLog => Color::new(100, 50, 150), // Purple Header for Debug
             }
         } else { Color::new(45, 45, 48) };
 
         painter.draw_rect(Rect::new(self.x, self.y, self.w, TITLE_BAR_HEIGHT), header_color);
         painter.draw_string(self.x + 8, self.y + 6, &self.title, Color::WHITE);
 
-        // Close Button
         painter.draw_rect(Rect::new(self.x + self.w - 24, self.y + 4, 20, 20), Color::new(200, 60, 60));
         painter.draw_string(self.x + self.w - 17, self.y + 4, "X", Color::WHITE);
 
-        // Text
         let start_y = self.y + TITLE_BAR_HEIGHT + 4;
         let available_height = self.h.saturating_sub(TITLE_BAR_HEIGHT + 10);
         let max_draw_lines = available_height / LINE_HEIGHT;
 
         for (i, line) in self.buffer.iter().enumerate() {
-            // Safety clip: don't draw if it exceeds window
             if i >= max_draw_lines { break; }
             painter.draw_string(self.x + 8, start_y + (i * LINE_HEIGHT), line, Color::WHITE);
         }
@@ -163,8 +156,12 @@ impl WindowManager {
             info.push(format!("Uptime: {:.1}s", uptime));
             info.push(format!("Windows: {}", self.windows.len()));
             info.push(format!("Mouse: {}, {}", mouse.x, mouse.y));
+            
             for win in self.windows.iter_mut() {
-                if win.window_type == WindowType::SystemMonitor { win.set_content(info.clone()); }
+                // FIX: Only update actual System Monitors! Don't touch DebugLog!
+                if win.window_type == WindowType::SystemMonitor { 
+                    win.set_content(info.clone()); 
+                }
             }
         }
 
