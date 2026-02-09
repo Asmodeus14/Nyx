@@ -1,6 +1,8 @@
 use core::arch::asm;
 
-pub fn exit(code: u64) -> ! {
+// --- NEW SYSCALLS (sys_ prefix) ---
+
+pub fn sys_exit(code: u64) -> ! {
     unsafe {
         asm!(
             "syscall",
@@ -13,7 +15,7 @@ pub fn exit(code: u64) -> ! {
     }
 }
 
-pub fn print(c: char) {
+pub fn sys_print(c: char) {
     unsafe {
         asm!(
             "syscall",
@@ -25,13 +27,12 @@ pub fn print(c: char) {
     }
 }
 
-pub fn read_key() -> Option<char> {
+pub fn sys_read_key() -> Option<char> {
     let mut result: u64;
     unsafe {
         asm!(
             "syscall", 
-            in("rax") 2, 
-            lateout("rax") result,
+            inout("rax") 2u64 => result, 
             out("rcx") _,
             out("r11") _,
             options(nostack)
@@ -45,3 +46,25 @@ pub fn read_key() -> Option<char> {
         char::try_from(result as u32).ok()
     }
 }
+
+pub fn sys_get_mouse() -> (usize, usize) {
+    let mut result: u64;
+    unsafe {
+        asm!(
+            "syscall", 
+            inout("rax") 3u64 => result, 
+            out("rcx") _,
+            out("r11") _,
+            options(nostack)
+        );
+    }
+    let x = (result >> 32) as usize;
+    let y = (result & 0xFFFFFFFF) as usize;
+    (x, y)
+}
+
+// --- LEGACY WRAPPERS (Prevent console.rs break) ---
+
+pub fn exit(code: u64) -> ! { sys_exit(code) }
+pub fn print(c: char) { sys_print(c) }
+pub fn read_key() -> Option<char> { sys_read_key() }

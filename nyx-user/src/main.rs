@@ -4,71 +4,43 @@
 mod syscalls;
 mod console;
 
-use core::str;
+use core::fmt::Write;
 
-#[link_section = ".text.entry"]
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    println!("Welcome to NyxOS v0.3 (GUI Mode)");
-    println!("Type 'help' for commands.");
-    print!("nyx> ");
-
-    let mut buffer = [0u8; 64];
-    let mut len = 0;
-
-    loop {
-        if let Some(c) = syscalls::read_key() {
-            match c {
-                '\n' => {
-                    print!("\n");
-                    if let Ok(cmd_str) = str::from_utf8(&buffer[..len]) {
-                        process_command(cmd_str);
-                    }
-                    len = 0;
-                    print!("nyx> ");
-                },
-                '\x08' => {
-                    if len > 0 { 
-                        len -= 1; 
-                        // VISUAL FIX: Move cursor back, overwrite with space, move back again
-                        print!("\x08 \x08"); 
-                    }
-                },
-                _ => {
-                    if len < buffer.len() {
-                        buffer[len] = c as u8;
-                        len += 1;
-                        // ECHO FIX: Show the character!
-                        print!("{}", c);
-                    }
-                }
-            }
-        }
-        // Optimization: Don't burn 100% CPU
-        for _ in 0..100 { unsafe { core::arch::asm!("nop"); } }
+struct ConsoleWriter;
+impl core::fmt::Write for ConsoleWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for c in s.chars() { syscalls::sys_print(c); }
+        Ok(())
     }
 }
 
-fn process_command(cmd: &str) {
-    let cmd = cmd.trim();
-    if cmd.len() == 0 { return; }
-    
-    let (command, args) = match cmd.find(' ') {
-        Some(index) => (&cmd[..index], &cmd[index+1..]),
-        None => (cmd, ""),
-    };
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    let mut console = ConsoleWriter;
+    let _ = write!(console, "\n[USER] Mouse Tracker Started.\n");
+    let _ = write!(console, "Move mouse to see coordinates...\n\n");
 
-    match command {
-        "help" => { println!("Commands: ver, echo, clear, exit"); },
-        "ver" => { println!("NyxOS v0.3 - GUI Edition"); },
-        "echo" => { println!("{}", args); },
-        "clear" => { for _ in 0..15 { print!("\n"); } },
-        "exit" => { syscalls::exit(0); },
-        _ => { print!("Unknown: '{}'\n", command); }
+    let mut prev_x = 0;
+    let mut prev_y = 0;
+
+    loop {
+        // 1. Get Mouse from Kernel via Syscall 3
+        let (x, y) = syscalls::sys_get_mouse();
+
+        // 2. Only print if changed
+        if x != prev_x || y != prev_y {
+            // \r returns cursor to start of line to overwrite previous coords
+            let _ = write!(console, "\rMouse: X={:04} Y={:04}   ", x, y);
+            prev_x = x;
+            prev_y = y;
+        }
+
+        // 3. Busy wait slightly to prevent flooding syscalls
+        for _ in 0..100_000 { unsafe { core::arch::asm!("nop"); } }
     }
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    syscalls::exit(1);
+    syscalls::sys_exit(1);
 }

@@ -90,6 +90,12 @@ extern "C" fn syscall_rust_dispatcher(stack_ptr: *mut SyscallRegisters) {
                  unsafe { (*stack_ptr).rax = 0; }
              }
         },
+        3 => { // GET_MOUSE
+            // Return Pack: (X << 32) | Y
+            let mouse = crate::mouse::MOUSE_STATE.lock();
+            let packed = ((mouse.x as u64) << 32) | (mouse.y as u64);
+            unsafe { (*stack_ptr).rax = packed; }
+        },
         _ => {}
     }
 }
@@ -170,24 +176,17 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 
     // 3. Update & Draw (~60Hz) - DEADLOCK SAFE
     if ticks % 16 == 0 {
-        // Only proceed if we can get the WindowManager lock (try_lock)
-        // If Main Thread has it (e.g. printing), skip this frame.
         if let Some(mut wm) = crate::window::WINDOW_MANAGER.try_lock() {
             let mouse_state = crate::mouse::MOUSE_STATE.lock();
             
-            // Update logic
             wm.update(&mouse_state);
 
-            // Paint Logic (Inlined to avoid double-locking wm)
             unsafe {
                 if let Some(bb) = &mut crate::BACK_BUFFER {
                     bb.clear(crate::gui::Color::new(0, 0, 30));
-                    wm.draw(bb); // wm is already locked here, so we call draw on the guard
-                    
-                    // Draw Mouse
+                    wm.draw(bb);
                     bb.draw_rect(crate::gui::Rect::new(mouse_state.x, mouse_state.y, 10, 10), crate::gui::Color::WHITE);
                     bb.draw_rect(crate::gui::Rect::new(mouse_state.x+1, mouse_state.y+1, 8, 8), crate::gui::Color::RED);
-                    
                     if let Some(s) = &mut crate::SCREEN_PAINTER { bb.present(s); }
                 }
             }
