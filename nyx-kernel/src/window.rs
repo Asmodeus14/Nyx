@@ -1,11 +1,10 @@
 use alloc::vec::Vec;
 use alloc::string::String;
-use alloc::format;
 use spin::Mutex;
 use lazy_static::lazy_static;
 use crate::gui::{Painter, Rect, Color};
 use crate::mouse::MouseState;
-use core::sync::atomic::Ordering;
+use core::fmt::Write; 
 
 lazy_static! {
     pub static ref WINDOW_MANAGER: Mutex<WindowManager> = Mutex::new(WindowManager::new());
@@ -14,11 +13,10 @@ lazy_static! {
 const TASKBAR_HEIGHT: usize = 40;
 const TITLE_BAR_HEIGHT: usize = 28;
 const SAFE_PADDING: usize = 40;
-const CHAR_WIDTH: usize = 8;
-const LINE_HEIGHT: usize = 18;
+const LINE_HEIGHT: usize = 36; 
+const CHAR_WIDTH: usize = 16; 
 
 #[derive(Clone, PartialEq)]
-// NEW: Added DebugLog type
 pub enum WindowType { Terminal, SystemMonitor, DebugLog }
 
 pub struct Window {
@@ -36,7 +34,6 @@ impl Window {
         let color = match w_type {
             WindowType::Terminal => Color::new(15, 15, 15),
             WindowType::SystemMonitor => Color::new(0, 0, 40),
-            // DebugLog gets a nice dark background
             WindowType::DebugLog => Color::new(10, 10, 10),
         };
         Self {
@@ -49,7 +46,7 @@ impl Window {
     pub fn append_char(&mut self, c: char) {
         if self.buffer.is_empty() { self.buffer.push(String::new()); }
         
-        let max_chars = (self.w - 16) / CHAR_WIDTH;
+        let max_chars = (self.w.saturating_sub(16)) / CHAR_WIDTH;
         let available_height = self.h.saturating_sub(TITLE_BAR_HEIGHT + 10);
         let max_lines = available_height / LINE_HEIGHT;
 
@@ -66,25 +63,21 @@ impl Window {
                 } 
             }
         }
-        
         while self.buffer.len() > max_lines { self.buffer.remove(0); }
     }
-
-    pub fn set_content(&mut self, lines: Vec<String>) { self.buffer = lines; }
 
     pub fn draw(&self, painter: &mut impl Painter, is_active: bool) {
         painter.draw_rect(Rect::new(self.x + 6, self.y + 6, self.w, self.h), Color::new(5, 5, 5));
 
         let border_color = if is_active { Color::new(200, 200, 200) } else { Color::new(60, 60, 60) };
         painter.draw_rect(Rect::new(self.x - 2, self.y - 2, self.w + 4, self.h + 4), border_color);
-
         painter.draw_rect(Rect::new(self.x, self.y, self.w, self.h), self.content_color);
 
         let header_color = if is_active { 
             match self.window_type {
                 WindowType::Terminal => Color::new(0, 122, 204),
                 WindowType::SystemMonitor => Color::new(0, 150, 136),
-                WindowType::DebugLog => Color::new(100, 50, 150), // Purple Header for Debug
+                WindowType::DebugLog => Color::new(100, 50, 150),
             }
         } else { Color::new(45, 45, 48) };
 
@@ -119,14 +112,13 @@ pub struct WindowManager {
     windows: Vec<Window>,
     prev_left: bool, prev_right: bool,
     pub screen_width: usize, pub screen_height: usize,
-    last_update_tick: u64,
 }
 
 impl WindowManager {
     pub fn new() -> Self { 
         let mut wm = Self { windows: Vec::new(), prev_left: false, prev_right: false, 
-                            screen_width: 800, screen_height: 600, last_update_tick: 0 };
-        wm.add(Window::new(100, 100, 500, 300, "Nyx Terminal", WindowType::Terminal));
+                            screen_width: 1024, screen_height: 768 };
+        wm.add(Window::new(50, 50, 900, 600, "Nyx Terminal", WindowType::Terminal));
         wm
     }
 
@@ -147,33 +139,19 @@ impl WindowManager {
         let click_r = mouse.right_click && !self.prev_right;
         self.prev_left = mouse.left_click; self.prev_right = mouse.right_click;
         
-        let ticks = crate::time::get_ticks();
-        if ticks > self.last_update_tick + 5 {
-            self.last_update_tick = ticks;
-            let uptime = crate::time::uptime_seconds();
-            let mut info = Vec::new();
-            info.push(format!("-- SYSTEM VITALS --"));
-            info.push(format!("Uptime: {:.1}s", uptime));
-            info.push(format!("Windows: {}", self.windows.len()));
-            info.push(format!("Mouse: {}, {}", mouse.x, mouse.y));
-            
-            for win in self.windows.iter_mut() {
-                // FIX: Only update actual System Monitors! Don't touch DebugLog!
-                if win.window_type == WindowType::SystemMonitor { 
-                    win.set_content(info.clone()); 
-                }
-            }
-        }
+        // REMOVED: Unsafe Allocations for SystemMonitor (Vec::new/format!)
+        // This prevents the heap allocation crash in interrupts.
 
         let tb_y = self.screen_height - TASKBAR_HEIGHT - SAFE_PADDING;
         if click_l && mouse.y >= tb_y && mouse.x < 100 {
+            // This is safe because it only happens on explicit click, not every tick
             let off = (self.windows.len() * 30) % 200;
-            self.add(Window::new(150+off, 100+off, 500, 300, "Terminal", WindowType::Terminal));
+            self.add(Window::new(50+off, 50+off, 900, 600, "Terminal", WindowType::Terminal));
             return;
         }
 
         if click_r {
-             self.add(Window::new(mouse.x, mouse.y, 300, 200, "System Monitor", WindowType::SystemMonitor));
+             self.add(Window::new(mouse.x, mouse.y, 500, 400, "System Monitor", WindowType::SystemMonitor));
         }
 
         for win in self.windows.iter_mut() {
@@ -211,19 +189,39 @@ impl WindowManager {
         painter.draw_rect(Rect::new(4, tb_y+4, 92, TASKBAR_HEIGHT-8), Color::new(0, 120, 215));
         painter.draw_string(28, tb_y+12, "START", Color::WHITE);
 
+        // STACK ALLOCATION ONLY (Safe for Interrupts)
         let uptime = crate::time::uptime_seconds() as u64;
-        let time_str = format!("{:02}:{:02}:{:02}", uptime/3600, (uptime%3600)/60, uptime%60);
-        let clk_x = self.screen_width - 120 - SAFE_PADDING;
-        painter.draw_string(clk_x, tb_y+12, &time_str, Color::GREEN);
+        let hours = uptime / 3600;
+        let mins = (uptime % 3600) / 60;
+        let secs = uptime % 60;
+
+        struct TimeBuf { buf: [u8; 32], len: usize }
+        impl Write for TimeBuf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for byte in s.bytes() {
+                    if self.len < self.buf.len() { self.buf[self.len] = byte; self.len += 1; }
+                }
+                Ok(())
+            }
+        }
+        let mut time_buf = TimeBuf { buf: [0; 32], len: 0 };
+        let _ = write!(time_buf, "{:02}:{:02}:{:02}", hours, mins, secs);
+        let time_str = core::str::from_utf8(&time_buf.buf[..time_buf.len]).unwrap_or("00:00:00");
+
+        let clk_x = self.screen_width - 150 - SAFE_PADDING;
+        painter.draw_string(clk_x, tb_y+12, time_str, Color::GREEN);
 
         for (i, w) in self.windows.iter().enumerate() { w.draw(painter, i == self.windows.len()-1); }
     }
 }
 
+// NOTE: This function is dangerous if called from interrupts without try_lock check
+// We will handle safety in interrupts.rs
 pub fn compositor_paint() {
     unsafe {
         if let Some(bb) = &mut crate::BACK_BUFFER {
             bb.clear(Color::new(0, 0, 30));
+            // WARNING: This blocks. Interrupts should use try_lock logic instead.
             WINDOW_MANAGER.lock().draw(bb);
             let mouse = crate::mouse::MOUSE_STATE.lock();
             bb.draw_rect(Rect::new(mouse.x, mouse.y, 10, 10), Color::WHITE);

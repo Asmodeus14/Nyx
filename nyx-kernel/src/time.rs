@@ -1,38 +1,35 @@
 use x86_64::instructions::port::Port;
 use spin::Mutex;
-use lazy_static::lazy_static;
 
-const PIT_COMMAND: u16 = 0x43;
-const PIT_CHANNEL0: u16 = 0x40;
+// 1.193182 MHz base frequency
+const PIT_FREQUENCY: u32 = 1193182;
+const TARGET_FREQ: u32 = 1000; // 1000 Hz = 1ms per tick
+const DIVISOR: u32 = PIT_FREQUENCY / TARGET_FREQ;
 
-// 1.193182 MHz / 11932 = ~100 Hz (10ms per tick)
-const DIVISOR: u16 = 11932; 
-
-lazy_static! {
-    pub static ref TICKS: Mutex<u64> = Mutex::new(0);
-}
+static TICK_COUNTER: Mutex<u64> = Mutex::new(0);
 
 pub fn init() {
-    unsafe {
-        let mut command = Port::<u8>::new(PIT_COMMAND);
-        let mut channel0 = Port::<u8>::new(PIT_CHANNEL0);
+    // Set PIT Channel 0 to 1000 Hz (Mode 3 - Square Wave)
+    let mut command_port = Port::<u8>::new(0x43);
+    let mut data_port = Port::<u8>::new(0x40);
 
-        command.write(0x36);
-        channel0.write((DIVISOR & 0xFF) as u8);
-        channel0.write((DIVISOR >> 8) as u8);
+    unsafe {
+        command_port.write(0x36);             // 00 (Chan 0) | 11 (Lo/Hi byte) | 011 (Mode 3) | 0 (Bin)
+        data_port.write((DIVISOR & 0xFF) as u8);       // Low byte
+        data_port.write(((DIVISOR >> 8) & 0xFF) as u8); // High byte
     }
 }
 
 pub fn tick() {
-    let mut ticks = TICKS.lock();
+    let mut ticks = TICK_COUNTER.lock();
     *ticks += 1;
 }
 
 pub fn get_ticks() -> u64 {
-    *TICKS.lock()
+    *TICK_COUNTER.lock()
 }
 
 pub fn uptime_seconds() -> f64 {
     let ticks = get_ticks();
-    (ticks as f64) / 100.0 // Correct math for 100Hz
+    (ticks as f64) / (TARGET_FREQ as f64)
 }

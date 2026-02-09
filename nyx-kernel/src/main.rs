@@ -65,26 +65,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::time::init();
     { let mut driver = crate::mouse::MouseDriver::new(); driver.init(); }
     
-    // --- CREATE DEBUG WINDOW ---
-    let mut log_window = Window::new(500, 100, 250, 400, "USB Log", WindowType::DebugLog);
+    // --- CREATE DEBUG WINDOW (950px WIDE FOR LONG LOGS) ---
+    let mut log_window = Window::new(20, 20, 950, 600, "USB Log", WindowType::DebugLog);
     
-    // --- SHOW WINDOW IMMEDIATELY ---
-    { let mut wm = crate::window::WINDOW_MANAGER.lock(); wm.add(log_window); }
     // Force first paint
+    { let mut wm = crate::window::WINDOW_MANAGER.lock(); wm.add(log_window); }
     crate::window::compositor_paint();
-
-    // Re-lock window to modify buffer (We need to retrieve it from WM or use a shared reference)
-    // NOTE: For simplicity in this single-threaded init, we will just create a temporary window struct 
-    // for logging and add the FINAL state to the WM later, OR modify it in place.
-    // ACTUALLY: The WM owns the window now. We can't modify `log_window` easily if it's moved.
-    // FIX: We will create the window, Log to it, and Add it at the end? NO, user wants to see progress.
-    // FIX: We will remove it, modify it, add it back in the loop? Slow but works.
-    // BETTER FIX: We will just keep it local, paint it manually, and add it to WM at the end.
     
-    // RESET: Let's keep `log_window` local for the init phase so we can write to it.
-    // We will draw it manually using `log_window.draw(...)` to the backbuffer and present.
-    
-    let mut log_window = Window::new(500, 100, 250, 400, "USB Log", WindowType::DebugLog);
+    // Re-create local instance for writing during init
+    let mut log_window = Window::new(20, 20, 950, 600, "USB Log", WindowType::DebugLog);
 
     // --- USB INIT ---
     {
@@ -118,7 +107,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                                         Ok(_) => {
                                             log_window.buffer.push(String::from("Init: OK"));
                                             xhci.check_ports(&mut log_window); 
-                                            core::mem::forget(xhci); 
+                                            *crate::usb::USB_CONTROLLER.lock() = Some(xhci);
                                         },
                                         Err(e) => {
                                             log_window.buffer.push(String::from("Init: Fail"));

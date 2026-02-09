@@ -84,7 +84,6 @@ extern "C" fn syscall_rust_dispatcher(stack_ptr: *mut SyscallRegisters) {
             crate::window::WINDOW_MANAGER.lock().console_print(char_to_print);
         },
         2 => { // READ_KEY
-             // FIX: Actually read from the shell buffer!
              if let Some(c) = crate::shell::pop_char() {
                  unsafe { (*stack_ptr).rax = c as u64; }
              } else {
@@ -154,19 +153,45 @@ pub fn init_syscalls() {
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::time::tick();
+    let ticks = crate::time::get_ticks();
     
-    crate::mouse::update();
-    crate::shell::process_keys();
-
-    // Logic Update
-    {
-        let mouse_state = crate::mouse::MOUSE_STATE.lock();
-        crate::window::WINDOW_MANAGER.lock().update(&mouse_state);
+    // 1. Poll USB Mouse (500Hz)
+    if ticks % 2 == 0 {
+        if let Some(mut usb_lock) = crate::usb::USB_CONTROLLER.try_lock() {
+            if let Some(controller) = usb_lock.as_mut() {
+                for i in 1..=4 { controller.poll_mouse(i); }
+            }
+        }
     }
 
-    // Draw Update (Limit FPS to prevent starvation)
-    if crate::time::get_ticks() % 3 == 0 {
-        crate::window::compositor_paint();
+    // 2. Process PS/2 Packets
+    crate::mouse::drain_queue();
+    crate::shell::process_keys();
+
+    // 3. Update & Draw (~60Hz) - DEADLOCK SAFE
+    if ticks % 16 == 0 {
+        // Only proceed if we can get the WindowManager lock (try_lock)
+        // If Main Thread has it (e.g. printing), skip this frame.
+        if let Some(mut wm) = crate::window::WINDOW_MANAGER.try_lock() {
+            let mouse_state = crate::mouse::MOUSE_STATE.lock();
+            
+            // Update logic
+            wm.update(&mouse_state);
+
+            // Paint Logic (Inlined to avoid double-locking wm)
+            unsafe {
+                if let Some(bb) = &mut crate::BACK_BUFFER {
+                    bb.clear(crate::gui::Color::new(0, 0, 30));
+                    wm.draw(bb); // wm is already locked here, so we call draw on the guard
+                    
+                    // Draw Mouse
+                    bb.draw_rect(crate::gui::Rect::new(mouse_state.x, mouse_state.y, 10, 10), crate::gui::Color::WHITE);
+                    bb.draw_rect(crate::gui::Rect::new(mouse_state.x+1, mouse_state.y+1, 8, 8), crate::gui::Color::RED);
+                    
+                    if let Some(s) = &mut crate::SCREEN_PAINTER { bb.present(s); }
+                }
+            }
+        }
     }
 
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET); }
@@ -202,6 +227,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 }
 
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use x86_64::instructions::port::Port;
+    let mut port = Port::<u8>::new(0x60);
+    let packet_byte = unsafe { port.read() };
+    crate::mouse::handle_interrupt(packet_byte);
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_2_OFFSET + 4); }
 }
 
