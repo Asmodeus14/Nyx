@@ -3,6 +3,9 @@ use noto_sans_mono_bitmap::{get_raster, FontWeight, RasterHeight};
 use alloc::vec::Vec;
 use alloc::vec;
 
+// NEW: Store Physical Address of Framebuffer here
+pub static mut FRAMEBUFFER_PHYS_ADDR: u64 = 0;
+
 pub struct Rect {
     pub x: usize, pub y: usize, pub w: usize, pub h: usize,
 }
@@ -21,7 +24,6 @@ impl Color {
     pub const RED: Color   = Color { r: 255, g: 0, b: 0 };
     pub const GREEN: Color = Color { r: 0, g: 255, b: 0 };
     pub const CYAN: Color  = Color { r: 0, g: 255, b: 255 };
-    // ADDED YELLOW HERE:
     pub const YELLOW: Color = Color { r: 255, g: 255, b: 0 }; 
     pub const DARK_GRAY: Color = Color { r: 45, g: 45, b: 48 };
     pub const DARK_BLUE: Color = Color { r: 0, g: 122, b: 204 };
@@ -38,7 +40,7 @@ pub trait Painter {
     fn height(&self) -> usize;
 }
 
-// --- HARDWARE PAINTER (Direct Video Memory) ---
+// --- HARDWARE PAINTER ---
 pub struct VgaPainter<'a> {
     pub buffer: &'a mut [u8],
     pub info: FrameBufferInfo,
@@ -134,7 +136,7 @@ impl<'a> Painter for VgaPainter<'a> {
     }
 }
 
-// --- SOFTWARE BACKBUFFER (OPTIMIZED) ---
+// --- SOFTWARE BACKBUFFER ---
 pub struct BackBuffer {
     pub buffer: Vec<u8>,
     pub info: FrameBufferInfo,

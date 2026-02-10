@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # We need 'compiler_builtins' for some basic math if we get complex,
 # but for now, no dependencies are needed.
+noto-sans-mono-bitmap = "0.2.0"
 
 [profile.release]
 panic = "abort"      # If we crash, just stop. Don't unwind stack.

@@ -24,6 +24,8 @@ pub static mut BACK_BUFFER: Option<gui::BackBuffer> = None;
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    // Map framebuffer so we can access it in kernel
+    config.mappings.framebuffer = bootloader_api::config::Mapping::Dynamic; 
     config
 };
 
@@ -40,6 +42,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("Heap Init Failed");
 
+    // Initialize Memory Manager EARLY so we can use virt_to_phys
     {
         let mut mm = crate::memory::MEMORY_MANAGER.lock();
         *mm = Some(crate::memory::MemorySystem { mapper, frame_allocator });
@@ -47,6 +50,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
+        
+        // FIX: Calculate Physical Address
+        // 1. Get Virtual Address of the buffer
+        let virt_addr = fb.buffer().as_ptr() as u64;
+        
+        // 2. Translate it to Physical Address using our Memory Manager
+        let phys_addr = crate::memory::virt_to_phys(virt_addr)
+            .expect("CRITICAL: Could not translate Framebuffer Address");
+
+        unsafe { crate::gui::FRAMEBUFFER_PHYS_ADDR = phys_addr; }
+
         {
             let mut wm = crate::window::WINDOW_MANAGER.lock();
             wm.set_resolution(info.width, info.height);
@@ -65,17 +79,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::time::init();
     { let mut driver = crate::mouse::MouseDriver::new(); driver.init(); }
     
-    // --- CREATE DEBUG WINDOW (950px WIDE FOR LONG LOGS) ---
+    // Create Default Windows
     let mut log_window = Window::new(20, 20, 950, 600, "USB Log", WindowType::DebugLog);
-    
-    // Force first paint
     { let mut wm = crate::window::WINDOW_MANAGER.lock(); wm.add(log_window); }
     crate::window::compositor_paint();
-    
-    // Re-create local instance for writing during init
     let mut log_window = Window::new(20, 20, 950, 600, "USB Log", WindowType::DebugLog);
 
-    // --- USB INIT ---
+    // USB Init
     {
         let mut pci = crate::pci::PciDriver::new();
         let devices = pci.scan();
@@ -98,33 +108,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         }; 
 
                         if let Some(virt_addr) = virt_addr_opt {
-                            log_window.buffer.push(String::from("Map OK"));
-                            
                             match crate::usb::XhciController::new(virt_addr.as_u64()) {
                                 Ok(mut xhci) => {
-                                    log_window.buffer.push(String::from("Alloc OK"));
                                     match xhci.init(&mut log_window) {
                                         Ok(_) => {
-                                            log_window.buffer.push(String::from("Init: OK"));
                                             xhci.check_ports(&mut log_window); 
                                             *crate::usb::USB_CONTROLLER.lock() = Some(xhci);
                                         },
-                                        Err(e) => {
-                                            log_window.buffer.push(String::from("Init: Fail"));
-                                            log_window.buffer.push(String::from(e));
-                                        }
+                                        Err(e) => { log_window.buffer.push(String::from(e)); }
                                     }
                                 },
-                                Err(e) => {
-                                    log_window.buffer.push(String::from("New Fail:"));
-                                    log_window.buffer.push(String::from(e));
-                                }
+                                Err(e) => { log_window.buffer.push(String::from(e)); }
                             }
-                        } else {
-                            log_window.buffer.push(String::from("Map Fail!"));
                         }
-                    } else {
-                        log_window.buffer.push(String::from("No BAR 0!"));
                     }
                 }
             }
@@ -132,12 +128,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if !found_xhci { log_window.buffer.push(String::from("No xHCI Device")); }
     }
     
-    // Add Final State to WM
     { let mut wm = crate::window::WINDOW_MANAGER.lock(); wm.add(log_window); }
 
     x86_64::instructions::interrupts::enable(); 
 
-    const PAGE_COUNT: u64 = 100;
+    // User Memory Setup
+const PAGE_COUNT: u64 = 8192; 
     const PAGE_SIZE: u64 = 4096;
     const TOTAL_MEM: u64 = PAGE_COUNT * PAGE_SIZE;
 

@@ -24,31 +24,35 @@ pub struct KernelGsData {
 
 static mut GS_DATA: KernelGsData = KernelGsData { kernel_stack: 0, user_stack: 0 };
 
+// --- SYSCALL ENTRY POINT (ASM WRAPPER) ---
 #[unsafe(naked)]
 pub extern "C" fn syscall_asm_wrapper() {
     unsafe {
         naked_asm!(
             "swapgs",
-            "mov gs:[8], rsp",      
-            "mov rsp, gs:[0]",      
+            "mov gs:[8], rsp",      // Save User Stack
+            "mov rsp, gs:[0]",      // Load Kernel Stack
             
+            // Push Context
             "push {user_data_sel}", 
             "push gs:[8]",          
-            "push r11",             
+            "push r11",             // RFLAGS
             "push {user_code_sel}", 
-            "push rcx",             
+            "push rcx",             // RIP
             
+            // Push Registers (C Calling Convention)
             "push rax",
             "push rdi",
             "push rsi",
             "push rdx",
-            "push rcx",
+            "push rcx",             
             "push r8",
             "push r9",
             
             "mov rdi, rsp",
             "call syscall_rust_dispatcher",
             
+            // Restore Context
             "pop r9",
             "pop r8",
             "pop rcx",
@@ -65,13 +69,22 @@ pub extern "C" fn syscall_asm_wrapper() {
     }
 }
 
+#[repr(C)]
+struct SyscallRegisters {
+    pub r9: u64, 
+    pub r8: u64, 
+    pub rcx: u64, 
+    pub rdx: u64,
+    pub rsi: u64, 
+    pub rdi: u64, 
+    pub rax: u64,
+}
+
+// --- SYSCALL DISPATCHER ---
 #[no_mangle]
 extern "C" fn syscall_rust_dispatcher(stack_ptr: *mut SyscallRegisters) {
     let regs = unsafe { &*stack_ptr };
-    let syscall_id = regs.rax; 
-    let arg1 = regs.rdi;       
-
-    match syscall_id {
+    match regs.rax {
         0 => { // EXIT
             use crate::gui::Color;
             if let Some(painter) = unsafe { &mut crate::SCREEN_PAINTER } {
@@ -80,7 +93,7 @@ extern "C" fn syscall_rust_dispatcher(stack_ptr: *mut SyscallRegisters) {
             loop { x86_64::instructions::hlt(); }
         },
         1 => { // PRINT
-            let char_to_print = arg1 as u8 as char;
+            let char_to_print = regs.rdi as u8 as char;
             crate::window::WINDOW_MANAGER.lock().console_print(char_to_print);
         },
         2 => { // READ_KEY
@@ -91,10 +104,66 @@ extern "C" fn syscall_rust_dispatcher(stack_ptr: *mut SyscallRegisters) {
              }
         },
         3 => { // GET_MOUSE
-            // Return Pack: (X << 32) | Y
             let mouse = crate::mouse::MOUSE_STATE.lock();
-            let packed = ((mouse.x as u64) << 32) | (mouse.y as u64);
+            let x = (mouse.x as u64) & 0xFFFF;
+            let y = (mouse.y as u64) & 0xFFFF;
+            let left = if mouse.left_click { 1u64 } else { 0u64 };
+            let right = if mouse.right_click { 1u64 } else { 0u64 };
+            let packed = (left << 63) | (right << 62) | (x << 32) | y;
             unsafe { (*stack_ptr).rax = packed; }
+        },
+        4 => { // SYS_DRAW
+             x86_64::instructions::interrupts::without_interrupts(|| {
+                crate::window::WINDOW_MANAGER.lock().put_desktop_pixel(regs.rdi as usize, regs.rsi as usize, regs.rdx as u32);
+             });
+        },
+        5 => { // SYS_BLIT
+            let x = regs.rdi as usize;
+            let y = regs.rsi as usize;
+            let w = regs.rdx as usize;
+            let h = regs.r8 as usize;
+            let ptr = regs.r9 as *const u32;
+
+            if w < 3000 && h < 3000 {
+                let buffer_len = w * h;
+                unsafe {
+                    if !ptr.is_null() {
+                        let buffer = core::slice::from_raw_parts(ptr, buffer_len);
+                        x86_64::instructions::interrupts::without_interrupts(|| {
+                             crate::window::WINDOW_MANAGER.lock().blit_desktop_rect(x, y, w, h, buffer);
+                        });
+                    }
+                }
+            }
+        },
+        6 => { // SYS_GET_SCREEN_INFO
+             x86_64::instructions::interrupts::without_interrupts(|| {
+                let wm = crate::window::WINDOW_MANAGER.lock();
+                let w = wm.screen_width as u64;
+                let h = wm.screen_height as u64;
+                let packed = (w << 32) | h;
+                unsafe { (*stack_ptr).rax = packed; }
+             });
+        },
+        7 => { // SYS_MAP_FRAMEBUFFER
+             x86_64::instructions::interrupts::without_interrupts(|| {
+                let phys = unsafe { crate::gui::FRAMEBUFFER_PHYS_ADDR };
+                if phys != 0 {
+                    let wm = crate::window::WINDOW_MANAGER.lock();
+                    let size = (wm.screen_width * wm.screen_height * 4) as u64;
+                    drop(wm);
+                    
+                    match crate::memory::map_user_framebuffer(phys, size) {
+                        Ok(virt_addr) => unsafe { (*stack_ptr).rax = virt_addr; },
+                        Err(_) => unsafe { (*stack_ptr).rax = 0; }
+                    }
+                } else {
+                    unsafe { (*stack_ptr).rax = 0; }
+                }
+             });
+        },
+        8 => { // SYS_GET_TIME (For 60FPS lock)
+             unsafe { (*stack_ptr).rax = crate::time::get_ticks(); }
         },
         _ => {}
     }
@@ -157,41 +226,20 @@ pub fn init_syscalls() {
     }
 }
 
+// --- TIMER INTERRUPT (TURBO MODE) ---
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::time::tick();
-    let ticks = crate::time::get_ticks();
     
-    // 1. Poll USB Mouse (500Hz)
-    if ticks % 2 == 0 {
-        if let Some(mut usb_lock) = crate::usb::USB_CONTROLLER.try_lock() {
-            if let Some(controller) = usb_lock.as_mut() {
-                for i in 1..=4 { controller.poll_mouse(i); }
-            }
+    // TURBO MODE: Poll USB on every tick (1ms) for max responsiveness
+    if let Some(mut usb_lock) = crate::usb::USB_CONTROLLER.try_lock() {
+        if let Some(controller) = usb_lock.as_mut() {
+            // Poll all 4 possible ports
+            for i in 1..=4 { controller.poll_mouse(i); }
         }
     }
 
-    // 2. Process PS/2 Packets
     crate::mouse::drain_queue();
     crate::shell::process_keys();
-
-    // 3. Update & Draw (~60Hz) - DEADLOCK SAFE
-    if ticks % 16 == 0 {
-        if let Some(mut wm) = crate::window::WINDOW_MANAGER.try_lock() {
-            let mouse_state = crate::mouse::MOUSE_STATE.lock();
-            
-            wm.update(&mouse_state);
-
-            unsafe {
-                if let Some(bb) = &mut crate::BACK_BUFFER {
-                    bb.clear(crate::gui::Color::new(0, 0, 30));
-                    wm.draw(bb);
-                    bb.draw_rect(crate::gui::Rect::new(mouse_state.x, mouse_state.y, 10, 10), crate::gui::Color::WHITE);
-                    bb.draw_rect(crate::gui::Rect::new(mouse_state.x+1, mouse_state.y+1, 8, 8), crate::gui::Color::RED);
-                    if let Some(s) = &mut crate::SCREEN_PAINTER { bb.present(s); }
-                }
-            }
-        }
-    }
 
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET); }
 }
@@ -202,7 +250,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
             Mutex::new(Keyboard::new(ScancodeSet1::new(), layouts::Us104Key, HandleControl::Ignore));
     }
-    
     let mut keyboard = KEYBOARD.lock();
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
@@ -210,14 +257,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
         if let Some(key) = keyboard.process_keyevent(key_event) {
             match key {
-                DecodedKey::Unicode(character) => { 
-                    crate::shell::handle_char(character); 
-                },
+                DecodedKey::Unicode(character) => { crate::shell::handle_char(character); },
                 DecodedKey::RawKey(k) => { 
                     use pc_keyboard::KeyCode;
-                    if k == KeyCode::F1 {
-                        crate::shell::handle_key(0x3B); 
-                    }
+                    if k == KeyCode::F1 { crate::shell::handle_key(0x3B); }
                 },
             }
         }
@@ -231,12 +274,6 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     let packet_byte = unsafe { port.read() };
     crate::mouse::handle_interrupt(packet_byte);
     unsafe { PICS.lock().notify_end_of_interrupt(PIC_2_OFFSET + 4); }
-}
-
-#[repr(C)]
-struct SyscallRegisters {
-    pub r9: u64, pub r8: u64, pub rcx: u64, pub rdx: u64,
-    pub rsi: u64, pub rdi: u64, pub rax: u64,
 }
 
 extern "x86-interrupt" fn breakpoint_handler(_sf: InterruptStackFrame) {}

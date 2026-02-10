@@ -85,18 +85,13 @@ pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
     }
 }
 
-// --- ALLOCATE USER PAGES (ROBUST FIX) ---
 pub fn allocate_user_pages(num_pages: u64) -> Result<VirtAddr, &'static str> {
     use x86_64::structures::paging::{PageTableFlags, Mapper};
     
     let mut system_lock = MEMORY_MANAGER.lock();
     let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
 
-    // FIX: Use 16MB Address (0x1000000). 
-    // This is safe (above Kernel 2MB) and fits in Small Code Model.
     let start_addr = VirtAddr::new(0x100_0000);
-    
-    // FLAGS: USER_ACCESSIBLE is critical
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     for i in 0..num_pages {
@@ -106,22 +101,36 @@ pub fn allocate_user_pages(num_pages: u64) -> Result<VirtAddr, &'static str> {
         unsafe {
             let frame = system.frame_allocator.allocate_frame()
                 .ok_or("Frame allocation failed")?;
-
-            // Try to map it
-            let map_result = system.mapper.map_to(page, frame, flags, &mut system.frame_allocator);
-
-            match map_result {
-                Ok(flusher) => flusher.flush(), 
-                Err(MapToError::PageAlreadyMapped(_)) => {
-                    // If already mapped, UPDATE FLAGS to allow User Access.
-                    system.mapper.update_flags(page, flags)
-                        .map_err(|_| "Failed to update flags")?
-                        .flush();
-                },
-                Err(_) => return Err("Map to failed (Unknown error)"),
+            if let Err(_) = system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                 return Err("Map failed");
             }
         }
     }
-
     Ok(start_addr)
+}
+
+// NEW: Map Framebuffer to User Space Fixed Address (0x80000000)
+// This enables "God Mode" graphics for the user app.
+pub fn map_user_framebuffer(phys_addr: u64, size: u64) -> Result<u64, &'static str> {
+    use x86_64::structures::paging::{PageTableFlags, Mapper};
+    
+    let mut system_lock = MEMORY_MANAGER.lock();
+    let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
+
+    let user_start = VirtAddr::new(0x8000_0000); // 2GB Mark
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_CACHE;
+
+    let start_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr));
+    let end_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr + size - 1));
+    let frame_range = PhysFrame::range_inclusive(start_frame, end_frame);
+
+    for (i, frame) in frame_range.enumerate() {
+        let page = Page::<Size4KiB>::containing_address(user_start + (i as u64 * 4096));
+        unsafe {
+            // Ignore errors if already mapped
+            let _ = system.mapper.map_to(page, frame, flags, &mut system.frame_allocator);
+        }
+    }
+
+    Ok(user_start.as_u64())
 }

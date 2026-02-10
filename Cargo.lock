@@ -1235,6 +1235,9 @@ dependencies = [
 [[package]]
 name = "nyx-user"
 version = "0.1.0"
+dependencies = [
+ "noto-sans-mono-bitmap",
+]
 
 [[package]]
 name = "once_cell"

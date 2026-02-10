@@ -112,19 +112,63 @@ pub struct WindowManager {
     windows: Vec<Window>,
     prev_left: bool, prev_right: bool,
     pub screen_width: usize, pub screen_height: usize,
+    // NEW: Persistent Desktop Buffer (The Wallpaper/Canvas)
+    pub desktop_buffer: Vec<u32>, 
 }
 
 impl WindowManager {
     pub fn new() -> Self { 
-        let mut wm = Self { windows: Vec::new(), prev_left: false, prev_right: false, 
-                            screen_width: 1024, screen_height: 768 };
+        let mut wm = Self { 
+            windows: Vec::new(), prev_left: false, prev_right: false, 
+            screen_width: 1024, screen_height: 768,
+            desktop_buffer: Vec::new(), 
+        };
         wm.add(Window::new(50, 50, 900, 600, "Nyx Terminal", WindowType::Terminal));
         wm
     }
 
-    pub fn set_resolution(&mut self, w: usize, h: usize) { self.screen_width = w; self.screen_height = h; }
+    pub fn set_resolution(&mut self, w: usize, h: usize) { 
+        self.screen_width = w; 
+        self.screen_height = h; 
+        // Init buffer with dark blue background
+        self.desktop_buffer.resize(w * h, 0x00000030); 
+    }
+
     pub fn add(&mut self, window: Window) { self.windows.push(window); }
     
+    // API: Draw single pixel (Old slow way)
+    pub fn put_desktop_pixel(&mut self, x: usize, y: usize, color: u32) {
+        if x < self.screen_width && y < self.screen_height {
+            let idx = y * self.screen_width + x;
+            if idx < self.desktop_buffer.len() {
+                self.desktop_buffer[idx] = color;
+            }
+        }
+    }
+
+    // NEW API: Blit Buffer (Fast way)
+    pub fn blit_desktop_rect(&mut self, x: usize, y: usize, w: usize, h: usize, buffer: &[u32]) {
+        if buffer.len() < w * h { return; }
+        
+        for row in 0..h {
+            let screen_y = y + row;
+            if screen_y >= self.screen_height { break; }
+            
+            let screen_row_start = screen_y * self.screen_width + x;
+            let buffer_row_start = row * w;
+
+            for col in 0..w {
+                if x + col >= self.screen_width { break; }
+                
+                let color = buffer[buffer_row_start + col];
+                // Simple Alpha Blending: Skip 0x00000000 (Transparent)
+                if color != 0 {
+                    self.desktop_buffer[screen_row_start + col] = color;
+                }
+            }
+        }
+    }
+
     pub fn console_print(&mut self, c: char) {
         for win in self.windows.iter_mut().rev() {
             if win.window_type == WindowType::Terminal {
@@ -139,12 +183,8 @@ impl WindowManager {
         let click_r = mouse.right_click && !self.prev_right;
         self.prev_left = mouse.left_click; self.prev_right = mouse.right_click;
         
-        // REMOVED: Unsafe Allocations for SystemMonitor (Vec::new/format!)
-        // This prevents the heap allocation crash in interrupts.
-
         let tb_y = self.screen_height - TASKBAR_HEIGHT - SAFE_PADDING;
         if click_l && mouse.y >= tb_y && mouse.x < 100 {
-            // This is safe because it only happens on explicit click, not every tick
             let off = (self.windows.len() * 30) % 200;
             self.add(Window::new(50+off, 50+off, 900, 600, "Terminal", WindowType::Terminal));
             return;
@@ -183,13 +223,28 @@ impl WindowManager {
         }
     }
 
-    pub fn draw(&self, painter: &mut impl Painter) {
+    pub fn draw(&self, painter: &mut crate::gui::BackBuffer) {
+        // 1. Draw Desktop Wallpaper (The User Canvas)
+        if self.desktop_buffer.len() == self.screen_width * self.screen_height {
+            for y in 0..self.screen_height {
+                for x in 0..self.screen_width {
+                    let color_u32 = self.desktop_buffer[y * self.screen_width + x];
+                    let r = ((color_u32 >> 16) & 0xFF) as u8;
+                    let g = ((color_u32 >> 8) & 0xFF) as u8;
+                    let b = (color_u32 & 0xFF) as u8;
+                    painter.put_pixel_safe(x, y, Color::new(r, g, b));
+                }
+            }
+        } else {
+            painter.clear(Color::new(0, 0, 30));
+        }
+
+        // 2. Draw Kernel UI elements on top
         let tb_y = self.screen_height - TASKBAR_HEIGHT - SAFE_PADDING;
         painter.draw_rect(Rect::new(0, tb_y, self.screen_width, TASKBAR_HEIGHT), Color::new(30, 30, 30));
         painter.draw_rect(Rect::new(4, tb_y+4, 92, TASKBAR_HEIGHT-8), Color::new(0, 120, 215));
         painter.draw_string(28, tb_y+12, "START", Color::WHITE);
 
-        // STACK ALLOCATION ONLY (Safe for Interrupts)
         let uptime = crate::time::uptime_seconds() as u64;
         let hours = uptime / 3600;
         let mins = (uptime % 3600) / 60;
@@ -215,13 +270,23 @@ impl WindowManager {
     }
 }
 
-// NOTE: This function is dangerous if called from interrupts without try_lock check
-// We will handle safety in interrupts.rs
+// Helper for raw buffer manipulation
+impl crate::gui::BackBuffer {
+    pub fn put_pixel_safe(&mut self, x: usize, y: usize, color: Color) {
+        let bpp = self.info.bytes_per_pixel;
+        let idx = (y * self.info.stride + x) * bpp;
+        if idx + 2 < self.buffer.len() {
+            self.buffer[idx] = color.b;   
+            self.buffer[idx+1] = color.g; 
+            self.buffer[idx+2] = color.r; 
+        }
+    }
+}
+
 pub fn compositor_paint() {
     unsafe {
         if let Some(bb) = &mut crate::BACK_BUFFER {
-            bb.clear(Color::new(0, 0, 30));
-            // WARNING: This blocks. Interrupts should use try_lock logic instead.
+            // Note: Background clear is now handled inside WINDOW_MANAGER.draw
             WINDOW_MANAGER.lock().draw(bb);
             let mouse = crate::mouse::MOUSE_STATE.lock();
             bb.draw_rect(Rect::new(mouse.x, mouse.y, 10, 10), Color::WHITE);
