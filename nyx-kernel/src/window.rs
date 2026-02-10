@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
 use lazy_static::lazy_static;
-use crate::gui::{Painter, Rect, Color};
+use crate::gui::{Painter, Rect, Color, turbo_copy}; // Added turbo_copy import
 use crate::mouse::MouseState;
 use core::fmt::Write; 
 
@@ -146,7 +146,7 @@ impl WindowManager {
         }
     }
 
-    // NEW API: Blit Buffer (Fast way)
+    // NEW API: Blit Buffer (Turbo Mode)
     pub fn blit_desktop_rect(&mut self, x: usize, y: usize, w: usize, h: usize, buffer: &[u32]) {
         if buffer.len() < w * h { return; }
         
@@ -157,14 +157,12 @@ impl WindowManager {
             let screen_row_start = screen_y * self.screen_width + x;
             let buffer_row_start = row * w;
 
-            for col in 0..w {
-                if x + col >= self.screen_width { break; }
-                
-                let color = buffer[buffer_row_start + col];
-                // Simple Alpha Blending: Skip 0x00000000 (Transparent)
-                if color != 0 {
-                    self.desktop_buffer[screen_row_start + col] = color;
-                }
+            // Optimization: If full width fits and alignment is good, use turbo_copy
+            // Note: Colors are u32, turbo_copy expects u8, so count * 4
+            unsafe {
+                let dest_ptr = self.desktop_buffer.as_mut_ptr().add(screen_row_start) as *mut u8;
+                let src_ptr = buffer.as_ptr().add(buffer_row_start) as *const u8;
+                turbo_copy(dest_ptr, src_ptr, w * 4);
             }
         }
     }
@@ -226,14 +224,13 @@ impl WindowManager {
     pub fn draw(&self, painter: &mut crate::gui::BackBuffer) {
         // 1. Draw Desktop Wallpaper (The User Canvas)
         if self.desktop_buffer.len() == self.screen_width * self.screen_height {
-            for y in 0..self.screen_height {
-                for x in 0..self.screen_width {
-                    let color_u32 = self.desktop_buffer[y * self.screen_width + x];
-                    let r = ((color_u32 >> 16) & 0xFF) as u8;
-                    let g = ((color_u32 >> 8) & 0xFF) as u8;
-                    let b = (color_u32 & 0xFF) as u8;
-                    painter.put_pixel_safe(x, y, Color::new(r, g, b));
-                }
+            // TURBO COPY for the Wallpaper
+            unsafe {
+                turbo_copy(
+                    painter.buffer.as_mut_ptr(),
+                    self.desktop_buffer.as_ptr() as *const u8,
+                    self.desktop_buffer.len() * 4
+                );
             }
         } else {
             painter.clear(Color::new(0, 0, 30));

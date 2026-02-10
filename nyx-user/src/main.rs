@@ -98,6 +98,8 @@ fn present_rect(
     front: &mut [u32], back: &[u32], stride: usize, height: usize,
     x: usize, y: usize, w: usize, h: usize
 ) {
+    // VSYNC / TURBO: We now assume 'sys_blit' handles the heavy lifting
+    // But in userspace, we simply copy.
     for row in 0..h {
         let screen_y = y + row;
         if screen_y >= height { break; }
@@ -235,13 +237,26 @@ pub extern "C" fn _start() -> ! {
     let mut prev_my = 0;
 
     let mut last_frame_time = syscalls::sys_get_time();
-    let ms_per_frame = 1000 / 60;
+    let ms_per_frame = 1000 / 60; // Target 60 FPS
     let mut force_redraw = true;
 
     // Track previous active rect for dirty calculations
     let mut prev_win_rect = (0, 0, 0, 0);
 
     loop {
+        // --- VSYNC / FPS LOCK ---
+        // Busy-wait until enough time has passed for the next frame
+        // This ensures smooth animation and prevents tearing by not drawing faster than refresh
+        let current_time = syscalls::sys_get_time();
+        let elapsed = current_time.wrapping_sub(last_frame_time);
+
+        if elapsed < ms_per_frame {
+            // Optional: Yield CPU here if we had a sys_yield syscall
+             unsafe { core::arch::asm!("nop"); } 
+            continue;
+        }
+        last_frame_time = current_time;
+
         let (mx, my, left, _right) = syscalls::sys_get_mouse();
         let mut input_changed = false;
 
@@ -331,12 +346,9 @@ pub extern "C" fn _start() -> ! {
         }
 
         // --- RENDER ---
-        let current_time = syscalls::sys_get_time();
-        let elapsed = current_time.wrapping_sub(last_frame_time);
-        
         let visual_change = is_dragging || is_resizing || input_changed || mx != prev_mx || my != prev_my || force_redraw;
 
-        if visual_change && elapsed >= ms_per_frame {
+        if visual_change {
             
             // 1. Erase Cursor
             restore_wallpaper_rect(back_buffer, screen_w, screen_h,
@@ -387,7 +399,6 @@ pub extern "C" fn _start() -> ! {
             }
             prev_mx = mx;
             prev_my = my;
-            last_frame_time = current_time;
             force_redraw = false;
         }
 

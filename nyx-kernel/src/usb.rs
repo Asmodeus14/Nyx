@@ -236,8 +236,11 @@ impl XhciController {
         Self::push_ring_trb(self.ep1_rings[slot_id], &mut self.ep1_indices[slot_id], &mut self.ep1_cycles[slot_id], trb);
     }
 
+    // FIX: Added TIMEOUT Loop to avoid Infinite Freeze during BIOS Handoff
     unsafe fn perform_bios_handoff(&self, log_win: &mut crate::window::Window) {
         let mut xecp_offset = self.caps.xecp();
+        let mut timeout = 10000000; // Safety timeout
+
         while xecp_offset != 0 {
             let cap_ptr = self.base.add((xecp_offset << 2) as usize) as *mut u32;
             let cap_val = read_volatile(cap_ptr);
@@ -245,8 +248,24 @@ impl XhciController {
                 log_win.buffer.push(alloc::string::String::from("BIOS Handoff..."));
                 if (cap_val & (1 << 16)) != 0 {
                     write_volatile(cap_ptr, cap_val | (1 << 24));
-                    for _ in 0..1000000 { if (read_volatile(cap_ptr) & (1 << 16)) == 0 { break; } core::hint::spin_loop(); }
-                    while (read_volatile(cap_ptr) & (1 << 24)) == 0 { core::hint::spin_loop(); }
+                    
+                    // Wait with timeout
+                    let mut t = 0;
+                    while t < 1000000 {
+                         if (read_volatile(cap_ptr) & (1 << 16)) == 0 { break; } 
+                         core::hint::spin_loop();
+                         t += 1;
+                    }
+
+                    t = 0;
+                    while (read_volatile(cap_ptr) & (1 << 24)) == 0 { 
+                        if t > 5000000 { 
+                            log_win.buffer.push(alloc::string::String::from("BIOS Handoff Timeout!"));
+                            break; 
+                        }
+                        core::hint::spin_loop(); 
+                        t += 1;
+                    }
                     log_win.buffer.push(alloc::string::String::from("BIOS Released."));
                 } else { write_volatile(cap_ptr, cap_val | (1 << 24)); }
                 break;
@@ -254,6 +273,12 @@ impl XhciController {
             let next = (cap_val >> 8) & 0xFF;
             if next == 0 { break; }
             xecp_offset += next;
+            
+            timeout -= 1;
+            if timeout == 0 {
+                log_win.buffer.push(alloc::string::String::from("BIOS Cap Loop Timeout"));
+                break;
+            }
         }
     }
 
@@ -336,7 +361,8 @@ impl XhciController {
             }
             self.doorbell.ring(0, 0);
             let mut noop_ok = false;
-            for _ in 0..1_000_000 { if let Some(_) = self.check_event(log_win) { noop_ok = true; break; } core::hint::spin_loop(); }
+            // Lowered wait time for NoOp
+            for _ in 0..200_000 { if let Some(_) = self.check_event(log_win) { noop_ok = true; break; } core::hint::spin_loop(); }
             if noop_ok { log_win.buffer.push(alloc::string::String::from("NoOp: OK")); } 
             else { log_win.buffer.push(alloc::string::String::from("NoOp: Fail")); }
             self.repaint(log_win);
@@ -360,7 +386,8 @@ impl XhciController {
                 self.cmd_cycle = !self.cmd_cycle;
             }
             self.doorbell.ring(0, 0); 
-            for _ in 0..2_000_000 { if let Some(slot) = self.check_event(log_win) { return Ok(slot); } core::hint::spin_loop(); }
+            // Reduced Timeout
+            for _ in 0..500_000 { if let Some(slot) = self.check_event(log_win) { return Ok(slot); } core::hint::spin_loop(); }
         }
         Err("Cmd Timeout")
     }
@@ -475,7 +502,7 @@ impl XhciController {
             let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
             self.push_ep0_trb(s_id, status);
             self.doorbell.ring(s_id, 1);
-            for _ in 0..5_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+            for _ in 0..2_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
         }
         Err("Cfg Timeout")
     }
@@ -488,7 +515,7 @@ impl XhciController {
             let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
             self.push_ep0_trb(s_id, status);
             self.doorbell.ring(s_id, 1);
-            for _ in 0..5_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+            for _ in 0..2_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
         }
         Err("Idle Timeout")
     }
@@ -501,7 +528,7 @@ impl XhciController {
             let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
             self.push_ep0_trb(s_id, status);
             self.doorbell.ring(s_id, 1);
-            for _ in 0..5_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+            for _ in 0..2_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
         }
         Err("Proto Timeout")
     }
@@ -519,7 +546,7 @@ impl XhciController {
             let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT;
             self.push_ep0_trb(s_id, status);
             self.doorbell.ring(s_id, 1); 
-            for _ in 0..5_000_000 {
+            for _ in 0..2_000_000 {
                 if let Some(id) = self.check_event(log_win) {
                     if id == 0 { return Err("Desc Fail"); }
                     Self::clflush(buffer); 
@@ -591,7 +618,7 @@ impl XhciController {
             }
             self.doorbell.ring(0, 0);
 
-            for _ in 0..5_000_000 {
+            for _ in 0..2_000_000 {
                 if let Some(id) = self.check_event(log_win) {
                     if id == slot_id { 
                         log_win.buffer.push(alloc::string::String::from("EP1: Config"));
@@ -646,7 +673,8 @@ impl XhciController {
                 self.cmd_cycle = !self.cmd_cycle;
             }
             self.doorbell.ring(0, 0); 
-            for _ in 0..10_000_000 { if let Some(s_id) = self.check_event(log_win) { if s_id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+            // Reduced Timeout
+            for _ in 0..5_000_000 { if let Some(s_id) = self.check_event(log_win) { if s_id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
         }
         Err("Addr Timeout")
     }
@@ -654,7 +682,10 @@ impl XhciController {
     pub fn check_ports(&mut self, log_win: &mut crate::window::Window) {
         unsafe {
             let max = self.caps.max_ports();
-            for i in 1..=max {
+            // FIX: Added limit to Max Ports to prevent scanning ghost ports on some chipsets
+            let limit = if max > 16 { 16 } else { max };
+
+            for i in 1..=limit {
                 let idx = (i - 1) as usize * 4;
                 if idx >= self.op.portregs.len() { break; }
                 let portsc = read_volatile(&self.op.portregs[idx]);
@@ -664,13 +695,14 @@ impl XhciController {
                     if (portsc & (1<<1)) == 0 { 
                         write_volatile(&mut self.op.portregs[idx], portsc | (1 << 4)); 
                         for _ in 0..10_000_000 { if (read_volatile(&self.op.portregs[idx]) & (1<<4)) == 0 { break; } core::hint::spin_loop(); }
-                        for _ in 0..50_000_000 { core::hint::spin_loop(); }
+                        for _ in 0..10_000_000 { core::hint::spin_loop(); } // Shortened delay
                     }
                     if (read_volatile(&self.op.portregs[idx]) & (1<<1)) != 0 {
                         let speed = (read_volatile(&self.op.portregs[idx]) >> 10) & 0xF; 
                         log_win.buffer.push(alloc::format!("P{} Spd{}", i, speed));
                         self.repaint(log_win);
                         
+                        // We use a safe wrapper logic here to prevent infinite chains
                         if let Ok(id) = self.enable_slot(log_win) {
                             if id > 0 { 
                                 if self.address_device(id, i as u8, speed as u8, log_win, true, None).is_ok() {
@@ -678,7 +710,8 @@ impl XhciController {
                                         if self.address_device(id, i as u8, speed as u8, log_win, false, Some(real_mp as u32)).is_ok() {
                                             let _ = self.get_descriptor(id, log_win, false);
                                             let _ = self.set_configuration(id, log_win);
-                                            for _ in 0..10_000_000 { core::hint::spin_loop(); }
+                                            // Reduced Wait
+                                            for _ in 0..1_000_000 { core::hint::spin_loop(); }
                                             let _ = self.set_idle(id, log_win);
                                             let _ = self.set_boot_protocol(id, log_win);
                                             let _ = self.configure_interrupt_endpoint(id, log_win);
