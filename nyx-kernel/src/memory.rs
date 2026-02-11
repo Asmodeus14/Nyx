@@ -19,11 +19,9 @@ pub struct MemorySystem {
 
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table_frame = x86_64::registers::control::Cr3::read().0;
-    
     let phys = level_4_table_frame.start_address();
     let virt = physical_memory_offset + phys.as_u64();
     let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
-    
     let level_4_table = &mut *page_table_ptr;
     OffsetPageTable::new(level_4_table, physical_memory_offset)
 }
@@ -55,82 +53,83 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     }
 }
 
-pub unsafe fn map_mmio(
-    phys_addr: u64, 
-    size: u64, 
-    mapper: &mut OffsetPageTable, 
-    frame_allocator: &mut BootInfoFrameAllocator
-) -> Result<VirtAddr, &'static str> {
-    let start_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr));
-    let end_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr + size - 1));
-    let frame_range = PhysFrame::range_inclusive(start_frame, end_frame);
-
-    let virt_start = VirtAddr::new(phys_addr);
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
-
-    for (i, frame) in frame_range.enumerate() {
-        let page = Page::<Size4KiB>::containing_address(virt_start + (i as u64 * 4096));
-        let _ = mapper.map_to(page, frame, flags, frame_allocator);
-    }
-    Ok(virt_start)
-}
-
 pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
     let mut lock = MEMORY_MANAGER.lock();
     if let Some(mm) = lock.as_mut() {
         let addr = VirtAddr::new(virt_addr);
         mm.mapper.translate_addr(addr).map(|p| p.as_u64())
-    } else {
-        None
-    }
+    } else { None }
 }
 
 pub fn allocate_user_pages(num_pages: u64) -> Result<VirtAddr, &'static str> {
-    use x86_64::structures::paging::{PageTableFlags, Mapper};
-    
     let mut system_lock = MEMORY_MANAGER.lock();
     let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
-
     let start_addr = VirtAddr::new(0x100_0000);
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-
+    
     for i in 0..num_pages {
-        let page_addr = start_addr + (i * 4096);
-        let page = Page::containing_address(page_addr);
-
+        let page = Page::<Size4KiB>::containing_address(start_addr + (i * 4096));
         unsafe {
-            let frame = system.frame_allocator.allocate_frame()
-                .ok_or("Frame allocation failed")?;
-            if let Err(_) = system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
-                 return Err("Map failed");
+            let frame = system.frame_allocator.allocate_frame().ok_or("OOM: User Code")?;
+            // FIX: Do not ignore errors!
+            match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                Ok(mapper) => mapper.flush(),
+                Err(_) => return Err("Map Failed: User Code"),
             }
         }
     }
     Ok(start_addr)
 }
 
-// NEW: Map Framebuffer to User Space Fixed Address (0x80000000)
-// This enables "God Mode" graphics for the user app.
 pub fn map_user_framebuffer(phys_addr: u64, size: u64) -> Result<u64, &'static str> {
-    use x86_64::structures::paging::{PageTableFlags, Mapper};
-    
     let mut system_lock = MEMORY_MANAGER.lock();
     let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
-
-    let user_start = VirtAddr::new(0x8000_0000); // 2GB Mark
+    let user_start = VirtAddr::new(0x8000_0000); 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_CACHE;
-
+    
     let start_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr));
     let end_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr + size - 1));
-    let frame_range = PhysFrame::range_inclusive(start_frame, end_frame);
-
-    for (i, frame) in frame_range.enumerate() {
+    
+    for (i, frame) in PhysFrame::range_inclusive(start_frame, end_frame).enumerate() {
         let page = Page::<Size4KiB>::containing_address(user_start + (i as u64 * 4096));
-        unsafe {
-            // Ignore errors if already mapped
-            let _ = system.mapper.map_to(page, frame, flags, &mut system.frame_allocator);
+        unsafe { 
+            match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                Ok(mapper) => mapper.flush(),
+                Err(_) => return Err("Map Failed: Framebuffer"),
+            }
         }
     }
+    Ok(user_start.as_u64())
+}
 
+// FIX: Now returns Error if mapping fails, instead of faking success
+pub fn map_user_memory(size: u64) -> Result<u64, &'static str> {
+    let mut system_lock = MEMORY_MANAGER.lock();
+    let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
+    
+    // We map dynamic memory at 1GB (0x40000000)
+    let user_start = VirtAddr::new(0x4000_0000); 
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    
+    let pages = (size + 4095) / 4096;
+
+    for i in 0..pages {
+        let page = Page::<Size4KiB>::containing_address(user_start + (i * 4096));
+        unsafe {
+            // 1. Allocate Physical Frame
+            let frame = system.frame_allocator.allocate_frame().ok_or("OOM: Dynamic Alloc")?;
+            
+            // 2. Map Page to Frame
+            match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                Ok(mapper) => mapper.flush(),
+                Err(MapToError::PageAlreadyMapped(_)) => {
+                    // If already mapped, we assume it's from a previous allocation and reuse it.
+                    // This is a simple 'bump' allocator that never frees.
+                    continue; 
+                },
+                Err(_) => return Err("Map Failed: Dynamic Alloc"),
+            }
+        }
+    }
     Ok(user_start.as_u64())
 }

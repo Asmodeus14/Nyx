@@ -1,12 +1,12 @@
 ENTRY(_start)
 
 SECTIONS {
-    /* FIX: Use 16MB (0x1000000). This fits in the "Small" code model. */
+    /* We load at 16MB. The kernel jumps here. */
     . = 0x1000000;
 
     .text : {
+        /* CRITICAL: Place the entry section first! */
         *(.text.entry) 
-        *(.text._start)
         *(.text*)
     }
 
@@ -23,8 +23,7 @@ SECTIONS {
     }
 
     /DISCARD/ : {
-       
- *(.eh_frame)
+        *(.eh_frame)
         *(.comment)
         *(.note*)
     }

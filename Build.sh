@@ -2,16 +2,18 @@
 set -e
 
 echo "--- 1. Building User Application ---"
-# We enter the directory so Cargo finds .cargo/config.toml
 cd nyx-user
+# Force rebuild to ensure code changes are picked up
+
 cargo build --release --target x86_64-unknown-none
 cd ..
 
 echo "--- 2. Extracting & Moving Binary ---"
-# FIX: The binary is in the ROOT target folder, not nyx-user/target
+# Ensure the path matches exactly where Cargo outputs it
 objcopy -O binary target/x86_64-unknown-none/release/nyx-user nyx-kernel/src/nyx-user.bin
 
 echo "--- 3. Forcing Kernel Rebuild ---"
+# Touch main.rs to force include_bytes! to reload the file
 touch nyx-kernel/src/main.rs
 
 echo "--- 4. Building Kernel & Bootable Image ---"
