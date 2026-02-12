@@ -100,6 +100,7 @@ extern "C" fn syscall_rust_dispatcher(ptr: *mut SyscallRegisters) {
              if let Some(p) = unsafe { &crate::SCREEN_PAINTER } {
                  regs.rax = ((p.info.width as u64) << 32) | (p.info.height as u64);
                  regs.rdi = p.info.stride as u64;
+                 regs.rsi = p.info.bytes_per_pixel as u64; // NEW: Return BPP in RSI
              }
         },
         7 => { // sys_map_framebuffer

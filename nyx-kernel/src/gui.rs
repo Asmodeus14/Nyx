@@ -3,7 +3,7 @@ use noto_sans_mono_bitmap::{get_raster, FontWeight, RasterHeight};
 use alloc::vec::Vec;
 use alloc::vec;
 
-// NEW: Store Physical Address of Framebuffer here
+// Store Physical Address of Framebuffer here (for Syscalls)
 pub static mut FRAMEBUFFER_PHYS_ADDR: u64 = 0;
 
 pub struct Rect {
@@ -36,17 +36,14 @@ impl Color {
 pub unsafe fn turbo_copy(dest: *mut u8, src: *const u8, count: usize) {
     let mut i = 0;
     
-    // 1. Align to 8 bytes if possible (simple optimization)
-    // For now, we assume buffers are mostly aligned or we just do the bulk copy
-    
-    // 2. Bulk Copy (u64)
+    // Bulk Copy (u64)
     while i + 8 <= count {
         let val = *(src.add(i) as *const u64);
         *(dest.add(i) as *mut u64) = val;
         i += 8;
     }
 
-    // 3. Trailing Bytes
+    // Trailing Bytes
     while i < count {
         *dest.add(i) = *src.add(i);
         i += 1;
@@ -62,7 +59,7 @@ pub trait Painter {
     fn height(&self) -> usize;
 }
 
-// --- HARDWARE PAINTER ---
+// --- HARDWARE PAINTER (Direct VRAM Access) ---
 pub struct VgaPainter<'a> {
     pub buffer: &'a mut [u8],
     pub info: FrameBufferInfo,
@@ -73,7 +70,6 @@ impl<'a> Painter for VgaPainter<'a> {
     fn height(&self) -> usize { self.info.height }
 
     fn clear(&mut self, color: Color) {
-        // Fast clear using u64 filling would be better, but rect is okay for now
         self.draw_rect(Rect::new(0, 0, self.width(), self.height()), color);
     }
 
@@ -151,7 +147,7 @@ impl<'a> Painter for VgaPainter<'a> {
     }
 }
 
-// --- SOFTWARE BACKBUFFER ---
+// --- SOFTWARE BACKBUFFER (Double Buffering) ---
 pub struct BackBuffer {
     pub buffer: Vec<u8>,
     pub info: FrameBufferInfo,
@@ -159,6 +155,7 @@ pub struct BackBuffer {
 
 impl BackBuffer {
     pub fn new(info: FrameBufferInfo) -> Self {
+        // IMPORTANT: We use stride here to match hardware layout exactly
         let size = info.stride * info.height * info.bytes_per_pixel;
         Self {
             buffer: vec![0; size],
@@ -166,7 +163,7 @@ impl BackBuffer {
         }
     }
 
-    // MODIFIED: Use Turbo Copy for Presentation
+    // Flips the backbuffer to the screen
     pub fn present(&self, screen: &mut VgaPainter) {
         let len = self.buffer.len().min(screen.buffer.len());
         unsafe {

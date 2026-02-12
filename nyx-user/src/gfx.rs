@@ -1,6 +1,5 @@
 use crate::syscalls;
 
-// A simple color struct
 #[derive(Clone, Copy)]
 pub struct Color {
     pub hex: u32,
@@ -16,7 +15,8 @@ impl Color {
     pub const TITLE_BLUE: u32 = 0x007ACC;
 }
 
-// 1. Primitive: Draw Rectangle (Optimized loop of sys_draw)
+// 1. Legacy Slow Draw (Uses Kernel WindowManager)
+// This should now work correctly because the kernel fixed the shift.
 pub fn draw_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     for row in 0..h {
         for col in 0..w {
@@ -25,36 +25,82 @@ pub fn draw_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     }
 }
 
-// 2. Component: Draw a "Windows-95 style" Window
-pub fn draw_window(x: usize, y: usize, w: usize, h: usize, title: &str) {
-    // Main Body (Gray)
-    draw_rect(x, y, w, h, Color::GRAY);
-    
-    // Border (White Highlight)
-    draw_rect(x, y, w, 2, Color::WHITE);      // Top
-    draw_rect(x, y, 2, h, Color::WHITE);      // Left
-    
-    // Border (Shadow)
-    draw_rect(x + w - 2, y, 2, h, 0x000000);  // Right
-    draw_rect(x, y + h - 2, w, 2, 0x000000);  // Bottom
-
-    // Title Bar (Blue)
-    draw_rect(x + 3, y + 3, w - 6, 20, Color::TITLE_BLUE);
-    
-    // Close Button (Red)
-    draw_rect(x + w - 22, y + 5, 16, 16, Color::RED);
-    
-    // NOTE: We don't have font rendering in userspace yet (that requires a font file),
-    // so we just draw colored blocks for now.
+// 2. NEW: Fast User Space Painter (Optional Upgrade)
+// Call init() then use this for 60FPS speed.
+pub struct FastPainter {
+    buffer: *mut u8,
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
 }
 
-// 3. Component: Draw Cursor (Arrow)
-pub fn draw_cursor(x: usize, y: usize) {
-    let color = Color::WHITE;
-    // Simple 10x10 cursor shape
-    for i in 0..10 {
-        syscalls::sys_draw(x + i, y + i, color);     // Diagonal
-        syscalls::sys_draw(x, y + i, color);         // Vertical
-        syscalls::sys_draw(x + i, y, color);         // Horizontal
+static mut PAINTER: Option<FastPainter> = None;
+
+pub fn init() {
+    let (w, h, stride, bpp) = syscalls::sys_get_screen_info();
+    let addr = syscalls::sys_map_framebuffer();
+    
+    if addr != 0 {
+        unsafe {
+            PAINTER = Some(FastPainter {
+                buffer: addr as *mut u8,
+                width: w as usize,
+                height: h as usize,
+                stride: stride as usize,
+                bpp: bpp as usize,
+            });
+        }
     }
+}
+
+pub fn fast_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
+    unsafe {
+        if let Some(p) = &mut PAINTER {
+            // Extract RGB
+            let r = ((color >> 16) & 0xFF) as u8;
+            let g = ((color >> 8) & 0xFF) as u8;
+            let b = (color & 0xFF) as u8;
+
+            for row in 0..h {
+                let screen_y = y + row;
+                if screen_y >= p.height { break; }
+                
+                let row_offset = screen_y * p.stride; // Use STRIDE
+                
+                for col in 0..w {
+                    let screen_x = x + col;
+                    if screen_x >= p.width { break; }
+                    
+                    let offset = (row_offset + screen_x) * p.bpp; // Use BPP
+                    
+                    if p.bpp == 4 {
+                        *(p.buffer.add(offset) as *mut u32) = color;
+                    } else if p.bpp == 3 {
+                        // BGR usually for 3-byte modes
+                        *p.buffer.add(offset) = b;
+                        *p.buffer.add(offset+1) = g;
+                        *p.buffer.add(offset+2) = r;
+                    }
+                }
+            }
+        } else {
+            // Fallback if init() wasn't called
+            draw_rect(x, y, w, h, color);
+        }
+    }
+}
+
+pub fn draw_window(x: usize, y: usize, w: usize, h: usize, title: &str) {
+    fast_rect(x, y, w, h, Color::GRAY);
+    fast_rect(x, y, w, 2, Color::WHITE);
+    fast_rect(x, y, 2, h, Color::WHITE);
+    fast_rect(x + w - 2, y, 2, h, 0x000000);
+    fast_rect(x, y + h - 2, w, 2, 0x000000);
+    fast_rect(x + 3, y + 3, w - 6, 20, Color::TITLE_BLUE);
+    fast_rect(x + w - 22, y + 5, 16, 16, Color::RED);
+}
+
+pub fn draw_cursor(x: usize, y: usize) {
+    fast_rect(x, y, 10, 10, Color::WHITE);
 }

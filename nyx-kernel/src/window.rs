@@ -5,6 +5,7 @@ use lazy_static::lazy_static;
 use crate::gui::{Painter, Rect, Color, turbo_copy}; 
 use crate::mouse::MouseState;
 use core::fmt::Write; 
+use bootloader_api::info::PixelFormat; // Required for the green-shift fix
 
 lazy_static! {
     pub static ref WINDOW_MANAGER: Mutex<WindowManager> = Mutex::new(WindowManager::new());
@@ -140,24 +141,9 @@ impl WindowManager {
             }
         }
     }
-
-    pub fn blit_desktop_rect(&mut self, x: usize, y: usize, w: usize, h: usize, buffer: &[u32]) {
-        if buffer.len() < w * h { return; }
-        for row in 0..h {
-            let screen_y = y + row;
-            if screen_y >= self.screen_height { break; }
-            let screen_row_start = screen_y * self.screen_width + x;
-            let buffer_row_start = row * w;
-            unsafe {
-                let dest_ptr = self.desktop_buffer.as_mut_ptr().add(screen_row_start) as *mut u8;
-                let src_ptr = buffer.as_ptr().add(buffer_row_start) as *const u8;
-                turbo_copy(dest_ptr, src_ptr, w * 4);
-            }
-        }
-    }
-
+    
+    // --- THIS IS THE MISSING METHOD CAUSING YOUR ERROR ---
     pub fn console_print(&mut self, c: char) {
-        // Kernel console logging (keep this if you want kernel logs)
         for win in self.windows.iter_mut().rev() {
             if win.window_type == WindowType::DebugLog {
                 win.append_char(c);
@@ -167,75 +153,80 @@ impl WindowManager {
     }
 
     pub fn update(&mut self, mouse: &MouseState) {
-        // ... (Keep existing mouse update logic if you want kernel windows to work, 
-        // OR empty this to fully disable kernel window management)
-        
-        // For now, let's keep it minimal so it doesn't crash
         let click_l = mouse.left_click && !self.prev_left;
         self.prev_left = mouse.left_click; self.prev_right = mouse.right_click;
-        
-        // Logic removed: Don't spawn new kernel windows on click
-        // Use user space for that!
     }
 
+    // Handles both Stride AND Pixel Format (3 vs 4 bytes)
     pub fn draw(&self, painter: &mut crate::gui::BackBuffer) {
-        // --- CRITICAL FIX: STOP DRAWING KERNEL WALLPAPER ---
-        // Comment out or remove the wallpaper drawing code.
-        // If we draw here, we overwrite the User Space application.
-        
-        /* if self.desktop_buffer.len() == self.screen_width * self.screen_height {
-            unsafe {
-                turbo_copy(
-                    painter.buffer.as_mut_ptr(),
-                    self.desktop_buffer.as_ptr() as *const u8,
-                    self.desktop_buffer.len() * 4
-                );
+        // Only draw desktop if buffer is ready
+        if self.desktop_buffer.len() == self.screen_width * self.screen_height {
+            let stride = painter.info.stride;
+            let width = self.screen_width;
+            let height = self.screen_height;
+            let bpp = painter.info.bytes_per_pixel;
+            let format = painter.info.pixel_format;
+
+            match bpp {
+                4 => {
+                    // Optimized path for 32-bit (4 byte) color
+                    for y in 0..height {
+                        let src_idx = y * width;
+                        let dest_offset = (y * stride) * 4;
+                        
+                        // Bounds check
+                        if src_idx < self.desktop_buffer.len() && dest_offset < painter.buffer.len() {
+                            unsafe {
+                                let src_ptr = self.desktop_buffer.as_ptr().add(src_idx) as *const u8;
+                                let dest_ptr = painter.buffer.as_mut_ptr().add(dest_offset);
+                                // We copy exactly 'width' pixels
+                                turbo_copy(dest_ptr, src_ptr, width * 4);
+                            }
+                        }
+                    }
+                },
+                3 => {
+                    // Slow path for 24-bit (3 byte) color
+                    // We must manually convert u32 (0xRRGGBB) -> 3 bytes
+                    for y in 0..height {
+                        let src_start = y * width;
+                        let dest_start = (y * stride) * 3;
+                        
+                        for x in 0..width {
+                            let color = self.desktop_buffer[src_start + x];
+                            let dest_idx = dest_start + (x * 3);
+                            
+                            if dest_idx + 2 < painter.buffer.len() {
+                                // Extract RGB
+                                let r = ((color >> 16) & 0xFF) as u8;
+                                let g = ((color >> 8) & 0xFF) as u8;
+                                let b = (color & 0xFF) as u8;
+
+                                match format {
+                                    PixelFormat::Rgb => {
+                                        painter.buffer[dest_idx] = r;
+                                        painter.buffer[dest_idx+1] = g;
+                                        painter.buffer[dest_idx+2] = b;
+                                    },
+                                    PixelFormat::Bgr | _ => {
+                                        painter.buffer[dest_idx] = b;
+                                        painter.buffer[dest_idx+1] = g;
+                                        painter.buffer[dest_idx+2] = r;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                _ => {} // Not supported
             }
         } else {
             painter.clear(Color::new(0, 0, 30));
         }
-        */
 
-        // Only draw specific Kernel overlays if absolutely necessary (like Panic messages)
-        // Otherwise, leave the screen alone for User Space.
-
-        // Draw Debug/Kernel windows on TOP if they exist (optional)
+        // Draw Kernel Windows
         for (i, w) in self.windows.iter().enumerate() { 
-             // Optional: w.draw(painter, i == self.windows.len()-1); 
-        }
-    }
-}
-
-// Helper for raw buffer manipulation
-impl crate::gui::BackBuffer {
-    pub fn put_pixel_safe(&mut self, x: usize, y: usize, color: Color) {
-        let bpp = self.info.bytes_per_pixel;
-        let idx = (y * self.info.stride + x) * bpp;
-        if idx + 2 < self.buffer.len() {
-            self.buffer[idx] = color.b;   
-            self.buffer[idx+1] = color.g; 
-            self.buffer[idx+2] = color.r; 
-        }
-    }
-}
-
-pub fn compositor_paint() {
-    unsafe {
-        if let Some(bb) = &mut crate::BACK_BUFFER {
-            // Only draw if we really need to (e.g. panic)
-            // For now, we disable the kernel compositor to let User Space rule.
-            
-            // WINDOW_MANAGER.lock().draw(bb); <-- DISABLED
-            
-            // Note: If you want the Kernel Mouse Cursor to stay, keep this:
-            /*
-            let mouse = crate::mouse::MOUSE_STATE.lock();
-            bb.draw_rect(Rect::new(mouse.x, mouse.y, 10, 10), Color::WHITE);
-            if let Some(s) = &mut crate::SCREEN_PAINTER { bb.present(s); }
-            */
-            
-            // But since User Space draws a mouse cursor too, we disable this 
-            // to avoid "Double Cursor" effect.
+             w.draw(painter, i == self.windows.len()-1); 
         }
     }
 }
