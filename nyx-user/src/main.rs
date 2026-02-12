@@ -10,9 +10,8 @@ use syscalls::*;
 use apps::terminal::Terminal;
 use apps::clock::Clock;
 
-// Import everything from our graphics modules
 use gfx::draw::{self, restore_wallpaper_rect};
-use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
+use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, draw_file_icon, Window, TASKBAR_H};
 
 const MAX_WINDOWS: usize = 3;
 
@@ -26,8 +25,6 @@ pub extern "C" fn _start() -> ! {
     let fb_ptr = sys_map_framebuffer();
     if fb_ptr == 0 { sys_exit(1); }
     
-    // Allocate Back Buffer (Double Buffering)
-    // Size = W * H * 4 bytes + Padding
     let buffer_size_bytes = (screen_w * screen_h * 4) + 4096;
     let back_ptr = sys_alloc(buffer_size_bytes);
     if back_ptr == 0 || back_ptr == 9 { loop {} }
@@ -36,11 +33,9 @@ pub extern "C" fn _start() -> ! {
     let back_buffer = unsafe { core::slice::from_raw_parts_mut(back_ptr as *mut u32, screen_w * screen_h) };
 
     // --- PHASE 1: BOOT SPLASH ---
-    // Pitch black background for splash
     draw::draw_rect_simple(back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h, 0xFF000000);
     draw::draw_text(back_buffer, screen_w, screen_h, (screen_w / 2) - 60, screen_h / 2, "NyxOS User Mode", 0xFFFFFFFF);
     
-    // Present Splash
     for y in 0..screen_h {
         let src = y * screen_w; let dst = y * screen_stride;
         if dst + screen_w <= front_buffer.len() { 
@@ -48,12 +43,9 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // --- PHASE 2: DESKTOP INITIALIZATION ---
-    // Fill entire screen with Pitch Black Wallpaper
+    // --- PHASE 2: DESKTOP INIT ---
     restore_wallpaper_rect(back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h);
 
-    // Define Windows
-    // ID 0 = Terminal, ID 1 = Sys Monitor, ID 2 = Help
     let mut windows = [
         Window { id: 0, x: 50, y: 150, w: 760, h: 480, title: "Nyx Terminal", active: true, exists: true },
         Window { id: 1, x: 850, y: 200, w: 300, h: 200, title: "Sys Monitor", active: false, exists: true },
@@ -62,9 +54,10 @@ pub extern "C" fn _start() -> ! {
     let mut z_order = [0, 1, 2];
 
     let mut my_terminal = Terminal::new();
-    my_terminal.write_str("NyxOS Shell v0.2\nType 'help' for commands.\n> ");
+    my_terminal.write_str("NyxOS Shell v0.3\n> ");
 
-    // Initial Full Draw
+    // Initial Draw
+    draw_desktop_icons(back_buffer, screen_w, screen_h);
     for &idx in z_order.iter() {
         if windows[idx].exists { 
             draw_window_rounded(back_buffer, screen_w, screen_h, &windows[idx]);
@@ -76,7 +69,6 @@ pub extern "C" fn _start() -> ! {
     draw_taskbar(back_buffer, screen_w, screen_h);
     Clock::draw(back_buffer, screen_w, screen_h); 
 
-    // Present Desktop
     for y in 0..screen_h {
         let src = y * screen_w; let dst = y * screen_stride;
         if dst + screen_w <= front_buffer.len() { 
@@ -111,7 +103,6 @@ pub extern "C" fn _start() -> ! {
         
         let mut needs_redraw = false;
         
-        // Dirty Rect Setup
         let mut dirty_min_x = screen_w; let mut dirty_min_y = screen_h;
         let mut dirty_max_x = 0; let mut dirty_max_y = 0;
 
@@ -123,55 +114,53 @@ pub extern "C" fn _start() -> ! {
             dirty_max_x = dirty_max_x.max(ex); dirty_max_y = dirty_max_y.max(ey);
         };
 
-        // 1. CLOCK UPDATE (Top Center)
+        // 1. CLOCK UPDATE
         if now / 1000 != last_second {
             last_second = now / 1000;
-            // UPDATED: Matches new Clock geometry (w=220, h=80, y=60)
             let clock_w = 220;
             let clock_h = 80;
             let clock_x = (screen_w / 2).saturating_sub(clock_w / 2);
             let clock_y = 60;
-            
             mark_dirty(clock_x, clock_y, clock_w, clock_h);
             needs_redraw = true;
         }
 
-        // 2. KEYBOARD INPUT
+        // 2. KEYBOARD
         if windows[0].active && windows[0].exists {
             if let Some(c) = sys_read_key() {
                 my_terminal.handle_key(c);
                 mark_dirty(windows[0].x, windows[0].y, windows[0].w, windows[0].h);
+                
+                // If user pressed Enter, update desktop icons (in case file was created)
+                if c == '\n' { 
+                    mark_dirty(0, 0, 300, screen_h - TASKBAR_H); // Repaint icon area
+                }
                 needs_redraw = true;
             }
         } else {
              let _ = sys_read_key(); 
         }
 
-        // 3. MOUSE INPUT
+        // 3. MOUSE
         if left && !prev_left {
             let mut hit_z_index = None;
             let mut hit_resize = false;
             let mut hit_close = false;
 
-            // Hit testing
             for i in (0..MAX_WINDOWS).rev() {
                 let idx = z_order[i];
                 let w = &windows[idx];
                 if !w.exists { continue; }
                 
-                // Close Button
                 if mx >= w.x + w.w - 35 && mx <= w.x + w.w - 5 && my >= w.y + 5 && my <= w.y + 25 {
                     hit_z_index = Some(i); hit_close = true; break;
                 }
-                // Resize Handle
                 if mx >= w.x + w.w - 25 && mx <= w.x + w.w && my >= w.y + w.h - 25 && my <= w.y + w.h {
                     hit_z_index = Some(i); hit_resize = true; break;
                 }
-                // Header (Move)
                 if mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + 30 {
                     hit_z_index = Some(i); break;
                 }
-                // Body (Focus)
                 if mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h {
                     hit_z_index = Some(i); break;
                 }
@@ -186,12 +175,8 @@ pub extern "C" fn _start() -> ! {
                 } else {
                     let old_w = windows[prev_active_idx];
                     mark_dirty(old_w.x, old_w.y, old_w.w, old_w.h);
-                    
-                    // Reorder Z-Index
                     for j in i..(MAX_WINDOWS-1) { z_order[j] = z_order[j+1]; }
                     z_order[MAX_WINDOWS-1] = idx;
-                    
-                    // Activate Window
                     for win in windows.iter_mut() { win.active = false; }
                     windows[idx].active = true;
                     prev_active_idx = idx; target_idx = idx;
@@ -243,7 +228,9 @@ pub extern "C" fn _start() -> ! {
             
             restore_wallpaper_rect(back_buffer, screen_w, screen_h, dx, dy, dw, dh);
             
-            // Draw Windows (Back to Front)
+            // --- DRAW ICONS ---
+            draw_desktop_icons(back_buffer, screen_w, screen_h);
+            
             for &idx in z_order.iter() {
                 if windows[idx].exists { 
                     draw_window_rounded(back_buffer, screen_w, screen_h, &windows[idx]);
@@ -260,6 +247,34 @@ pub extern "C" fn _start() -> ! {
             present_rect(front_buffer, back_buffer, screen_w, screen_stride, screen_h, dx, dy, dw, dh);
             
             prev_mx = mx; prev_my = my;
+        }
+    }
+}
+
+// Helper to draw icons based on FS content
+fn draw_desktop_icons(fb: &mut [u32], w: usize, h: usize) {
+    use crate::syscalls::{sys_fs_count, sys_fs_get_name};
+    
+    let count = sys_fs_count();
+    let mut icon_x = 20;
+    let mut icon_y = 20;
+    let grid_h = 100; 
+
+    for i in 0..count {
+        let mut name_buf = [0u8; 32];
+        let len = sys_fs_get_name(i, &mut name_buf);
+        
+        if len > 0 {
+            if let Ok(name) = core::str::from_utf8(&name_buf[..len]) {
+                // Now we call the function from gfx::ui
+                crate::gfx::ui::draw_file_icon(fb, w, h, icon_x, icon_y, name);
+                
+                icon_y += grid_h;
+                if icon_y > h - 100 {
+                    icon_y = 20;
+                    icon_x += 80; 
+                }
+            }
         }
     }
 }

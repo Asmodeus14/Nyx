@@ -1,13 +1,9 @@
-// nyx-user/src/apps/terminal.rs
-
-// FIX: Import the drawing functions here
 use crate::gfx::draw::{draw_char, draw_rect_simple};
+use crate::gfx::font::{CHAR_WIDTH, CHAR_HEIGHT};
 
 pub const COLS: usize = 80;
 pub const ROWS: usize = 25;
-pub const CHAR_WIDTH: usize = 9;
-pub const CHAR_HEIGHT: usize = 16;
-const MAX_INPUT: usize = 128; 
+const MAX_INPUT: usize = 128;
 
 #[derive(Copy, Clone)]
 pub struct TerminalCell {
@@ -89,42 +85,129 @@ impl Terminal {
         }
     }
 
+    // --- COMMAND PROCESSOR ---
     fn process_command(&mut self) {
         self.new_line(); 
-        let cmd_len = self.input_len;
         
-        if self.match_cmd(&self.input_buffer[..cmd_len], "help") {
-            self.write_str("Available commands:\n");
-            self.write_str("  help    - Show this message\n");
-            self.write_str("  clear   - Clear the screen\n");
-            self.write_str("  ver     - Show OS version\n");
-            self.write_str("  whoami  - Show current user\n");
-        } 
-        else if self.match_cmd(&self.input_buffer[..cmd_len], "clear") {
-            self.clear_screen();
+        // 1. Convert input buffer to string for easier parsing
+        // We create a temporary buffer on the stack
+        let mut cmd_buf = [0u8; MAX_INPUT];
+        let mut cmd_len = 0;
+        for i in 0..self.input_len {
+            // Simple cast to u8 (Assuming ASCII for commands)
+            cmd_buf[i] = self.input_buffer[i] as u8;
+            cmd_len += 1;
         }
-        else if self.match_cmd(&self.input_buffer[..cmd_len], "ver") {
-            self.write_str("NyxOS User Shell v0.2.0 (Alpha)\n");
-        }
-        else if self.match_cmd(&self.input_buffer[..cmd_len], "whoami") {
-            self.write_str("root\n");
-        }
-        else if cmd_len > 0 {
-            self.write_str("Unknown command: ");
-            for i in 0..cmd_len { 
-                let c = self.input_buffer[i];
-                self.write_char_visual(c); 
+
+        if let Ok(cmd_str) = core::str::from_utf8(&cmd_buf[..cmd_len]) {
+            let mut parts = cmd_str.split_whitespace();
+            let command = parts.next().unwrap_or("");
+
+            match command {
+                "help" => {
+                    self.write_str("NyxOS Commands:\n");
+                    self.write_str("  ls            - List files\n");
+                    self.write_str("  cat <file>    - Read file\n");
+                    self.write_str("  touch <file>  - Create empty file\n");
+                    self.write_str("  write <f> <t> - Write text to file\n");
+                    self.write_str("  clear         - Clear screen\n");
+                },
+                "clear" => self.clear_screen(),
+                "ls" => {
+                    use crate::syscalls::{sys_fs_count, sys_fs_get_name};
+                    let count = sys_fs_count();
+                    self.write_str("Files:\n");
+                    let mut name_buf = [0u8; 32];
+                    for i in 0..count {
+                        for b in name_buf.iter_mut() { *b = 0; }
+                        let len = sys_fs_get_name(i, &mut name_buf);
+                        if len > 0 {
+                            if let Ok(s) = core::str::from_utf8(&name_buf[..len]) {
+                                self.write_str("  - ");
+                                self.write_str(s);
+                                self.write_str("\n");
+                            }
+                        }
+                    }
+                },
+                "touch" => {
+                    if let Some(filename) = parts.next() {
+                        use crate::syscalls::sys_fs_write;
+                        // Create empty file (or default content)
+                        sys_fs_write(filename, b"Created by touch.");
+                        self.write_str("File created: ");
+                        self.write_str(filename);
+                        self.write_str("\n");
+                    } else {
+                        self.write_str("Usage: touch <filename>\n");
+                    }
+                },
+                "cat" => {
+                    if let Some(filename) = parts.next() {
+                        use crate::syscalls::{sys_fs_open, sys_fs_read};
+                        let id = sys_fs_open(filename);
+                        if id > 0 {
+                            let mut file_buf = [0u8; 256];
+                            let read_len = sys_fs_read(id, &mut file_buf);
+                            if read_len > 0 {
+                                if let Ok(content) = core::str::from_utf8(&file_buf[..read_len]) {
+                                    self.write_str(content);
+                                    self.write_str("\n");
+                                } else {
+                                    self.write_str("Error: Not valid text file.\n");
+                                }
+                            } else {
+                                self.write_str("(File is empty)\n");
+                            }
+                        } else {
+                            self.write_str("Error: File not found: ");
+                            self.write_str(filename);
+                            self.write_str("\n");
+                        }
+                    } else {
+                        self.write_str("Usage: cat <filename>\n");
+                    }
+                },
+                "write" => {
+                    if let Some(filename) = parts.next() {
+                        // Reconstruct content from the rest of the parts
+                        // This is a bit manual because split_whitespace consumes the string
+                        
+                        // Find where content starts in original string
+                        // "write filename content..."
+                        // 1. Find end of filename
+                        if let Some(start_idx) = cmd_str.find(filename) {
+                            let content_start = start_idx + filename.len();
+                            if content_start < cmd_str.len() {
+                                let content = &cmd_str[content_start..].trim_start();
+                                if content.len() > 0 {
+                                    use crate::syscalls::sys_fs_write;
+                                    sys_fs_write(filename, content.as_bytes());
+                                    self.write_str("Wrote to ");
+                                    self.write_str(filename);
+                                    self.write_str("\n");
+                                } else {
+                                    self.write_str("Error: No content to write.\n");
+                                }
+                            } else {
+                                self.write_str("Usage: write <filename> <content>\n");
+                            }
+                        }
+                    } else {
+                        self.write_str("Usage: write <filename> <content>\n");
+                    }
+                },
+                "" => {}, // Empty Enter
+                _ => {
+                    self.write_str("Unknown command: ");
+                    self.write_str(command);
+                    self.write_str("\n");
+                }
             }
-            self.write_str("\n");
         }
+
         self.input_len = 0;
         self.write_str("> "); 
-    }
-
-    fn match_cmd(&self, buffer: &[char], cmd: &str) -> bool {
-        if buffer.len() != cmd.len() { return false; }
-        for (i, c) in cmd.chars().enumerate() { if buffer[i] != c { return false; } }
-        true
     }
 
     fn clear_screen(&mut self) {
@@ -145,16 +228,13 @@ impl Terminal {
                 
                 if px < screen_w && py < screen_h {
                     if cell.char != ' ' {
-                        // FIX: Updated call to just draw_char()
                         draw_char(fb, screen_w, screen_h, px, py, cell.char, cell.fg);
                     }
                 }
             }
         }
-        // Draw Cursor
         let cx = offset_x + (self.cursor_x * CHAR_WIDTH);
         let cy = offset_y + (self.cursor_y * CHAR_HEIGHT) + 14; 
-        // FIX: Updated call to just draw_rect_simple()
         draw_rect_simple(fb, screen_w, screen_h, cx, cy, CHAR_WIDTH, 2, 0xFFFFFFFF);
     }
 }

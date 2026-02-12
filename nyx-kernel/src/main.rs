@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 mod allocator; mod memory; mod gui; mod shell; mod interrupts;
 mod gdt; mod time; mod mouse; mod pci; mod task; mod executor; 
 mod window; mod process; mod usb; mod scheduler; 
+mod fs; // <--- NEW: File System Module
 
 pub static mut SCREEN_PAINTER: Option<gui::VgaPainter> = None;
 pub static mut BACK_BUFFER: Option<gui::BackBuffer> = None;
@@ -58,24 +59,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::time::init();
     { let mut driver = crate::mouse::MouseDriver::new(); driver.init(); }
 
-    // --- FIX: SAFE 32MB LIMIT ---
-    // We restrict the main program to 32MB so it fits in RAM.
+    // --- FILE SYSTEM INIT ---
+    // Initialize RamFS (Creates readme.txt, etc.)
+    crate::fs::FS.lock().init();
+
+    // --- USER MODE SETUP ---
     const PAGE_COUNT: u64 = 8192; 
-    
     let user_base = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Alloc Failed");
     const USER_BIN: &[u8] = include_bytes!("nyx-user.bin");
     
     unsafe {
         if let Some(p) = &mut SCREEN_PAINTER {
             use alloc::format;
-            // CRITICAL DEBUG: If you don't see this, the kernel didn't update!
-            p.draw_string(10, 30, "KERNEL REBUILD CHECK: OK", Color::GREEN);
+            p.draw_string(10, 30, "KERNEL: FILESYSTEM LOADED", Color::GREEN);
             
             let msg = format!("Loading User Bin: {} bytes", USER_BIN.len());
             p.draw_string(10, 50, &msg, Color::YELLOW);
-            
-            let mem_msg = format!("User Mem: 32MB @ 0x{:x}", user_base.as_u64());
-            p.draw_string(10, 70, &mem_msg, Color::CYAN);
         }
         let ptr = user_base.as_mut_ptr::<u8>();
         for (i, b) in USER_BIN.iter().enumerate() { ptr.add(i).write(*b); }
