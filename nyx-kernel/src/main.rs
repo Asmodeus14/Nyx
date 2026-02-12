@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 mod allocator; mod memory; mod gui; mod shell; mod interrupts;
 mod gdt; mod time; mod mouse; mod pci; mod task; mod executor; 
 mod window; mod process; mod usb; mod scheduler; 
-mod fs; // <--- NEW: File System Module
+mod fs;
 
 pub static mut SCREEN_PAINTER: Option<gui::VgaPainter> = None;
 pub static mut BACK_BUFFER: Option<gui::BackBuffer> = None;
@@ -59,8 +59,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::time::init();
     { let mut driver = crate::mouse::MouseDriver::new(); driver.init(); }
 
-    // --- FILE SYSTEM INIT ---
-    // Initialize RamFS (Creates readme.txt, etc.)
     crate::fs::FS.lock().init();
 
     // --- USER MODE SETUP ---
@@ -72,7 +70,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if let Some(p) = &mut SCREEN_PAINTER {
             use alloc::format;
             p.draw_string(10, 30, "KERNEL: FILESYSTEM LOADED", Color::GREEN);
-            
             let msg = format!("Loading User Bin: {} bytes", USER_BIN.len());
             p.draw_string(10, 50, &msg, Color::YELLOW);
         }
@@ -81,7 +78,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     
     let entry = 0x1000000; 
-    let stack = user_base.as_u64() + (PAGE_COUNT * 4096) - 16;
+    
+    // --- FIX: LOWER STACK POINTER ---
+    // We subtract 4096 (1 Page) to ensure the stack top isn't touching unmapped memory (0x3000000).
+    // This prevents "prefetch" page faults when the Kernel reads buffers on the stack.
+    let stack = user_base.as_u64() + (PAGE_COUNT * 4096) - 4096;
+
     USER_ENTRY.store(entry, Ordering::SeqCst);
     USER_STACK.store(stack, Ordering::SeqCst);
 

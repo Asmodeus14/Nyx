@@ -2,3 +2,4 @@
 
 pub mod terminal;
 pub mod clock;
+pub mod editor;

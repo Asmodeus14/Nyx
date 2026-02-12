@@ -9,11 +9,13 @@ mod gfx;
 use syscalls::*;
 use apps::terminal::Terminal;
 use apps::clock::Clock;
+use apps::editor::Editor; // Import the Editor
 
 use gfx::draw::{self, restore_wallpaper_rect};
-use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, draw_file_icon, Window, TASKBAR_H};
+use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
-const MAX_WINDOWS: usize = 3;
+// We now have 4 windows: Terminal, SysMon, Help, Editor
+const MAX_WINDOWS: usize = 4;
 
 #[no_mangle]
 #[link_section = ".text.entry"]
@@ -46,29 +48,41 @@ pub extern "C" fn _start() -> ! {
     // --- PHASE 2: DESKTOP INIT ---
     restore_wallpaper_rect(back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h);
 
+    // --- WINDOW DEFINITIONS ---
     let mut windows = [
         Window { id: 0, x: 50, y: 150, w: 760, h: 480, title: "Nyx Terminal", active: true, exists: true },
         Window { id: 1, x: 850, y: 200, w: 300, h: 200, title: "Sys Monitor", active: false, exists: true },
         Window { id: 2, x: 200, y: 400, w: 300, h: 200, title: "Help", active: false, exists: true },
+        // NEW: Text Editor Window (ID 3)
+        Window { id: 3, x: 300, y: 100, w: 500, h: 400, title: "NyxPad", active: false, exists: true },
     ];
-    let mut z_order = [0, 1, 2];
+    let mut z_order = [0, 1, 2, 3]; // Z-order stack
 
+    // --- APP INITIALIZATION ---
     let mut my_terminal = Terminal::new();
-    my_terminal.write_str("NyxOS Shell v0.3\n> ");
+    my_terminal.write_str("NyxOS Shell v0.4\nType 'help' for commands.\n> ");
 
-    // Initial Draw
+    let mut my_editor = Editor::new();
+    my_editor.load_file("readme.txt"); // Load default file on startup
+
+    // --- INITIAL DRAW ---
     draw_desktop_icons(back_buffer, screen_w, screen_h);
+    
     for &idx in z_order.iter() {
         if windows[idx].exists { 
             draw_window_rounded(back_buffer, screen_w, screen_h, &windows[idx]);
+            // Dispatch Draw
             if windows[idx].id == 0 { 
                 my_terminal.draw(back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y); 
+            } else if windows[idx].id == 3 {
+                my_editor.draw(back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
             }
         }
     }
     draw_taskbar(back_buffer, screen_w, screen_h);
     Clock::draw(back_buffer, screen_w, screen_h); 
 
+    // Present
     for y in 0..screen_h {
         let src = y * screen_w; let dst = y * screen_stride;
         if dst + screen_w <= front_buffer.len() { 
@@ -117,50 +131,55 @@ pub extern "C" fn _start() -> ! {
         // 1. CLOCK UPDATE
         if now / 1000 != last_second {
             last_second = now / 1000;
-            let clock_w = 220;
-            let clock_h = 80;
+            let clock_w = 220; let clock_h = 80;
             let clock_x = (screen_w / 2).saturating_sub(clock_w / 2);
             let clock_y = 60;
             mark_dirty(clock_x, clock_y, clock_w, clock_h);
             needs_redraw = true;
         }
 
-        // 2. KEYBOARD
-        if windows[0].active && windows[0].exists {
-            if let Some(c) = sys_read_key() {
+        // 2. KEYBOARD INPUT
+        if let Some(c) = sys_read_key() {
+            // Route to Active Window
+            if windows[0].active && windows[0].exists {
                 my_terminal.handle_key(c);
                 mark_dirty(windows[0].x, windows[0].y, windows[0].w, windows[0].h);
-                
-                // If user pressed Enter, update desktop icons (in case file was created)
-                if c == '\n' { 
-                    mark_dirty(0, 0, 300, screen_h - TASKBAR_H); // Repaint icon area
-                }
+                // If user pressed Enter in Terminal, refresh icons (in case of 'touch' or 'write')
+                if c == '\n' { mark_dirty(0, 0, 300, screen_h - TASKBAR_H); }
+                needs_redraw = true;
+            } 
+            else if windows[3].active && windows[3].exists {
+                my_editor.handle_key(c);
+                mark_dirty(windows[3].x, windows[3].y, windows[3].w, windows[3].h);
                 needs_redraw = true;
             }
-        } else {
-             let _ = sys_read_key(); 
         }
 
-        // 3. MOUSE
+        // 3. MOUSE INPUT
         if left && !prev_left {
             let mut hit_z_index = None;
             let mut hit_resize = false;
             let mut hit_close = false;
 
+            // Check Windows (Top to Bottom)
             for i in (0..MAX_WINDOWS).rev() {
                 let idx = z_order[i];
                 let w = &windows[idx];
                 if !w.exists { continue; }
                 
+                // Close Button
                 if mx >= w.x + w.w - 35 && mx <= w.x + w.w - 5 && my >= w.y + 5 && my <= w.y + 25 {
                     hit_z_index = Some(i); hit_close = true; break;
                 }
+                // Resize Grip
                 if mx >= w.x + w.w - 25 && mx <= w.x + w.w && my >= w.y + w.h - 25 && my <= w.y + w.h {
                     hit_z_index = Some(i); hit_resize = true; break;
                 }
+                // Header (Move)
                 if mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + 30 {
                     hit_z_index = Some(i); break;
                 }
+                // Body (Click inside)
                 if mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h {
                     hit_z_index = Some(i); break;
                 }
@@ -173,6 +192,7 @@ pub extern "C" fn _start() -> ! {
                     windows[idx].exists = false;
                     needs_redraw = true;
                 } else {
+                    // Activate Window
                     let old_w = windows[prev_active_idx];
                     mark_dirty(old_w.x, old_w.y, old_w.w, old_w.h);
                     for j in i..(MAX_WINDOWS-1) { z_order[j] = z_order[j+1]; }
@@ -190,6 +210,26 @@ pub extern "C" fn _start() -> ! {
                         drag_off_x = mx as isize - windows[idx].x as isize;
                         drag_off_y = my as isize - windows[idx].y as isize;
                     }
+                    
+                    // --- APP SPECIFIC CLICKS ---
+                    // Editor (ID 3) Click Handling
+                    if windows[idx].id == 3 {
+                         let wx = windows[idx].x; 
+                         let wy = windows[idx].y;
+                         
+                         // Map absolute mouse to relative window coordinates
+                         let rel_x = if mx > wx { mx - wx } else { 0 };
+                         let rel_y = if my > wy { my - wy } else { 0 };
+                         
+                         // Pass click to Editor logic (handles focus switching and save button)
+                         let saved = my_editor.handle_click(rel_x, rel_y);
+                         
+                         // If saved, force a desktop icon refresh
+                         if saved {
+                             mark_dirty(0, 0, 300, screen_h - TASKBAR_H); 
+                         }
+                    }
+
                     mark_dirty(windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     needs_redraw = true;
                 }
@@ -227,8 +267,6 @@ pub extern "C" fn _start() -> ! {
             let dw = dirty_max_x - dx; let dh = dirty_max_y - dy;
             
             restore_wallpaper_rect(back_buffer, screen_w, screen_h, dx, dy, dw, dh);
-            
-            // --- DRAW ICONS ---
             draw_desktop_icons(back_buffer, screen_w, screen_h);
             
             for &idx in z_order.iter() {
@@ -236,6 +274,8 @@ pub extern "C" fn _start() -> ! {
                     draw_window_rounded(back_buffer, screen_w, screen_h, &windows[idx]);
                     if windows[idx].id == 0 { 
                          my_terminal.draw(back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
+                    } else if windows[idx].id == 3 {
+                        my_editor.draw(back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     }
                 }
             }
@@ -245,7 +285,6 @@ pub extern "C" fn _start() -> ! {
             draw_cursor(back_buffer, screen_w, screen_h, mx, my);
             
             present_rect(front_buffer, back_buffer, screen_w, screen_stride, screen_h, dx, dy, dw, dh);
-            
             prev_mx = mx; prev_my = my;
         }
     }
@@ -254,7 +293,6 @@ pub extern "C" fn _start() -> ! {
 // Helper to draw icons based on FS content
 fn draw_desktop_icons(fb: &mut [u32], w: usize, h: usize) {
     use crate::syscalls::{sys_fs_count, sys_fs_get_name};
-    
     let count = sys_fs_count();
     let mut icon_x = 20;
     let mut icon_y = 20;
@@ -263,17 +301,11 @@ fn draw_desktop_icons(fb: &mut [u32], w: usize, h: usize) {
     for i in 0..count {
         let mut name_buf = [0u8; 32];
         let len = sys_fs_get_name(i, &mut name_buf);
-        
         if len > 0 {
             if let Ok(name) = core::str::from_utf8(&name_buf[..len]) {
-                // Now we call the function from gfx::ui
                 crate::gfx::ui::draw_file_icon(fb, w, h, icon_x, icon_y, name);
-                
                 icon_y += grid_h;
-                if icon_y > h - 100 {
-                    icon_y = 20;
-                    icon_x += 80; 
-                }
+                if icon_y > h - 100 { icon_y = 20; icon_x += 80; }
             }
         }
     }
