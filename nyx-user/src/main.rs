@@ -3,13 +3,12 @@
 
 mod syscalls;
 mod console;
-mod terminal; // Connects to terminal.rs
-mod clock;    // Connects to clock.rs
+mod apps;
 
 use noto_sans_mono_bitmap::{get_raster, FontWeight, RasterHeight};
 use syscalls::*;
-use terminal::Terminal;
-use clock::Clock;
+use apps::terminal::Terminal; // Updated path
+use apps::clock::Clock;       // Updated path
 
 const MAX_WINDOWS: usize = 3;
 const TASKBAR_H: usize = 50; 
