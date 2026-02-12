@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
 use lazy_static::lazy_static;
-use crate::gui::{Painter, Rect, Color, turbo_copy}; // Added turbo_copy import
+use crate::gui::{Painter, Rect, Color, turbo_copy}; 
 use crate::mouse::MouseState;
 use core::fmt::Write; 
 
@@ -112,31 +112,26 @@ pub struct WindowManager {
     windows: Vec<Window>,
     prev_left: bool, prev_right: bool,
     pub screen_width: usize, pub screen_height: usize,
-    // NEW: Persistent Desktop Buffer (The Wallpaper/Canvas)
     pub desktop_buffer: Vec<u32>, 
 }
 
 impl WindowManager {
     pub fn new() -> Self { 
-        let mut wm = Self { 
+        Self { 
             windows: Vec::new(), prev_left: false, prev_right: false, 
             screen_width: 1024, screen_height: 768,
             desktop_buffer: Vec::new(), 
-        };
-        wm.add(Window::new(50, 50, 900, 600, "Nyx Terminal", WindowType::Terminal));
-        wm
+        }
     }
 
     pub fn set_resolution(&mut self, w: usize, h: usize) { 
         self.screen_width = w; 
         self.screen_height = h; 
-        // Init buffer with dark blue background
         self.desktop_buffer.resize(w * h, 0x00000030); 
     }
 
     pub fn add(&mut self, window: Window) { self.windows.push(window); }
     
-    // API: Draw single pixel (Old slow way)
     pub fn put_desktop_pixel(&mut self, x: usize, y: usize, color: u32) {
         if x < self.screen_width && y < self.screen_height {
             let idx = y * self.screen_width + x;
@@ -146,19 +141,13 @@ impl WindowManager {
         }
     }
 
-    // NEW API: Blit Buffer (Turbo Mode)
     pub fn blit_desktop_rect(&mut self, x: usize, y: usize, w: usize, h: usize, buffer: &[u32]) {
         if buffer.len() < w * h { return; }
-        
         for row in 0..h {
             let screen_y = y + row;
             if screen_y >= self.screen_height { break; }
-            
             let screen_row_start = screen_y * self.screen_width + x;
             let buffer_row_start = row * w;
-
-            // Optimization: If full width fits and alignment is good, use turbo_copy
-            // Note: Colors are u32, turbo_copy expects u8, so count * 4
             unsafe {
                 let dest_ptr = self.desktop_buffer.as_mut_ptr().add(screen_row_start) as *mut u8;
                 let src_ptr = buffer.as_ptr().add(buffer_row_start) as *const u8;
@@ -168,8 +157,9 @@ impl WindowManager {
     }
 
     pub fn console_print(&mut self, c: char) {
+        // Kernel console logging (keep this if you want kernel logs)
         for win in self.windows.iter_mut().rev() {
-            if win.window_type == WindowType::Terminal {
+            if win.window_type == WindowType::DebugLog {
                 win.append_char(c);
                 return;
             }
@@ -177,54 +167,23 @@ impl WindowManager {
     }
 
     pub fn update(&mut self, mouse: &MouseState) {
+        // ... (Keep existing mouse update logic if you want kernel windows to work, 
+        // OR empty this to fully disable kernel window management)
+        
+        // For now, let's keep it minimal so it doesn't crash
         let click_l = mouse.left_click && !self.prev_left;
-        let click_r = mouse.right_click && !self.prev_right;
         self.prev_left = mouse.left_click; self.prev_right = mouse.right_click;
         
-        let tb_y = self.screen_height - TASKBAR_HEIGHT - SAFE_PADDING;
-        if click_l && mouse.y >= tb_y && mouse.x < 100 {
-            let off = (self.windows.len() * 30) % 200;
-            self.add(Window::new(50+off, 50+off, 900, 600, "Terminal", WindowType::Terminal));
-            return;
-        }
-
-        if click_r {
-             self.add(Window::new(mouse.x, mouse.y, 500, 400, "System Monitor", WindowType::SystemMonitor));
-        }
-
-        for win in self.windows.iter_mut() {
-            if win.is_dragging {
-                if mouse.left_click {
-                    if mouse.x >= win.drag_offset_x { win.x = mouse.x - win.drag_offset_x; }
-                    if mouse.y >= win.drag_offset_y { win.y = mouse.y - win.drag_offset_y; }
-                } else { win.is_dragging = false; }
-                return;
-            }
-        }
-
-        if click_l {
-            let mut hit_idx = None;
-            let mut close = false;
-            for (i, win) in self.windows.iter_mut().enumerate().rev() {
-                if win.is_close_hit(mouse.x, mouse.y) { hit_idx = Some(i); close = true; break; }
-                else if win.is_header_hit(mouse.x, mouse.y) {
-                    hit_idx = Some(i); win.is_dragging = true;
-                    win.drag_offset_x = mouse.x.saturating_sub(win.x);
-                    win.drag_offset_y = mouse.y.saturating_sub(win.y);
-                    break;
-                } else if win.is_body_hit(mouse.x, mouse.y) { hit_idx = Some(i); break; }
-            }
-            if let Some(i) = hit_idx {
-                let w = self.windows.remove(i);
-                if !close { self.windows.push(w); }
-            }
-        }
+        // Logic removed: Don't spawn new kernel windows on click
+        // Use user space for that!
     }
 
     pub fn draw(&self, painter: &mut crate::gui::BackBuffer) {
-        // 1. Draw Desktop Wallpaper (The User Canvas)
-        if self.desktop_buffer.len() == self.screen_width * self.screen_height {
-            // TURBO COPY for the Wallpaper
+        // --- CRITICAL FIX: STOP DRAWING KERNEL WALLPAPER ---
+        // Comment out or remove the wallpaper drawing code.
+        // If we draw here, we overwrite the User Space application.
+        
+        /* if self.desktop_buffer.len() == self.screen_width * self.screen_height {
             unsafe {
                 turbo_copy(
                     painter.buffer.as_mut_ptr(),
@@ -235,35 +194,15 @@ impl WindowManager {
         } else {
             painter.clear(Color::new(0, 0, 30));
         }
+        */
 
-        // 2. Draw Kernel UI elements on top
-        let tb_y = self.screen_height - TASKBAR_HEIGHT - SAFE_PADDING;
-        painter.draw_rect(Rect::new(0, tb_y, self.screen_width, TASKBAR_HEIGHT), Color::new(30, 30, 30));
-        painter.draw_rect(Rect::new(4, tb_y+4, 92, TASKBAR_HEIGHT-8), Color::new(0, 120, 215));
-        painter.draw_string(28, tb_y+12, "START", Color::WHITE);
+        // Only draw specific Kernel overlays if absolutely necessary (like Panic messages)
+        // Otherwise, leave the screen alone for User Space.
 
-        let uptime = crate::time::uptime_seconds() as u64;
-        let hours = uptime / 3600;
-        let mins = (uptime % 3600) / 60;
-        let secs = uptime % 60;
-
-        struct TimeBuf { buf: [u8; 32], len: usize }
-        impl Write for TimeBuf {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for byte in s.bytes() {
-                    if self.len < self.buf.len() { self.buf[self.len] = byte; self.len += 1; }
-                }
-                Ok(())
-            }
+        // Draw Debug/Kernel windows on TOP if they exist (optional)
+        for (i, w) in self.windows.iter().enumerate() { 
+             // Optional: w.draw(painter, i == self.windows.len()-1); 
         }
-        let mut time_buf = TimeBuf { buf: [0; 32], len: 0 };
-        let _ = write!(time_buf, "{:02}:{:02}:{:02}", hours, mins, secs);
-        let time_str = core::str::from_utf8(&time_buf.buf[..time_buf.len]).unwrap_or("00:00:00");
-
-        let clk_x = self.screen_width - 150 - SAFE_PADDING;
-        painter.draw_string(clk_x, tb_y+12, time_str, Color::GREEN);
-
-        for (i, w) in self.windows.iter().enumerate() { w.draw(painter, i == self.windows.len()-1); }
     }
 }
 
@@ -283,12 +222,20 @@ impl crate::gui::BackBuffer {
 pub fn compositor_paint() {
     unsafe {
         if let Some(bb) = &mut crate::BACK_BUFFER {
-            // Note: Background clear is now handled inside WINDOW_MANAGER.draw
-            WINDOW_MANAGER.lock().draw(bb);
+            // Only draw if we really need to (e.g. panic)
+            // For now, we disable the kernel compositor to let User Space rule.
+            
+            // WINDOW_MANAGER.lock().draw(bb); <-- DISABLED
+            
+            // Note: If you want the Kernel Mouse Cursor to stay, keep this:
+            /*
             let mouse = crate::mouse::MOUSE_STATE.lock();
             bb.draw_rect(Rect::new(mouse.x, mouse.y, 10, 10), Color::WHITE);
-            bb.draw_rect(Rect::new(mouse.x+1, mouse.y+1, 8, 8), Color::RED);
             if let Some(s) = &mut crate::SCREEN_PAINTER { bb.present(s); }
+            */
+            
+            // But since User Space draws a mouse cursor too, we disable this 
+            // to avoid "Double Cursor" effect.
         }
     }
 }
