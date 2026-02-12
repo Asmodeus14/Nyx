@@ -1,8 +1,7 @@
 // nyx-user/src/apps/clock.rs
 
 use crate::syscalls::sys_get_time;
-// FIX: Update import to use the new gfx::draw module
-use crate::gfx::draw::{draw_char, draw_rect_simple};
+use crate::gfx::draw::{draw_char, draw_glass_rounded_rect, draw_rect_simple};
 
 pub struct Clock;
 
@@ -10,28 +9,47 @@ impl Clock {
     pub fn draw(fb: &mut [u32], screen_w: usize, screen_h: usize) {
         let ticks = sys_get_time();
         
+        // Calculate Time
         let total_seconds = ticks / 1000; 
-        let seconds = total_seconds % 60;
         let mins = (total_seconds / 60) % 60;
         let hrs = (total_seconds / 3600) % 24;
 
-        let taskbar_height = 50;
-        let x = screen_w - 110;
-        let y = screen_h - taskbar_height + 17;
+        // --- WIDGET DIMENSIONS ---
+        // Keeping the wider glass look
+        let w = 220;
+        let h = 80;
+        
+        // Position: Top Center
+        let x = (screen_w / 2) - (w / 2);
+        let y = 60; 
 
-        draw_rect_simple(fb, screen_w, screen_h, x, y, 90, 16, 0xFF1A1A1A);
-        draw_two_digits(fb, screen_w, screen_h, x, y, hrs);
+        // 1. Draw Background (Glass Effect)
+        draw_glass_rounded_rect(fb, screen_w, screen_h, x, y, w, h, 20, 0x050520, 180);
 
-        draw_rect_simple(fb, screen_w, screen_h, x + 19, y + 4, 2, 2, 0xFFFFFFFF);
-        draw_rect_simple(fb, screen_w, screen_h, x + 19, y + 10, 2, 2, 0xFFFFFFFF);
+        // 2. Draw Text (HH : MM only)
+        // Standard char width is 9px.
+        // "00 : 00" is approx 45px wide.
+        
+        let center_x = x + (w / 2);
+        let center_y = y + (h / 2) - 8; // -8 to center the 16px high text
 
-        draw_two_digits(fb, screen_w, screen_h, x + 24, y, mins);
+        // Draw Hours (Left of center)
+        // Shift left by ~25px
+        draw_two_digits(fb, screen_w, screen_h, center_x - 25, center_y, hrs);
 
-        draw_rect_simple(fb, screen_w, screen_h, x + 43, y + 4, 2, 2, 0xFFFFFFFF);
-        draw_rect_simple(fb, screen_w, screen_h, x + 43, y + 10, 2, 2, 0xFFFFFFFF);
+        // Draw Separator (Colon)
+        draw_separator(fb, screen_w, screen_h, center_x - 4, center_y);
 
-        draw_two_digits(fb, screen_w, screen_h, x + 48, y, seconds);
+        // Draw Minutes (Right of center)
+        // Shift right by ~8px (separator width)
+        draw_two_digits(fb, screen_w, screen_h, center_x + 8, center_y, mins);
     }
+}
+
+fn draw_separator(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize) {
+    // A nice glowing colon
+    draw_rect_simple(fb, w, h, x + 2, y + 3, 2, 2, 0xFFFFFFFF);
+    draw_rect_simple(fb, w, h, x + 2, y + 10, 2, 2, 0xFFFFFFFF);
 }
 
 fn draw_two_digits(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, val: u64) {

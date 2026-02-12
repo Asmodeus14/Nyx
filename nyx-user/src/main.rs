@@ -4,15 +4,15 @@
 mod syscalls;
 mod console;
 mod apps;
-mod gfx; // IMPORT THE NEW MODULE
+mod gfx;
 
 use syscalls::*;
 use apps::terminal::Terminal;
 use apps::clock::Clock;
 
-// NEW: Import everything from our graphics modules
+// Import everything from our graphics modules
 use gfx::draw::{self, restore_wallpaper_rect};
-use gfx::ui::{self, draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
+use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
 const MAX_WINDOWS: usize = 3;
 
@@ -27,6 +27,7 @@ pub extern "C" fn _start() -> ! {
     if fb_ptr == 0 { sys_exit(1); }
     
     // Allocate Back Buffer (Double Buffering)
+    // Size = W * H * 4 bytes + Padding
     let buffer_size_bytes = (screen_w * screen_h * 4) + 4096;
     let back_ptr = sys_alloc(buffer_size_bytes);
     if back_ptr == 0 || back_ptr == 9 { loop {} }
@@ -35,24 +36,28 @@ pub extern "C" fn _start() -> ! {
     let back_buffer = unsafe { core::slice::from_raw_parts_mut(back_ptr as *mut u32, screen_w * screen_h) };
 
     // --- PHASE 1: BOOT SPLASH ---
-    // Note: We use draw::draw_rect_simple now
+    // Pitch black background for splash
     draw::draw_rect_simple(back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h, 0xFF000000);
     draw::draw_text(back_buffer, screen_w, screen_h, (screen_w / 2) - 60, screen_h / 2, "NyxOS User Mode", 0xFFFFFFFF);
     
     // Present Splash
     for y in 0..screen_h {
         let src = y * screen_w; let dst = y * screen_stride;
-        if dst + screen_w <= front_buffer.len() { front_buffer[dst..dst+screen_w].copy_from_slice(&back_buffer[src..src+screen_w]); }
+        if dst + screen_w <= front_buffer.len() { 
+            front_buffer[dst..dst+screen_w].copy_from_slice(&back_buffer[src..src+screen_w]); 
+        }
     }
 
     // --- PHASE 2: DESKTOP INITIALIZATION ---
+    // Fill entire screen with Pitch Black Wallpaper
     restore_wallpaper_rect(back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h);
 
-    // Define Windows (Window struct is now imported from gfx::ui)
+    // Define Windows
+    // ID 0 = Terminal, ID 1 = Sys Monitor, ID 2 = Help
     let mut windows = [
-        Window { id: 0, x: 50, y: 50, w: 760, h: 480, title: "Nyx Terminal", active: true, exists: true },
-        Window { id: 1, x: 850, y: 100, w: 300, h: 200, title: "Sys Monitor", active: false, exists: true },
-        Window { id: 2, x: 200, y: 300, w: 300, h: 200, title: "Help", active: false, exists: true },
+        Window { id: 0, x: 50, y: 150, w: 760, h: 480, title: "Nyx Terminal", active: true, exists: true },
+        Window { id: 1, x: 850, y: 200, w: 300, h: 200, title: "Sys Monitor", active: false, exists: true },
+        Window { id: 2, x: 200, y: 400, w: 300, h: 200, title: "Help", active: false, exists: true },
     ];
     let mut z_order = [0, 1, 2];
 
@@ -74,7 +79,9 @@ pub extern "C" fn _start() -> ! {
     // Present Desktop
     for y in 0..screen_h {
         let src = y * screen_w; let dst = y * screen_stride;
-        if dst + screen_w <= front_buffer.len() { front_buffer[dst..dst+screen_w].copy_from_slice(&back_buffer[src..src+screen_w]); }
+        if dst + screen_w <= front_buffer.len() { 
+            front_buffer[dst..dst+screen_w].copy_from_slice(&back_buffer[src..src+screen_w]); 
+        }
     }
 
     // --- VARIABLES ---
@@ -116,10 +123,16 @@ pub extern "C" fn _start() -> ! {
             dirty_max_x = dirty_max_x.max(ex); dirty_max_y = dirty_max_y.max(ey);
         };
 
-        // 1. CLOCK UPDATE
+        // 1. CLOCK UPDATE (Top Center)
         if now / 1000 != last_second {
             last_second = now / 1000;
-            mark_dirty(screen_w - 120, screen_h - TASKBAR_H, 120, TASKBAR_H);
+            // UPDATED: Matches new Clock geometry (w=220, h=80, y=60)
+            let clock_w = 220;
+            let clock_h = 80;
+            let clock_x = (screen_w / 2).saturating_sub(clock_w / 2);
+            let clock_y = 60;
+            
+            mark_dirty(clock_x, clock_y, clock_w, clock_h);
             needs_redraw = true;
         }
 
@@ -146,11 +159,11 @@ pub extern "C" fn _start() -> ! {
                 let w = &windows[idx];
                 if !w.exists { continue; }
                 
-                // Close
+                // Close Button
                 if mx >= w.x + w.w - 35 && mx <= w.x + w.w - 5 && my >= w.y + 5 && my <= w.y + 25 {
                     hit_z_index = Some(i); hit_close = true; break;
                 }
-                // Resize
+                // Resize Handle
                 if mx >= w.x + w.w - 25 && mx <= w.x + w.w && my >= w.y + w.h - 25 && my <= w.y + w.h {
                     hit_z_index = Some(i); hit_resize = true; break;
                 }
@@ -230,6 +243,7 @@ pub extern "C" fn _start() -> ! {
             
             restore_wallpaper_rect(back_buffer, screen_w, screen_h, dx, dy, dw, dh);
             
+            // Draw Windows (Back to Front)
             for &idx in z_order.iter() {
                 if windows[idx].exists { 
                     draw_window_rounded(back_buffer, screen_w, screen_h, &windows[idx]);
@@ -250,7 +264,6 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-// Present function can stay here for now as it's specific to the buffer swp
 fn present_rect(front: &mut [u32], back: &[u32], w: usize, stride: usize, h: usize, x: usize, y: usize, dw: usize, dh: usize) {
     for row in 0..dh {
         let sy = y + row; if sy >= h { break; }
