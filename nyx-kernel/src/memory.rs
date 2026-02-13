@@ -71,9 +71,9 @@ pub fn allocate_user_pages(num_pages: u64) -> Result<VirtAddr, &'static str> {
         let page = Page::<Size4KiB>::containing_address(start_addr + (i * 4096));
         unsafe {
             let frame = system.frame_allocator.allocate_frame().ok_or("OOM: User Code")?;
-            // FIX: Do not ignore errors!
             match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
                 Ok(mapper) => mapper.flush(),
+                Err(MapToError::PageAlreadyMapped(_)) => continue, // Ignore if reusing pages
                 Err(_) => return Err("Map Failed: User Code"),
             }
         }
@@ -95,6 +95,7 @@ pub fn map_user_framebuffer(phys_addr: u64, size: u64) -> Result<u64, &'static s
         unsafe { 
             match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
                 Ok(mapper) => mapper.flush(),
+                Err(MapToError::PageAlreadyMapped(_)) => continue,
                 Err(_) => return Err("Map Failed: Framebuffer"),
             }
         }
@@ -102,12 +103,10 @@ pub fn map_user_framebuffer(phys_addr: u64, size: u64) -> Result<u64, &'static s
     Ok(user_start.as_u64())
 }
 
-// FIX: Now returns Error if mapping fails, instead of faking success
 pub fn map_user_memory(size: u64) -> Result<u64, &'static str> {
     let mut system_lock = MEMORY_MANAGER.lock();
     let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
     
-    // We map dynamic memory at 1GB (0x40000000)
     let user_start = VirtAddr::new(0x4000_0000); 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     
@@ -116,20 +115,36 @@ pub fn map_user_memory(size: u64) -> Result<u64, &'static str> {
     for i in 0..pages {
         let page = Page::<Size4KiB>::containing_address(user_start + (i * 4096));
         unsafe {
-            // 1. Allocate Physical Frame
             let frame = system.frame_allocator.allocate_frame().ok_or("OOM: Dynamic Alloc")?;
-            
-            // 2. Map Page to Frame
             match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
                 Ok(mapper) => mapper.flush(),
-                Err(MapToError::PageAlreadyMapped(_)) => {
-                    // If already mapped, we assume it's from a previous allocation and reuse it.
-                    // This is a simple 'bump' allocator that never frees.
-                    continue; 
-                },
+                Err(MapToError::PageAlreadyMapped(_)) => continue, 
                 Err(_) => return Err("Map Failed: Dynamic Alloc"),
             }
         }
     }
     Ok(user_start.as_u64())
+}
+
+// --- NEW: MMIO MAPPING FOR DRIVERS ---
+pub unsafe fn map_mmio(phys_addr: u64, size: usize) -> Result<u64, &'static str> {
+    let mut lock = MEMORY_MANAGER.lock();
+    let system = lock.as_mut().ok_or("Memory System not initialized")?;
+
+    let start_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr));
+    let end_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr + size as u64));
+    
+    // We identity map MMIO (Virtual Address == Physical Address) for simplicity in Kernel Mode
+    for frame in PhysFrame::range_inclusive(start_frame, end_frame) {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(frame.start_address().as_u64()));
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        
+        // Ignore "AlreadyMapped" because Bootloader might have mapped it already
+        match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+            Ok(mapper) => mapper.flush(),
+            Err(MapToError::PageAlreadyMapped(_)) => continue,
+            Err(_) => return Err("Map Failed: MMIO"),
+        }
+    }
+    Ok(phys_addr)
 }
