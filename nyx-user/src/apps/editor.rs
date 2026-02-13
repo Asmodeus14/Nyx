@@ -77,26 +77,21 @@ impl Editor {
     }
 
     pub fn handle_click(&mut self, rel_x: usize, rel_y: usize) -> bool {
-        // Offset Logic: Window Title is 30px high. 
-        // We must subtract 30 from rel_y to get "client area" Y.
-        if rel_y < 30 { return false; } // Clicked title bar
+        if rel_y < 30 { return false; } 
         let client_y = rel_y - 30;
 
-        // 1. Filename Box (Top Left of Client Area)
-        // Rect: x:5, y:5, w:200, h:25
+        // Filename Box
         if rel_x >= 5 && rel_x <= 205 && client_y >= 5 && client_y <= 30 {
             self.focus = EditorFocus::Filename;
             return false;
         }
 
-        // 2. Save Button (Top Right of Client Area)
-        // Rect: x:220, y:5, w:60, h:25
+        // Save Button
         if rel_x >= 220 && rel_x <= 280 && client_y >= 5 && client_y <= 30 {
             return self.save_file(); 
         }
 
-        // 3. Content Area
-        // Below y=40 (relative to client area)
+        // Content Area
         if client_y > 40 {
             self.focus = EditorFocus::Content;
         }
@@ -142,86 +137,83 @@ impl Editor {
     // --- DRAW FUNCTION (FIXED) ---
     pub fn draw(&self, fb: &mut [u32], screen_w: usize, screen_h: usize, win_x: usize, win_y: usize, win_w: usize, win_h: usize) {
         // CONSTANTS
-        let title_h = 30;  // Height of Window Title Bar (drawn by OS)
-        let tool_h = 40;   // Height of Editor Toolbar
-        let padding = 4;   // Inner padding
+        let title_h = 30;  
+        let tool_h = 40;   
+        
+        if win_h < title_h + tool_h + 10 { return; }
 
-        // 1. Calculate Client Area
-        // We start drawing BELOW the title bar.
         let client_y = win_y + title_h;
-        let client_h = win_h.saturating_sub(title_h);
+        
+        // 1. Draw Toolbar Background
+        draw_rect_simple(fb, screen_w, screen_h, win_x + 2, client_y, win_w - 4, tool_h, 0xFF333333);
 
-        // 2. Draw Toolbar Background
-        // Only draws inside the window bounds
-        draw_rect_simple(fb, screen_w, screen_h, win_x, client_y, win_w, tool_h, 0xFF333333);
-
-        // 3. Filename Input Box
+        // 2. Filename Input Box
         let name_bg = if self.focus == EditorFocus::Filename { 0xFFFFFFFF } else { 0xFFAAAAAA };
-        let name_fg = 0xFF000000;
         draw_rect_simple(fb, screen_w, screen_h, win_x + 5, client_y + 5, 200, 25, name_bg);
         
         let mut fx = win_x + 8;
         for i in 0..self.filename_len {
-            draw_char(fb, screen_w, screen_h, fx, client_y + 10, self.filename[i], name_fg);
+            draw_char(fb, screen_w, screen_h, fx, client_y + 10, self.filename[i], 0xFF000000);
             fx += CHAR_WIDTH;
         }
         if self.focus == EditorFocus::Filename {
             draw_rect_simple(fb, screen_w, screen_h, fx, client_y + 10, 2, 16, 0xFF000000);
         }
 
-        // 4. Save Button
+        // 3. Save Button
         let btn_color = if self.is_dirty { 0xFFFFAA00 } else { 0xFF555555 };
         draw_rect_simple(fb, screen_w, screen_h, win_x + 220, client_y + 5, 60, 25, btn_color);
         draw_text(fb, screen_w, screen_h, win_x + 235, client_y + 10, "SAVE", 0xFFFFFFFF);
 
-        // 5. Text Area Background
-        // It starts below toolbar
-        let text_area_y = client_y + tool_h;
-        // Height is remaining space minus bottom padding
-        let text_area_h = client_h.saturating_sub(tool_h).saturating_sub(padding);
-        // Width is window width minus padding
-        let text_area_w = win_w.saturating_sub(padding * 2);
+        // 4. Draw Content Area Background
+        let content_y = client_y + tool_h;
         
-        // Draw black background for text
-        draw_rect_simple(fb, screen_w, screen_h, win_x + padding, text_area_y, text_area_w, text_area_h, 0xFF000000);
+        // FIX: Subtract 5 pixels from height to create a bottom margin
+        // FIX: Subtract 4 pixels from width (2 left, 2 right) to preserve window borders
+        let content_h = win_h.saturating_sub(title_h + tool_h + 5); 
+        let content_w = win_w.saturating_sub(4);
+        
+        draw_rect_simple(fb, screen_w, screen_h, win_x + 2, content_y, content_w, content_h, 0xFF000000);
 
-        // 6. Render Text Content
-        let mut cx = win_x + padding + 4;
-        let mut cy = text_area_y + 4;
-        let max_y = text_area_y + text_area_h - CHAR_HEIGHT;
+        // 5. Render Text Content (With Clipping)
+        let padding = 6;
+        let mut cx = win_x + padding + 2;
+        let mut cy = content_y + padding;
+        
+        // Clip strictly before the black box ends
+        let max_y = content_y + content_h - CHAR_HEIGHT - 2;
 
         for i in 0..self.len {
-            if cy > max_y { break; } // Clipping check
+            if cy > max_y { break; } 
 
             let c = self.buffer[i];
             
             if c == '\n' {
-                cx = win_x + padding + 4;
+                cx = win_x + padding + 2;
                 cy += CHAR_HEIGHT + 2;
                 continue;
             }
 
-            // Draw Cursor
+            // Cursor
             if i == self.cursor && self.focus == EditorFocus::Content {
                 if cy <= max_y {
                     draw_rect_simple(fb, screen_w, screen_h, cx, cy, 2, CHAR_HEIGHT, 0xFF00FF00);
                 }
             }
 
-            // Wrap text
-            if cx + CHAR_WIDTH < win_x + text_area_w - 4 {
+            // Wrap Text
+            if cx + CHAR_WIDTH < win_x + content_w - padding {
                 draw_char(fb, screen_w, screen_h, cx, cy, c, 0xFFFFFFFF);
                 cx += CHAR_WIDTH;
             } else {
-                cx = win_x + padding + 4;
+                cx = win_x + padding + 2;
                 cy += CHAR_HEIGHT + 2;
-                if cy > max_y { break; }
+                if cy > max_y { break; } 
                 draw_char(fb, screen_w, screen_h, cx, cy, c, 0xFFFFFFFF);
                 cx += CHAR_WIDTH;
             }
         }
         
-        // Draw cursor at end
         if self.cursor == self.len && self.focus == EditorFocus::Content {
              if cy <= max_y {
                 draw_rect_simple(fb, screen_w, screen_h, cx, cy, 2, CHAR_HEIGHT, 0xFF00FF00);
