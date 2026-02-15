@@ -232,7 +232,10 @@ pub extern "C" fn _start() -> ! {
                         // Pass click to App Logic
                         let rx = mx.saturating_sub(wx);
                         let ry = my.saturating_sub(wy);
-                        if wid == 3 { my_editor.handle_click(rx, ry); }
+                        
+                        // UPDATED: Pass 'ww' (window width) to handle_click
+                        if wid == 3 { my_editor.handle_click(rx, ry, ww); }
+                        
                         if wid == 4 { my_explorer.handle_click(rx, ry, ww); }
                     }
                     mark_dirty(wx, wy, ww, wh);
