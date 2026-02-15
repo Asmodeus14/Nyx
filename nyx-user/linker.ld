@@ -1,11 +1,11 @@
 ENTRY(_start)
 
 SECTIONS {
-    /* We load at 16MB. The kernel jumps here. */
-    . = 0x1000000;
+    /* FIX: Load at 32MB (0x2000000) to match Kernel ELF Loader expectations */
+    . = 0x2000000;
 
     .text : {
-        /* CRITICAL: Place the entry section first! */
+        /* Ensure entry point is first */
         *(.text.entry) 
         *(.text*)
     }

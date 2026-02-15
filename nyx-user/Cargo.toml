@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# We need 'compiler_builtins' for some basic math if we get complex,
-# but for now, no dependencies are needed.
-noto-sans-mono-bitmap = "0.2.0"
+# Allocator for Vec, String, Box
+linked_list_allocator = "0.9.0"
+
+# Keyboard handling (Scancodes -> Chars)
+pc-keyboard = "0.7.0"
+
+# Font Bitmap Data (Used by gfx/font.rs and gfx/draw.rs)
+noto-sans-mono-bitmap = { version = "0.2.0", features = ["size_32"] }
 
 [profile.release]
-panic = "abort"      # If we crash, just stop. Don't unwind stack.
-lto = true           # Link Time Optimization (smaller binary)
-opt-level = "z"      # Optimize for Size (tiny binaries)
-codegen-units = 1
+panic = "abort"

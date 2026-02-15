@@ -1,22 +1,26 @@
 #!/bin/bash
 set -e
 
-echo "--- 1. Building User Application ---"
+# 1. Clean and Build User App (Force new address)
+echo "--- Building User App ---"
 cd nyx-user
-# Force rebuild to ensure code changes are picked up
-
+cargo clean
 cargo build --release --target x86_64-unknown-none
 cd ..
 
-echo "--- 2. Extracting & Moving Binary ---"
-# Ensure the path matches exactly where Cargo outputs it
-objcopy -O binary target/x86_64-unknown-none/release/nyx-user nyx-kernel/src/nyx-user.bin
+# 2. DELETE OLD BINARY (Force update)
+rm -f nyx-kernel/src/nyx-user.bin
 
-echo "--- 3. Forcing Kernel Rebuild ---"
-# Touch main.rs to force include_bytes! to reload the file
+# 3. COPY NEW ELF BINARY
+# CRITICAL: Use 'cp' to keep ELF Headers! Do not use objcopy!
+echo "--- Copying Binary ---"
+cp target/x86_64-unknown-none/release/nyx-user nyx-kernel/src/nyx-user.bin
+
+# 4. Verify the Copy (Debug)
+echo "--- verifying nyx-user.bin ---"
+readelf -h nyx-kernel/src/nyx-user.bin | grep "Entry point"
+
+# 5. Rebuild and Run Kernel
+echo "--- Running Kernel ---"
 touch nyx-kernel/src/main.rs
-
-echo "--- 4. Building Kernel & Bootable Image ---"
 cargo run --package nyx-kernel --release --target x86_64-unknown-none
-
-echo "SUCCESS! Bootable Image Ready"

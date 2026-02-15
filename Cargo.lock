@@ -177,7 +177,7 @@ checksum = "b5fb69232f250c0d5b74eeb285702b4b0479f574980f45dc9bef97b2c65e2021"
 dependencies = [
  "anyhow",
  "bootloader-boot-config",
- "fatfs",
+ "fatfs 0.3.6",
  "gpt",
  "llvm-tools",
  "mbrman",
@@ -532,6 +532,15 @@ checksum = "05669f8e7e2d7badc545c513710f0eba09c2fbef683eb859fd79c46c355048e0"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
+ "log",
+]
+
+[[package]]
+name = "fatfs"
+version = "0.4.0"
+source = "git+https://github.com/rafalh/rust-fatfs.git#4eccb50d011146fbed20e133d33b22f3c27292e7"
+dependencies = [
+ "bitflags 2.10.0",
  "log",
 ]
 
@@ -1219,6 +1228,7 @@ name = "nyx-kernel"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
+ "fatfs 0.4.0",
  "futures",
  "lazy_static",
  "linked_list_allocator",
@@ -1236,7 +1246,9 @@ dependencies = [
 name = "nyx-user"
 version = "0.1.0"
 dependencies = [
+ "linked_list_allocator",
  "noto-sans-mono-bitmap",
+ "pc-keyboard",
 ]
 
 [[package]]
