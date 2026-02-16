@@ -52,7 +52,6 @@ impl Write for NvmeStream {
         let offset_in_block = (self.position % BLOCK_SIZE) as usize;
         let mut temp_block = [0u8; 4096];
         
-        // 1. Read existing block (Modify-Write)
         if !self.driver.read_block(current_lba, &mut temp_block) { 
             return Err(()); 
         }
@@ -60,16 +59,12 @@ impl Write for NvmeStream {
         let bytes_available = (BLOCK_SIZE as usize) - offset_in_block;
         let bytes_to_copy = cmp::min(buf.len(), bytes_available);
         
-        // 2. Modify buffer
         temp_block[offset_in_block..offset_in_block+bytes_to_copy].copy_from_slice(&buf[..bytes_to_copy]);
         
-        // 3. Write back
         if self.driver.write_block(current_lba, &temp_block) {
             self.position += bytes_to_copy as u64;
             Ok(bytes_to_copy)
         } else {
-            // DEBUG: Write Failed
-            unsafe { if let Some(p) = &mut crate::SCREEN_PAINTER { p.draw_string(0, 0, "NVMe Write Fail!", Color::RED); } }
             Err(())
         }
     }
@@ -90,15 +85,18 @@ impl Seek for NvmeStream {
 // --- FS MANAGER ---
 pub struct FileSystem {
     inner: Option<fatfs::FileSystem<NvmeStream, fatfs::NullTimeProvider, fatfs::LossyOemCpConverter>>,
+    cache_path: String,
+    cache_files: Vec<String>,
 }
 
 impl FileSystem {
-    pub const fn new() -> Self { Self { inner: None } }
+    pub const fn new() -> Self { 
+        Self { inner: None, cache_path: String::new(), cache_files: Vec::new() } 
+    }
 
     pub fn init(&mut self, mut driver: NvmeDriver) {
         if !driver.create_io_queues() { return; }
         
-        // Find Partition Logic (Simplified)
         let mut sector0 = [0u8; 4096];
         let _ = driver.find_active_namespace();
         if !driver.read_block(0, &mut sector0) { return; }
@@ -106,13 +104,13 @@ impl FileSystem {
         let mut partition_start_lba = 0;
         let part_type = sector0[0x1BE + 4];
 
-        if part_type == 0xEE { // GPT
+        if part_type == 0xEE { 
              let mut gpt_header = [0u8; 4096];
              if driver.read_block(1, &mut gpt_header) {
                  let entry_list_lba = u64::from_le_bytes(gpt_header[72..80].try_into().unwrap());
                  let mut entry_block = [0u8; 4096];
                  if driver.read_block(entry_list_lba, &mut entry_block) {
-                     for i in 0..4 { // Check first 4 partitions
+                     for i in 0..4 { 
                          let offset = i * 128;
                          let type_guid_first = u64::from_le_bytes(entry_block[offset..offset+8].try_into().unwrap());
                          if type_guid_first != 0 {
@@ -122,28 +120,24 @@ impl FileSystem {
                      }
                  }
              }
-        } else { // MBR
+        } else { 
              partition_start_lba = u32::from_le_bytes([sector0[0x1BE+8], sector0[0x1BE+9], sector0[0x1BE+10], sector0[0x1BE+11]]) as u64;
         }
 
         if partition_start_lba == 0 { return; }
 
         let stream = NvmeStream::new(driver, partition_start_lba);
-        
-        // Mount with options
         let options = fatfs::FsOptions::new().update_accessed_date(true);
-        match fatfs::FileSystem::new(stream, options) {
-            Ok(fs) => { 
-                self.inner = Some(fs);
-                unsafe { if let Some(p) = &mut crate::SCREEN_PAINTER { p.draw_string(400, 100, "FS Mounted!", Color::GREEN); } }
-            },
-            Err(_) => {
-                unsafe { if let Some(p) = &mut crate::SCREEN_PAINTER { p.draw_string(400, 100, "FS Mount FAIL", Color::RED); } }
-            }
+        if let Ok(fs) = fatfs::FileSystem::new(stream, options) {
+            self.inner = Some(fs);
         }
     }
 
     pub fn ls(&mut self, path: &str) -> Vec<String> {
+        if !self.cache_path.is_empty() && self.cache_path == path {
+            return self.cache_files.clone();
+        }
+
         let mut list = Vec::new();
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
@@ -159,6 +153,8 @@ impl FileSystem {
                 }
             }
         }
+        self.cache_path = String::from(path);
+        self.cache_files = list.clone();
         list
     }
 
@@ -183,27 +179,15 @@ impl FileSystem {
     }
 
     pub fn write_file(&mut self, name: &str, data: &[u8]) -> bool {
+        self.cache_path.clear(); 
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
             let clean_name = if name.starts_with('/') { &name[1..] } else { name };
-            
-            // Check Read-Only Status
-            if fs.stats().is_err() {
-                 unsafe { if let Some(p) = &mut crate::SCREEN_PAINTER { p.draw_string(0, 0, "FS Error: Probably Read-Only!", Color::RED); } }
-                 return false;
-            }
-
             match root.create_file(clean_name) {
                 Ok(mut file) => {
-                    if file.write_all(data).is_ok() {
-                        return true;
-                    } else {
-                        unsafe { if let Some(p) = &mut crate::SCREEN_PAINTER { p.draw_string(0, 20, "File Write All Failed", Color::RED); } }
-                    }
+                    return file.write_all(data).is_ok();
                 },
-                Err(_) => {
-                    unsafe { if let Some(p) = &mut crate::SCREEN_PAINTER { p.draw_string(0, 40, "Create File Failed (Read Only?)", Color::RED); } }
-                }
+                Err(_) => { return false; }
             }
         }
         false

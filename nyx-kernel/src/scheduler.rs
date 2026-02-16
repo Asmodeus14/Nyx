@@ -2,12 +2,34 @@ use alloc::vec::Vec;
 use alloc::boxed::Box;
 use x86_64::VirtAddr;
 use crate::gui::Painter; 
-use x86_64::registers::segmentation::{Segment, CS}; // Needed to get valid Code Segment
+use x86_64::registers::segmentation::{Segment, CS}; 
+use spin::Mutex; 
+
+// --- DYNAMIC JOB SYSTEM ---
+// A 'Job' is just a closure function waiting to be run.
+// Send + 'static allows it to be moved between threads safely.
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+// The centralized work queue for the entire OS
+pub static JOB_QUEUE: Mutex<Vec<Job>> = Mutex::new(Vec::new());
+
+// Public API to submit work from anywhere (Syscalls, Drivers, etc.)
+pub fn submit_job<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    // Wrap the function in a Box and push to queue
+    // Usage: scheduler::submit_job(move || { some_heavy_function(); });
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut queue = JOB_QUEUE.lock();
+        queue.push(Box::new(f));
+    });
+}
+// -------------------------------
 
 // Global Scheduler Instance
 pub static mut SCHEDULER: Option<Scheduler> = None;
 
-// A simple Linear Congruential Generator for "Quantum" randomness
 struct QuantumRng {
     seed: u64,
 }
@@ -58,48 +80,21 @@ impl Scheduler {
         let stack_bottom = stack.as_ptr() as u64;
         let stack_top = stack_bottom + stack.capacity() as u64;
         
-        // 2. Align Stack Pointer (16-byte alignment required by x64 ABI)
         let mut sp = stack_top & !0xF;
 
         unsafe {
-            // --- BUILD THE INTERRUPT STACK FRAME (For IRETQ) ---
-            // The CPU pops these 5 values when returning from an interrupt.
-            // Order is crucial: SS, RSP, RFLAGS, CS, RIP
-            
-            // 5. SS (Stack Segment) - 0 is fine for kernel mode
+            // Build Interrupt Stack Frame
             sp -= 8; * (sp as *mut u64) = 0; 
-            
-            // 4. RSP (Stack Pointer) - Where the task's stack should start
-            // We use the current 'sp' (before we pushed SS) as the starting point.
-            // Note: Since we are modifying 'sp' downwards, the 'sp' variable tracks the growing stack.
-            // But the 'RSP' value we push here is where the stack *would be* if we hadn't pushed the trap frame.
-            // Actually, let's simply point it to the top of the context we are about to create.
-            // The logic: When iretq runs, it sets RSP to this value.
             let task_stack_start = sp; 
             sp -= 8; * (sp as *mut u64) = task_stack_start;
-
-            // 3. RFLAGS (CPU Flags) - 0x202 = Interrupts Enabled
-            sp -= 8; * (sp as *mut u64) = 0x202;
-
-            // 2. CS (Code Segment) - Must match current Kernel Code Selector
+            sp -= 8; * (sp as *mut u64) = 0x202; // RFLAGS: Interrupts Enabled
             sp -= 8; * (sp as *mut u64) = CS::get_reg().0 as u64;
-
-            // 1. RIP (Instruction Pointer) - The function to run
-            sp -= 8; * (sp as *mut u64) = func as u64;
-
-            // --- BUILD THE SAVED REGISTERS (For POP) ---
-            // Our interrupt handler does 'pop rbp', 'pop r15', ... 'pop rax'.
-            // We push 15 zeroed registers to match this.
-            // 15 * 8 bytes = 120 bytes.
-            sp -= 120;
+            sp -= 8; * (sp as *mut u64) = func as u64; // RIP
             
-            // The 'sp' is now at the bottom of the stack frame.
-            // When we switch to this task, we load this 'sp' into RSP.
-            // Then the `pop` instructions consume the 120 bytes of zeros.
-            // Then `iretq` consumes the 5 values (RIP, CS, RFLAGS, RSP, SS).
+            // Saved Registers
+            sp -= 120;
         }
 
-        // Prevent Rust from deallocating the stack vector
         core::mem::forget(stack.clone()); 
 
         let task = Task {
@@ -116,12 +111,10 @@ impl Scheduler {
     pub fn schedule(&mut self, current_rsp: u64) -> u64 {
         if self.tasks.is_empty() { return current_rsp; }
 
-        // Save current task's state
         if let Some(current) = self.tasks.get_mut(self.current_task_idx) {
             current.stack_ptr = current_rsp;
         }
 
-        // Pick next task (Quantum Lottery)
         let total_tickets: usize = self.tasks.iter()
             .filter(|t| t.active)
             .map(|t| t.tickets)
@@ -139,8 +132,6 @@ impl Scheduler {
                 }
             }
         }
-
-        // Return new stack pointer
         self.tasks[self.current_task_idx].stack_ptr
     }
 }
@@ -151,22 +142,39 @@ pub extern "C" fn clock_task() {
         ticks += 1;
         unsafe {
             if let Some(painter) = &mut crate::SCREEN_PAINTER {
-                let time_str = alloc::format!("Quantum Time: {:05}", ticks);
-                // Draw clock at top right
+                let time_str = alloc::format!("Time: {:05}", ticks);
                 let x_pos = if painter.width() > 200 { painter.width() - 200 } else { 0 };
                 painter.draw_string(x_pos, 20, &time_str, crate::gui::Color::CYAN);
             }
         }
-        // Slow down the loop so we can see the counting
-        for _ in 0..5_000_000 { core::hint::spin_loop(); }
+        // Yield time
+        for _ in 0..1_000_000 { core::hint::spin_loop(); }
     }
 }
 
+// --- UNIVERSAL BACKGROUND WORKER ---
 pub extern "C" fn background_worker() {
-    let mut _id = 0;
     loop {
-        _id += 1;
-        // Just burn CPU cycles to show preemptive multitasking works
-        // (If it wasn't preemptive, this infinite loop would freeze the clock)
+        // 1. Check for ANY generic job
+        // We use without_interrupts to safely pop from the queue
+        let job_opt = x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut queue = JOB_QUEUE.lock();
+            if !queue.is_empty() {
+                // Remove from front (FIFO Queue)
+                Some(queue.remove(0))
+            } else {
+                None
+            }
+        });
+
+        // 2. Execute it
+        if let Some(job) = job_opt {
+            // This calls the closure we created in syscalls.
+            // The worker doesn't know it's a file write, it just runs it!
+            job(); 
+        } else {
+            // 3. Sleep if empty (prevents CPU burning)
+            for _ in 0..10_000 { core::hint::spin_loop(); }
+        }
     }
 }

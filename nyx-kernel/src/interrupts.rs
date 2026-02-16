@@ -181,8 +181,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              } else { frame.rax = 0; }
         },
-        // UPDATED FILESYSTEM SYSCALLS
-        10 => { // sys_fs_count(path_ptr, path_len)
+        10 => { // sys_fs_count
             let ptr = arg1 as *const u8;
             let len = arg2 as usize;
             let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
@@ -191,7 +190,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = fs.ls(path).len() as u64;
             } else { frame.rax = 0; }
         },
-        11 => { // sys_fs_get_name(idx, buf_ptr, path_ptr, path_len)
+        11 => { // sys_fs_get_name
             let idx = arg1 as usize;
             let buf_ptr = arg2 as *mut u8;
             let path_ptr = arg3 as *const u8;
@@ -212,7 +211,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = 0; }
             } else { frame.rax = 0; }
         },
-        12 => { // sys_fs_read(name_ptr, name_len, buf_ptr)
+        12 => { // sys_fs_read
              let name_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
              if let Ok(name) = core::str::from_utf8(name_slice) {
                  let mut fs = fs::FS.lock();
@@ -224,12 +223,30 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              }
         },
-        13 => { // sys_fs_write
+        // --- UPDATED SYSCALL 13: DYNAMIC SCHEDULER ---
+        13 => { 
              let name_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
              let data_slice = unsafe { core::slice::from_raw_parts(arg3 as *const u8, arg4 as usize) };
+             
              if let Ok(name) = core::str::from_utf8(name_slice) {
-                 let mut fs = fs::FS.lock();
-                 if fs.write_file(name, data_slice) { frame.rax = 1; } else { frame.rax = 0; }
+                 // 1. Copy data from User space to Kernel space (Heap)
+                 // This is CRITICAL. We can't use the raw pointers in the background thread
+                 // because the user program might have changed that memory by then.
+                 let filename = alloc::string::String::from(name);
+                 let data = data_slice.to_vec();
+                 
+                 // 2. Submit a Generic Job to the Scheduler
+                 // "move" transfers ownership of filename/data into the closure
+                 crate::scheduler::submit_job(move || {
+                     // This runs later in the background worker thread
+                     let mut fs = crate::fs::FS.lock();
+                     fs.write_file(&filename, &data);
+                 });
+                 
+                 // 3. Return Success Immediately
+                 frame.rax = 1; 
+             } else {
+                 frame.rax = 0;
              }
         },
         _ => {}
