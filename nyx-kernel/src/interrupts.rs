@@ -369,6 +369,39 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 }
             }
         },
+        17 => {
+            let buf_ptr = arg1 as *mut u8;
+            let buf_len = arg2 as usize;
+            
+            let mcfg = unsafe { crate::acpi::ACPI_INFO.mcfg_addr.unwrap_or(0) };
+            let madt = unsafe { crate::acpi::ACPI_INFO.madt_addr.unwrap_or(0) };
+            
+            let info = alloc::format!(
+                "Hardware Discovery Report:\n--------------------------\nACPI MCFG (PCIe): {:#010x}\nACPI MADT (APIC): {:#010x}\n\nLocal APIC: Enabled (MSI Ready)\nGPU Init: Waiting for Mesa", 
+                mcfg, madt
+            );
+            
+            let bytes = info.as_bytes();
+            let len = core::cmp::min(bytes.len(), buf_len);
+            unsafe {
+                for i in 0..len { *buf_ptr.add(i) = bytes[i]; }
+            }
+            frame.rax = len as u64;
+        },
+        18 => {
+            let buf_ptr = arg1 as *mut u8;
+            let buf_len = arg2 as usize;
+            
+            unsafe {
+                let log_len = crate::serial::BOOT_LOG_IDX;
+                let copy_len = core::cmp::min(buf_len, log_len);
+                
+                for i in 0..copy_len {
+                    *buf_ptr.add(i) = crate::serial::BOOT_LOG[i];
+                }
+                frame.rax = copy_len as u64;
+            }
+        },
         _ => {}
     }
 }

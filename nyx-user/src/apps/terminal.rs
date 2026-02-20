@@ -1,4 +1,4 @@
-use crate::syscalls::{sys_fs_read, sys_fs_write, sys_fs_count, sys_fs_get_name};
+use crate::syscalls::{sys_fs_read, sys_fs_write, sys_fs_count, sys_fs_get_name, sys_get_hw_info};
 use crate::gfx::draw::{draw_rect_simple, draw_text};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -43,9 +43,24 @@ impl Terminal {
         if parts.is_empty() { return; }
 
         match parts[0] {
-            "help" => self.history.push("cmds: ls, cd <dir>, cat <file>, clear".into()),
+            "help" => self.history.push("cmds: ls, cd <dir>, cat <file>, write, hwinfo, clear".into()),
             "clear" => self.history.clear(),
             "pwd" => self.history.push(self.current_dir.clone()),
+            "hwinfo" => {
+                let mut buf = [0u8; 512];
+                let len = sys_get_hw_info(&mut buf);
+                if len > 0 {
+                    if let Ok(info) = core::str::from_utf8(&buf[..len]) {
+                        for line in info.split('\n') {
+                            self.history.push(String::from(line));
+                        }
+                    } else {
+                        self.history.push("Encoding error reading hardware info.".into());
+                    }
+                } else {
+                    self.history.push("Kernel failed to provide hardware info.".into());
+                }
+            },
             "ls" => {
                 let count = sys_fs_count(&self.current_dir);
                 if count == 0 { self.history.push("(empty)".into()); }

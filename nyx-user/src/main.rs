@@ -17,6 +17,8 @@ use apps::clock::Clock;
 use apps::editor::Editor;
 use apps::explorer::Explorer;
 use apps::monitor::SysMonitor;
+use apps::sysinfo::SysInfoApp;
+use apps::bootlog::BootlogApp;
 use gfx::draw;
 use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
@@ -26,8 +28,7 @@ static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-// 5 Apps: Terminal, SysMon, Help, Editor, Explorer
-const MAX_WINDOWS: usize = 5; 
+const MAX_WINDOWS: usize = 7; 
 
 #[no_mangle]
 #[link_section = ".text.entry"]
@@ -67,8 +68,10 @@ pub extern "C" fn _start() -> ! {
         Window { id: 2, x: 150, y: 150, w: 300, h: 200, title: "Help", active: false, exists: false },
         Window { id: 3, x: 200, y: 100, w: 600, h: 450, title: "NyxPad", active: false, exists: false },
         Window { id: 4, x: 150, y: 150, w: 500, h: 400, title: "File Explorer", active: false, exists: true }, 
+        Window { id: 5, x: 250, y: 150, w: 400, h: 250, title: "Hardware Profile", active: false, exists: false },
+        Window { id: 6, x: 100, y: 80, w: 800, h: 500, title: "Kernel Boot Logs (dmesg)", active: false, exists: false },
     ];
-    let mut z_order = [0, 1, 2, 3, 4];
+    let mut z_order = [0, 1, 2, 3, 4, 5, 6];
 
     // --- APP INITIALIZATION ---
     let mut my_terminal = Terminal::new();
@@ -76,6 +79,8 @@ pub extern "C" fn _start() -> ! {
     let mut my_editor = Editor::new();
     let mut my_explorer = Explorer::new(); 
     let mut my_monitor = SysMonitor::new();
+    let mut my_sysinfo = SysInfoApp::new();
+    let mut my_bootlog = BootlogApp::new();
 
     // ============================================================
     // --- PHASE 4 PREP: VFS HARDWARE ROUTING TEST ---
@@ -84,7 +89,6 @@ pub extern "C" fn _start() -> ! {
     let gpu_fd = sys_open("/dev/dri/card0");
     
     if gpu_fd >= 0 {
-        // 0xC0DE is our fake request ID for "Initialize GPU"
         let _result = sys_ioctl(gpu_fd, 0xC0DE, 0x1234);
         my_terminal.write_str("[DRM] Successfully opened /dev/dri/card0 and sent ioctl!\n> ");
     } else {
@@ -131,21 +135,17 @@ pub extern "C" fn _start() -> ! {
         if now / 1000 != last_second {
             last_second = now / 1000;
             
-            // Mark Clock Dirty
             let clock_w = 220; let clock_h = 80;
             let clock_x = (screen_w / 2).saturating_sub(clock_w / 2);
             mark_dirty(clock_x, 60, clock_w, clock_h);
             
-            // Update the system monitor backend
             my_monitor.update_stats();
 
-            // If Sys Monitor is open, redraw it every second
             for w in windows.iter() {
                 if w.id == 1 && w.exists {
                     mark_dirty(w.x, w.y, w.w, w.h);
                 }
             }
-
             needs_redraw = true;
         }
 
@@ -171,7 +171,7 @@ pub extern "C" fn _start() -> ! {
 
             if show_start_menu {
                 let menu_w = 150;
-                let menu_h = 200; 
+                let menu_h = 280; // Expanded to fit 7 items
                 let menu_x = 10;
                 let menu_y = screen_h - TASKBAR_H - menu_h;
 
@@ -183,6 +183,8 @@ pub extern "C" fn _start() -> ! {
                         2 => launch_app(&mut windows, &mut z_order, 3, &mut mark_dirty), 
                         3 => launch_app(&mut windows, &mut z_order, 1, &mut mark_dirty), 
                         4 => launch_app(&mut windows, &mut z_order, 2, &mut mark_dirty), 
+                        5 => launch_app(&mut windows, &mut z_order, 5, &mut mark_dirty),
+                        6 => launch_app(&mut windows, &mut z_order, 6, &mut mark_dirty),
                         _ => {}
                     }
                     show_start_menu = false;
@@ -199,7 +201,7 @@ pub extern "C" fn _start() -> ! {
             if !handled && my >= screen_h - TASKBAR_H {
                 if mx < 100 { 
                     show_start_menu = !show_start_menu;
-                    let menu_h = 200; 
+                    let menu_h = 280; 
                     mark_dirty(10, screen_h - TASKBAR_H - menu_h, 150, menu_h + TASKBAR_H);
                     needs_redraw = true;
                     handled = true;
@@ -310,7 +312,6 @@ pub extern "C" fn _start() -> ! {
                     if windows[idx].id == 0 { 
                          my_terminal.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
                     } else if windows[idx].id == 1 {
-                        // Display Modular Sys Monitor
                         my_monitor.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
                     } else if windows[idx].id == 2 {
                         draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 50, "NyxOS Help", 0xFFFFFFFF);
@@ -319,6 +320,10 @@ pub extern "C" fn _start() -> ! {
                         my_editor.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     } else if windows[idx].id == 4 {
                         my_explorer.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
+                    } else if windows[idx].id == 5 {
+                        my_sysinfo.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
+                    } else if windows[idx].id == 6 {
+                        my_bootlog.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     }
                 }
             }
@@ -343,7 +348,7 @@ pub extern "C" fn _start() -> ! {
 
 fn draw_start_menu(fb: &mut [u32], w: usize, h: usize) {
     let menu_w = 150;
-    let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help"];
+    let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help", "Hardware Info", "Boot Logs"];
     let item_h = 40;
     let menu_h = items.len() * item_h;
     let x = 10;

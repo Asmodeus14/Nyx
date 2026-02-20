@@ -13,8 +13,6 @@ pub struct SerialPort {
 }
 
 impl SerialPort {
-    /// Initializes a new serial port on the given base I/O port.
-    /// COM1 is typically 0x3F8
     pub const fn new(port_base: u16) -> Self {
         Self {
             data: Port::new(port_base),
@@ -28,19 +26,18 @@ impl SerialPort {
 
     pub fn init(&mut self) {
         unsafe {
-            self.int_en.write(0x00);     // Disable all interrupts
-            self.line_ctrl.write(0x80);  // Enable DLAB (set baud rate divisor)
-            self.data.write(0x03);       // Set divisor to 3 (lo byte) 38400 baud
-            self.int_en.write(0x00);     //                  (hi byte)
-            self.line_ctrl.write(0x03);  // 8 bits, no parity, one stop bit
-            self.fifo_ctrl.write(0xC7);  // Enable FIFO, clear them, 14-byte threshold
-            self.modem_ctrl.write(0x0B); // IRQs enabled, RTS/DSR set
+            self.int_en.write(0x00);     
+            self.line_ctrl.write(0x80);  
+            self.data.write(0x03);       
+            self.int_en.write(0x00);     
+            self.line_ctrl.write(0x03);  
+            self.fifo_ctrl.write(0xC7);  
+            self.modem_ctrl.write(0x0B); 
         }
     }
 
     fn wait_for_tx_empty(&mut self) {
         unsafe {
-            // Bit 5 of the line status register tells us if the transmit buffer is empty
             while (self.line_sts.read() & 0x20) == 0 {
                 core::hint::spin_loop();
             }
@@ -49,19 +46,14 @@ impl SerialPort {
 
     pub fn write_byte(&mut self, b: u8) {
         self.wait_for_tx_empty();
-        unsafe {
-            self.data.write(b);
-        }
+        unsafe { self.data.write(b); }
     }
 }
 
 impl fmt::Write for SerialPort {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
-            // Standardize newlines for serial terminals (CR+LF)
-            if byte == b'\n' {
-                self.write_byte(b'\r');
-            }
+            if byte == b'\n' { self.write_byte(b'\r'); }
             self.write_byte(byte);
         }
         Ok(())
@@ -70,23 +62,45 @@ impl fmt::Write for SerialPort {
 
 lazy_static! {
     pub static ref SERIAL1: Mutex<SerialPort> = {
-        let mut serial_port = SerialPort::new(0x3F8); // 0x3F8 is COM1
+        let mut serial_port = SerialPort::new(0x3F8); // COM1
         serial_port.init();
         Mutex::new(serial_port)
     };
 }
 
+// --- NEW: KERNEL BOOT LOG BUFFER ---
+pub const BOOT_LOG_SIZE: usize = 16384; // 16 KB of text
+pub static mut BOOT_LOG: [u8; BOOT_LOG_SIZE] = [0; BOOT_LOG_SIZE];
+pub static mut BOOT_LOG_IDX: usize = 0;
+
+struct BufWriter;
+impl core::fmt::Write for BufWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        unsafe {
+            for &b in s.as_bytes() {
+                if BOOT_LOG_IDX < BOOT_LOG_SIZE {
+                    BOOT_LOG[BOOT_LOG_IDX] = b;
+                    BOOT_LOG_IDX += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
-    // We disable interrupts while printing so a timer context switch 
-    // doesn't interrupt a thread mid-print and scramble the log text.
     x86_64::instructions::interrupts::without_interrupts(|| {
+        // Write to physical hardware serial
         SERIAL1.lock().write_fmt(args).expect("Printing to serial failed");
+        
+        // Save a copy in RAM for the userspace UI
+        let mut bw = BufWriter;
+        let _ = core::fmt::Write::write_fmt(&mut bw, args);
     });
 }
 
-/// Prints to the host through the serial interface.
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
@@ -94,7 +108,6 @@ macro_rules! serial_print {
     };
 }
 
-/// Prints to the host through the serial interface, appending a newline.
 #[macro_export]
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
