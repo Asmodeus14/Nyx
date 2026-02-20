@@ -83,7 +83,7 @@ pub fn enumerate_pci() {
     
     let mcfg_phys = unsafe { ACPI_INFO.mcfg_addr };
     if mcfg_phys.is_none() {
-        crate::vga_println!("[PCI] ERR: No MCFG table found.");
+        crate::serial_println!("[PCI] ERR: No MCFG table found.");
         return;
     }
 
@@ -98,6 +98,9 @@ pub fn enumerate_pci() {
         let alloc = unsafe { &*alloc_ptr.add(i) };
         scan_bus_range(alloc.base_address, alloc.start_bus_number, alloc.end_bus_number);
     }
+    
+    // NEW: Tells us when it finishes so we know it didn't freeze!
+    crate::serial_println!("[PCI] PCIe Enumeration Complete.");
 }
 
 fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
@@ -112,7 +115,8 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                         let class_code = unsafe { core::ptr::read_volatile((device_virt + 11) as *const u8) };
 
                         if class_code == 0x03 {
-                            crate::vga_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
+                            // FIXED: Now using serial_println! to send to dmesg buffer
+                            crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
                         }
                     }
                 }
