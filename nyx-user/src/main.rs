@@ -81,35 +81,55 @@ pub extern "C" fn _start() -> ! {
     let mut my_monitor = SysMonitor::new();
     let mut my_sysinfo = SysInfoApp::new();
     let mut my_bootlog = BootlogApp::new();
+// ============================================================
+    // --- PHASE 4 PREP: THE LINUX DRM HANDSHAKE ---
+    // ============================================================
+    #[repr(C)]
+    #[derive(Debug, Default)]
+    pub struct DrmVersion {
+        pub version_major: i32,
+        pub version_minor: i32,
+        pub version_patchlevel: i32,
+        pub name_len: usize,
+        pub name: *mut u8,
+        pub date_len: usize,
+        pub date: *mut u8,
+        pub desc_len: usize,
+        pub desc: *mut u8,
+    }
 
-    // ============================================================
-    // --- PHASE 4 PREP: VFS HARDWARE ROUTING & MMAP TEST ---
-    // ============================================================
     sys_print("Attempting to open DRM device...\n");
     let gpu_fd = sys_open("/dev/dri/card0");
     
     if gpu_fd >= 0 {
-        let _result = sys_ioctl(gpu_fd, 0xC0DE, 0x1234);
-        my_terminal.write_str("[DRM] Successfully opened /dev/dri/card0 and sent ioctl!\n");
+        // 1. Allocate empty buffers for the kernel to fill with strings
+        let mut name_buf = [0u8; 32];
+        let mut date_buf = [0u8; 32];
+        let mut desc_buf = [0u8; 64];
 
-        // --- NEW: Test sys_mmap ---
-        // Request 4096 bytes (1 Page) of GPU Memory
-        let vram_ptr = sys_mmap(gpu_fd, 4096, 0);
+        // 2. Set up the struct with pointers to our empty buffers
+        let mut version = DrmVersion {
+            version_major: 0, version_minor: 0, version_patchlevel: 0,
+            name_len: name_buf.len(), name: name_buf.as_mut_ptr(),
+            date_len: date_buf.len(), date: date_buf.as_mut_ptr(),
+            desc_len: desc_buf.len(), desc: desc_buf.as_mut_ptr(),
+        };
+
+        // 3. The exact hex code Mesa uses to ask "Who are you?"
+        const DRM_IOCTL_VERSION: usize = 0xC0406400;
         
-        // Check against our -1 error code (u64::MAX)
-        if vram_ptr != core::u64::MAX && vram_ptr != 0 {
-            let msg = alloc::format!("[DRM] SUCCESS! Fake VRAM mapped to Userspace at: {:#x}\n> ", vram_ptr);
-            my_terminal.write_str(&msg);
+        // 4. Send it to the kernel!
+        let result = sys_ioctl(gpu_fd, DRM_IOCTL_VERSION, &mut version as *mut DrmVersion as usize);
+        
+        if result >= 0 {
+            let name_str = core::str::from_utf8(&name_buf[..version.name_len]).unwrap_or("err");
+            let desc_str = core::str::from_utf8(&desc_buf[..version.desc_len]).unwrap_or("err");
             
-            // PROVE WE HAVE RING-3 ACCESS: Write a byte to the hardware memory!
-            unsafe {
-                let test_ptr = vram_ptr as *mut u8;
-                // If the kernel didn't map this with USER_ACCESSIBLE, this line will crash the OS.
-                // If it succeeds, you officially have zero-copy hardware access!
-                *test_ptr = 0xAA; 
-            }
+            let msg = alloc::format!("[DRM] Handshake Success!\n[DRM] Kernel replied -> Driver: {} v{}.{}.{} ({})\n> ", 
+                name_str, version.version_major, version.version_minor, version.version_patchlevel, desc_str);
+            my_terminal.write_str(&msg);
         } else {
-            my_terminal.write_str("[DRM] Failed to mmap GPU memory.\n> ");
+            my_terminal.write_str("[DRM] Handshake Failed!\n> ");
         }
     } else {
         my_terminal.write_str("[DRM] Failed to open /dev/dri/card0.\n> ");

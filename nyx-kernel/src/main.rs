@@ -15,8 +15,9 @@ pub mod serial;
 pub mod vga_log; 
 pub mod vfs;
 pub mod acpi;
-pub mod apic; // Assumes you created the apic.rs file from earlier!
-pub mod pci;  // Assumes you created the pci.rs file from earlier!
+pub mod apic; 
+pub mod pci;  
+pub mod drm;  // <--- NEW: The Linux DRM Emulator for Mesa!
 
 mod allocator;
 mod memory;

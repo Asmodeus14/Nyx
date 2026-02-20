@@ -15,7 +15,7 @@ pub trait VNode: Send + Sync {
         Err(-1) // -ENOSYS (Not implemented by default)
     }
 
-    /// --- NEW: Memory Mapping ---
+    /// Memory Mapping
     /// Allows userspace to map the physical VRAM of this device
     fn mmap(&self, _offset: usize, _size: usize) -> Result<u64, isize> {
         Err(-1) // -ENOSYS
@@ -70,15 +70,14 @@ pub struct DrmDevice;
 
 impl VNode for DrmDevice {
     fn ioctl(&self, request: usize, arg: usize) -> Result<usize, isize> {
-        crate::serial_println!("[DRM] Received GPU ioctl req: {:#x}, arg: {:#x}", request, arg);
-        Ok(0) // Success
+        // Forward the request to our new Linux DRM emulator!
+        crate::drm::handle_drm_ioctl(request, arg)
     }
 
-    // --- NEW: Mock GPU Memory Map ---
     fn mmap(&self, offset: usize, size: usize) -> Result<u64, isize> {
         crate::serial_println!("[DRM] Mesa requested mmap! Offset: {:#x}, Size: {}", offset, size);
         // We will pretend the GPU allocated physical memory at 0x1234_0000 for now.
-        // In Phase 4, this will be the actual BAR address of your GTX 1650!
+        // Once we link Mesa, this will be the actual BAR address of your GTX 1650!
         Ok(0x1234_0000) 
     }
 }
