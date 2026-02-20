@@ -12,7 +12,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::format;
 
 pub mod serial;
-pub mod vga_log; // --- NEW MODULE ---
+pub mod vga_log; 
+pub mod vfs;
+pub mod acpi; 
 
 mod allocator;
 mod memory;
@@ -96,6 +98,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 2. MEMORY
     if let Some(offset) = boot_info.physical_memory_offset.into_option() {
         let phys_mem_offset = VirtAddr::new(offset);
+        
+        // --- NEW: Save the offset globally for ACPI & PCI parsing ---
+        unsafe { crate::memory::PHYS_MEM_OFFSET = offset; }
+
         let mut mapper = unsafe { memory::init(phys_mem_offset, &boot_info.memory_regions) };
         {
             let mut system_lock = memory::MEMORY_MANAGER.lock();
@@ -116,6 +122,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     crate::vga_println!("[INIT] Graphics initialized. VGA Logger online.");
 
+    // ==========================================
+    // 3.5 ACPI INITIALIZATION
+    // ==========================================
+    if let Some(rsdp_addr) = boot_info.rsdp_addr.into_option() {
+        acpi::init(rsdp_addr);
+    } else {
+        crate::vga_println!("[ACPI] ERR: Bootloader did not provide RSDP!");
+    }
+    // ==========================================
+
     // 4. DEVICE INIT
     crate::time::init();
     { 
@@ -134,7 +150,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::vga_println!("[SCHEDULER] Spawning Background Threads...");
         let mut scheduler = crate::scheduler::Scheduler::new();
         
-        // --- THIS PREVENTS THE DOUBLE FAULT CUCKOO BUG ---
         scheduler.register_main_thread();
         
         scheduler.spawn(crate::scheduler::clock_task, 50);

@@ -77,6 +77,21 @@ pub extern "C" fn _start() -> ! {
     let mut my_explorer = Explorer::new(); 
     let mut my_monitor = SysMonitor::new();
 
+    // ============================================================
+    // --- PHASE 4 PREP: VFS HARDWARE ROUTING TEST ---
+    // ============================================================
+    sys_print("Attempting to open DRM device...\n");
+    let gpu_fd = sys_open("/dev/dri/card0");
+    
+    if gpu_fd >= 0 {
+        // 0xC0DE is our fake request ID for "Initialize GPU"
+        let _result = sys_ioctl(gpu_fd, 0xC0DE, 0x1234);
+        my_terminal.write_str("[DRM] Successfully opened /dev/dri/card0 and sent ioctl!\n> ");
+    } else {
+        my_terminal.write_str("[DRM] Failed to open /dev/dri/card0.\n> ");
+    }
+    // ============================================================
+
     let mut show_start_menu = false;
     let mut is_dragging = false;
     let mut is_resizing = false;

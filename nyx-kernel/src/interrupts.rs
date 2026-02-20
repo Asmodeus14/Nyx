@@ -320,6 +320,55 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             use core::sync::atomic::Ordering;
             frame.rax = crate::scheduler::CONTEXT_SWITCHES.load(Ordering::Relaxed);
         },
+        // --- NEW: SYS_OPEN ---
+        15 => {
+            let path_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
+            if let Ok(path) = core::str::from_utf8(path_slice) {
+                // 1. Ask VFS to find the file/device
+                if let Some(vnode) = crate::vfs::VFS.open_path(path) {
+                    unsafe {
+                        if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
+                            let curr_idx = scheduler.current_task_idx;
+                            let task = &mut scheduler.tasks[curr_idx];
+                            
+                            // 2. Find an empty File Descriptor slot (Start at 3, skip stdin/out/err)
+                            let mut allocated_fd = -1;
+                            for i in 3..32 {
+                                if task.fd_table[i].is_none() {
+                                    task.fd_table[i] = Some(alloc::sync::Arc::new(crate::vfs::OpenFile::new(vnode)));
+                                    allocated_fd = i as isize;
+                                    break;
+                                }
+                            }
+                            frame.rax = allocated_fd as u64; // Return the FD integer!
+                        } else { frame.rax = (-1isize) as u64; }
+                    }
+                } else { frame.rax = (-1isize) as u64; } // File not found
+            } else { frame.rax = (-1isize) as u64; }
+        },
+        // --- NEW: SYS_IOCTL ---
+        16 => {
+            let fd = arg1 as usize;
+            let request = arg2 as usize;
+            let ioctl_arg = arg3 as usize;
+            
+            unsafe {
+                if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
+                    let curr_idx = scheduler.current_task_idx;
+                    let task = &mut scheduler.tasks[curr_idx];
+                    
+                    if fd < 32 {
+                        if let Some(open_file) = &task.fd_table[fd] {
+                            // Route the ioctl directly to the hardware VNode!
+                            match open_file.node.ioctl(request, ioctl_arg) {
+                                Ok(res) => frame.rax = res as u64,
+                                Err(e) => frame.rax = e as u64,
+                            }
+                        } else { frame.rax = (-1isize) as u64; } // Bad FD
+                    } else { frame.rax = (-1isize) as u64; }
+                }
+            }
+        },
         _ => {}
     }
 }

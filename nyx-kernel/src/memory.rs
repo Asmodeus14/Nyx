@@ -12,6 +12,9 @@ lazy_static::lazy_static! {
     pub static ref MEMORY_MANAGER: Mutex<Option<MemorySystem>> = Mutex::new(None);
 }
 
+// --- NEW: Global physical memory offset for hardware drivers ---
+pub static mut PHYS_MEM_OFFSET: u64 = 0;
+
 pub struct MemorySystem {
     pub mapper: OffsetPageTable<'static>,
     pub frame_allocator: BootInfoFrameAllocator,
@@ -95,6 +98,14 @@ pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
     } else { None }
 }
 
+// --- NEW: Hardware helper to read ACPI/PCIe tables ---
+pub fn phys_to_virt(phys_addr: u64) -> Option<u64> {
+    unsafe {
+        if PHYS_MEM_OFFSET == 0 { return None; }
+        Some(phys_addr + PHYS_MEM_OFFSET)
+    }
+}
+
 pub unsafe fn map_mmio(phys_addr: u64, size: usize) -> Result<u64, &'static str> {
     let mut lock = MEMORY_MANAGER.lock();
     let system = lock.as_mut().ok_or("Memory System not initialized")?;
@@ -114,12 +125,10 @@ pub unsafe fn map_mmio(phys_addr: u64, size: usize) -> Result<u64, &'static str>
     Ok(phys_addr)
 }
 
-// --- UPDATED USER ALLOCATION ---
 pub fn allocate_user_pages(num_pages: u64) -> Result<VirtAddr, &'static str> {
     let mut system_lock = MEMORY_MANAGER.lock();
     let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
     
-    // FIX: Use 0x2000000 (32MB) to match new Linker Script and avoid collisions
     let start_addr = VirtAddr::new(0x200_0000);
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     
@@ -130,9 +139,7 @@ pub fn allocate_user_pages(num_pages: u64) -> Result<VirtAddr, &'static str> {
             match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
                 Ok(mapper) => mapper.flush(),
                 Err(MapToError::PageAlreadyMapped(_)) => {
-                     // If mapped, ensure we aren't leaking frames
                      system.frame_allocator.deallocate_frame(frame);
-                     // We assume existing mapping is fine/compatible
                      continue;
                 },
                 Err(_) => {

@@ -13,6 +13,9 @@ pub const SYS_FS_COUNT: u64 = 10;
 pub const SYS_FS_GET_NAME: u64 = 11;
 pub const SYS_FS_READ: u64 = 12;
 pub const SYS_FS_WRITE: u64 = 13;
+pub const SYS_OPEN: u64 = 15;
+pub const SYS_IOCTL: u64 = 16;
+
 
 #[inline(always)]
 pub fn syscall(id: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
@@ -100,4 +103,13 @@ pub fn sys_get_context_switches() -> u64 {
         );
     }
     result
+}
+pub fn sys_open(path: &str) -> i32 {
+    let ret = syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, 0, 0, 0);
+    ret as i32
+}
+
+pub fn sys_ioctl(fd: i32, request: usize, arg: usize) -> i32 {
+    let ret = syscall(SYS_IOCTL, fd as u64, request as u64, arg as u64, 0, 0);
+    ret as i32
 }

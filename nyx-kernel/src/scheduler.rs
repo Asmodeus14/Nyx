@@ -1,10 +1,12 @@
 use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use x86_64::VirtAddr;
 use crate::gui::Painter; 
 use x86_64::registers::segmentation::{Segment, CS}; 
 use spin::Mutex; 
 use core::sync::atomic::{AtomicU64, Ordering};
+use crate::vfs::OpenFile; // --- NEW: Import OpenFile for the FD Table ---
 
 // --- DYNAMIC JOB SYSTEM ---
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -48,12 +50,16 @@ pub struct Task {
     pub stack: Vec<u8>,     
     pub stack_ptr: u64,     
     pub active: bool,
-    pub tickets: usize,     
+    pub tickets: usize,  
+    // --- NEW: Per-Process File Descriptor Table ---
+    // FD 0, 1, 2 are traditionally stdin, stdout, stderr. 
+    // FD 3+ are for files and GPUs.
+    pub fd_table: [Option<Arc<OpenFile>>; 32], 
 }
 
 pub struct Scheduler {
-    tasks: Vec<Task>,
-    current_task_idx: usize,
+    pub tasks: Vec<Task>,
+    pub current_task_idx: usize,
     rng: QuantumRng,
 }
 
@@ -66,14 +72,15 @@ impl Scheduler {
         }
     }
 
-    // --- NEW: Register the booting thread so it doesn't overwrite others ---
+    // Register the booting thread so it doesn't overwrite others
     pub fn register_main_thread(&mut self) {
         let task = Task {
             id: self.tasks.len(),
             stack: Vec::new(), // Current thread already has a stack
-            stack_ptr: 0,      // Will be populated on the first timer tick
+            stack_ptr: 0,      // Populated on the first timer tick
             active: true,
             tickets: 50,       // UI gets high priority
+            fd_table: core::array::from_fn(|_| None), // Initialize empty FDs
         };
         self.tasks.push(task);
         self.current_task_idx = 0; // Make this the active task
@@ -103,6 +110,7 @@ impl Scheduler {
             stack_ptr: sp,
             active: true,
             tickets,
+            fd_table: core::array::from_fn(|_| None), // Initialize empty FDs
         };
         
         self.tasks.push(task);
