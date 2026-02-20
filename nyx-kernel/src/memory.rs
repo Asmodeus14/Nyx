@@ -98,7 +98,6 @@ pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
     } else { None }
 }
 
-// --- NEW: Hardware helper to read ACPI/PCIe tables ---
 pub fn phys_to_virt(phys_addr: u64) -> Option<u64> {
     unsafe {
         if PHYS_MEM_OFFSET == 0 { return None; }
@@ -172,4 +171,37 @@ pub fn map_user_framebuffer(phys_addr: u64, size: u64) -> Result<u64, &'static s
         }
     }
     Ok(user_start.as_u64())
+}
+
+// --- NEW: USER MEMORY MAPPING FOR GPU (mmap) ---
+pub fn map_user_mmio(phys_addr: u64, size: usize) -> Result<u64, &'static str> {
+    let mut lock = MEMORY_MANAGER.lock();
+    let system = lock.as_mut().ok_or("Memory System not initialized")?;
+
+    // Start placing hardware mappings at virtual address 0xA000_0000
+    static mut NEXT_MMIO_VIRT: u64 = 0xA000_0000;
+    let virt_base = unsafe { NEXT_MMIO_VIRT };
+
+    let start_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr));
+    let end_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr + size as u64 - 1));
+
+    let mut current_virt = virt_base;
+    for frame in PhysFrame::range_inclusive(start_frame, end_frame) {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(current_virt));
+        
+        // CRITICAL: USER_ACCESSIBLE allows Ring-3. NO_CACHE prevents CPU from caching VRAM.
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE 
+                  | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_CACHE;
+        
+        unsafe {
+            match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                Ok(mapper) => mapper.flush(),
+                Err(_) => return Err("Map Failed: User MMIO"),
+            }
+        }
+        current_virt += 4096;
+    }
+    
+    unsafe { NEXT_MMIO_VIRT = current_virt; }
+    Ok(virt_base)
 }

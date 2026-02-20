@@ -255,6 +255,34 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              } else { frame.rax = 0; }
         },
+        // --- NEW: SYS_MMAP (Syscall 9) ---
+        9 => {
+            let fd = arg1 as usize;
+            let size = arg2 as usize;
+            let offset = arg3 as usize;
+
+            unsafe {
+                if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
+                    let curr_idx = scheduler.current_task_idx;
+                    let task = &mut scheduler.tasks[curr_idx];
+
+                    if fd < 32 {
+                        if let Some(open_file) = &task.fd_table[fd] {
+                            // 1. Ask the hardware device for the physical address
+                            match open_file.node.mmap(offset, size) {
+                                Ok(phys_addr) => {
+                                    // 2. Map that physical address directly into userspace!
+                                    if let Ok(virt_addr) = crate::memory::map_user_mmio(phys_addr, size) {
+                                        frame.rax = virt_addr;
+                                    } else { frame.rax = (-1isize) as u64; }
+                                },
+                                Err(e) => frame.rax = e as u64,
+                            }
+                        } else { frame.rax = (-1isize) as u64; } // Bad FD
+                    } else { frame.rax = (-1isize) as u64; }
+                } else { frame.rax = (-1isize) as u64; }
+            }
+        },
         10 => { // sys_fs_count
             let ptr = arg1 as *const u8;
             let len = arg2 as usize;

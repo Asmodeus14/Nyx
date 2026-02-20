@@ -16,7 +16,11 @@ pub const SYS_FS_WRITE: u64 = 13;
 pub const SYS_OPEN: u64 = 15;
 pub const SYS_IOCTL: u64 = 16;
 pub const SYS_GET_BOOT_LOGS: u64 = 18;
+pub const SYS_MMAP: u64 = 9;
 
+pub fn sys_mmap(fd: i32, size: usize, offset: usize) -> u64 {
+    syscall(SYS_MMAP, fd as u64, size as u64, offset as u64, 0, 0)
+}
 pub fn sys_get_boot_logs(buffer: &mut [u8]) -> usize {
     syscall(SYS_GET_BOOT_LOGS, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0, 0) as usize
 }

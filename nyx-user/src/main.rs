@@ -83,19 +83,38 @@ pub extern "C" fn _start() -> ! {
     let mut my_bootlog = BootlogApp::new();
 
     // ============================================================
-    // --- PHASE 4 PREP: VFS HARDWARE ROUTING TEST ---
+    // --- PHASE 4 PREP: VFS HARDWARE ROUTING & MMAP TEST ---
     // ============================================================
     sys_print("Attempting to open DRM device...\n");
     let gpu_fd = sys_open("/dev/dri/card0");
     
     if gpu_fd >= 0 {
         let _result = sys_ioctl(gpu_fd, 0xC0DE, 0x1234);
-        my_terminal.write_str("[DRM] Successfully opened /dev/dri/card0 and sent ioctl!\n> ");
+        my_terminal.write_str("[DRM] Successfully opened /dev/dri/card0 and sent ioctl!\n");
+
+        // --- NEW: Test sys_mmap ---
+        // Request 4096 bytes (1 Page) of GPU Memory
+        let vram_ptr = sys_mmap(gpu_fd, 4096, 0);
+        
+        // Check against our -1 error code (u64::MAX)
+        if vram_ptr != core::u64::MAX && vram_ptr != 0 {
+            let msg = alloc::format!("[DRM] SUCCESS! Fake VRAM mapped to Userspace at: {:#x}\n> ", vram_ptr);
+            my_terminal.write_str(&msg);
+            
+            // PROVE WE HAVE RING-3 ACCESS: Write a byte to the hardware memory!
+            unsafe {
+                let test_ptr = vram_ptr as *mut u8;
+                // If the kernel didn't map this with USER_ACCESSIBLE, this line will crash the OS.
+                // If it succeeds, you officially have zero-copy hardware access!
+                *test_ptr = 0xAA; 
+            }
+        } else {
+            my_terminal.write_str("[DRM] Failed to mmap GPU memory.\n> ");
+        }
     } else {
         my_terminal.write_str("[DRM] Failed to open /dev/dri/card0.\n> ");
     }
     // ============================================================
-
     let mut show_start_menu = false;
     let mut is_dragging = false;
     let mut is_resizing = false;

@@ -6,18 +6,23 @@ use spin::Mutex;
 /// The VNode trait represents anything that can act like a file.
 /// This could be an NVMe text file, a Terminal, or a Hardware GPU.
 pub trait VNode: Send + Sync {
-    fn read(&self, offset: usize, buf: &mut [u8]) -> usize { 0 }
-    fn write(&self, offset: usize, buf: &[u8]) -> usize { 0 }
+    fn read(&self, _offset: usize, _buf: &mut [u8]) -> usize { 0 }
+    fn write(&self, _offset: usize, _buf: &[u8]) -> usize { 0 }
     
     /// ioctl (I/O Control) is crucial for GPU drivers (DRM).
     /// Mesa uses this to send hardware-specific commands to the GPU.
     fn ioctl(&self, _request: usize, _arg: usize) -> Result<usize, isize> {
         Err(-1) // -ENOSYS (Not implemented by default)
     }
+
+    /// --- NEW: Memory Mapping ---
+    /// Allows userspace to map the physical VRAM of this device
+    fn mmap(&self, _offset: usize, _size: usize) -> Result<u64, isize> {
+        Err(-1) // -ENOSYS
+    }
 }
 
 /// An OpenFile tracks a specific process's interaction with a VNode.
-/// If two apps open the same file, they share the VNode but have different offsets.
 pub struct OpenFile {
     pub node: Arc<dyn VNode>,
     pub offset: Mutex<usize>,
@@ -65,10 +70,16 @@ pub struct DrmDevice;
 
 impl VNode for DrmDevice {
     fn ioctl(&self, request: usize, arg: usize) -> Result<usize, isize> {
-        crate::vga_println!("[DRM] Received GPU ioctl req: {:#x}, arg: {:#x}", request, arg);
-        // In Phase 4, we will parse the request to allocate GPU memory, 
-        // submit command buffers, and ring the hardware doorbell.
+        crate::serial_println!("[DRM] Received GPU ioctl req: {:#x}, arg: {:#x}", request, arg);
         Ok(0) // Success
+    }
+
+    // --- NEW: Mock GPU Memory Map ---
+    fn mmap(&self, offset: usize, size: usize) -> Result<u64, isize> {
+        crate::serial_println!("[DRM] Mesa requested mmap! Offset: {:#x}, Size: {}", offset, size);
+        // We will pretend the GPU allocated physical memory at 0x1234_0000 for now.
+        // In Phase 4, this will be the actual BAR address of your GTX 1650!
+        Ok(0x1234_0000) 
     }
 }
 
@@ -77,7 +88,6 @@ impl VNode for DrmDevice {
 // ==========================================
 
 pub struct VfsManager {
-    // In a real OS this is a tree, but a flat list is perfect to start
     gpu_device: Arc<DrmDevice>,
 }
 
@@ -86,17 +96,13 @@ impl VfsManager {
         Self { gpu_device: Arc::new(DrmDevice) }
     }
 
-    /// Resolves a string path into a hardware VNode
     pub fn open_path(&self, path: &str) -> Option<Arc<dyn VNode>> {
-        crate::vga_println!("[VFS] Intercepting open req for: {}", path);
+        crate::serial_println!("[VFS] Intercepting open req for: {}", path);
         
         if path == "/dev/dri/card0" {
-            // Route directly to the GPU Hardware!
             return Some(self.gpu_device.clone() as Arc<dyn VNode>);
         } 
         
-        // Otherwise, fallback to the physical NVMe File System
-        // (We will wire this back into your real `fs.rs` soon)
         let mock_file = Arc::new(NvmeFile {
             name: String::from(path),
             data: Mutex::new(Vec::new()),
