@@ -4,36 +4,28 @@ use x86_64::VirtAddr;
 use crate::gui::Painter; 
 use x86_64::registers::segmentation::{Segment, CS}; 
 use spin::Mutex; 
+use core::sync::atomic::{AtomicU64, Ordering};
 
 // --- DYNAMIC JOB SYSTEM ---
-// A 'Job' is just a closure function waiting to be run.
-// Send + 'static allows it to be moved between threads safely.
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
-
-// The centralized work queue for the entire OS
 pub static JOB_QUEUE: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
-// Public API to submit work from anywhere (Syscalls, Drivers, etc.)
+// --- TELEMETRY ---
+pub static CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
 pub fn submit_job<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    // Wrap the function in a Box and push to queue
-    // Usage: scheduler::submit_job(move || { some_heavy_function(); });
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut queue = JOB_QUEUE.lock();
         queue.push(Box::new(f));
     });
 }
-// -------------------------------
 
-// Global Scheduler Instance
 pub static mut SCHEDULER: Option<Scheduler> = None;
 
-struct QuantumRng {
-    seed: u64,
-}
-
+struct QuantumRng { seed: u64 }
 impl QuantumRng {
     fn new(seed: u64) -> Self { Self { seed } }
     fn next(&mut self) -> u64 {
@@ -74,25 +66,33 @@ impl Scheduler {
         }
     }
 
+    // --- NEW: Register the booting thread so it doesn't overwrite others ---
+    pub fn register_main_thread(&mut self) {
+        let task = Task {
+            id: self.tasks.len(),
+            stack: Vec::new(), // Current thread already has a stack
+            stack_ptr: 0,      // Will be populated on the first timer tick
+            active: true,
+            tickets: 50,       // UI gets high priority
+        };
+        self.tasks.push(task);
+        self.current_task_idx = 0; // Make this the active task
+    }
+
     pub fn spawn(&mut self, func: extern "C" fn(), tickets: usize) {
-        // 1. Allocate Stack (32KB)
         let stack = Vec::with_capacity(4096 * 8); 
         let stack_bottom = stack.as_ptr() as u64;
         let stack_top = stack_bottom + stack.capacity() as u64;
-        
         let mut sp = stack_top & !0xF;
 
         unsafe {
-            // Build Interrupt Stack Frame
             sp -= 8; * (sp as *mut u64) = 0; 
             let task_stack_start = sp; 
             sp -= 8; * (sp as *mut u64) = task_stack_start;
-            sp -= 8; * (sp as *mut u64) = 0x202; // RFLAGS: Interrupts Enabled
+            sp -= 8; * (sp as *mut u64) = 0x202; // RFLAGS
             sp -= 8; * (sp as *mut u64) = CS::get_reg().0 as u64;
             sp -= 8; * (sp as *mut u64) = func as u64; // RIP
-            
-            // Saved Registers
-            sp -= 120;
+            sp -= 120; // Saved Registers
         }
 
         core::mem::forget(stack.clone()); 
@@ -132,6 +132,10 @@ impl Scheduler {
                 }
             }
         }
+        
+        // --- TELEMETRY UPDATE ---
+        CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        
         self.tasks[self.current_task_idx].stack_ptr
     }
 }
@@ -144,37 +148,22 @@ pub extern "C" fn clock_task() {
             if let Some(painter) = &mut crate::SCREEN_PAINTER {
                 let time_str = alloc::format!("Time: {:05}", ticks);
                 let x_pos = if painter.width() > 200 { painter.width() - 200 } else { 0 };
+                // Draw in the top right corner
                 painter.draw_string(x_pos, 20, &time_str, crate::gui::Color::CYAN);
             }
         }
-        // Yield time
         for _ in 0..1_000_000 { core::hint::spin_loop(); }
     }
 }
 
-// --- UNIVERSAL BACKGROUND WORKER ---
 pub extern "C" fn background_worker() {
     loop {
-        // 1. Check for ANY generic job
-        // We use without_interrupts to safely pop from the queue
         let job_opt = x86_64::instructions::interrupts::without_interrupts(|| {
             let mut queue = JOB_QUEUE.lock();
-            if !queue.is_empty() {
-                // Remove from front (FIFO Queue)
-                Some(queue.remove(0))
-            } else {
-                None
-            }
+            if !queue.is_empty() { Some(queue.remove(0)) } else { None }
         });
 
-        // 2. Execute it
-        if let Some(job) = job_opt {
-            // This calls the closure we created in syscalls.
-            // The worker doesn't know it's a file write, it just runs it!
-            job(); 
-        } else {
-            // 3. Sleep if empty (prevents CPU burning)
-            for _ in 0..10_000 { core::hint::spin_loop(); }
-        }
+        if let Some(job) = job_opt { job(); } 
+        else { for _ in 0..10_000 { core::hint::spin_loop(); } }
     }
 }

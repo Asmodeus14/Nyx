@@ -88,3 +88,16 @@ pub fn sys_fs_read(name: &str, buffer: &mut [u8]) -> usize {
 pub fn sys_fs_write(name: &str, data: &[u8]) -> bool {
     syscall(SYS_FS_WRITE, name.as_ptr() as u64, name.len() as u64, data.as_ptr() as u64, data.len() as u64, 0) == 1
 }
+// In nyx-user/src/syscalls.rs
+pub fn sys_get_context_switches() -> u64 {
+    let mut result: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80", // CRITICAL: This MUST be "int 0x80", not "syscall"
+            in("rax") 14,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    result
+}

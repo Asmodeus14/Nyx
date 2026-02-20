@@ -11,6 +11,9 @@ use crate::gui::{Painter, Color};
 use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::format;
 
+pub mod serial;
+pub mod vga_log; // --- NEW MODULE ---
+
 mod allocator;
 mod memory;
 mod gui;
@@ -78,17 +81,15 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    crate::serial_println!("[INIT] NyxOS Kernel Booting...");
+
     // 1. HARDWARE INIT
     gdt::init();
     interrupts::init_idt();
     
-    // FIX: Initialize PICs AND Unmask Interrupts!
     unsafe { 
         let mut pics = interrupts::PICS.lock();
         pics.initialize();
-        // Unmask IRQ 0 (Timer), 1 (Keyboard), 2 (Cascade), 12 (Mouse)
-        // Master Mask: 0b11111000 = 0xF8 (0 = Unmasked)
-        // Slave Mask:  0b11101111 = 0xEF (Bit 4 is Mouse)
         pics.write_masks(0xF8, 0xEF);
     };
 
@@ -105,13 +106,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         panic!("Memory Error");
     }
 
-    // 3. GRAPHICS
+    // 3. GRAPHICS 
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
         unsafe { SCREEN_PAINTER = Some(gui::VgaPainter { buffer: fb.buffer_mut(), info }); }
         { let mut wm = crate::window::WINDOW_MANAGER.lock(); wm.set_resolution(info.width, info.height); }
         { let mut m = crate::mouse::MOUSE_STATE.lock(); m.screen_width = info.width; m.screen_height = info.height; m.x = info.width/2; m.y = info.height/2; }
     }
+
+    crate::vga_println!("[INIT] Graphics initialized. VGA Logger online.");
 
     // 4. DEVICE INIT
     crate::time::init();
@@ -122,35 +125,47 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     unsafe {
         if let Some(p) = &mut SCREEN_PAINTER {
-            p.clear(Color::BLACK);
-            p.draw_string(10, 10, "NyxOS Kernel v2.5 - Unmasked IRQs", Color::WHITE);
+            p.draw_string(10, 10, "NyxOS Kernel v2.5 - Multitasking Active", Color::WHITE);
         }
     }
 
-    // 5. ENABLE INTERRUPTS (Now that PIC is ready)
+    // --- INITIALIZE SCHEDULER ---
+    unsafe {
+        crate::vga_println!("[SCHEDULER] Spawning Background Threads...");
+        let mut scheduler = crate::scheduler::Scheduler::new();
+        
+        // --- THIS PREVENTS THE DOUBLE FAULT CUCKOO BUG ---
+        scheduler.register_main_thread();
+        
+        scheduler.spawn(crate::scheduler::clock_task, 50);
+        scheduler.spawn(crate::scheduler::background_worker, 10);
+        
+        crate::scheduler::SCHEDULER = Some(scheduler);
+        crate::vga_println!("[SCHEDULER] Ready.");
+    }
+
+    // 5. ENABLE INTERRUPTS
+    crate::vga_println!("[INIT] Enabling Hardware Interrupts...");
     x86_64::instructions::interrupts::enable();
 
     // 6. STORAGE
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
     if let Some(driver) = nvme_driver_opt {
         crate::fs::FS.lock().init(driver);
+        crate::vga_println!("[STORAGE] NVMe Mounted successfully.");
     } else {
-        unsafe { if let Some(p) = &mut SCREEN_PAINTER { p.draw_string(10, 30, "No NVMe Found", Color::RED); } }
+        crate::vga_println!("[STORAGE] ERR: No NVMe Found!");
     }
 
     // --- USERSPACE LOADER ---
+    crate::vga_println!("[LOADER] Allocating Userspace Pages...");
     const PAGE_COUNT: u64 = 8192; 
     let _ = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Alloc User Failed");
     
     const USER_BIN: &[u8] = include_bytes!("nyx-user.bin");
     let entry_point_addr = unsafe { load_elf(USER_BIN) };
     
-    unsafe {
-        if let Some(p) = &mut SCREEN_PAINTER {
-            let msg = format!("ELF Entry: {:#x}", entry_point_addr);
-            p.draw_string(10, 50, &msg, Color::GREEN);
-        }
-    }
+    crate::vga_println!("[LOADER] Executing Userspace at: {:#x}", entry_point_addr);
 
     let stack_addr = 0x4000000; 
 
@@ -207,18 +222,13 @@ unsafe fn load_elf(binary: &[u8]) -> u64 {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     x86_64::instructions::interrupts::disable();
+    
+    crate::serial_println!("[KERNEL PANIC] {}", info);
+    crate::vga_println!("[KERNEL PANIC] {}", info);
+
     unsafe {
         if let Some(s) = &mut SCREEN_PAINTER {
-            s.clear(Color::RED);
-            s.draw_string(10, 10, "KERNEL PANIC", Color::WHITE);
-            let msg = format!("{}", info);
-            let mut y = 30;
-            for chunk in msg.as_bytes().chunks(80) {
-                 if let Ok(s_chunk) = core::str::from_utf8(chunk) {
-                     s.draw_string(10, y, s_chunk, Color::WHITE);
-                     y += 20;
-                 }
-            }
+            s.draw_string(10, 10, "KERNEL PANIC", Color::RED);
         }
     }
     loop { x86_64::instructions::hlt(); }

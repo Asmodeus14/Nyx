@@ -25,7 +25,12 @@ lazy_static! {
         idt.page_fault.set_handler_fn(pf_handler);
         idt.general_protection_fault.set_handler_fn(gpf_handler);
         
-        idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
+        // --- UPDATED TIMER HANDLER ---
+        unsafe {
+            idt[InterruptIndex::Timer.as_usize()]
+                .set_handler_addr(VirtAddr::new(timer_interrupt_stub as *const () as u64));
+        }
+        
         idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Mouse.as_usize()].set_handler_fn(mouse_interrupt_handler);
         
@@ -69,9 +74,78 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
         cr2, error_code, stack_frame.instruction_pointer.as_u64());
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+// --- CONTEXT SWITCH ASSEMBLY STUB ---
+core::arch::global_asm!(r#"
+.intel_syntax noprefix
+.global timer_interrupt_stub
+timer_interrupt_stub:
+    // The CPU automatically pushed SS, RSP, RFLAGS, CS, RIP
+    // Save the general purpose registers
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    // First argument (rdi) to our Rust function is the current stack pointer
+    mov rdi, rsp
+    
+    // Call the Rust scheduler context switch
+    call timer_context_switch
+    
+    // The Rust function returns the new task's stack pointer in rax
+    mov rsp, rax
+
+    // Restore the general purpose registers for the new/resumed task
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    iretq
+"#);
+
+extern "C" { fn timer_interrupt_stub(); }
+
+// --- RUST CONTEXT SWITCH HANDLER ---
+#[no_mangle]
+pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
+    // 1. Tick the system clock
     crate::time::tick();
+    
+    // 2. Acknowledge the interrupt so the PIC sends the next one
     unsafe { PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8()); }
+
+    // 3. Ask the Scheduler for the next thread's stack pointer
+    unsafe {
+        if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
+            return scheduler.schedule(current_rsp);
+        }
+    }
+    
+    // If scheduler isn't initialized yet, return the same stack pointer to continue execution
+    current_rsp
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
@@ -223,31 +297,28 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              }
         },
-        // --- UPDATED SYSCALL 13: DYNAMIC SCHEDULER ---
-        13 => { 
+        13 => { // sys_fs_write (Dynamic Scheduler Submission)
              let name_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
              let data_slice = unsafe { core::slice::from_raw_parts(arg3 as *const u8, arg4 as usize) };
              
              if let Ok(name) = core::str::from_utf8(name_slice) {
-                 // 1. Copy data from User space to Kernel space (Heap)
-                 // This is CRITICAL. We can't use the raw pointers in the background thread
-                 // because the user program might have changed that memory by then.
                  let filename = alloc::string::String::from(name);
                  let data = data_slice.to_vec();
                  
-                 // 2. Submit a Generic Job to the Scheduler
-                 // "move" transfers ownership of filename/data into the closure
                  crate::scheduler::submit_job(move || {
-                     // This runs later in the background worker thread
                      let mut fs = crate::fs::FS.lock();
                      fs.write_file(&filename, &data);
                  });
                  
-                 // 3. Return Success Immediately
                  frame.rax = 1; 
              } else {
                  frame.rax = 0;
              }
+        },
+        14 => { 
+            // sys_get_context_switches
+            use core::sync::atomic::Ordering;
+            frame.rax = crate::scheduler::CONTEXT_SWITCHES.load(Ordering::Relaxed);
         },
         _ => {}
     }

@@ -2,7 +2,6 @@
 #![no_main]
 
 extern crate alloc;
-use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
 use alloc::vec::Vec;
 use alloc::vec;
@@ -17,6 +16,7 @@ use apps::terminal::Terminal;
 use apps::clock::Clock;
 use apps::editor::Editor;
 use apps::explorer::Explorer;
+use apps::monitor::SysMonitor;
 use gfx::draw;
 use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
@@ -70,10 +70,12 @@ pub extern "C" fn _start() -> ! {
     ];
     let mut z_order = [0, 1, 2, 3, 4];
 
+    // --- APP INITIALIZATION ---
     let mut my_terminal = Terminal::new();
     my_terminal.write_str("NyxOS Shell v0.6\nType 'ls' to list files.\n> ");
     let mut my_editor = Editor::new();
     let mut my_explorer = Explorer::new(); 
+    let mut my_monitor = SysMonitor::new();
 
     let mut show_start_menu = false;
     let mut is_dragging = false;
@@ -113,9 +115,22 @@ pub extern "C" fn _start() -> ! {
 
         if now / 1000 != last_second {
             last_second = now / 1000;
+            
+            // Mark Clock Dirty
             let clock_w = 220; let clock_h = 80;
             let clock_x = (screen_w / 2).saturating_sub(clock_w / 2);
             mark_dirty(clock_x, 60, clock_w, clock_h);
+            
+            // Update the system monitor backend
+            my_monitor.update_stats();
+
+            // If Sys Monitor is open, redraw it every second
+            for w in windows.iter() {
+                if w.id == 1 && w.exists {
+                    mark_dirty(w.x, w.y, w.w, w.h);
+                }
+            }
+
             needs_redraw = true;
         }
 
@@ -192,7 +207,6 @@ pub extern "C" fn _start() -> ! {
                 if let Some(i) = hit_z_index {
                     let idx = z_order[i];
                     
-                    // FIX: Temporarily copy needed values to avoid conflicting borrows
                     let old_w_idx = prev_active_idx;
                     let old_x = windows[old_w_idx].x;
                     let old_y = windows[old_w_idx].y;
@@ -207,7 +221,6 @@ pub extern "C" fn _start() -> ! {
                     windows[idx].active = true;
                     prev_active_idx = idx; target_idx = idx;
 
-                    // FIX: Re-borrow purely for read access values
                     let wx = windows[idx].x;
                     let wy = windows[idx].y;
                     let ww = windows[idx].w;
@@ -229,13 +242,9 @@ pub extern "C" fn _start() -> ! {
                         drag_off_y = my as isize - wy as isize;
                     }
                     else {
-                        // Pass click to App Logic
                         let rx = mx.saturating_sub(wx);
                         let ry = my.saturating_sub(wy);
-                        
-                        // UPDATED: Pass 'ww' (window width) to handle_click
                         if wid == 3 { my_editor.handle_click(rx, ry, ww); }
-                        
                         if wid == 4 { my_explorer.handle_click(rx, ry, ww); }
                     }
                     mark_dirty(wx, wy, ww, wh);
@@ -285,16 +294,16 @@ pub extern "C" fn _start() -> ! {
                     draw_window_rounded(&mut back_buffer, screen_w, screen_h, &windows[idx]);
                     if windows[idx].id == 0 { 
                          my_terminal.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
+                    } else if windows[idx].id == 1 {
+                        // Display Modular Sys Monitor
+                        my_monitor.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
+                    } else if windows[idx].id == 2 {
+                        draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 50, "NyxOS Help", 0xFFFFFFFF);
+                        draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 70, "v0.6 Beta", 0xFFAAAAAA);
                     } else if windows[idx].id == 3 {
                         my_editor.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     } else if windows[idx].id == 4 {
                         my_explorer.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
-                    } else if windows[idx].id == 1 {
-                        draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 50, "CPU: <1%", 0xFFFFFFFF);
-                        draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 70, "RAM: 32MB", 0xFFFFFFFF);
-                    } else if windows[idx].id == 2 {
-                        draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 50, "NyxOS Help", 0xFFFFFFFF);
-                        draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 70, "v0.6 Beta", 0xFFAAAAAA);
                     }
                 }
             }
@@ -348,7 +357,6 @@ fn launch_app(
         if w.id == id_to_launch { arr_idx = i; break; }
     }
     
-    // Copy values to avoid borrow issues
     let (wx, wy, ww, wh) = {
         let w = &windows[arr_idx];
         (w.x, w.y, w.w, w.h)
@@ -364,19 +372,19 @@ fn launch_app(
     for j in z_pos..(MAX_WINDOWS-1) { z_order[j] = z_order[j+1]; }
     z_order[MAX_WINDOWS-1] = arr_idx;
 
-    for w in windows.iter_mut() { w.active = (w.id == id_to_launch); }
+    for w in windows.iter_mut() { w.active = w.id == id_to_launch; }
 }
 
 fn draw_desktop_icons(fb: &mut [u32], w: usize, h: usize) {
     use crate::syscalls::{sys_fs_count, sys_fs_get_name};
-    let count = sys_fs_count("/"); // Pass root path
+    let count = sys_fs_count("/"); 
     let mut icon_x = 20;
     let mut icon_y = 20;
     let grid_h = 100; 
 
     for i in 0..count {
         let mut name_buf = [0u8; 32];
-        let len = sys_fs_get_name("/", i, &mut name_buf); // Pass root path
+        let len = sys_fs_get_name("/", i, &mut name_buf); 
         if len > 0 {
             if let Ok(name) = core::str::from_utf8(&name_buf[..len]) {
                 crate::gfx::ui::draw_file_icon(fb, w, h, icon_x, icon_y, name);
