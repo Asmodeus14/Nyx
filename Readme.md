@@ -46,6 +46,7 @@ fn main() -> int {
 
     return 0;
 }
+```
 Status
 Pre-alpha / Early Development Stage
 QCLang compiler is the most mature component
