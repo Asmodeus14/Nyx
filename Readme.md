@@ -1,7 +1,14 @@
-[![Rust](https://img.shields.io/badge/Rust-1.80+-000000?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-nightly%20%7C%201.80+-000000?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/Asmodeus14/Nyx/ci.yml?branch=master&label=build&logo=github)](https://github.com/Asmodeus14/Nyx/actions/workflows/Build.yml)
-[![Crates.io](https://img.shields.io/crates/v/nyx-kernel?label=nyx-kernel&logo=rust)](https://crates.io/crates/nyx-kernel)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/Asmodeus14/Nyx/ci.yml?branch=master&label=build&logo=github&color=green)](https://github.com/Asmodeus14/Nyx/actions/workflows/build.yaml)
+[![Dev Containers](https://img.shields.io/badge/Dev%20Containers-supported-blue?logo=visualstudiocode&logoColor=white&labelColor=007ACC&color=007ACC)](https://github.com/Asmodeus14/Nyx/tree/master/.devcontainer)
+[![Codespaces Ready](https://img.shields.io/badge/GitHub%20Codespaces-Ready-brightgreen?logo=github)](https://github.com/codespaces/new?hide_repo_select=true&ref=master&repo=Asmodeus14/Nyx)
+[![Repo Size](https://img.shields.io/github/repo-size/Asmodeus14/Nyx?color=informational&logo=github)](https://github.com/Asmodeus14/Nyx)
+[![Code Lines](https://img.shields.io/tokei/lines/github/Asmodeus14/Nyx?color=blueviolet)](https://github.com/Asmodeus14/Nyx)
+[![Last Commit](https://img.shields.io/github/last-commit/Asmodeus14/Nyx/master?color=important&logo=github)](https://github.com/Asmodeus14/Nyx/commits/master)
+[![Contributors](https://img.shields.io/github/contributors/Asmodeus14/Nyx?color=purple)](https://github.com/Asmodeus14/Nyx/graphs/contributors)
+[![Open Issues](https://img.shields.io/github/issues/Asmodeus14/Nyx?color=yellow)](https://github.com/Asmodeus14/Nyx/issues)
+[![Pull Requests](https://img.shields.io/github/issues-pr/Asmodeus14/Nyx?color=orange)](https://github.com/Asmodeus14/Nyx/pulls)
 [![GitHub stars](https://img.shields.io/github/stars/Asmodeus14/Nyx?style=social)](https://github.com/Asmodeus14/Nyx/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/Asmodeus14/Nyx?style=social)](https://github.com/Asmodeus14/Nyx/forks)
 [![Pre-Alpha](https://img.shields.io/badge/Status-Pre--Alpha-red?style=flat)](https://github.com/Asmodeus14/Nyx)
@@ -36,12 +43,13 @@ Nyx aims to be more than an OS: a unified platform where classical code, quantum
 
 ## Current Status
 
-**Pre-alpha / Early Development** (as of March 2026)
+**Pre-alpha / Early Development** (March 2026)
 
 - Most mature: **QCLang compiler** + syntax/runtime
-- In progress: **nyx-kernel** (Rust monolithic kernel with QCLang hooks)
+- In progress: **nyx-kernel** (Rust monolithic kernel with QCLang hooks, partial real-hardware boot)
 - Early stages: userspace, runtime libs, quantum simulation backend
-- No bootloader yet; runs in QEMU for now
+- Runs in QEMU; real hardware progress (Nouveau DRM handshake, etc.)
+- Dev environment: fully containerized via **Dev Containers** / Codespaces
 
 See [CHANGELOG.md](./CHANGELOG.md) for commit-level updates.
 
@@ -49,19 +57,20 @@ See [CHANGELOG.md](./CHANGELOG.md) for commit-level updates.
 
 ```text
 nyx/
-├── compiler/        # QCLang compiler, parser, codegen (Rust-inspired quantum lang)
-├── nyx-kernel/      # Custom monolithic Rust kernel (core + quantum extensions)
-├── nyx-user/        # Userspace binaries, init, services
-├── runtime/         # Core runtime libraries & syscalls
-├── runner/          # QEMU runner, disk images, test harness
-├── script/          # Build utilities, helpers
-├── .github/workflows/  # CI pipelines
-├── Build.sh         # Main one-command build script
-├── Cargo.toml       # Rust workspace (kernel + compiler + libs)
-├── SYNTAX.md        # Detailed QCLang language specification
-├── CLI.md           # Build/run CLI reference
-├── CONTRIBUTING.md  # How to contribute
-└── ... (see root for full list)
+├── .devcontainer/       # Dev Containers config → instant reproducible env
+├── .github/workflows/   # CI pipelines
+├── compiler/            # QCLang compiler, parser, codegen
+├── nyx-kernel/          # Custom monolithic Rust kernel + quantum extensions
+├── nyx-user/            # Userspace binaries, init, services
+├── runtime/             # Core runtime libraries & syscalls
+├── runner/              # QEMU runner, disk images, test harness
+├── script/              # Build utilities, helpers
+├── Build.sh             # One-command build script
+├── Cargo.toml           # Rust workspace
+├── SYNTAX.md            # QCLang language specification
+├── CLI.md               # Build/run CLI reference
+├── CONTRIBUTING.md      # How to contribute
+└── ... (full list in repo)
 Quick Start (Simulation Mode)
 Requires: Rust (nightly/toolchain pinned via rust-toolchain.toml), QEMU.
 Bashgit clone https://github.com/Asmodeus14/Nyx.git
