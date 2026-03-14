@@ -30,6 +30,9 @@ noto-sans-mono-bitmap = { version = "0.2.0", features = ["size_32"] }
 # Async
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
+# Cryptography
+sha3 = { version = "0.10", default-features = false }
+
 # --- FIX: Use GIT dependency for fatfs 0.4-dev ---
 # This version includes the modern IO traits and removes the broken core_io dependency.
 fatfs = { git = "https://github.com/rafalh/rust-fatfs.git", default-features = false, features = ["alloc", "unicode", "lfn"] }

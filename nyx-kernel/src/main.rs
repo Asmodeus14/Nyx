@@ -18,6 +18,7 @@ pub mod acpi;
 pub mod apic; 
 pub mod pci;  
 pub mod drm;  // <--- NEW: The Linux DRM Emulator for Mesa!
+pub mod entity; // <--- NEW: The Nyx Entity Core
 
 mod allocator;
 mod memory;
@@ -144,6 +145,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
     if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
+
+    // ==========================================
+    // PHASE 0: ENTITY BIRTH
+    // ==========================================
+    crate::entity::awaken_entity();
+    // ==========================================
 
     const PAGE_COUNT: u64 = 8192; 
     let _ = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Alloc User Failed");
