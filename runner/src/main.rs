@@ -15,6 +15,12 @@ fn main() {
     println!("UEFI IMAGE CREATED: {}", image_path.display());
     println!("--------------------------------------------------");
 
+    // Prevent QEMU from launching in GitHub Actions to avoid hangs/crashes
+    if env::var("CI").is_ok() {
+        println!("CI environment detected. Skipping QEMU execution.");
+        return;
+    }
+
     // 2. Launch QEMU with UEFI Support
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.arg("-bios").arg("/usr/share/OVMF/OVMF_CODE.fd"); // Required for UEFI images
