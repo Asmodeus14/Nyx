@@ -1,7 +1,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.80+-000000?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/Asmodeus14/Nyx/ci.yml?branch=master&label=build&logo=github)](https://github.com/Asmodeus14/Nyx/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/nyx-kernel?label=nyx-kernel&logo=rust)](https://crates.io/crates/nyx-kernel) <!-- Update crate name if published -->
+[![Build Status](https://img.shields.io/github/actions/workflow/status/Asmodeus14/Nyx/ci.yml?branch=master&label=build&logo=github)](https://github.com/Asmodeus14/Nyx/actions/workflows/Build.yml)
+[![Crates.io](https://img.shields.io/crates/v/nyx-kernel?label=nyx-kernel&logo=rust)](https://crates.io/crates/nyx-kernel)
 [![GitHub stars](https://img.shields.io/github/stars/Asmodeus14/Nyx?style=social)](https://github.com/Asmodeus14/Nyx/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/Asmodeus14/Nyx?style=social)](https://github.com/Asmodeus14/Nyx/forks)
 [![Pre-Alpha](https://img.shields.io/badge/Status-Pre--Alpha-red?style=flat)](https://github.com/Asmodeus14/Nyx)
