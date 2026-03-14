@@ -32,7 +32,7 @@ jobs:
           ./Build.sh
 
       - name: Fallback Kernel ELF Compilation
-        run: cargo build --package nyx-kernel --release
+        run: cargo build --package nyx-kernel --release --target x86_64-unknown-none
 
       - name: Stage Release Artifacts
         run: |
