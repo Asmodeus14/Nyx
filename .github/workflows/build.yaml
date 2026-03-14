@@ -1,0 +1,44 @@
+name: NyxOS Bare Metal Build
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch: # Allows manual triggering via GitHub CLI or Web UI
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Rust Nightly Toolchain
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rust-src, llvm-tools-preview
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Execute System Build.sh
+      run: |
+        chmod +x ./Build.sh
+        ./Build.sh
+
+    - name: Fallback Kernel ELF Compilation
+      run: cargo build --package nyx-kernel --release
+
+    - name: Archive Bare Metal Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nyxos-hardware-binaries
+        path: |
+          target/*/release/nyx-kernel
+          target/*/release/*.img
+          target/*/release/*.efi
+        if-no-files-found: warn

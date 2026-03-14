@@ -1,0 +1,22 @@
+{
+  "name": "NyxOS Systems Environment",
+  "build": {
+    "dockerfile": "DOCKERFILE",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.features": "all"
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "llvm-vs-code-extensions.vscode-clangd"
+      ]
+    }
+  },
+  "remoteUser": "vscode"
+}

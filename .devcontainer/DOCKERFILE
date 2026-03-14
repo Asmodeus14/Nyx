@@ -1,0 +1,22 @@
+FROM mcr.microsoft.com/devcontainers/rust:1-bullseye
+
+# Install tools required for raw UEFI/BIOS image generation. No QEMU.
+RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
+    && apt-get -y install --no-install-recommends \
+        mtools \
+        xorriso \
+        grub-pc-bin \
+        grub-efi-amd64-bin \
+        nasm \
+        lld \
+        clang \
+        llvm \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Force the environment into the nightly toolchain required for OS dev
+RUN rustup toolchain install nightly \
+    && rustup default nightly \
+    && rustup component add rust-src llvm-tools-preview
+
+# Force the linker to use LLD for bare-metal targets
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
