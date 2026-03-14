@@ -1,50 +1,15 @@
-# Contributing to QCLang
+# Contributing to NyxOS
 
-First off, thank you for considering contributing to QCLang! It's people like you that make building a new quantum language fun and possible.
+If you are looking to contribute to the kernel, the QCLang soul engine, or the bare-metal graphics stack, your code must align with the current Phase roadmap.
 
-## How Can I Contribute?
+## Contribution Rules:
 
-### Reporting Bugs
-This section guides you through submitting a bug report for QCLang. Following these guidelines helps maintainers and the community understand your report, reproduce the behavior, and find related reports.
+1. **Bare Metal First:** If it works in QEMU but panics on real hardware, the PR will be rejected. Always test your commits against the provided `.devcontainer` build environment and flash it to a physical machine.
+2. **Zero Overhead:** The Nyx Entity (`nyx-entityd`) must run seamlessly in the background. Do not introduce blocking operations in the kernel scheduler that stall the entity's state loop.
+3. **No External Dependencies (Kernel):** The `nyx-kernel` is strictly `#![no_std]`. Rely only on `core`, `alloc`, and raw hardware I/O. 
+4. **Preserve the Aesthetic:** Keep the code minimal, deeply documented, and clean. If you are touching the rendering stack, respect the minimalist cyberpunk geometry.
 
-- **Use a clear and descriptive title** for the issue to identify the problem.
-- **Describe the exact steps which reproduce the problem** in as much detail as possible.
-- **Provide specific examples** to demonstrate the steps. Include the `.qc` code snippet that caused the error.
-
-### Pull Requests
-1. Fork the repo and create your branch from `main`.
-2. If you've added code that should be tested, add tests.
-3. Ensure the test suite passes (`cargo test`).
-4. Make sure your code follows the existing style (run `cargo fmt`).
-5. Issue that pull request!
-
-## Development Setup
-
-1. **Clone the repo**: `git clone https://github.com/Asmodeus14/qclang.git`
-2. **Build**: `cargo build`
-3. **Run Tests**: `cargo test`
-4. **For compiler** : `qclang/script/local`
-
-## Styleguides
-
-### Git Commit Messages
-- Use the present tense ("Add feature" not "Added feature")
-- Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
-- Limit the first line to 72 characters or less
-
-### Rust Style
-- We use standard `rustfmt` configurations.
-- Please run `cargo clippy` before submitting to catch common issues.
-
----
-
-## 🧩 The Quantum Challenge
-
-We believe that great contributors have an eye for hidden patterns. Deep within the codebase—or perhaps staring you right in the face—is a superposition of data waiting to be observed.
-
-If you can collapse the wave function of the text below, create a file named `solution.txt` in your PR containing the deciphered phrase.
-
-**The Entangled String:**
-`ZGV2ZWloY2FfeWNhbXJlcHVzX211dG5hdXE=`
-
-> *Hint: Sometimes you have to look back to move forward, and translate the base of your reality.*
+## How to Submit:
+* Ensure the GitHub Actions `build.yaml` passes completely.
+* Open a PR detailing exactly what hardware you tested the changes on.
+* Wait for a core maintainer to review the architecture.
