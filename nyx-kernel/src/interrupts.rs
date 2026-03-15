@@ -325,20 +325,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              }
         },
-        13 => { // sys_fs_write (Dynamic Scheduler Submission)
+        13 => { // sys_fs_write (Synchronous Blocking I/O)
              let name_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
              let data_slice = unsafe { core::slice::from_raw_parts(arg3 as *const u8, arg4 as usize) };
              
              if let Ok(name) = core::str::from_utf8(name_slice) {
-                 let filename = alloc::string::String::from(name);
-                 let data = data_slice.to_vec();
+                 // 1. Lock the filesystem atomically inside the syscall
+                 let mut fs = crate::fs::FS.lock();
                  
-                 crate::scheduler::submit_job(move || {
-                     let mut fs = crate::fs::FS.lock();
-                     fs.write_file(&filename, &data);
-                 });
+                 // 2. Perform the compression and write immediately, 
+                 // blocking the caller until it is safely on the NVMe.
+                 let success = fs.write_file(name, data_slice);
                  
-                 frame.rax = 1; 
+                 frame.rax = if success { 1 } else { 0 }; 
              } else {
                  frame.rax = 0;
              }

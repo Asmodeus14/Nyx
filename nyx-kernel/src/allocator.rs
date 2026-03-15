@@ -7,7 +7,7 @@ use x86_64::{
 use linked_list_allocator::LockedHeap;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+pub const HEAP_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();

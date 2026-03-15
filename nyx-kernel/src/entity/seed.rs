@@ -7,7 +7,7 @@ pub static mut GENETIC_SEED: [u8; 32] = [0; 32];
 static SEED_LOCKED: AtomicBool = AtomicBool::new(false);
 
 // LBA 2000 is safely in the hidden gap between the GPT header and the first partition.
-const ENTITY_LBA: u64 = 32768;
+const ENTITY_LBA: u64 = 1000;
 const MAGIC_SIG: &[u8; 4] = b"NYX!";
 
 pub fn awaken_entity(nvme_opt: &mut Option<crate::drivers::nvme::NvmeDriver>) {

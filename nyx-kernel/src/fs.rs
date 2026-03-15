@@ -1,6 +1,5 @@
 use alloc::vec::Vec;
 use alloc::string::String;
-use alloc::boxed::Box;
 use spin::Mutex;
 use core::cmp;
 use core::convert::TryInto;
@@ -8,9 +7,62 @@ use alloc::format;
 
 use crate::drivers::nvme::NvmeDriver;
 use fatfs::{Read, Write, Seek, SeekFrom, IoBase};
-use crate::gui::{Painter, Color}; 
 
 const BLOCK_SIZE: u64 = 512;
+const MAGIC_SIG: &[u8; 4] = b"NYXZ";
+
+// ==========================================
+// NYX NATIVE LOSSLESS COMPRESSION ENGINE
+// 100% Heap-safe Run-Length Encoding. 
+// Never stack overflows.
+// ==========================================
+fn nyx_compress(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let current = data[i];
+        let mut run_len = 1;
+
+        // Count how many identical bytes are in a row (up to 255)
+        while i + run_len < data.len() && data[i + run_len] == current && run_len < 255 {
+            run_len += 1;
+        }
+
+        // 0xFD is our special marker byte. 
+        // We compress if we have a run of 4+ bytes, OR if the raw data actually contains 0xFD.
+        if run_len >= 4 || current == 0xFD {
+            out.push(0xFD); // Marker
+            out.push(run_len as u8); // Length
+            out.push(current); // The Byte
+            i += run_len;
+        } else {
+            out.push(current);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn nyx_decompress(data: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0xFD { // Found a compression marker!
+            if i + 2 >= data.len() { return Err(()); } // Prevent out-of-bounds crash
+            let run_len = data[i + 1];
+            let val = data[i + 2];
+            for _ in 0..run_len {
+                out.push(val);
+            }
+            i += 3;
+        } else { // Standard uncompressed byte
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+// ==========================================
 
 // --- ADAPTER ---
 pub struct NvmeStream {
@@ -52,9 +104,7 @@ impl Write for NvmeStream {
         let offset_in_block = (self.position % BLOCK_SIZE) as usize;
         let mut temp_block = [0u8; 4096];
         
-        if !self.driver.read_block(current_lba, &mut temp_block) { 
-            return Err(()); 
-        }
+        if !self.driver.read_block(current_lba, &mut temp_block) { return Err(()); }
         
         let bytes_available = (BLOCK_SIZE as usize) - offset_in_block;
         let bytes_to_copy = cmp::min(buf.len(), bytes_available);
@@ -84,7 +134,7 @@ impl Seek for NvmeStream {
 
 // --- FS MANAGER ---
 pub struct FileSystem {
-    inner: Option<fatfs::FileSystem<NvmeStream, fatfs::NullTimeProvider, fatfs::LossyOemCpConverter>>,
+    pub inner: Option<fatfs::FileSystem<NvmeStream, fatfs::NullTimeProvider, fatfs::LossyOemCpConverter>>,
     cache_path: String,
     cache_files: Vec<String>,
 }
@@ -95,8 +145,6 @@ impl FileSystem {
     }
 
     pub fn init(&mut self, mut driver: NvmeDriver) {
-        // if !driver.create_io_queues() { return; }
-        
         let mut sector0 = [0u8; 4096];
         let _ = driver.find_active_namespace();
         if !driver.read_block(0, &mut sector0) { return; }
@@ -134,9 +182,7 @@ impl FileSystem {
     }
 
     pub fn ls(&mut self, path: &str) -> Vec<String> {
-        if !self.cache_path.is_empty() && self.cache_path == path {
-            return self.cache_files.clone();
-        }
+        if !self.cache_path.is_empty() && self.cache_path == path { return self.cache_files.clone(); }
 
         let mut list = Vec::new();
         if let Some(fs) = &self.inner {
@@ -172,7 +218,19 @@ impl FileSystem {
                         Err(_) => return None,
                     }
                 }
-                return Some(buf);
+                
+                // DECOMPRESSION
+                if buf.len() >= 4 && &buf[0..4] == MAGIC_SIG {
+                    match nyx_decompress(&buf[4..]) {
+                        Ok(decompressed) => {
+                            crate::serial_println!("[FS] Nyx-Decompressed {} -> {} bytes.", buf.len(), decompressed.len());
+                            return Some(decompressed);
+                        },
+                        Err(_) => return Some(buf), // Corrupted, return raw
+                    }
+                } else {
+                    return Some(buf); // Legacy file
+                }
             }
         }
         None
@@ -183,11 +241,20 @@ impl FileSystem {
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
             let clean_name = if name.starts_with('/') { &name[1..] } else { name };
+            
+            // COMPRESSION
+            crate::serial_println!("[FS] Nyx-Compressing file '{}' ({} bytes)...", clean_name, data.len());
+            let compressed_payload = nyx_compress(data);
+            
+            let mut final_data = Vec::with_capacity(4 + compressed_payload.len());
+            final_data.extend_from_slice(MAGIC_SIG);
+            final_data.extend_from_slice(&compressed_payload);
+
+            crate::serial_println!("[FS] Compressed to {} bytes.", final_data.len());
+
             match root.create_file(clean_name) {
-                Ok(mut file) => {
-                    return file.write_all(data).is_ok();
-                },
-                Err(_) => { return false; }
+                Ok(mut file) => return file.write_all(&final_data).is_ok(),
+                Err(_) => return false,
             }
         }
         false
