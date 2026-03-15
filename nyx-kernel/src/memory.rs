@@ -205,3 +205,36 @@ pub fn map_user_mmio(phys_addr: u64, size: usize) -> Result<u64, &'static str> {
     unsafe { NEXT_MMIO_VIRT = current_virt; }
     Ok(virt_base)
 }
+
+// --- NEW: DYNAMIC USERSPACE HEAP ALLOCATOR ---
+pub fn allocate_user_heap_pages(num_pages: usize) -> Result<u64, &'static str> {
+    let mut system_lock = MEMORY_MANAGER.lock();
+    let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
+
+    // Start dynamic userspace heap at the 1GB mark (0x4000_0000)
+    static mut NEXT_HEAP_VIRT: u64 = 0x4000_0000;
+    let virt_base = unsafe { NEXT_HEAP_VIRT };
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    for i in 0..num_pages {
+        let addr = virt_base + (i as u64 * 4096);
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+        unsafe {
+            // Grab a fresh physical frame of RAM
+            let frame = system.frame_allocator.allocate_frame().ok_or("OOM: User Heap")?;
+            
+            // Map it to the virtual address with Ring-3 User access
+            match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                Ok(mapper) => mapper.flush(),
+                Err(_) => return Err("Map Failed: User Heap"),
+            }
+        }
+    }
+
+    // Move the tip forward for the next allocation
+    unsafe { NEXT_HEAP_VIRT += num_pages as u64 * 4096; }
+    
+    // Return the starting virtual address
+    Ok(virt_base)
+}

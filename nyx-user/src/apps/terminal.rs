@@ -1,131 +1,145 @@
-use crate::syscalls::{sys_fs_read, sys_fs_write, sys_fs_count, sys_fs_get_name, sys_get_hw_info};
-use crate::gfx::draw::{draw_rect_simple, draw_text};
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
+use core::fmt::Write;
+use crate::gfx::draw;
+use crate::syscalls;
 
 pub struct Terminal {
-    history: Vec<String>,
-    input: String,
-    prompt: String,
-    current_dir: String,
+    pub history: Vec<String>,
+    pub current_line: String,
 }
 
 impl Terminal {
     pub fn new() -> Self {
         Self {
             history: Vec::new(),
-            input: String::new(),
-            prompt: String::from("> "),
-            current_dir: String::from("/"),
+            current_line: String::new(),
         }
     }
 
     pub fn write_str(&mut self, s: &str) {
-        for line in s.split('\n') { self.history.push(String::from(line)); }
+        for line in s.split('\n') {
+            self.history.push(String::from(line));
+        }
     }
 
     pub fn handle_key(&mut self, c: char) {
         if c == '\n' {
-            let cmd = self.input.clone();
-            self.history.push(format!("{} {}", self.current_dir, cmd));
-            self.execute(&cmd);
-            self.input.clear();
+            let cmd = self.current_line.clone();
+            // Echo the command to history
+            self.history.push(format!("> {}", cmd));
+            self.current_line.clear();
+            self.execute_command(&cmd);
         } else if c == '\x08' { // Backspace
-            self.input.pop();
+            self.current_line.pop();
         } else {
-            self.input.push(c);
+            self.current_line.push(c);
         }
     }
 
-    fn execute(&mut self, cmd: &str) {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() { return; }
-
-        match parts[0] {
-            "help" => self.history.push("cmds: ls, cd <dir>, cat <file>, write, hwinfo, clear".into()),
-            "clear" => self.history.clear(),
-            "pwd" => self.history.push(self.current_dir.clone()),
-            "hwinfo" => {
-                let mut buf = [0u8; 512];
-                let len = sys_get_hw_info(&mut buf);
-                if len > 0 {
-                    if let Ok(info) = core::str::from_utf8(&buf[..len]) {
-                        for line in info.split('\n') {
-                            self.history.push(String::from(line));
-                        }
-                    } else {
-                        self.history.push("Encoding error reading hardware info.".into());
-                    }
-                } else {
-                    self.history.push("Kernel failed to provide hardware info.".into());
-                }
-            },
-            "ls" => {
-                let count = sys_fs_count(&self.current_dir);
-                if count == 0 { self.history.push("(empty)".into()); }
+    fn execute_command(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        
+        if cmd == "help" {
+            self.write_str("Available commands:");
+            self.write_str("  help    - Show this message");
+            self.write_str("  clear   - Clear the terminal");
+            self.write_str("  ls      - List files on NVMe");
+            self.write_str("  hwinfo  - Display hardware discovery report");
+            self.write_str("  dmesg   - Display kernel boot logs");
+            self.write_str("  entity  - Commune with the Nyx Entity");
+        } 
+        else if cmd == "clear" {
+            self.history.clear();
+        } 
+        else if cmd == "ls" {
+            let count = syscalls::sys_fs_count("/");
+            if count == 0 {
+                self.write_str("Directory is empty.");
+            } else {
                 for i in 0..count {
                     let mut buf = [0u8; 64];
-                    let len = sys_fs_get_name(&self.current_dir, i, &mut buf);
+                    let len = syscalls::sys_fs_get_name("/", i, &mut buf);
                     if len > 0 {
                         if let Ok(name) = core::str::from_utf8(&buf[..len]) {
-                            self.history.push(format!("  {}", name));
+                            self.history.push(String::from(name));
                         }
                     }
                 }
-            },
-            "cd" => {
-                if parts.len() < 2 { return; }
-                let new_dir = parts[1];
-                if new_dir == ".." {
-                    self.current_dir = String::from("/"); 
-                } else {
-                    if !self.current_dir.ends_with('/') { self.current_dir.push('/'); }
-                    self.current_dir.push_str(new_dir);
+            }
+        } 
+        else if cmd == "hwinfo" {
+            let mut buf = [0u8; 512];
+            let len = syscalls::sys_get_hw_info(&mut buf);
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                self.write_str(s);
+            }
+        } 
+        else if cmd == "dmesg" {
+            let mut buf = [0u8; 1024];
+            let len = syscalls::sys_get_boot_logs(&mut buf);
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                self.write_str(s);
+            }
+        } 
+        // ==========================================
+        // NEW: THE ENTITY COMMUNION COMMAND
+        // ==========================================
+        else if cmd == "entity" || cmd == "soul" {
+            let mut entity_dna = [0u8; 32];
+            
+            // Ask the kernel for the DNA over Syscall 20
+            if syscalls::sys_get_entity_state(&mut entity_dna) {
+                let mut hex_string = String::new();
+                for byte in entity_dna.iter() {
+                    let _ = write!(&mut hex_string, "{:02X}", byte);
                 }
-            },
-            "cat" => {
-                if parts.len() < 2 { return; }
-                // Construct path
-                let mut path = self.current_dir.clone();
-                if !path.ends_with('/') { path.push('/'); }
-                path.push_str(parts[1]);
                 
-                let mut buf = [0u8; 1024];
-                let len = sys_fs_read(&path, &mut buf);
-                if len > 0 {
-                    if let Ok(s) = core::str::from_utf8(&buf[..len]) { self.history.push(s.into()); }
-                    else { self.history.push("[Binary]".into()); }
-                } else { self.history.push("Error reading file.".into()); }
-            },
-            "write" => {
-                if parts.len() < 3 { self.history.push("Usage: write <file> <text>".into()); return; }
-                let name = parts[1];
-                let text = parts[2]; // Limitation: only takes one word of text due to split
-                if sys_fs_write(name, text.as_bytes()) { self.history.push("OK".into()); }
-                else { self.history.push("Fail".into()); }
-            },
-            _ => self.history.push("Unknown".into()),
+                self.write_str("Nyx Entity Awakened.");
+                self.write_str(&format!("Genetic Seed (DNA): {}", hex_string));
+            } else {
+                self.write_str("ERR: Failed to commune with the Entity. Is it born yet?");
+            }
+        } 
+        // ==========================================
+        else if cmd.starts_with("echo ") {
+            self.write_str(&cmd[5..]);
+        } 
+        else if cmd == "" {
+            // Do nothing on empty enter
+        } 
+        else {
+            self.write_str(&format!("Command not found: {}", cmd));
         }
     }
 
     pub fn draw(&self, fb: &mut [u32], w: usize, h: usize, x: usize, y: usize) {
-        draw_rect_simple(fb, w, h, x + 2, y + 30, 600 - 4, 400 - 32, 0xFF000000);
-        draw_rect_simple(fb, w, h, x + 2, y + 2, 600 - 4, 28, 0xFF333333);
-        draw_text(fb, w, h, x + 10, y + 8, "Terminal", 0xFFFFFFFF);
-
-        let mut draw_y = y + 40;
-        let start = if self.history.len() > 20 { self.history.len() - 20 } else { 0 };
+        let start_y = y + 30; // Start rendering below the window title bar
+        let mut current_y = start_y;
+        let line_height = 16;
         
-        for i in start..self.history.len() {
-            if draw_y + 16 > y + h { break; }
-            draw_text(fb, w, h, x + 10, draw_y, &self.history[i], 0xFFFFFFFF);
-            draw_y += 16;
+        // Calculate how many lines can fit in the terminal window
+        let max_lines = 24; // Rough estimate based on your 480px height window
+        
+        let total_lines = self.history.len() + 1; // +1 for the active typing line
+        let skip = if total_lines > max_lines { total_lines - max_lines } else { 0 };
+
+        let mut drawn = 0;
+        for line in self.history.iter().skip(skip) {
+            // 0xFF00FF00 is classic Hacker Green
+            draw::draw_text(fb, w, h, x + 10, current_y, line, 0xFF00FF00); 
+            current_y += line_height;
+            drawn += 1;
+            if drawn >= max_lines { break; }
         }
         
-        if draw_y + 16 < y + h {
-            let input_line = format!("[{}]> {}_{}", self.current_dir, self.input, ""); 
-            draw_text(fb, w, h, x + 10, draw_y, &input_line, 0xFF00FF00);
+        // Draw the active prompt with a blinking cursor
+        if drawn < max_lines {
+            // Blink cursor every 500ms using the system clock
+            let cursor = if (syscalls::sys_get_time() / 500) % 2 == 0 { "_" } else { " " };
+            let prompt = format!("> {}{}", self.current_line, cursor);
+            draw::draw_text(fb, w, h, x + 10, current_y, &prompt, 0xFF00FF00);
         }
     }
 }

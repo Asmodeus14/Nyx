@@ -430,6 +430,33 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = copy_len as u64;
             }
         },
+        19 => {
+            let num_pages = arg1 as usize;
+            // Ask the memory manager for the pages
+            match crate::memory::allocate_user_heap_pages(num_pages) {
+                Ok(virt_addr) => frame.rax = virt_addr,
+                Err(_) => frame.rax = 0, // 0 = Null pointer (Out of Memory)
+            }
+        },
+        20 => {
+            let buf_ptr = arg1 as *mut u8;
+            let buf_len = arg2 as usize;
+            
+            // The Genetic Seed is exactly 32 bytes (SHA3-256)
+            if buf_len >= 32 { 
+                unsafe {
+                    // Read the immutable soul directly from the kernel module
+                    let seed = &crate::entity::seed::GENETIC_SEED;
+                    for i in 0..32 {
+                        *buf_ptr.add(i) = seed[i];
+                    }
+                }
+                frame.rax = 1; // Success
+            } else {
+                frame.rax = 0; // Buffer provided by userspace is too small!
+            }
+        },
         _ => {}
+    
     }
 }

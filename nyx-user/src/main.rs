@@ -22,8 +22,6 @@ use apps::bootlog::BootlogApp;
 use gfx::draw;
 use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
-const HEAP_SIZE: usize = 8 * 1024 * 1024; 
-static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -33,7 +31,23 @@ const MAX_WINDOWS: usize = 7;
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    unsafe { ALLOCATOR.lock().init(HEAP_MEM.as_mut_ptr() as usize, HEAP_SIZE); }
+    // ---------------------------------------------------------
+    // NEW: DYNAMIC HEAP INITIALIZATION
+    // Request 2048 pages (8 MB) from the Kernel dynamically
+    const HEAP_PAGES: usize = 2048; 
+    let heap_start = sys_alloc_pages(HEAP_PAGES);
+    
+    if heap_start == 0 { 
+        // If the kernel returns 0, we are Out of Memory. Abort.
+        sys_print("FATAL: Failed to allocate userspace heap!\n");
+        sys_exit(1); 
+    }
+    
+    unsafe { 
+        // Give the memory to the linked-list allocator!
+        ALLOCATOR.lock().init(heap_start as usize, HEAP_PAGES * 4096); 
+    }
+    // ---------------------------------------------------------
 
     let (screen_w, screen_h, screen_stride) = sys_get_screen_info();
     if screen_w == 0 || screen_h == 0 { sys_exit(1); }

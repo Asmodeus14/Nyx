@@ -17,7 +17,21 @@ pub const SYS_OPEN: u64 = 15;
 pub const SYS_IOCTL: u64 = 16;
 pub const SYS_GET_BOOT_LOGS: u64 = 18;
 pub const SYS_MMAP: u64 = 9;
+// Add this near the top with your other constants
+pub const SYS_ALLOC_PAGES: u64 = 19;
+// Add this near your other constants at the top:
+pub const SYS_GET_ENTITY_STATE: u64 = 20;
 
+// Add this wrapper function at the bottom:
+pub fn sys_get_entity_state(buffer: &mut [u8; 32]) -> bool {
+    // We pass the pointer to our 32-byte array and its length
+    syscall(SYS_GET_ENTITY_STATE, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0, 0) == 1
+}
+
+// Add this wrapper function
+pub fn sys_alloc_pages(num_pages: usize) -> u64 {
+    syscall(SYS_ALLOC_PAGES, num_pages as u64, 0, 0, 0, 0)
+}
 pub fn sys_mmap(fd: i32, size: usize, offset: usize) -> u64 {
     syscall(SYS_MMAP, fd as u64, size as u64, offset as u64, 0, 0)
 }
