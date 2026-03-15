@@ -17,8 +17,8 @@ pub mod vfs;
 pub mod acpi;
 pub mod apic; 
 pub mod pci;  
-pub mod drm;  // <--- NEW: The Linux DRM Emulator for Mesa!
-pub mod entity; // <--- NEW: The Nyx Entity Core
+pub mod drm;  
+pub mod entity; // <--- The Nyx Entity Core
 
 mod allocator;
 mod memory;
@@ -143,13 +143,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     x86_64::instructions::interrupts::enable();
 
+    // ==========================================
+    // NVMe INITIALIZATION & ENTITY BIRTH
+    // ==========================================
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
-    if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
 
-    // ==========================================
-    // PHASE 0: ENTITY BIRTH
-    // ==========================================
-    crate::entity::awaken_entity();
+    if let Some(ref mut driver) = nvme_driver_opt {
+        // 1. Create IO Queues ONCE in main so the Entity can read/write the silicon
+        driver.create_io_queues();
+    }
+
+    // 2. Awaken the Entity from the raw drive (LBA 32768)
+    crate::entity::awaken_entity(&mut nvme_driver_opt);
+
+    // 3. Hand ownership of the driver completely over to the filesystem
+    // (Because we removed line 66 in fs.rs, it will no longer crash here)
+    if let Some(driver) = nvme_driver_opt { 
+        crate::fs::FS.lock().init(driver); 
+    }
     // ==========================================
 
     const PAGE_COUNT: u64 = 8192; 

@@ -95,7 +95,7 @@ impl FileSystem {
     }
 
     pub fn init(&mut self, mut driver: NvmeDriver) {
-        if !driver.create_io_queues() { return; }
+        // if !driver.create_io_queues() { return; }
         
         let mut sector0 = [0u8; 4096];
         let _ = driver.find_active_namespace();
