@@ -21,6 +21,14 @@ pub const SYS_MMAP: u64 = 9;
 pub const SYS_ALLOC_PAGES: u64 = 19;
 // Add this near your other constants at the top:
 pub const SYS_GET_ENTITY_STATE: u64 = 20;
+// Add this near your other constants at the top:
+pub const SYS_GET_ENTITY_STATS: u64 = 21;
+
+// Add this wrapper function at the bottom:
+pub fn sys_get_entity_stats(stats: &mut [f32; 4]) -> bool {
+    // We pass the pointer to our array of 4 floats
+    syscall(SYS_GET_ENTITY_STATS, stats.as_mut_ptr() as u64, 4, 0, 0, 0) == 1
+}
 
 // Add this wrapper function at the bottom:
 pub fn sys_get_entity_state(buffer: &mut [u8; 32]) -> bool {

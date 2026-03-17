@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Bootloader
-bootloader_api = "0.11"
+bootloader_api = "0.11.15"
 
 # Architecture
 x86_64 = "0.14.13"
@@ -33,13 +33,23 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 # Cryptography
 sha3 = { version = "0.10", default-features = false }
 
-
+aml = "0.16.4"
+smoltcp = { version = "0.9.1", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-icmp", "socket-tcp"] }
 
 # --- FIX: Use GIT dependency for fatfs 0.4-dev ---
 # This version includes the modern IO traits and removes the broken core_io dependency.
 fatfs = { git = "https://github.com/rafalh/rust-fatfs.git", default-features = false, features = ["alloc", "unicode", "lfn"] }
 
+[build-dependencies]
+bindgen = "0.69.1"
+cc = "1.0"
+
 
 [package.metadata.bootloader]
 map-physical-memory = true
 run-args = ["-display", "none", "-serial", "stdio"]
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

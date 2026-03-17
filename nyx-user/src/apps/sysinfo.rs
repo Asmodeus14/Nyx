@@ -1,32 +1,62 @@
+use alloc::format;
 use crate::gfx::draw;
 use crate::syscalls;
-use alloc::string::String;
 
 pub struct SysInfoApp {
-    info_text: String,
+    last_update: usize,
+    stats: [f32; 4], // [Energy, Entropy, Stability, Curiosity]
 }
 
 impl SysInfoApp {
     pub fn new() -> Self {
-        let mut buf = [0u8; 512];
-        let len = syscalls::sys_get_hw_info(&mut buf);
-        let info = if len > 0 {
-            core::str::from_utf8(&buf[..len]).unwrap_or("Encoding Error").into()
-        } else {
-            "Kernel failed to provide hardware info.".into()
-        };
-        
-        Self { info_text: info }
+        Self {
+            last_update: 0,
+            stats: [0.0; 4],
+        }
     }
 
-    pub fn draw(&mut self, fb: &mut [u32], screen_w: usize, screen_h: usize, window_x: usize, window_y: usize) {
-        let content_x = window_x + 20;
-        let mut content_y = window_y + 40;
+    pub fn draw(&mut self, fb: &mut [u32], w: usize, h: usize, x: usize, y: usize) {
+        let now = syscalls::sys_get_time();
         
-        for line in self.info_text.split('\n') {
-            // Draw in "Hacker Green" to fit the aesthetic!
-            draw::draw_text(fb, screen_w, screen_h, content_x, content_y, line, 0xFF00FF00); 
-            content_y += 20;
+        // Only ping the kernel for new stats every 100ms so we don't spam Syscalls
+        if now.wrapping_sub(self.last_update) > 100 {
+            syscalls::sys_get_entity_stats(&mut self.stats);
+            self.last_update = now;
         }
+
+        let start_y = y + 40;
+        let pad_x = x + 20;
+
+        // Static System Info
+        draw::draw_text(fb, w, h, pad_x, start_y, "NyxOS v0.6 [Kernel Ring-0]", 0xFF00AAFF);
+        draw::draw_text(fb, w, h, pad_x, start_y + 25, "Architecture: x86_64", 0xFFDDDDDD);
+        draw::draw_text(fb, w, h, pad_x, start_y + 45, "NVMe Lossless Compression: ACTIVE", 0xFF00FF00);
+
+        // Entity Vitals Header
+        draw::draw_text(fb, w, h, pad_x, start_y + 80, "ENTITY LIVE TELEMETRY", 0xFFFF00FF);
+        draw::draw_rect_simple(fb, w, h, pad_x, start_y + 98, 300, 1, 0xFF555555);
+
+        // Helper function to draw a data bar
+        let mut draw_bar = |label: &str, value: f32, y_offset: usize, color: u32| {
+            let bar_y = start_y + y_offset;
+            let val_str = format!("{}: {:.2}", label, value);
+            draw::draw_text(fb, w, h, pad_x, bar_y, &val_str, 0xFFFFFFFF);
+            
+            // Bar Background
+            draw::draw_rect_simple(fb, w, h, pad_x, bar_y + 18, 200, 8, 0xFF222222);
+            
+            // Filled Bar (clamp value between 0 and 100 for width calc)
+            let fill_width = ((value.clamp(0.0, 100.0) / 100.0) * 200.0) as usize;
+            if fill_width > 0 {
+                draw::draw_rect_simple(fb, w, h, pad_x, bar_y + 18, fill_width, 8, color);
+            }
+        };
+
+        // Render the 4 states!
+        // Energy (Red), Entropy (Cyan), Stability (Green), Curiosity (Yellow)
+        draw_bar("Energy", self.stats[0], 110, 0xFFFF3333);
+        draw_bar("Entropy", self.stats[1], 150, 0xFF00FFFF);
+        draw_bar("Stability", self.stats[2], 190, 0xFF33FF33);
+        draw_bar("Curiosity", self.stats[3], 230, 0xFFFFFF00);
     }
 }

@@ -38,7 +38,7 @@ impl Terminal {
         }
     }
 
-    fn execute_command(&mut self, cmd: &str) {
+fn execute_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
         
         if cmd == "help" {
@@ -46,7 +46,8 @@ impl Terminal {
             self.write_str("  help    - Show this message");
             self.write_str("  clear   - Clear the terminal");
             self.write_str("  ls      - List files on NVMe");
-            self.write_str("  hwinfo  - Display hardware discovery report");
+            self.write_str("  lspci   - List PCI devices (Hardware Scan)");
+            self.write_str("  uptime  - Show system uptime");
             self.write_str("  dmesg   - Display kernel boot logs");
             self.write_str("  entity  - Commune with the Nyx Entity");
         } 
@@ -54,6 +55,7 @@ impl Terminal {
             self.history.clear();
         } 
         else if cmd == "ls" {
+            // ... (keep existing ls logic) ...
             let count = syscalls::sys_fs_count("/");
             if count == 0 {
                 self.write_str("Directory is empty.");
@@ -69,13 +71,23 @@ impl Terminal {
                 }
             }
         } 
-        else if cmd == "hwinfo" {
-            let mut buf = [0u8; 512];
+        // ==========================================
+        // THE LSPCI & UPTIME COMMANDS
+        // ==========================================
+        else if cmd == "lspci" || cmd == "hwinfo" {
+            // Increased buffer to 1024 to ensure we catch the whole PCI bus
+            let mut buf = [0u8; 1024]; 
             let len = syscalls::sys_get_hw_info(&mut buf);
             if let Ok(s) = core::str::from_utf8(&buf[..len]) {
                 self.write_str(s);
             }
         } 
+        else if cmd == "uptime" {
+            let ticks = syscalls::sys_get_time();
+            let seconds = ticks / 1000;
+            self.write_str(&format!("Uptime: {} seconds ({} ticks)", seconds, ticks));
+        }
+        // ==========================================
         else if cmd == "dmesg" {
             let mut buf = [0u8; 1024];
             let len = syscalls::sys_get_boot_logs(&mut buf);
@@ -83,6 +95,7 @@ impl Terminal {
                 self.write_str(s);
             }
         } 
+
         // ==========================================
         // NEW: THE ENTITY COMMUNION COMMAND
         // ==========================================

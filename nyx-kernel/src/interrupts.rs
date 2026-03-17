@@ -227,7 +227,20 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  p.draw_rect(rect, color);
              }
         },
-        4 => { use core::sync::atomic::Ordering; frame.rax = crate::time::TICKS.load(Ordering::Relaxed); },
+        // --- UPDATED SYSCALL 4 (Time) ---
+       // --- UPDATED SYSCALL 4 (Time) ---
+        4 => { 
+            // The legacy PIC is dead, so we read the CPU's physical heartbeat directly!
+            let mut lo: u32;
+            let mut hi: u32;
+            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+            
+            let tsc = ((hi as u64) << 32) | (lo as u64);
+            
+            // Divide the raw CPU cycles to get an approximate millisecond counter.
+            // (Assuming an average 2.0 GHz CPU speed: 2,000,000 cycles = 1 ms)
+            frame.rax = tsc / 2_000_000; 
+        },
         5 => { 
             let m = crate::mouse::MOUSE_STATE.lock();
             frame.rax = (m.x as u64) << 32 | (m.y as u64) << 16 | (if m.left_click {1} else {0}) << 1 | (if m.right_click {1} else {0});
@@ -453,6 +466,24 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 1; // Success
             } else {
                 frame.rax = 0; // Buffer provided by userspace is too small!
+            }
+        },
+        21 => {
+            // We expect userspace to pass a pointer to an array of four f32s
+            let buf_ptr = arg1 as *mut f32;
+            let buf_len = arg2 as usize;
+            
+            if buf_len >= 4 {
+                unsafe {
+                    // Pull the live floating-point values from the background soul
+                    *buf_ptr.add(0) = crate::entity::state::ENTITY_STATE.get_energy();
+                    *buf_ptr.add(1) = crate::entity::state::ENTITY_STATE.get_entropy();
+                    *buf_ptr.add(2) = crate::entity::state::ENTITY_STATE.get_stability();
+                    *buf_ptr.add(3) = crate::entity::state::ENTITY_STATE.get_curiosity();
+                }
+                frame.rax = 1; // Success
+            } else {
+                frame.rax = 0; // Buffer too small
             }
         },
         _ => {}

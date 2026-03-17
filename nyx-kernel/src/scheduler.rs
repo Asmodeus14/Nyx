@@ -173,5 +173,14 @@ pub extern "C" fn background_worker() {
 
         if let Some(job) = job_opt { job(); } 
         else { for _ in 0..10_000 { core::hint::spin_loop(); } }
+        // Let the Entity breathe and evolve
+        crate::entity::state::evolve_state();
+        
+        // Pause briefly so we don't melt the CPU
+        for _ in 0..100_000 { unsafe { core::arch::asm!("nop"); } }
+        crate::drivers::net::poll_network();
+        
+        // Yield to let other threads run
+        x86_64::instructions::hlt();
     }
 }

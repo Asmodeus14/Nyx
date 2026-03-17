@@ -1,0 +1,5 @@
+--- Building User App ---
+--- Copying Binary ---
+--- verifying nyx-user.bin ---
+  Entry point address:               0x2000000
+--- Running Kernel ---

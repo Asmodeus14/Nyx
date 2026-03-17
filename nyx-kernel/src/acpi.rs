@@ -1,88 +1,94 @@
-use core::slice;
-use crate::memory::phys_to_virt;
+// Turn off Rust's strict naming rules so it doesn't complain about C-style variable names
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(dead_code)]
 
-#[repr(C, packed)]
-struct RsdpDescriptor {
-    signature: [u8; 8],
-    checksum: u8,
-    oem_id: [u8; 6],
-    revision: u8,
-    rsdt_address: u32,
-}
+// ==========================================
+// 1. INJECT THE GENERATED C-TO-RUST BINDINGS
+// ==========================================
+include!(concat!(env!("OUT_DIR"), "/acpi_bindings.rs"));
 
-#[repr(C, packed)]
-struct RsdpDescriptor20 {
-    first_part: RsdpDescriptor,
-    length: u32,
-    xsdt_address: u64,
-    extended_checksum: u8,
-    reserved: [u8; 3],
-}
-
-#[repr(C, packed)]
-struct SdtHeader {
-    signature: [u8; 4],
-    length: u32,
-    revision: u8,
-    checksum: u8,
-    oem_id: [u8; 6],
-    oem_table_id: [u8; 8],
-    oem_revision: u32,
-    creator_id: u32,
-    creator_revision: u32,
-}
-
-pub struct AcpiTables {
+// Legacy ACPI info to keep the PCI module compiling while we transition
+// Legacy ACPI info to keep the PCI module compiling while we transition
+pub struct AcpiInfo {
+    pub rsdp_addr: Option<u64>,
     pub mcfg_addr: Option<u64>,
-    pub madt_addr: Option<u64>,
+    pub madt_addr: Option<u64>, // <--- ADDED BACK FOR apic.rs
+}
+pub static mut ACPI_INFO: AcpiInfo = AcpiInfo { 
+    rsdp_addr: None, 
+    mcfg_addr: None, 
+    madt_addr: None 
+};
+pub fn init(rsdp: u64) {
+    unsafe { ACPI_INFO.rsdp_addr = Some(rsdp); }
 }
 
-pub static mut ACPI_INFO: AcpiTables = AcpiTables { mcfg_addr: None, madt_addr: None };
-
-pub fn init(rsdp_physical_addr: u64) {
-    crate::serial_println!("[ACPI] Found RSDP at physical address: {:#x}", rsdp_physical_addr);
-    crate::vga_println!("[ACPI] Found RSDP at physical address: {:#x}", rsdp_physical_addr);
-
-    let rsdp_virt = phys_to_virt(rsdp_physical_addr).expect("Failed to map RSDP");
-    let rsdp = unsafe { &*(rsdp_virt as *const RsdpDescriptor) };
-    let sig = core::str::from_utf8(&rsdp.signature).unwrap_or("INVALID");
+// ==========================================
+// 2. THE NEW INTEL INIT SEQUENCE
+// ==========================================
+pub fn init_intel_acpica() {
+    crate::serial_println!("[ACPI] Booting Intel ACPICA Engine...");
     
-    if sig != "RSD PTR " { return; }
-
-    let mut xsdt_virt = 0;
-    let mut entries_count = 0;
-    let mut is_xsdt = false;
-
-    if rsdp.revision >= 2 {
-        let rsdp20 = unsafe { &*(rsdp_virt as *const RsdpDescriptor20) };
-        xsdt_virt = phys_to_virt(rsdp20.xsdt_address).unwrap();
-        let header = unsafe { &*(xsdt_virt as *const SdtHeader) };
-        entries_count = (header.length as usize - core::mem::size_of::<SdtHeader>()) / 8;
-        is_xsdt = true;
-    } else {
-        xsdt_virt = phys_to_virt(rsdp.rsdt_address as u64).unwrap();
-        let header = unsafe { &*(xsdt_virt as *const SdtHeader) };
-        entries_count = (header.length as usize - core::mem::size_of::<SdtHeader>()) / 4;
-    }
-
-    let entry_base = xsdt_virt + core::mem::size_of::<SdtHeader>() as u64;
-    
-    for i in 0..entries_count {
-        let table_phys_addr = if is_xsdt {
-            unsafe { *((entry_base + (i * 8) as u64) as *const u64) }
-        } else {
-            unsafe { *((entry_base + (i * 4) as u64) as *const u32) as u64 }
-        };
-
-        if let Some(table_virt) = phys_to_virt(table_phys_addr) {
-            let header = unsafe { &*(table_virt as *const SdtHeader) };
-            if let Ok(sig) = core::str::from_utf8(&header.signature) {
-                if sig == "MCFG" {
-                    unsafe { ACPI_INFO.mcfg_addr = Some(table_phys_addr); }
-                } else if sig == "APIC" {
-                    unsafe { ACPI_INFO.madt_addr = Some(table_phys_addr); }
-                }
-            }
+    unsafe {
+        // 1. Boot the core engine
+        let mut status = AcpiInitializeSubsystem();
+        if status != 0 {
+            crate::serial_println!("[ACPI] FATAL: Subsystem Init Failed! Status: {}", status);
+            return;
         }
+
+        // 2. Copy the ACPI tables from the motherboard into our memory
+        crate::serial_println!("[ACPI] Initializing ACPI Tables...");
+        status = AcpiInitializeTables(core::ptr::null_mut(), 16, 0);
+        if status != 0 {
+            crate::serial_println!("[ACPI] FATAL: Table Init Failed! Status: {}", status);
+            return;
+        }
+
+        // 3. Build the Hardware Namespace Tree
+        crate::serial_println!("[ACPI] Loading Hardware Namespace...");
+        status = AcpiLoadTables();
+        if status != 0 {
+            crate::serial_println!("[ACPI] FATAL: Namespace Load Failed! Status: {}", status);
+            return;
+        }
+
+        // 4. Transition the motherboard from Legacy mode to ACPI mode
+        crate::serial_println!("[ACPI] Enabling ACPI Hardware Mode...");
+        status = AcpiEnableSubsystem(0);
+        if status != 0 {
+            crate::serial_println!("[ACPI] FATAL: Subsystem Enable Failed! Status: {}", status);
+            return;
+        }
+
+        // 5. Execute the `_INI` methods to turn on the hidden hardware (like the Wi-Fi card!)
+        crate::serial_println!("[ACPI] Initializing Hardware Objects...");
+        status = AcpiInitializeObjects(0);
+        if status != 0 {
+            crate::serial_println!("[ACPI] FATAL: Object Init Failed! Status: {}", status);
+            return;
+        }
+
+        crate::serial_println!("[ACPI] Intel ACPICA is FULLY ONLINE.");
+    }
+}
+// ==========================================
+// 3. CUSTOM ACPI METHODS
+// ==========================================
+extern "C" {
+    fn acpi_wake_cnvi_wifi() -> i32;
+}
+
+pub fn power_on_wifi_via_acpi() -> bool {
+    crate::serial_println!("[ACPI] Hunting for CNVi Wi-Fi node in motherboard namespace...");
+    let result = unsafe { acpi_wake_cnvi_wifi() };
+    if result != 0 {
+        crate::serial_println!("[ACPI] SUCCESS: Executed _PS0! Motherboard relay is OPEN. Power is flowing.");
+        true
+    } else {
+        crate::serial_println!("[ACPI] ERR: Could not find or power on CNVi node.");
+        false
     }
 }

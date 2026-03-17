@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(c_variadic)]
 #![allow(static_mut_refs)]
 
 extern crate alloc;
@@ -18,7 +19,8 @@ pub mod acpi;
 pub mod apic; 
 pub mod pci;  
 pub mod drm;  
-pub mod entity; // <--- The Nyx Entity Core
+pub mod entity; 
+pub mod c_stubs; // <--- The C memory stubs we just added
 
 mod allocator;
 mod memory;
@@ -116,12 +118,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     crate::vga_println!("[INIT] Graphics initialized.");
-
+    if let Some(offset) = boot_info.physical_memory_offset.into_option() {
+        unsafe {
+    crate::memory::PHYS_MEM_OFFSET = offset;
+}
+    }
     // ==========================================
     // HARDWARE ENUMERATION PHASE
     // ==========================================
     if let Some(rsdp_addr) = boot_info.rsdp_addr.into_option() {
+        
+        // Keep the legacy init so PCI doesn't complain during compile
         acpi::init(rsdp_addr);
+        
+        // NEW: Call the Intel ACPICA initialization!
+        acpi::init_intel_acpica();
+        
         apic::init();
         crate::pci::enumerate_pci();
     } else {
@@ -149,15 +161,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
 
     if let Some(ref mut driver) = nvme_driver_opt {
-        // 1. Create IO Queues ONCE in main so the Entity can read/write the silicon
         driver.create_io_queues();
     }
 
-    // 2. Awaken the Entity from the raw drive (LBA 32768)
     crate::entity::awaken_entity(&mut nvme_driver_opt);
 
-    // 3. Hand ownership of the driver completely over to the filesystem
-    // (Because we removed line 66 in fs.rs, it will no longer crash here)
     if let Some(driver) = nvme_driver_opt { 
         crate::fs::FS.lock().init(driver); 
     }

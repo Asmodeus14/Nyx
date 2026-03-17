@@ -3,7 +3,9 @@ use x86_64::instructions::port::Port;
 use crate::memory::phys_to_virt;
 use crate::acpi::ACPI_INFO;
 
-// --- LEGACY PCI (For NVMe & AHCI) ---
+// ==========================================
+// 1. LEGACY PCI STRUCTURES
+// ==========================================
 #[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
     pub bus: u8,
@@ -20,7 +22,7 @@ pub struct PciDriver;
 impl PciDriver {
     pub fn new() -> Self { Self }
 
-    fn read_config(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
+    pub fn read_config(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
         let address = 0x80000000 | ((bus as u32) << 16) | ((device as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
         let mut port_addr: Port<u32> = Port::new(0xCF8);
         let mut port_data: Port<u32> = Port::new(0xCFC);
@@ -34,16 +36,18 @@ impl PciDriver {
         let mut devices = Vec::new();
         for bus in 0..=255 {
             for device in 0..32 {
-                let vendor = Self::read_config(bus, device, 0, 0) as u16;
-                if vendor != 0xFFFF {
-                    let class_sub = Self::read_config(bus, device, 0, 0x08);
-                    devices.push(PciDevice {
-                        bus, device, func: 0,
-                        vendor_id: vendor,
-                        device_id: (Self::read_config(bus, device, 0, 0) >> 16) as u16,
-                        class_id: (class_sub >> 24) as u8,
-                        subclass_id: (class_sub >> 16) as u8,
-                    });
+                for func in 0..8 {
+                    let vendor = Self::read_config(bus, device, func, 0) as u16;
+                    if vendor != 0xFFFF {
+                        let class_sub = Self::read_config(bus, device, func, 0x08);
+                        devices.push(PciDevice {
+                            bus, device, func,
+                            vendor_id: vendor,
+                            device_id: (Self::read_config(bus, device, func, 0) >> 16) as u16,
+                            class_id: (class_sub >> 24) as u8,
+                            subclass_id: (class_sub >> 16) as u8,
+                        });
+                    }
                 }
             }
         }
@@ -64,7 +68,9 @@ impl PciDriver {
     }
 }
 
-// --- MODERN PCIe (For GPU Discovery) ---
+// ==========================================
+// 2. MODERN PCIe (MCFG) STRUCTURES
+// ==========================================
 #[repr(C, packed)]
 struct McfgHeader {
     signature: [u8; 4], length: u32, revision: u8, checksum: u8,
@@ -78,12 +84,16 @@ struct McfgAllocation {
     start_bus_number: u8, end_bus_number: u8, reserved: u32,
 }
 
+// ==========================================
+// 3. THE DISPATCHER
+// ==========================================
 pub fn enumerate_pci() {
-    crate::serial_println!("[PCI] Starting PCIe Bus Enumeration...");
+    crate::serial_println!("[PCI] Starting PCI(e) Bus Enumeration...");
     
     let mcfg_phys = unsafe { ACPI_INFO.mcfg_addr };
     if mcfg_phys.is_none() {
-        crate::serial_println!("[PCI] ERR: No MCFG table found.");
+        crate::serial_println!("[PCI] No MCFG table found. Falling back to Legacy Port I/O...");
+        enumerate_pci_legacy();
         return;
     }
 
@@ -99,10 +109,98 @@ pub fn enumerate_pci() {
         scan_bus_range(alloc.base_address, alloc.start_bus_number, alloc.end_bus_number);
     }
     
-    // NEW: Tells us when it finishes so we know it didn't freeze!
     crate::serial_println!("[PCI] PCIe Enumeration Complete.");
 }
 
+// ==========================================
+// 4. THE LEGACY FALLBACK SCANNER
+// ==========================================
+fn enumerate_pci_legacy() {
+    let mut driver = PciDriver::new();
+    let devices = driver.scan();
+
+    for dev in devices {
+        match dev.class_id {
+            0x02 => {
+                crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id); 
+                
+                // --- INTEL AX201 CNVi WI-FI ---
+                if dev.vendor_id == 0x8086 && dev.device_id == 0x06f0 {
+                    crate::serial_println!("[PCI] Found Intel AX201 CNVi. Negotiating ACPI Power State...");
+                    
+                    if crate::acpi::power_on_wifi_via_acpi() {
+                        let mut lo: u32; let mut hi: u32;
+                        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+                        let start = ((hi as u64) << 32) | (lo as u64);
+                        let wait_ticks = 20 * 24_000; 
+                        loop {
+                            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+                            let now = ((hi as u64) << 32) | (lo as u64);
+                            if now - start > wait_ticks { break; }
+                            core::hint::spin_loop();
+                        }
+
+                        let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
+                        cmd |= 0x06; 
+                        let address = 0x80000000 | ((dev.bus as u32) << 16) | ((dev.device as u32) << 11) | ((dev.func as u32) << 8) | 0x04;
+                        unsafe { Port::<u32>::new(0xCF8).write(address); Port::<u32>::new(0xCFC).write(cmd); }
+
+                        if let Some(mmio_phys) = driver.get_bar_address(&dev, 0) {
+                            crate::serial_println!("[PCI] Intel Wi-Fi Physical MMIO Base: {:#x}", mmio_phys);
+                            let mut wifi_driver = crate::drivers::net::iwlwifi::IntelWifiDriver::new(dev, mmio_phys);
+                            wifi_driver.initialize();
+                        }
+                    } else {
+                        crate::serial_println!("[PCI] WARNING: ACPI Power-On failed. Leaving Wi-Fi locked to prevent CPU halt.");
+                    }
+                }
+                
+                // --- REALTEK RTL8168 ETHERNET ---
+                if dev.vendor_id == 0x10ec && dev.device_id == 0x8168 {
+                    crate::serial_println!("[PCI] Binding Realtek RTL8168 Ethernet Driver...");
+                    
+                    let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
+                    cmd |= 0x06; 
+                    let address = 0x80000000 | ((dev.bus as u32) << 16) | ((dev.device as u32) << 11) | ((dev.func as u32) << 8) | 0x04;
+                    unsafe { Port::<u32>::new(0xCF8).write(address); Port::<u32>::new(0xCFC).write(cmd); }
+                    
+                    let mut mmio_phys = driver.get_bar_address(&dev, 2).unwrap_or(0);
+                    if mmio_phys == 0 { mmio_phys = driver.get_bar_address(&dev, 0).unwrap_or(0); }
+
+                    if mmio_phys != 0 {
+                        crate::serial_println!("[PCI] RTL8168 Physical MMIO Base: {:#x}", mmio_phys);
+                        let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(dev, mmio_phys);
+                        eth_driver.initialize();
+
+                        use smoltcp::iface::{Config, Interface};
+                        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+
+                        let hw_addr = HardwareAddress::Ethernet(EthernetAddress::from_bytes(&eth_driver.mac_address));
+                        let mut config = Config::new();
+                        config.hardware_addr = Some(hw_addr);
+                        
+                        let mut iface = Interface::new(config, &mut eth_driver);
+                        let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 1, 99), 24);
+                        iface.update_ip_addrs(|ip_addrs| {
+                            ip_addrs.push(ip_addr).expect("Failed to assign IP");
+                        });
+
+                        *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
+                        *crate::drivers::net::NET_IFACE.lock() = Some(iface);
+                    }
+                }
+            }
+            0x01 => crate::serial_println!("[PCI] Found Mass Storage: Vendor {:#06x}, Device {:#06x}", dev.vendor_id, dev.device_id),
+            0x03 => crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id),
+            0x0C => crate::serial_println!("[PCI] Found USB Controller: Vendor {:#06x}, Device {:#06x}", dev.vendor_id, dev.device_id),
+            _ => {}
+        }
+    }
+}
+
+// ==========================================
+// 5. THE MODERN MCFG SCANNER
+// ==========================================
 fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
     for bus in start_bus..=end_bus {
         for device in 0..32 {
@@ -113,10 +211,111 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                     if vendor_id != 0xFFFF {
                         let device_id = unsafe { core::ptr::read_volatile((device_virt + 2) as *const u16) };
                         let class_code = unsafe { core::ptr::read_volatile((device_virt + 11) as *const u8) };
+                        let subclass = unsafe { core::ptr::read_volatile((device_virt + 10) as *const u8) };
 
-                        if class_code == 0x03 {
-                            // FIXED: Now using serial_println! to send to dmesg buffer
-                            crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
+                        match class_code {
+                            0x02 => {
+                                crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id); 
+                                
+                                // --- INTEL AX201 CNVi WI-FI ---
+                                if vendor_id == 0x8086 && device_id == 0x06f0 {
+                                    crate::serial_println!("[PCI] Found Intel AX201 CNVi. Negotiating ACPI Power State...");
+                                    
+                                    if crate::acpi::power_on_wifi_via_acpi() {
+                                        let mut lo: u32; let mut hi: u32;
+                                        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+                                        let start = ((hi as u64) << 32) | (lo as u64);
+                                        let wait_ticks = 20 * 24_000; 
+                                        loop {
+                                            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+                                            let now = ((hi as u64) << 32) | (lo as u64);
+                                            if now - start > wait_ticks { break; }
+                                            core::hint::spin_loop();
+                                        }
+
+                                        let command_ptr = (device_virt + 0x04) as *mut u16;
+                                        let mut command = unsafe { core::ptr::read_volatile(command_ptr) };
+                                        command |= 0x06; 
+                                        unsafe { core::ptr::write_volatile(command_ptr, command) };
+                                        
+                                        let bar0 = unsafe { core::ptr::read_volatile((device_virt + 0x10) as *const u32) };
+                                        let mut mmio_phys = (bar0 & 0xFFFFFFF0) as u64;
+                                        if (bar0 & 0b100) != 0 { 
+                                            let bar1 = unsafe { core::ptr::read_volatile((device_virt + 0x14) as *const u32) };
+                                            mmio_phys |= (bar1 as u64) << 32; 
+                                        }
+
+                                        crate::serial_println!("[PCI] Intel Wi-Fi Physical MMIO Base: {:#x}", mmio_phys);
+                                        
+                                        let pci_dev = crate::pci::PciDevice {
+                                            bus, device, func,
+                                            vendor_id, device_id,
+                                            class_id: class_code,
+                                            subclass_id: subclass,
+                                        };
+                                        
+                                        let mut wifi_driver = crate::drivers::net::iwlwifi::IntelWifiDriver::new(pci_dev, mmio_phys);
+                                        wifi_driver.initialize();
+                                    } else {
+                                        crate::serial_println!("[PCI] WARNING: ACPI Power-On failed. Leaving Wi-Fi locked.");
+                                    }
+                                }
+                                
+                                // --- REALTEK RTL8168 ETHERNET ---
+                                if vendor_id == 0x10ec && device_id == 0x8168 {
+                                    crate::serial_println!("[PCI] Binding Realtek RTL8168 Ethernet Driver...");
+                                    
+                                    let command_ptr = (device_virt + 0x04) as *mut u16;
+                                    let mut command = unsafe { core::ptr::read_volatile(command_ptr) };
+                                    command |= 0x06; 
+                                    unsafe { core::ptr::write_volatile(command_ptr, command) };
+                                    
+                                    let bar2 = unsafe { core::ptr::read_volatile((device_virt + 0x18) as *const u32) };
+                                    let bar3 = unsafe { core::ptr::read_volatile((device_virt + 0x1C) as *const u32) };
+                                    
+                                    let mut mmio_phys = (bar2 & 0xFFFFFFF0) as u64;
+                                    if (bar2 & 0b100) != 0 { mmio_phys |= (bar3 as u64) << 32; }
+
+                                    if mmio_phys == 0 {
+                                        let bar0 = unsafe { core::ptr::read_volatile((device_virt + 0x10) as *const u32) };
+                                        let bar1 = unsafe { core::ptr::read_volatile((device_virt + 0x14) as *const u32) };
+                                        mmio_phys = (bar0 & 0xFFFFFFF0) as u64;
+                                        if (bar0 & 0b100) != 0 { mmio_phys |= (bar1 as u64) << 32; }
+                                    }
+
+                                    crate::serial_println!("[PCI] RTL8168 Physical MMIO Base: {:#x}", mmio_phys);
+                                    
+                                    let pci_dev = crate::pci::PciDevice {
+                                        bus, device, func,
+                                        vendor_id, device_id,
+                                        class_id: class_code,
+                                        subclass_id: subclass,
+                                    };
+                                    
+                                    let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(pci_dev, mmio_phys);
+                                    eth_driver.initialize();
+
+                                    use smoltcp::iface::{Config, Interface};
+                                    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+
+                                    let hw_addr = HardwareAddress::Ethernet(EthernetAddress::from_bytes(&eth_driver.mac_address));
+                                    let mut config = Config::new();
+                                    config.hardware_addr = Some(hw_addr);
+                                    
+                                    let mut iface = Interface::new(config, &mut eth_driver);
+                                    let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 1, 99), 24);
+                                    iface.update_ip_addrs(|ip_addrs| {
+                                        ip_addrs.push(ip_addr).expect("Failed to assign IP");
+                                    });
+
+                                    *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
+                                    *crate::drivers::net::NET_IFACE.lock() = Some(iface);
+                                }
+                            }
+                            0x01 => crate::serial_println!("[PCI] Found Mass Storage: Vendor {:#06x}, Device {:#06x}", vendor_id, device_id),
+                            0x03 => crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id),
+                            0x0C => crate::serial_println!("[PCI] Found USB Controller: Vendor {:#06x}, Device {:#06x}", vendor_id, device_id),
+                            _ => {}
                         }
                     }
                 }

@@ -2,15 +2,17 @@
 members = [
     "nyx-kernel",
     "compiler",
-    "runner"
-, "nyx-user"]
+    "runner",
+    "nyx-user"
+]
+
+# NEW: Force Cargo to ONLY build the kernel by default
+default-members = ["nyx-kernel"]
+
 resolver = "2"
+
 [profile.dev]
 panic = "abort"
 
 [profile.release]
 panic = "abort"
-
-[workspace.dependencies]
-# UPDATE: Remove '=' to allow upgrading to 0.11.15+
-bootloader = "0.11"
