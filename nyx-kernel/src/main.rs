@@ -20,7 +20,7 @@ pub mod apic;
 pub mod pci;  
 pub mod drm;  
 pub mod entity; 
-pub mod c_stubs; // <--- The C memory stubs we just added
+pub mod c_stubs; 
 
 mod allocator;
 mod memory;
@@ -118,28 +118,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     crate::vga_println!("[INIT] Graphics initialized.");
-    if let Some(offset) = boot_info.physical_memory_offset.into_option() {
-        unsafe {
-    crate::memory::PHYS_MEM_OFFSET = offset;
-}
-    }
-    // ==========================================
-    // HARDWARE ENUMERATION PHASE
-    // ==========================================
+    
     if let Some(rsdp_addr) = boot_info.rsdp_addr.into_option() {
-        
-        // Keep the legacy init so PCI doesn't complain during compile
         acpi::init(rsdp_addr);
-        
-        // NEW: Call the Intel ACPICA initialization!
         acpi::init_intel_acpica();
-        
         apic::init();
         crate::pci::enumerate_pci();
     } else {
         crate::vga_println!("[ACPI] ERR: Bootloader did not provide RSDP!");
     }
-    // ==========================================
 
     crate::time::init();
     { let mut driver = crate::mouse::MouseDriver::new(); driver.init(); }
@@ -150,26 +137,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler.register_main_thread();
         scheduler.spawn(crate::scheduler::clock_task, 50);
         scheduler.spawn(crate::scheduler::background_worker, 10);
+        
+        // --- NETWORK THREAD: 1000 Priority Tickets! ---
+        scheduler.spawn(network_thread, 1000);
+        
         crate::scheduler::SCHEDULER = Some(scheduler);
     }
 
     x86_64::instructions::interrupts::enable();
 
-    // ==========================================
-    // NVMe INITIALIZATION & ENTITY BIRTH
-    // ==========================================
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
-
-    if let Some(ref mut driver) = nvme_driver_opt {
-        driver.create_io_queues();
-    }
-
+    if let Some(ref mut driver) = nvme_driver_opt { driver.create_io_queues(); }
     crate::entity::awaken_entity(&mut nvme_driver_opt);
-
-    if let Some(driver) = nvme_driver_opt { 
-        crate::fs::FS.lock().init(driver); 
-    }
-    // ==========================================
+    if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
 
     const PAGE_COUNT: u64 = 8192; 
     let _ = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Alloc User Failed");
@@ -182,9 +162,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     USER_STACK.store(stack_addr, Ordering::SeqCst);
 
     interrupts::init_syscalls(); 
+
+    // --- LAUNCH THE GUI ---
     enter_userspace_trampoline();
 
+    // The main thread can now go to sleep, the background scheduler will handle the network!
     loop { x86_64::instructions::hlt(); }
+}
+
+pub extern "C" fn network_thread() {
+    loop {
+        crate::drivers::net::poll_network();
+        // NO MORE SLEEPING! When the OS gives us CPU time, 
+        // we use 100% of it to poll the hardware at maximum speed!
+    }
 }
 
 pub extern "C" fn enter_userspace_trampoline() {

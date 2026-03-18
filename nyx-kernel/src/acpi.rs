@@ -82,13 +82,12 @@ extern "C" {
 }
 
 pub fn power_on_wifi_via_acpi() -> bool {
-    crate::serial_println!("[ACPI] Hunting for CNVi Wi-Fi node in motherboard namespace...");
-    let result = unsafe { acpi_wake_cnvi_wifi() };
-    if result != 0 {
-        crate::serial_println!("[ACPI] SUCCESS: Executed _PS0! Motherboard relay is OPEN. Power is flowing.");
-        true
-    } else {
-        crate::serial_println!("[ACPI] ERR: Could not find or power on CNVi node.");
-        false
-    }
+    crate::serial_println!("[ACPI] Initiating Motherboard 'Wake Everything' sequence...");
+    let count = unsafe { acpi_wake_cnvi_wifi() };
+    
+    crate::serial_println!("[ACPI] Blasted _PS0 (Power On) to {} hidden hardware nodes!", count);
+    
+    // We return true so the PCI driver proceeds to touch the memory.
+    // If it still freezes, we know Intel locked the Wi-Fi behind an Airplane Mode switch!
+    true
 }

@@ -1,33 +1,28 @@
 #include "acpi.h"
 
-// This callback runs for every single device in the motherboard's ACPI tree
-static ACPI_STATUS PowerOnWifiCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
-    ACPI_DEVICE_INFO *Info;
-    ACPI_STATUS Status;
-
-    Status = AcpiGetObjectInfo(Object, &Info);
-    if (ACPI_FAILURE(Status)) { return AE_OK; }
-
-    // Look for the CNVi module at PCI Device 20 (0x14), Function 3
-    if ((Info->Valid & ACPI_VALID_ADR) && (Info->Address == 0x00140003)) {
+// This callback runs for literally every object in the motherboard
+static ACPI_STATUS WakeEverythingCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
+    ACPI_HANDLE TempHandle;
+    
+    // Check if this specific piece of hardware has a Power State 0 (_PS0) switch
+    if (ACPI_SUCCESS(AcpiGetHandle(Object, (char*)"_PS0", &TempHandle))) {
         
-        // WE FOUND IT! Execute _PS0 (Power State 0 / Fully On)
-        Status = AcpiEvaluateObject(Object, (char*)"_PS0", NULL, NULL);
+        // It has a power switch! YANK IT!
+        AcpiEvaluateObject(Object, (char*)"_PS0", NULL, NULL);
         
-        if (ACPI_SUCCESS(Status)) {
-            *((int*)Context) = 1; // Mark as successfully powered on!
-        }
+        // Tally up how many things we woke up
+        *((int*)Context) += 1; 
     }
 
-    ACPI_FREE(Info);
-    return AE_OK; // Continue walking the tree
+    return AE_OK; // Keep walking the tree
 }
 
-// The function we will call from Rust
 int acpi_wake_cnvi_wifi(void) {
-    int success = 0;
-    // Walk the entire ACPI Namespace from the root down
-    AcpiWalkNamespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT, ACPI_UINT32_MAX, 
-                      PowerOnWifiCallback, NULL, &success, NULL);
-    return success;
+    int wake_count = 0;
+    
+    // Walk the entire tree and blast the power-on signal to everything
+    AcpiWalkNamespace(ACPI_TYPE_ANY, ACPI_ROOT_OBJECT, ACPI_UINT32_MAX, 
+                      WakeEverythingCallback, NULL, &wake_count, NULL);
+                      
+    return wake_count;
 }

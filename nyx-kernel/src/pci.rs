@@ -124,41 +124,17 @@ fn enumerate_pci_legacy() {
             0x02 => {
                 crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id); 
                 
-                // --- INTEL AX201 CNVi WI-FI ---
+                // --- INTEL AX201 CNVi WI-FI (QUARANTINED) ---
                 if dev.vendor_id == 0x8086 && dev.device_id == 0x06f0 {
-                    crate::serial_println!("[PCI] Found Intel AX201 CNVi. Negotiating ACPI Power State...");
-                    
-                    if crate::acpi::power_on_wifi_via_acpi() {
-                        let mut lo: u32; let mut hi: u32;
-                        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-                        let start = ((hi as u64) << 32) | (lo as u64);
-                        let wait_ticks = 20 * 24_000; 
-                        loop {
-                            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-                            let now = ((hi as u64) << 32) | (lo as u64);
-                            if now - start > wait_ticks { break; }
-                            core::hint::spin_loop();
-                        }
-
-                        let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
-                        cmd |= 0x06; 
-                        let address = 0x80000000 | ((dev.bus as u32) << 16) | ((dev.device as u32) << 11) | ((dev.func as u32) << 8) | 0x04;
-                        unsafe { Port::<u32>::new(0xCF8).write(address); Port::<u32>::new(0xCFC).write(cmd); }
-
-                        if let Some(mmio_phys) = driver.get_bar_address(&dev, 0) {
-                            crate::serial_println!("[PCI] Intel Wi-Fi Physical MMIO Base: {:#x}", mmio_phys);
-                            let mut wifi_driver = crate::drivers::net::iwlwifi::IntelWifiDriver::new(dev, mmio_phys);
-                            wifi_driver.initialize();
-                        }
-                    } else {
-                        crate::serial_println!("[PCI] WARNING: ACPI Power-On failed. Leaving Wi-Fi locked to prevent CPU halt.");
-                    }
+                    crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
+                    crate::serial_println!("[PCI] WARNING: CNVi requires Intel ME sideband handshakes. Skipping to prevent CPU halt.");
                 }
                 
                 // --- REALTEK RTL8168 ETHERNET ---
                 if dev.vendor_id == 0x10ec && dev.device_id == 0x8168 {
                     crate::serial_println!("[PCI] Binding Realtek RTL8168 Ethernet Driver...");
                     
+                    // Enable Bus Mastering
                     let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
                     cmd |= 0x06; 
                     let address = 0x80000000 | ((dev.bus as u32) << 16) | ((dev.device as u32) << 11) | ((dev.func as u32) << 8) | 0x04;
@@ -169,7 +145,7 @@ fn enumerate_pci_legacy() {
 
                     if mmio_phys != 0 {
                         crate::serial_println!("[PCI] RTL8168 Physical MMIO Base: {:#x}", mmio_phys);
-                        let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(dev, mmio_phys);
+                        let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(dev.clone(), mmio_phys);
                         eth_driver.initialize();
 
                         use smoltcp::iface::{Config, Interface};
@@ -184,6 +160,9 @@ fn enumerate_pci_legacy() {
                         iface.update_ip_addrs(|ip_addrs| {
                             ip_addrs.push(ip_addr).expect("Failed to assign IP");
                         });
+
+                        crate::serial_println!("[NET] TCP/IP Stack Online!");
+                        crate::serial_println!("[NET] Assigned Static IP: {}", ip_addr);
 
                         *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
                         *crate::drivers::net::NET_IFACE.lock() = Some(iface);
@@ -217,48 +196,10 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                             0x02 => {
                                 crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id); 
                                 
-                                // --- INTEL AX201 CNVi WI-FI ---
+                                // --- INTEL AX201 CNVi WI-FI (QUARANTINED) ---
                                 if vendor_id == 0x8086 && device_id == 0x06f0 {
-                                    crate::serial_println!("[PCI] Found Intel AX201 CNVi. Negotiating ACPI Power State...");
-                                    
-                                    if crate::acpi::power_on_wifi_via_acpi() {
-                                        let mut lo: u32; let mut hi: u32;
-                                        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-                                        let start = ((hi as u64) << 32) | (lo as u64);
-                                        let wait_ticks = 20 * 24_000; 
-                                        loop {
-                                            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-                                            let now = ((hi as u64) << 32) | (lo as u64);
-                                            if now - start > wait_ticks { break; }
-                                            core::hint::spin_loop();
-                                        }
-
-                                        let command_ptr = (device_virt + 0x04) as *mut u16;
-                                        let mut command = unsafe { core::ptr::read_volatile(command_ptr) };
-                                        command |= 0x06; 
-                                        unsafe { core::ptr::write_volatile(command_ptr, command) };
-                                        
-                                        let bar0 = unsafe { core::ptr::read_volatile((device_virt + 0x10) as *const u32) };
-                                        let mut mmio_phys = (bar0 & 0xFFFFFFF0) as u64;
-                                        if (bar0 & 0b100) != 0 { 
-                                            let bar1 = unsafe { core::ptr::read_volatile((device_virt + 0x14) as *const u32) };
-                                            mmio_phys |= (bar1 as u64) << 32; 
-                                        }
-
-                                        crate::serial_println!("[PCI] Intel Wi-Fi Physical MMIO Base: {:#x}", mmio_phys);
-                                        
-                                        let pci_dev = crate::pci::PciDevice {
-                                            bus, device, func,
-                                            vendor_id, device_id,
-                                            class_id: class_code,
-                                            subclass_id: subclass,
-                                        };
-                                        
-                                        let mut wifi_driver = crate::drivers::net::iwlwifi::IntelWifiDriver::new(pci_dev, mmio_phys);
-                                        wifi_driver.initialize();
-                                    } else {
-                                        crate::serial_println!("[PCI] WARNING: ACPI Power-On failed. Leaving Wi-Fi locked.");
-                                    }
+                                    crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
+                                    crate::serial_println!("[PCI] WARNING: CNVi requires Intel ME sideband handshakes. Skipping to prevent CPU halt.");
                                 }
                                 
                                 // --- REALTEK RTL8168 ETHERNET ---
@@ -307,6 +248,9 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                     iface.update_ip_addrs(|ip_addrs| {
                                         ip_addrs.push(ip_addr).expect("Failed to assign IP");
                                     });
+
+                                    crate::serial_println!("[NET] TCP/IP Stack Online!");
+                                    crate::serial_println!("[NET] Assigned Static IP: {}", ip_addr);
 
                                     *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
                                     *crate::drivers::net::NET_IFACE.lock() = Some(iface);

@@ -166,21 +166,27 @@ pub extern "C" fn clock_task() {
 
 pub extern "C" fn background_worker() {
     loop {
+        // 1. Process Dynamic OS Jobs
         let job_opt = x86_64::instructions::interrupts::without_interrupts(|| {
             let mut queue = JOB_QUEUE.lock();
             if !queue.is_empty() { Some(queue.remove(0)) } else { None }
         });
 
-        if let Some(job) = job_opt { job(); } 
-        else { for _ in 0..10_000 { core::hint::spin_loop(); } }
-        // Let the Entity breathe and evolve
+        if let Some(job) = job_opt { 
+            job(); 
+        } 
+        
+        // 2. Let the Entity breathe and evolve
         crate::entity::state::evolve_state();
         
-        // Pause briefly so we don't melt the CPU
-        for _ in 0..100_000 { unsafe { core::arch::asm!("nop"); } }
+        // 3. Poll the Network DMA Rings! 
+        // This tells smoltcp to check the physical RAM for incoming Ethernet frames
+        // and automatically forge/transmit replies (like ICMP Pings).
         crate::drivers::net::poll_network();
         
-        // Yield to let other threads run
+        // 4. Yield Control
+        // `hlt` puts the CPU into a low-power state until the very next hardware interrupt
+        // (like a timer tick or network card IRQ). This prevents the loop from melting the CPU.
         x86_64::instructions::hlt();
     }
 }
