@@ -95,3 +95,14 @@ pub fn get_kernel_code_selector() -> u16 {
 pub fn get_kernel_data_selector() -> u16 {
     GDT.1.data_selector.0
 }
+use x86_64::registers::model_specific::KernelGsBase;
+
+
+pub fn load_kernel_gs(logical_id: usize) {
+    unsafe {
+        if let Some(per_cpu_array) = &crate::percpu::PER_CPU {
+            let ptr = &per_cpu_array[logical_id] as *const _ as u64;
+            KernelGsBase::write(VirtAddr::new(ptr));
+        }
+    }
+}

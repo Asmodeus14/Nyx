@@ -10,17 +10,18 @@
 include!(concat!(env!("OUT_DIR"), "/acpi_bindings.rs"));
 
 // Legacy ACPI info to keep the PCI module compiling while we transition
-// Legacy ACPI info to keep the PCI module compiling while we transition
 pub struct AcpiInfo {
     pub rsdp_addr: Option<u64>,
     pub mcfg_addr: Option<u64>,
-    pub madt_addr: Option<u64>, // <--- ADDED BACK FOR apic.rs
+    pub madt_addr: Option<u64>, 
 }
+
 pub static mut ACPI_INFO: AcpiInfo = AcpiInfo { 
     rsdp_addr: None, 
     mcfg_addr: None, 
     madt_addr: None 
 };
+
 pub fn init(rsdp: u64) {
     unsafe { ACPI_INFO.rsdp_addr = Some(rsdp); }
 }
@@ -47,6 +48,29 @@ pub fn init_intel_acpica() {
             return;
         }
 
+        // --- PHASE 0: DYNAMIC MADT DETECTION ---
+        crate::serial_println!("[ACPI] Extracting MADT for real SMP...");
+        let mut madt_header: *mut core::ffi::c_void = core::ptr::null_mut();
+        
+        // Ask ACPICA to find the "APIC" table (MADT). Instance 1.
+        let get_status = AcpiGetTable(
+            b"APIC\0".as_ptr() as *mut i8, 
+            1, 
+            &mut madt_header as *mut _ as *mut *mut _
+        );
+        
+        if get_status == 0 && !madt_header.is_null() {
+            let madt_virt = madt_header as u64;
+            // ACPICA maps this for us. We need to find the physical address for our APIC module.
+            let madt_phys = crate::memory::virt_to_phys(madt_virt).unwrap_or(madt_virt);
+            
+            ACPI_INFO.madt_addr = Some(madt_phys);
+            crate::serial_println!("[ACPI] MADT stored dynamically @ {:#x}", madt_phys);
+        } else {
+            crate::serial_println!("[ACPI] WARNING: MADT not found! Status: {}", get_status);
+        }
+        // ---------------------------------------
+
         // 3. Build the Hardware Namespace Tree
         crate::serial_println!("[ACPI] Loading Hardware Namespace...");
         status = AcpiLoadTables();
@@ -63,7 +87,7 @@ pub fn init_intel_acpica() {
             return;
         }
 
-        // 5. Execute the `_INI` methods to turn on the hidden hardware (like the Wi-Fi card!)
+        // 5. Execute the `_INI` methods to turn on the hidden hardware
         crate::serial_println!("[ACPI] Initializing Hardware Objects...");
         status = AcpiInitializeObjects(0);
         if status != 0 {
@@ -74,6 +98,7 @@ pub fn init_intel_acpica() {
         crate::serial_println!("[ACPI] Intel ACPICA is FULLY ONLINE.");
     }
 }
+
 // ==========================================
 // 3. CUSTOM ACPI METHODS
 // ==========================================
@@ -84,10 +109,6 @@ extern "C" {
 pub fn power_on_wifi_via_acpi() -> bool {
     crate::serial_println!("[ACPI] Initiating Motherboard 'Wake Everything' sequence...");
     let count = unsafe { acpi_wake_cnvi_wifi() };
-    
     crate::serial_println!("[ACPI] Blasted _PS0 (Power On) to {} hidden hardware nodes!", count);
-    
-    // We return true so the PCI driver proceeds to touch the memory.
-    // If it still freezes, we know Intel locked the Wi-Fi behind an Airplane Mode switch!
     true
 }

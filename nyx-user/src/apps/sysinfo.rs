@@ -5,6 +5,7 @@ use crate::syscalls;
 pub struct SysInfoApp {
     last_update: usize,
     stats: [f32; 4], // [Energy, Entropy, Stability, Curiosity]
+    active_cores: usize, 
 }
 
 impl SysInfoApp {
@@ -12,6 +13,8 @@ impl SysInfoApp {
         Self {
             last_update: 0,
             stats: [0.0; 4],
+            // Grab the core count immediately on app launch
+            active_cores: syscalls::sys_get_active_cores(),
         }
     }
 
@@ -21,6 +24,8 @@ impl SysInfoApp {
         // Only ping the kernel for new stats every 100ms so we don't spam Syscalls
         if now.wrapping_sub(self.last_update) > 100 {
             syscalls::sys_get_entity_stats(&mut self.stats);
+            // Refresh the core count dynamically just in case one wakes up late!
+            self.active_cores = syscalls::sys_get_active_cores(); 
             self.last_update = now;
         }
 
@@ -29,12 +34,18 @@ impl SysInfoApp {
 
         // Static System Info
         draw::draw_text(fb, w, h, pad_x, start_y, "NyxOS v0.6 [Kernel Ring-0]", 0xFF00AAFF);
-        draw::draw_text(fb, w, h, pad_x, start_y + 25, "Architecture: x86_64", 0xFFDDDDDD);
-        draw::draw_text(fb, w, h, pad_x, start_y + 45, "NVMe Lossless Compression: ACTIVE", 0xFF00FF00);
+        draw::draw_text(fb, w, h, pad_x, start_y + 20, "Architecture: x86_64 SMP", 0xFFDDDDDD);
+        
+        // --- NEW: Dynamic Hardware Core Display ---
+        let core_text = format!("Active Hardware Cores: {}", self.active_cores);
+        draw::draw_text(fb, w, h, pad_x, start_y + 40, &core_text, 0xFF00FFFF); // Bright Cyan
+        // ------------------------------------------
 
-        // Entity Vitals Header
-        draw::draw_text(fb, w, h, pad_x, start_y + 80, "ENTITY LIVE TELEMETRY", 0xFFFF00FF);
-        draw::draw_rect_simple(fb, w, h, pad_x, start_y + 98, 300, 1, 0xFF555555);
+        draw::draw_text(fb, w, h, pad_x, start_y + 60, "NVMe Lossless Compression: ACTIVE", 0xFF00FF00);
+
+        // Entity Vitals Header (Shifted down slightly to make room)
+        draw::draw_text(fb, w, h, pad_x, start_y + 95, "ENTITY LIVE TELEMETRY", 0xFFFF00FF);
+        draw::draw_rect_simple(fb, w, h, pad_x, start_y + 113, 300, 1, 0xFF555555);
 
         // Helper function to draw a data bar
         let mut draw_bar = |label: &str, value: f32, y_offset: usize, color: u32| {
@@ -52,11 +63,10 @@ impl SysInfoApp {
             }
         };
 
-        // Render the 4 states!
-        // Energy (Red), Entropy (Cyan), Stability (Green), Curiosity (Yellow)
-        draw_bar("Energy", self.stats[0], 110, 0xFFFF3333);
-        draw_bar("Entropy", self.stats[1], 150, 0xFF00FFFF);
-        draw_bar("Stability", self.stats[2], 190, 0xFF33FF33);
-        draw_bar("Curiosity", self.stats[3], 230, 0xFFFFFF00);
+        // Render the 4 states! (Y-offsets pushed down to accommodate the new core text)
+        draw_bar("Energy", self.stats[0], 125, 0xFFFF3333);
+        draw_bar("Entropy", self.stats[1], 165, 0xFF00FFFF);
+        draw_bar("Stability", self.stats[2], 205, 0xFF33FF33);
+        draw_bar("Curiosity", self.stats[3], 245, 0xFFFFFF00);
     }
 }

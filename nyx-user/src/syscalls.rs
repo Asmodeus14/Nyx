@@ -47,6 +47,13 @@ pub fn sys_get_boot_logs(buffer: &mut [u8]) -> usize {
     syscall(SYS_GET_BOOT_LOGS, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0, 0) as usize
 }
 
+pub const SYS_GET_ACTIVE_CORES: u64 = 22;
+
+// Add this wrapper function anywhere in the file
+pub fn sys_get_active_cores() -> usize {
+    syscall(SYS_GET_ACTIVE_CORES, 0, 0, 0, 0, 0) as usize
+}
+
 
 #[inline(always)]
 pub fn syscall(id: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {

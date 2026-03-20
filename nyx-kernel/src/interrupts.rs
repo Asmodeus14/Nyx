@@ -129,22 +129,21 @@ timer_interrupt_stub:
 extern "C" { fn timer_interrupt_stub(); }
 
 // --- RUST CONTEXT SWITCH HANDLER ---
+// In nyx-kernel/src/interrupts.rs
+
 #[no_mangle]
 pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
-    // 1. Tick the system clock
     crate::time::tick();
     
-    // 2. Acknowledge the interrupt so the PIC sends the next one
-    unsafe { PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8()); }
+    // --- THE FIX: Modern APIC EOI ---
+    crate::apic::end_of_interrupt();
+    // --------------------------------
 
-    // 3. Ask the Scheduler for the next thread's stack pointer
     unsafe {
         if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
             return scheduler.schedule(current_rsp);
         }
     }
-    
-    // If scheduler isn't initialized yet, return the same stack pointer to continue execution
     current_rsp
 }
 
@@ -153,7 +152,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     crate::shell::handle_key(scancode);
-    unsafe { PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8()); }
+    
+    // --- THE FIX: Modern APIC EOI ---
+    crate::apic::end_of_interrupt();
+    // --------------------------------
 }
 
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
@@ -161,7 +163,10 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     let mut port = Port::new(0x60);
     let packet_byte: u8 = unsafe { port.read() };
     crate::mouse::handle_interrupt(packet_byte);
-    unsafe { PICS.lock().notify_end_of_interrupt(InterruptIndex::Mouse.as_u8()); }
+    
+    // --- THE FIX: Modern APIC EOI ---
+    crate::apic::end_of_interrupt();
+    // --------------------------------
 }
 
 pub fn init_syscalls() {}
@@ -468,14 +473,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 0; // Buffer provided by userspace is too small!
             }
         },
-        21 => {
-            // We expect userspace to pass a pointer to an array of four f32s
+    21 => {
             let buf_ptr = arg1 as *mut f32;
             let buf_len = arg2 as usize;
             
             if buf_len >= 4 {
                 unsafe {
-                    // Pull the live floating-point values from the background soul
                     *buf_ptr.add(0) = crate::entity::state::ENTITY_STATE.get_energy();
                     *buf_ptr.add(1) = crate::entity::state::ENTITY_STATE.get_entropy();
                     *buf_ptr.add(2) = crate::entity::state::ENTITY_STATE.get_stability();
@@ -486,7 +489,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 0; // Buffer too small
             }
         },
+        // --- NEW: SYS_GET_ACTIVE_CORES ---
+        22 => {
+            use core::sync::atomic::Ordering;
+            // Read the live core count directly from the SMP module!
+            frame.rax = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst) as u64;
+        },
         _ => {}
-    
     }
 }

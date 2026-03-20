@@ -12,15 +12,19 @@ use crate::gui::{Painter, Color};
 use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::format;
 
+// --- KERNEL MODULES ---
 pub mod serial;
 pub mod vga_log; 
 pub mod vfs;
 pub mod acpi;
 pub mod apic; 
+pub mod ioapic; // <-- Modern Interrupt Routing
 pub mod pci;  
 pub mod drm;  
 pub mod entity; 
 pub mod c_stubs; 
+pub mod percpu; // Phase 1: Per-CPU Architecture
+pub mod smp;    // Phase 2: Symmetric Multiprocessing
 
 mod allocator;
 mod memory;
@@ -89,15 +93,19 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::serial_println!("[INIT] NyxOS Kernel Booting...");
 
+    // 1. Core CPU Architecture Init
     gdt::init();
     interrupts::init_idt();
     
+    // KILL THE LEGACY PICs!
+    // We mask them completely with 0xFF to prevent ghost interrupts.
     unsafe { 
         let mut pics = interrupts::PICS.lock();
         pics.initialize();
-        pics.write_masks(0xF8, 0xEF);
+        pics.write_masks(0xFF, 0xFF);
     };
 
+    // 2. Memory Subsystem Init
     if let Some(offset) = boot_info.physical_memory_offset.into_option() {
         let phys_mem_offset = VirtAddr::new(offset);
         unsafe { crate::memory::PHYS_MEM_OFFSET = offset; }
@@ -110,6 +118,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     } else { panic!("Memory Error"); }
 
+    // 3. Graphical Interface Init
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
         unsafe { SCREEN_PAINTER = Some(gui::VgaPainter { buffer: fb.buffer_mut(), info }); }
@@ -119,18 +128,43 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     crate::vga_println!("[INIT] Graphics initialized.");
     
+    // 4. ACPI, APIC, and SMP Discovery
     if let Some(rsdp_addr) = boot_info.rsdp_addr.into_option() {
         acpi::init(rsdp_addr);
         acpi::init_intel_acpica();
         apic::init();
+        
+        // --- PHASE 0, 1 & 2: THE SMP BRINGUP ---
+        let apic_ids = crate::apic::get_cpu_apic_ids();
+        
+        // Setup isolated stacks and map the trampoline
+        crate::percpu::init(&apic_ids);
+        crate::memory::identity_map_low_memory();
+        
+        // Initialize the TSC-based time system and the IOAPIC
+        crate::time::init();
+        crate::ioapic::init();
+        
+        // Route hardware IRQs to Core 0 (BSP)
+        crate::ioapic::route_irq(1, 0, crate::interrupts::InterruptIndex::Keyboard as u8);
+        crate::ioapic::route_irq(12, 0, crate::interrupts::InterruptIndex::Mouse as u8);
+
+        // Turn on hardware interrupts!
+        x86_64::instructions::interrupts::enable();
+        
+        // Wake the Application Processors!
+        crate::smp::init_aps(&apic_ids);
+        // ---------------------------------------
+
         crate::pci::enumerate_pci();
     } else {
         crate::vga_println!("[ACPI] ERR: Bootloader did not provide RSDP!");
     }
 
-    crate::time::init();
+    // 5. Hardware Drivers Init
     { let mut driver = crate::mouse::MouseDriver::new(); driver.init(); }
 
+    // 6. OS Thread Spawning
     unsafe {
         crate::vga_println!("[SCHEDULER] Spawning Threads...");
         let mut scheduler = crate::scheduler::Scheduler::new();
@@ -144,13 +178,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::scheduler::SCHEDULER = Some(scheduler);
     }
 
-    x86_64::instructions::interrupts::enable();
-
+    // 7. Storage and Entity Init
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
     if let Some(ref mut driver) = nvme_driver_opt { driver.create_io_queues(); }
     crate::entity::awaken_entity(&mut nvme_driver_opt);
     if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
 
+    // 8. Userspace Setup
+    crate::vga_println!("[OS] Loading Userspace Environment...");
     const PAGE_COUNT: u64 = 8192; 
     let _ = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Alloc User Failed");
     
@@ -164,17 +199,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_syscalls(); 
 
     // --- LAUNCH THE GUI ---
+    crate::vga_println!("[OS] Handing control to Ring 3...");
     enter_userspace_trampoline();
 
-    // The main thread can now go to sleep, the background scheduler will handle the network!
+    // The main thread drops into this loop if userspace exits, 
+    // while the APs are in their own hlt loops waiting for work.
     loop { x86_64::instructions::hlt(); }
 }
 
 pub extern "C" fn network_thread() {
     loop {
         crate::drivers::net::poll_network();
-        // NO MORE SLEEPING! When the OS gives us CPU time, 
-        // we use 100% of it to poll the hardware at maximum speed!
     }
 }
 

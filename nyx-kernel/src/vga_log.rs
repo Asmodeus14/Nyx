@@ -1,5 +1,6 @@
 use core::fmt;
 use spin::Mutex;
+use core::fmt::Write;
 use crate::gui::Color;
 use crate::gui::Painter;
 
@@ -48,7 +49,6 @@ impl fmt::Write for VgaLogger {
 
 #[doc(hidden)]
 pub fn _vga_print(args: fmt::Arguments) {
-    use core::fmt::Write;
     // Disable interrupts so a context switch doesn't split a log message in half
     x86_64::instructions::interrupts::without_interrupts(|| {
         VGA_LOGGER.lock().write_fmt(args).unwrap();

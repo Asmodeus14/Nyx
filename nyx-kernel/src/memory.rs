@@ -238,3 +238,54 @@ pub fn allocate_user_heap_pages(num_pages: usize) -> Result<u64, &'static str> {
     // Return the starting virtual address
     Ok(virt_base)
 }
+pub fn allocate_kernel_stack(pages: usize) -> u64 {
+    let mut lock = MEMORY_MANAGER.lock();
+    let system = lock.as_mut().expect("Memory System not initialized");
+
+    // Place isolated kernel stacks high up in virtual memory
+    static mut NEXT_STACK_VIRT: u64 = 0xFFFF_8000_0000_0000;
+    let virt_base = unsafe { NEXT_STACK_VIRT };
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let mut top_of_stack = 0;
+
+    for i in 0..pages {
+        let addr = virt_base + (i as u64 * 4096);
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+
+        unsafe {
+            let frame = system.frame_allocator.allocate_frame().expect("OOM: Kernel Stack");
+            match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                Ok(mapper) => mapper.flush(),
+                Err(_) => panic!("Failed to map kernel stack page"),
+            }
+        }
+        top_of_stack = addr + 4096;
+    }
+
+    // Leave a 4096-byte "Guard Page" unmapped to catch stack overflows
+    unsafe { NEXT_STACK_VIRT += (pages as u64 + 1) * 4096; }
+
+    // Stacks grow downwards, so return the highest address. 
+    // Mask with !0xF to ensure strict 16-byte alignment (System V ABI requirement).
+    top_of_stack & !0xF 
+}
+pub fn identity_map_low_memory() {
+    let mut lock = MEMORY_MANAGER.lock();
+    if let Some(system) = lock.as_mut() {
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        
+        // Map the first 1 MiB (0x0 to 0x100000)
+        for addr in (0..0x10_0000).step_by(4096) {
+            let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(addr));
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+            
+            unsafe {
+                match system.mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                    Ok(mapper) => mapper.flush(),
+                    Err(_) => {} // Ignore if the bootloader already mapped a specific page
+                }
+            }
+        }
+    }
+}
