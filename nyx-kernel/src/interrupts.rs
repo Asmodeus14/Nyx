@@ -34,6 +34,9 @@ lazy_static! {
         idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Mouse.as_usize()].set_handler_fn(mouse_interrupt_handler);
         
+        // --- ADDED FOR STEP 2: MSI ETHERNET HANDLER ---
+        idt[0x30].set_handler_fn(ethernet_interrupt_handler);
+        
         unsafe {
             idt[0x80].set_handler_addr(VirtAddr::new(syscall_handler_asm as *const () as u64))
                 .set_privilege_level(PrivilegeLevel::Ring3);
@@ -232,8 +235,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  p.draw_rect(rect, color);
              }
         },
-        // --- UPDATED SYSCALL 4 (Time) ---
-       // --- UPDATED SYSCALL 4 (Time) ---
         4 => { 
             // The legacy PIC is dead, so we read the CPU's physical heartbeat directly!
             let mut lo: u32;
@@ -273,7 +274,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              } else { frame.rax = 0; }
         },
-        // --- NEW: SYS_MMAP (Syscall 9) ---
         9 => {
             let fd = arg1 as usize;
             let size = arg2 as usize;
@@ -365,18 +365,15 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             use core::sync::atomic::Ordering;
             frame.rax = crate::scheduler::CONTEXT_SWITCHES.load(Ordering::Relaxed);
         },
-        // --- NEW: SYS_OPEN ---
         15 => {
             let path_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
-                // 1. Ask VFS to find the file/device
                 if let Some(vnode) = crate::vfs::VFS.open_path(path) {
                     unsafe {
                         if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
                             let curr_idx = scheduler.current_task_idx;
                             let task = &mut scheduler.tasks[curr_idx];
                             
-                            // 2. Find an empty File Descriptor slot (Start at 3, skip stdin/out/err)
                             let mut allocated_fd = -1;
                             for i in 3..32 {
                                 if task.fd_table[i].is_none() {
@@ -385,13 +382,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                                     break;
                                 }
                             }
-                            frame.rax = allocated_fd as u64; // Return the FD integer!
+                            frame.rax = allocated_fd as u64; 
                         } else { frame.rax = (-1isize) as u64; }
                     }
-                } else { frame.rax = (-1isize) as u64; } // File not found
+                } else { frame.rax = (-1isize) as u64; } 
             } else { frame.rax = (-1isize) as u64; }
         },
-        // --- NEW: SYS_IOCTL ---
         16 => {
             let fd = arg1 as usize;
             let request = arg2 as usize;
@@ -404,12 +400,11 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     
                     if fd < 32 {
                         if let Some(open_file) = &task.fd_table[fd] {
-                            // Route the ioctl directly to the hardware VNode!
                             match open_file.node.ioctl(request, ioctl_arg) {
                                 Ok(res) => frame.rax = res as u64,
                                 Err(e) => frame.rax = e as u64,
                             }
-                        } else { frame.rax = (-1isize) as u64; } // Bad FD
+                        } else { frame.rax = (-1isize) as u64; }
                     } else { frame.rax = (-1isize) as u64; }
                 }
             }
@@ -449,31 +444,28 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
         19 => {
             let num_pages = arg1 as usize;
-            // Ask the memory manager for the pages
             match crate::memory::allocate_user_heap_pages(num_pages) {
                 Ok(virt_addr) => frame.rax = virt_addr,
-                Err(_) => frame.rax = 0, // 0 = Null pointer (Out of Memory)
+                Err(_) => frame.rax = 0, 
             }
         },
         20 => {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
             
-            // The Genetic Seed is exactly 32 bytes (SHA3-256)
             if buf_len >= 32 { 
                 unsafe {
-                    // Read the immutable soul directly from the kernel module
                     let seed = &crate::entity::seed::GENETIC_SEED;
                     for i in 0..32 {
                         *buf_ptr.add(i) = seed[i];
                     }
                 }
-                frame.rax = 1; // Success
+                frame.rax = 1; 
             } else {
-                frame.rax = 0; // Buffer provided by userspace is too small!
+                frame.rax = 0; 
             }
         },
-    21 => {
+        21 => {
             let buf_ptr = arg1 as *mut f32;
             let buf_len = arg2 as usize;
             
@@ -484,17 +476,26 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     *buf_ptr.add(2) = crate::entity::state::ENTITY_STATE.get_stability();
                     *buf_ptr.add(3) = crate::entity::state::ENTITY_STATE.get_curiosity();
                 }
-                frame.rax = 1; // Success
+                frame.rax = 1; 
             } else {
-                frame.rax = 0; // Buffer too small
+                frame.rax = 0; 
             }
         },
-        // --- NEW: SYS_GET_ACTIVE_CORES ---
         22 => {
             use core::sync::atomic::Ordering;
-            // Read the live core count directly from the SMP module!
             frame.rax = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst) as u64;
         },
         _ => {}
     }
+}
+
+// --- ADDED FOR STEP 2: ACTUAL INTERRUPT HANDLER ---
+extern "x86-interrupt" fn ethernet_interrupt_handler(_stack: InterruptStackFrame) {
+    if let Some(driver) = crate::drivers::net::NET_DRIVER.lock().as_mut() {
+        driver.ack_interrupt();
+    }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    crate::drivers::net::NETWORK_PENDING.store(true, core::sync::atomic::Ordering::Release);
+    crate::apic::end_of_interrupt();
+    crate::serial_println!("[IRQ] Ethernet handled on core {}", crate::percpu::current().logical_id);
 }

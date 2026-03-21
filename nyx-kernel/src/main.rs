@@ -126,7 +126,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         { let mut m = crate::mouse::MOUSE_STATE.lock(); m.screen_width = info.width; m.screen_height = info.height; m.x = info.width/2; m.y = info.height/2; }
     }
 
-    crate::vga_println!("[INIT] Graphics initialized.");
+    crate::serial_println!("[INIT] Graphics initialized.");
     
     // 4. ACPI, APIC, and SMP Discovery
     if let Some(rsdp_addr) = boot_info.rsdp_addr.into_option() {
@@ -158,7 +158,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         crate::pci::enumerate_pci();
     } else {
-        crate::vga_println!("[ACPI] ERR: Bootloader did not provide RSDP!");
+        crate::serial_println!("[ACPI] ERR: Bootloader did not provide RSDP!");
     }
 
     // 5. Hardware Drivers Init
@@ -166,15 +166,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 6. OS Thread Spawning
     unsafe {
-        crate::vga_println!("[SCHEDULER] Spawning Threads...");
+        crate::serial_println!("[SCHEDULER] Spawning Threads...");
         let mut scheduler = crate::scheduler::Scheduler::new();
         scheduler.register_main_thread();
-        scheduler.spawn(crate::scheduler::clock_task, 50);
-        scheduler.spawn(crate::scheduler::background_worker, 10);
         
-        // --- NETWORK THREAD: 1000 Priority Tickets! ---
-        scheduler.spawn(network_thread, 1000);
+        // PINNING CORES
+        scheduler.spawn_on_core(0, crate::scheduler::clock_task, 50);
+        scheduler.spawn_on_core(0, crate::scheduler::background_worker, 10);
         
+        // 👉 PROPER SMP: The Network thread operates safely on Core 1 now!
+        scheduler.spawn_on_core(1, network_thread, 1000); 
+        
+        crate::serial_println!("[SMP] ✅ GUI + Clock on Core 0");
+        crate::serial_println!("[SMP] ✅ Ethernet TCP/IP + MSI on Core 1");
+
         crate::scheduler::SCHEDULER = Some(scheduler);
     }
 
@@ -185,7 +190,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
 
     // 8. Userspace Setup
-    crate::vga_println!("[OS] Loading Userspace Environment...");
+    crate::serial_println!("[OS] Loading Userspace Environment...");
     const PAGE_COUNT: u64 = 8192; 
     let _ = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Alloc User Failed");
     
@@ -198,18 +203,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     interrupts::init_syscalls(); 
 
-    // --- LAUNCH THE GUI ---
-    crate::vga_println!("[OS] Handing control to Ring 3...");
+    // 👉 Launching the GUI and jumping to Ring 3
+    crate::serial_println!("[OS] Handing control to Ring 3...");
     enter_userspace_trampoline();
 
-    // The main thread drops into this loop if userspace exits, 
-    // while the APs are in their own hlt loops waiting for work.
+    // The main thread drops into this loop if userspace exits
     loop { x86_64::instructions::hlt(); }
 }
 
+// --- HYBRID NETWORK THREAD ---
 pub extern "C" fn network_thread() {
     loop {
+        // 1. Always process the network stack (clears ARP queues and forged replies)
         crate::drivers::net::poll_network();
+        
+        // 2. Clear the hardware pending flag if an interrupt hit
+        crate::drivers::net::NETWORK_PENDING.store(false, core::sync::atomic::Ordering::Release);
+        
+        // 3. Hybrid Yield: Let Core 1 spin lightly instead of a deep sleep. 
+        for _ in 0..50_000 { core::hint::spin_loop(); }
     }
 }
 

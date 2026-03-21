@@ -69,22 +69,35 @@ pub fn init_aps(apic_ids: &[u32]) {
 }
 
 #[no_mangle]
-pub extern "C" fn ap_main(apic_id: u32, logical_id: usize) -> ! {
-    x86_64::instructions::interrupts::disable();
-
-    crate::gdt::load_kernel_gs(logical_id);
+pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
+    // 1. Load IDT
     crate::interrupts::init_idt();
-    crate::apic::init_ap(); 
 
-    ACTIVE_CORES.fetch_add(1, Ordering::SeqCst);
+    // 2. Enable APIC
+    unsafe {
+        let apic_base = 0xFEE0_0000u64;
+        let virt_base = crate::memory::phys_to_virt(apic_base).unwrap_or(apic_base);
+        let svr_ptr = (virt_base + 0xF0) as *mut u32;
+        
+        let mut svr = core::ptr::read_volatile(svr_ptr);
+        svr |= 0x100; // Bit 8: APIC Software Enable
+        svr |= 0xFF;  // Bits 0-7: Spurious Interrupt Vector (0xFF)
+        core::ptr::write_volatile(svr_ptr, svr);
+    }
     
-    // Set ready BEFORE printing, so the BSP immediately releases the boot lock
-    AP_READY.store(true, Ordering::SeqCst);
-    
-    crate::vga_println!("[SMP] Core {} reporting for duty!", logical_id);
+    crate::smp::ACTIVE_CORES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    crate::serial_println!("[SMP] Core {} Interrupt Pipeline Online and Armed!", logical_id);
 
     x86_64::instructions::interrupts::enable();
-    
+
+    // 👉 THE MISSING LINK: Hijack Core 1! 
+    // Since Core 1 has no timer interrupt, we bypass the scheduler and force it into the network loop!
+    if logical_id == 1 {
+        crate::serial_println!("[SMP] Core 1 bypassing scheduler and hijacking Network Thread!");
+        crate::network_thread(); // This is an infinite loop, Core 1 will stay here forever!
+    }
+
+    // Cores 2-7 will fall through to this sleep loop
     loop {
         x86_64::instructions::hlt();
     }

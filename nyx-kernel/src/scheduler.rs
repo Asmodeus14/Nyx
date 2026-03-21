@@ -6,7 +6,7 @@ use crate::gui::Painter;
 use x86_64::registers::segmentation::{Segment, CS}; 
 use spin::Mutex; 
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::vfs::OpenFile; // --- NEW: Import OpenFile for the FD Table ---
+use crate::vfs::OpenFile; 
 
 // --- DYNAMIC JOB SYSTEM ---
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -51,15 +51,14 @@ pub struct Task {
     pub stack_ptr: u64,     
     pub active: bool,
     pub tickets: usize,  
-    // --- NEW: Per-Process File Descriptor Table ---
-    // FD 0, 1, 2 are traditionally stdin, stdout, stderr. 
-    // FD 3+ are for files and GPUs.
+    pub core_id: usize, // --- NEW: Which CPU core this task is pinned to ---
     pub fd_table: [Option<Arc<OpenFile>>; 32], 
 }
 
 pub struct Scheduler {
     pub tasks: Vec<Task>,
-    pub current_task_idx: usize,
+    pub current_task_idx: usize, // Kept for legacy syscall compatibility
+    pub core_task_idx: [usize; 32], // Tracks the current task for up to 32 cores
     rng: QuantumRng,
 }
 
@@ -68,6 +67,7 @@ impl Scheduler {
         Self {
             tasks: Vec::new(),
             current_task_idx: 0,
+            core_task_idx: [0; 32],
             rng: QuantumRng::new(12345),
         }
     }
@@ -76,17 +76,20 @@ impl Scheduler {
     pub fn register_main_thread(&mut self) {
         let task = Task {
             id: self.tasks.len(),
-            stack: Vec::new(), // Current thread already has a stack
-            stack_ptr: 0,      // Populated on the first timer tick
+            stack: Vec::new(), 
+            stack_ptr: 0,      
             active: true,
-            tickets: 50,       // UI gets high priority
-            fd_table: core::array::from_fn(|_| None), // Initialize empty FDs
+            tickets: 50,       
+            core_id: 0, // Main thread lives on BSP (Core 0)
+            fd_table: core::array::from_fn(|_| None), 
         };
         self.tasks.push(task);
-        self.current_task_idx = 0; // Make this the active task
+        self.current_task_idx = 0; 
+        self.core_task_idx[0] = 0;
     }
 
-    pub fn spawn(&mut self, func: extern "C" fn(), tickets: usize) {
+    // --- NEW: SPAWN ON CORE METHOD ---
+    pub fn spawn_on_core(&mut self, core_id: usize, func: extern "C" fn(), tickets: usize) {
         let stack = Vec::with_capacity(4096 * 8); 
         let stack_bottom = stack.as_ptr() as u64;
         let stack_top = stack_bottom + stack.capacity() as u64;
@@ -110,21 +113,34 @@ impl Scheduler {
             stack_ptr: sp,
             active: true,
             tickets,
-            fd_table: core::array::from_fn(|_| None), // Initialize empty FDs
+            core_id, // Pin it to the requested core!
+            fd_table: core::array::from_fn(|_| None), 
         };
         
         self.tasks.push(task);
     }
 
+    // Legacy spawn wrapper defaults to Core 0
+    pub fn spawn(&mut self, func: extern "C" fn(), tickets: usize) {
+        self.spawn_on_core(0, func, tickets);
+    }
+
     pub fn schedule(&mut self, current_rsp: u64) -> u64 {
         if self.tasks.is_empty() { return current_rsp; }
 
-        if let Some(current) = self.tasks.get_mut(self.current_task_idx) {
+        // Find out which CPU core is currently asking for a task
+        let core_id = crate::percpu::current().logical_id;
+        let core_idx = core_id % 32; // Safety boundary
+        let curr_idx = self.core_task_idx[core_idx];
+
+        // Save the stack pointer of the task that was just interrupted on this core
+        if let Some(current) = self.tasks.get_mut(curr_idx) {
             current.stack_ptr = current_rsp;
         }
 
+        // Only lottery against tasks pinned to THIS core
         let total_tickets: usize = self.tasks.iter()
-            .filter(|t| t.active)
+            .filter(|t| t.active && t.core_id == core_id)
             .map(|t| t.tickets)
             .sum();
 
@@ -132,10 +148,11 @@ impl Scheduler {
             let winning_ticket = self.rng.next_limit(total_tickets);
             let mut counter = 0;
             for (i, task) in self.tasks.iter().enumerate() {
-                if !task.active { continue; }
+                if !task.active || task.core_id != core_id { continue; } // Skip other cores' tasks
                 counter += task.tickets;
                 if counter > winning_ticket {
-                    self.current_task_idx = i;
+                    self.core_task_idx[core_idx] = i;
+                    self.current_task_idx = i; // Hack for legacy syscalls reading this field
                     break;
                 }
             }
@@ -144,7 +161,7 @@ impl Scheduler {
         // --- TELEMETRY UPDATE ---
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
         
-        self.tasks[self.current_task_idx].stack_ptr
+        self.tasks[self.core_task_idx[core_idx]].stack_ptr
     }
 }
 
@@ -180,13 +197,9 @@ pub extern "C" fn background_worker() {
         crate::entity::state::evolve_state();
         
         // 3. Poll the Network DMA Rings! 
-        // This tells smoltcp to check the physical RAM for incoming Ethernet frames
-        // and automatically forge/transmit replies (like ICMP Pings).
         crate::drivers::net::poll_network();
         
         // 4. Yield Control
-        // `hlt` puts the CPU into a low-power state until the very next hardware interrupt
-        // (like a timer tick or network card IRQ). This prevents the loop from melting the CPU.
         x86_64::instructions::hlt();
     }
 }

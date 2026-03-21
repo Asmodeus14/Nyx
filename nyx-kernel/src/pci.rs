@@ -148,6 +148,60 @@ fn enumerate_pci_legacy() {
                         let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(dev.clone(), mmio_phys);
                         eth_driver.initialize();
 
+                        // ADD THIS LINE TO VERIFY YOUR HARDWARE MAC:
+                        crate::serial_println!("[NET] Hardware MAC Read: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", 
+                            eth_driver.mac_address[0], eth_driver.mac_address[1], eth_driver.mac_address[2], 
+                            eth_driver.mac_address[3], eth_driver.mac_address[4], eth_driver.mac_address[5]);
+
+                        // === ULTIMATE MSI SETUP — 64-BIT AWARE + CORRECT ORDER + IMR + INTx DISABLE ===
+                        let mut cap_ptr = (PciDriver::read_config(dev.bus, dev.device, dev.func, 0x34) & 0xFF) as u8;
+                        while cap_ptr != 0 {
+                            let cap = PciDriver::read_config(dev.bus, dev.device, dev.func, cap_ptr as u8);
+                            let cap_id = (cap & 0xFF) as u8;
+                            if cap_id == 0x05 { // MSI capability
+                                let msg_ctrl = PciDriver::read_config(dev.bus, dev.device, dev.func, (cap_ptr + 2) as u8);
+                                let is_64bit = (msg_ctrl & (1 << 7)) != 0;
+                                
+                                // 1. Address low
+                                let core1_apic_id = unsafe { crate::percpu::PER_CPU.as_ref().unwrap()[1].apic_id } as u32;
+                                let msi_addr_low = 0xFEE0_0000 | (core1_apic_id << 12);
+                                let addr_reg = cap_ptr + 4;
+                                let addr_cfg = 0x80000000 | ((dev.bus as u32)<<16) | ((dev.device as u32)<<11) | ((dev.func as u32)<<8) | (addr_reg as u32);
+                                unsafe { Port::<u32>::new(0xCF8).write(addr_cfg); Port::<u32>::new(0xCFC).write(msi_addr_low); }
+                                
+                                // 2. Address high if 64-bit
+                                if is_64bit {
+                                    let high_reg = cap_ptr + 8;
+                                    let high_cfg = 0x80000000 | ((dev.bus as u32)<<16) | ((dev.device as u32)<<11) | ((dev.func as u32)<<8) | (high_reg as u32);
+                                    unsafe { Port::<u32>::new(0xCF8).write(high_cfg); Port::<u32>::new(0xCFC).write(0); }
+                                }
+                                
+                                // 3. Data (vector 0x30)
+                                let msi_data = 0x30u32;
+                                let data_reg = if is_64bit { cap_ptr + 12 } else { cap_ptr + 8 };
+                                let data_cfg = 0x80000000 | ((dev.bus as u32)<<16) | ((dev.device as u32)<<11) | ((dev.func as u32)<<8) | (data_reg as u32);
+                                unsafe { Port::<u32>::new(0xCF8).write(data_cfg); Port::<u32>::new(0xCFC).write(msi_data); }
+                                
+                                // 4. Enable MSI + disable legacy INTx
+                                let mut msg_ctrl_new = PciDriver::read_config(dev.bus, dev.device, dev.func, (cap_ptr + 2) as u8);
+                                msg_ctrl_new |= 1;
+                                let mut cmd_new = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
+                                cmd_new |= 1 << 10;
+                                let ctrl_cfg = 0x80000000 | ((dev.bus as u32)<<16) | ((dev.device as u32)<<11) | ((dev.func as u32)<<8) | ((cap_ptr + 2) as u32);
+                                let cmd_cfg  = 0x80000000 | ((dev.bus as u32)<<16) | ((dev.device as u32)<<11) | ((dev.func as u32)<<8) | 0x04;
+                                unsafe {
+                                    Port::<u32>::new(0xCF8).write(ctrl_cfg); Port::<u32>::new(0xCFC).write(msg_ctrl_new);
+                                    Port::<u32>::new(0xCF8).write(cmd_cfg);  Port::<u32>::new(0xCFC).write(cmd_new);
+                                }
+                                
+                                // 5. Enable interrupts inside the NIC (IMR)
+                                eth_driver.write16(0x3C, 0xFFFF);
+                                crate::serial_println!("[PCI] MSI correctly enabled for RTL8168 → Core 1 (APIC ID {}, Vector 0x30, 64-bit: {})", core1_apic_id, is_64bit);
+                                break;
+                            }
+                            cap_ptr = ((cap >> 8) & 0xFF) as u8;
+                        }
+
                         use smoltcp::iface::{Config, Interface};
                         use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
@@ -235,6 +289,60 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                     
                                     let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(pci_dev, mmio_phys);
                                     eth_driver.initialize();
+
+                                    // ADD THIS LINE TO VERIFY YOUR HARDWARE MAC:
+                                    crate::serial_println!("[NET] Hardware MAC Read: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", 
+                                        eth_driver.mac_address[0], eth_driver.mac_address[1], eth_driver.mac_address[2], 
+                                        eth_driver.mac_address[3], eth_driver.mac_address[4], eth_driver.mac_address[5]);
+
+                                    // === ULTIMATE MSI SETUP — 64-BIT AWARE + CORRECT ORDER + IMR + INTx DISABLE ===
+                                    let mut cap_ptr = (PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, 0x34) & 0xFF) as u8;
+                                    while cap_ptr != 0 {
+                                        let cap = PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, cap_ptr as u8);
+                                        let cap_id = (cap & 0xFF) as u8;
+                                        if cap_id == 0x05 { // MSI capability
+                                            let msg_ctrl = PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, (cap_ptr + 2) as u8);
+                                            let is_64bit = (msg_ctrl & (1 << 7)) != 0;
+                                            
+                                            // 1. Address low
+                                            let core1_apic_id = unsafe { crate::percpu::PER_CPU.as_ref().unwrap()[1].apic_id } as u32;
+                                            let msi_addr_low = 0xFEE0_0000 | (core1_apic_id << 12);
+                                            let addr_reg = cap_ptr + 4;
+                                            let addr_cfg = 0x80000000 | ((pci_dev.bus as u32)<<16) | ((pci_dev.device as u32)<<11) | ((pci_dev.func as u32)<<8) | (addr_reg as u32);
+                                            unsafe { Port::<u32>::new(0xCF8).write(addr_cfg); Port::<u32>::new(0xCFC).write(msi_addr_low); }
+                                            
+                                            // 2. Address high if 64-bit
+                                            if is_64bit {
+                                                let high_reg = cap_ptr + 8;
+                                                let high_cfg = 0x80000000 | ((pci_dev.bus as u32)<<16) | ((pci_dev.device as u32)<<11) | ((pci_dev.func as u32)<<8) | (high_reg as u32);
+                                                unsafe { Port::<u32>::new(0xCF8).write(high_cfg); Port::<u32>::new(0xCFC).write(0); }
+                                            }
+                                            
+                                            // 3. Data (vector 0x30)
+                                            let msi_data = 0x30u32;
+                                            let data_reg = if is_64bit { cap_ptr + 12 } else { cap_ptr + 8 };
+                                            let data_cfg = 0x80000000 | ((pci_dev.bus as u32)<<16) | ((pci_dev.device as u32)<<11) | ((pci_dev.func as u32)<<8) | (data_reg as u32);
+                                            unsafe { Port::<u32>::new(0xCF8).write(data_cfg); Port::<u32>::new(0xCFC).write(msi_data); }
+                                            
+                                            // 4. Enable MSI + disable legacy INTx
+                                            let mut msg_ctrl_new = PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, (cap_ptr + 2) as u8);
+                                            msg_ctrl_new |= 1;
+                                            let mut cmd_new = PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, 0x04);
+                                            cmd_new |= 1 << 10;
+                                            let ctrl_cfg = 0x80000000 | ((pci_dev.bus as u32)<<16) | ((pci_dev.device as u32)<<11) | ((pci_dev.func as u32)<<8) | ((cap_ptr + 2) as u32);
+                                            let cmd_cfg  = 0x80000000 | ((pci_dev.bus as u32)<<16) | ((pci_dev.device as u32)<<11) | ((pci_dev.func as u32)<<8) | 0x04;
+                                            unsafe {
+                                                Port::<u32>::new(0xCF8).write(ctrl_cfg); Port::<u32>::new(0xCFC).write(msg_ctrl_new);
+                                                Port::<u32>::new(0xCF8).write(cmd_cfg);  Port::<u32>::new(0xCFC).write(cmd_new);
+                                            }
+                                            
+                                            // 5. Enable interrupts inside the NIC (IMR)
+                                            eth_driver.write16(0x3C, 0xFFFF);
+                                            crate::serial_println!("[PCI] MSI correctly enabled for RTL8168 → Core 1 (APIC ID {}, Vector 0x30, 64-bit: {})", core1_apic_id, is_64bit);
+                                            break;
+                                        }
+                                        cap_ptr = ((cap >> 8) & 0xFF) as u8;
+                                    }
 
                                     use smoltcp::iface::{Config, Interface};
                                     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};

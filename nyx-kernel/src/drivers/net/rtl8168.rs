@@ -1,11 +1,10 @@
 use crate::pci::PciDevice;
-use crate::gui::Painter;
 use core::ptr::{read_volatile, write_volatile};
 use alloc::vec::Vec;
-use alloc::vec;
 use alloc::boxed::Box;
 use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken, ChecksumCapabilities};
 use smoltcp::time::Instant;
+use core::sync::atomic::{fence, Ordering};
 
 const NUM_TX_DESC: usize = 16;
 const NUM_RX_DESC: usize = 16;
@@ -81,10 +80,17 @@ impl Rtl8168Driver {
         driver
     }
 
-    fn read8(&self, offset: usize) -> u8 { unsafe { read_volatile((self.mmio_base + offset as u64) as *const u8) } }
-    fn write8(&mut self, offset: usize, val: u8) { unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u8, val) } }
-    fn write16(&mut self, offset: usize, val: u16) { unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u16, val) } }
-    fn write32(&mut self, offset: usize, val: u32) { unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u32, val) } }
+    // I/O Methods
+    pub fn read8(&self, offset: usize) -> u8 { unsafe { read_volatile((self.mmio_base + offset as u64) as *const u8) } }
+    pub fn write8(&mut self, offset: usize, val: u8) { unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u8, val) } }
+    pub fn read16(&self, offset: usize) -> u16 { unsafe { read_volatile((self.mmio_base + offset as u64) as *const u16) } }
+    pub fn write16(&mut self, offset: usize, val: u16) { unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u16, val) } }
+    pub fn read32(&self, offset: usize) -> u32 { unsafe { read_volatile((self.mmio_base + offset as u64) as *const u32) } }
+    pub fn write32(&mut self, offset: usize, val: u32) { unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u32, val) } }
+
+    pub fn ack_interrupt(&mut self) {
+        self.write16(0x3E, 0xFFFF); // ISR clear
+    }
 
     pub fn initialize(&mut self) {
         crate::serial_println!("[RTL8168] Resetting NIC...");
@@ -100,7 +106,7 @@ impl Rtl8168Driver {
             let mut port_data = x86_64::instructions::port::Port::<u32>::new(0xCFC);
             port_addr.write(address);
             let mut cmd = port_data.read();
-            cmd |= 0x06; 
+            cmd |= 0x06; // Enable Bus Mastering and Memory Space
             port_addr.write(address);
             port_data.write(cmd);
         }
@@ -138,17 +144,31 @@ impl Rtl8168Driver {
         self.write32(REG_RCR, 0xE73F); 
         self.write32(REG_TCR, 0x03000700); 
         self.write8(REG_CR, 0x0C); 
+
+        // --- HARDWARE DIAGNOSTIC PATCH ---
+        let phy_status = self.read8(0x6C);
+        if (phy_status & 0x02) != 0 {
+            crate::serial_println!("[RTL8168] ✅ HARDWARE REPORTS PHYSICAL LINK IS UP!");
+        } else {
+            crate::serial_println!("[RTL8168] ❌ HARDWARE REPORTS PHYSICAL LINK IS DOWN!");
+        }
+        
+        let isr_status = self.read16(0x3E);
+        crate::serial_println!("[RTL8168] Initial Interrupt Status Register: {:#06X}", isr_status);
     }
 }
 
 // ==========================================
-// SMOLTCP BINDINGS
+// SMOLTCP BINDINGS (SMP SAFE)
 // ==========================================
 impl Device for Rtl8168Driver {
     type RxToken<'a> = RtkRxToken where Self: 'a;
     type TxToken<'a> = RtkTxToken<'a> where Self: 'a;
 
     fn receive<'a>(&'a mut self, _timestamp: Instant) -> Option<(Self::RxToken<'a>, Self::TxToken<'a>)> {
+        // 1. ACQUIRE FENCE: Force CPU to read fresh DMA memory from RAM, not cache!
+        fence(Ordering::Acquire);
+
         let cmd_ptr = core::ptr::addr_of!(self.rx_ring.descs[self.rx_index].command_status);
         let status = unsafe { core::ptr::read_volatile(cmd_ptr) };
         
@@ -159,30 +179,22 @@ impl Device for Rtl8168Driver {
             let mut packet = alloc::vec![0; length];
             packet.copy_from_slice(&self.rx_buffers[self.rx_index].data[..length]);
 
-            // --- THE VISUAL HEX DUMP SNIFFER (LIVE MODE) ---
+            // --- GOD MODE SNIFFER ---
             if length >= 14 {
-                let dest_mac = alloc::format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", packet[0], packet[1], packet[2], packet[3], packet[4], packet[5]);
                 let eth_type = (packet[12] as u16) << 8 | (packet[13] as u16);
+                let dest_mac = alloc::format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", 
+                    packet[0], packet[1], packet[2], packet[3], packet[4], packet[5]);
                 
-                if eth_type == 0x0806 {
-                    unsafe {
-                        if let Some(painter) = &mut crate::SCREEN_PAINTER {
-                            let msg1 = alloc::format!("RX: {}b, Dest MAC: {}     ", length, dest_mac);
-                            painter.draw_string(10, 80, &msg1, crate::gui::Color::CYAN);
-                            
-                            let msg2 = alloc::format!("Raw Bytes 12-15: {:02X} {:02X} {:02X} {:02X}", packet[12], packet[13], packet[14], packet[15]);
-                            painter.draw_string(10, 100, &msg2, crate::gui::Color::WHITE);
-
-                            painter.draw_string(10, 120, "SNIFFER: TARGET ARP REQUEST CAUGHT!        ", crate::gui::Color::YELLOW);
-                        }
-                    }
-                }
+                crate::serial_println!("[NIC Sniffer] Caught {} byte packet! Dest: {}, Type: {:#06X}", length, dest_mac, eth_type);
             }
 
             let cmd_mut_ptr = core::ptr::addr_of_mut!(self.rx_ring.descs[self.rx_index].command_status);
             let mut reset_cmd = BUFFER_SIZE as u32 | (1 << 31);
             if self.rx_index == NUM_RX_DESC - 1 { reset_cmd |= 1 << 30; } 
             unsafe { core::ptr::write_volatile(cmd_mut_ptr, reset_cmd) };
+
+            // 2. RELEASE FENCE: Ensure the reset command hits RAM before the NIC checks it!
+            fence(Ordering::Release);
 
             self.rx_index = (self.rx_index + 1) % NUM_RX_DESC;
 
@@ -226,16 +238,14 @@ impl<'a> smoltcp::phy::TxToken for RtkTxToken<'a> {
         if idx == NUM_TX_DESC - 1 { cmd |= 1 << 30; } 
         
         unsafe { core::ptr::write_volatile(cmd_mut_ptr, cmd) };
+        
+        // 3. RELEASE FENCE: Ensure payload and descriptor hit RAM before ringing the doorbell!
+        fence(Ordering::Release);
+        
         self.0.tx_index = (idx + 1) % NUM_TX_DESC;
 
+        // Ring the doorbell
         self.0.write8(0x38, 0x40); 
-
-        unsafe {
-            if let Some(painter) = &mut crate::SCREEN_PAINTER {
-                let msg = alloc::format!("TX REPLY: {} bytes!    ", len);
-                painter.draw_string(10, 140, &msg, crate::gui::Color::GREEN);
-            }
-        }
 
         result
     }
