@@ -12,6 +12,7 @@ use x86_64::VirtAddr;
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
+// We keep the legacy PICs around strictly to keep them masked/disabled.
 pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 lazy_static! {
@@ -25,16 +26,17 @@ lazy_static! {
         idt.page_fault.set_handler_fn(pf_handler);
         idt.general_protection_fault.set_handler_fn(gpf_handler);
         
-        // --- UPDATED TIMER HANDLER ---
+        // --- PHASE 3: APIC TIMER -> CONTEXT SWITCHER ---
+        // We bypass standard Rust interrupt handlers and jump directly 
+        // to our assembly stub to swap the stack pointers!
         unsafe {
-            idt[InterruptIndex::Timer.as_usize()]
-                .set_handler_addr(VirtAddr::new(timer_interrupt_stub as *const () as u64));
+            idt[0x40].set_handler_addr(VirtAddr::new(timer_interrupt_stub as *const () as u64));
         }
         
         idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Mouse.as_usize()].set_handler_fn(mouse_interrupt_handler);
         
-        // --- ADDED FOR STEP 2: MSI ETHERNET HANDLER ---
+        // --- MSI ETHERNET HANDLER ---
         idt[0x30].set_handler_fn(ethernet_interrupt_handler);
         
         unsafe {
@@ -51,7 +53,7 @@ pub fn init_idt() { IDT.load(); }
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {
-    Timer = PIC_1_OFFSET,
+    Timer = PIC_1_OFFSET, // Legacy, unused
     Keyboard = PIC_1_OFFSET + 1,
     Mouse = PIC_2_OFFSET + 4,
 }
@@ -82,8 +84,6 @@ core::arch::global_asm!(r#"
 .intel_syntax noprefix
 .global timer_interrupt_stub
 timer_interrupt_stub:
-    // The CPU automatically pushed SS, RSP, RFLAGS, CS, RIP
-    // Save the general purpose registers
     push rax
     push rbx
     push rcx
@@ -100,16 +100,12 @@ timer_interrupt_stub:
     push r14
     push r15
 
-    // First argument (rdi) to our Rust function is the current stack pointer
     mov rdi, rsp
     
-    // Call the Rust scheduler context switch
     call timer_context_switch
     
-    // The Rust function returns the new task's stack pointer in rax
     mov rsp, rax
 
-    // Restore the general purpose registers for the new/resumed task
     pop r15
     pop r14
     pop r13
@@ -131,34 +127,39 @@ timer_interrupt_stub:
 
 extern "C" { fn timer_interrupt_stub(); }
 
+// --- PHASE 3: RUST CONTEXT SWITCH HANDLER ---
 // --- RUST CONTEXT SWITCH HANDLER ---
-// In nyx-kernel/src/interrupts.rs
-
 #[no_mangle]
 pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
-    crate::time::tick();
-    
-    // --- THE FIX: Modern APIC EOI ---
+    // 1. Acknowledge the hardware interrupt immediately
     crate::apic::end_of_interrupt();
-    // --------------------------------
 
-    unsafe {
-        if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
-            return scheduler.schedule(current_rsp);
+    // 2. Safely check if we are on Core 0 via hardware MSR
+    let is_bsp = unsafe {
+        (x86_64::registers::model_specific::Msr::new(0x1B).read() & (1 << 8)) != 0
+    };
+
+    // 3. Drive the scheduler!
+    if is_bsp {
+        // ❌ DELIBERATELY REMOVED crate::time::tick() !!
+        // It occasionally locked the system clock and caused a micro-deadlock.
+        unsafe {
+            if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
+                return scheduler.schedule(current_rsp);
+            }
         }
     }
+    
     current_rsp
 }
+
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     crate::shell::handle_key(scancode);
-    
-    // --- THE FIX: Modern APIC EOI ---
     crate::apic::end_of_interrupt();
-    // --------------------------------
 }
 
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
@@ -166,10 +167,7 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     let mut port = Port::new(0x60);
     let packet_byte: u8 = unsafe { port.read() };
     crate::mouse::handle_interrupt(packet_byte);
-    
-    // --- THE FIX: Modern APIC EOI ---
     crate::apic::end_of_interrupt();
-    // --------------------------------
 }
 
 pub fn init_syscalls() {}
@@ -236,15 +234,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
              }
         },
         4 => { 
-            // The legacy PIC is dead, so we read the CPU's physical heartbeat directly!
             let mut lo: u32;
             let mut hi: u32;
             unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-            
             let tsc = ((hi as u64) << 32) | (lo as u64);
-            
-            // Divide the raw CPU cycles to get an approximate millisecond counter.
-            // (Assuming an average 2.0 GHz CPU speed: 2,000,000 cycles = 1 ms)
             frame.rax = tsc / 2_000_000; 
         },
         5 => { 
@@ -286,17 +279,15 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
                     if fd < 32 {
                         if let Some(open_file) = &task.fd_table[fd] {
-                            // 1. Ask the hardware device for the physical address
                             match open_file.node.mmap(offset, size) {
                                 Ok(phys_addr) => {
-                                    // 2. Map that physical address directly into userspace!
                                     if let Ok(virt_addr) = crate::memory::map_user_mmio(phys_addr, size) {
                                         frame.rax = virt_addr;
                                     } else { frame.rax = (-1isize) as u64; }
                                 },
                                 Err(e) => frame.rax = e as u64,
                             }
-                        } else { frame.rax = (-1isize) as u64; } // Bad FD
+                        } else { frame.rax = (-1isize) as u64; }
                     } else { frame.rax = (-1isize) as u64; }
                 } else { frame.rax = (-1isize) as u64; }
             }
@@ -343,25 +334,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              }
         },
-        13 => { // sys_fs_write (Synchronous Blocking I/O)
+        13 => { // sys_fs_write
              let name_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
              let data_slice = unsafe { core::slice::from_raw_parts(arg3 as *const u8, arg4 as usize) };
              
              if let Ok(name) = core::str::from_utf8(name_slice) {
-                 // 1. Lock the filesystem atomically inside the syscall
                  let mut fs = crate::fs::FS.lock();
-                 
-                 // 2. Perform the compression and write immediately, 
-                 // blocking the caller until it is safely on the NVMe.
                  let success = fs.write_file(name, data_slice);
-                 
                  frame.rax = if success { 1 } else { 0 }; 
              } else {
                  frame.rax = 0;
              }
         },
         14 => { 
-            // sys_get_context_switches
             use core::sync::atomic::Ordering;
             frame.rax = crate::scheduler::CONTEXT_SWITCHES.load(Ordering::Relaxed);
         },
@@ -489,13 +474,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
     }
 }
 
-// --- ADDED FOR STEP 2: ACTUAL INTERRUPT HANDLER ---
 extern "x86-interrupt" fn ethernet_interrupt_handler(_stack: InterruptStackFrame) {
-    if let Some(driver) = crate::drivers::net::NET_DRIVER.lock().as_mut() {
-        driver.ack_interrupt();
+    // 1. Use try_lock! If the network thread is currently polling, we just skip the ACK.
+    // This prevents the interrupt handler from deadlocking the CPU!
+    if let Some(mut driver_guard) = crate::drivers::net::NET_DRIVER.try_lock() {
+        if let Some(driver) = driver_guard.as_mut() {
+            driver.ack_interrupt();
+        }
     }
+    
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
     crate::drivers::net::NETWORK_PENDING.store(true, core::sync::atomic::Ordering::Release);
     crate::apic::end_of_interrupt();
-    crate::serial_println!("[IRQ] Ethernet handled on core {}", crate::percpu::current().logical_id);
+    
+    // 2. NEVER PRINT INSIDE A HIGH-SPEED INTERRUPT HANDLER!
+    // crate::serial_println!("[IRQ] Ethernet handled on core...");
 }

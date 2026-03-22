@@ -49,9 +49,7 @@ pub fn init_aps(apic_ids: &[u32]) {
         // Second SIPI just in case it missed the first
         crate::apic::send_sipi(apic_id, trampoline_vector);
         
-        // --- THE FIX: BOOT TIMEOUT ---
-        // Wait maximum 500ms for the core to check in. If it triple faults,
-        // we break the loop and continue booting the rest of the OS!
+        // Wait maximum 500ms for the core to check in.
         let mut timeout = 0;
         while !AP_READY.load(Ordering::SeqCst) && timeout < 500 {
             crate::time::sleep_ms(1);
@@ -70,10 +68,10 @@ pub fn init_aps(apic_ids: &[u32]) {
 
 #[no_mangle]
 pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
-    // 1. Load IDT
+    // 1. Load IDT for this core
     crate::interrupts::init_idt();
 
-    // 2. Enable APIC
+    // 2. Enable Local APIC for this core
     unsafe {
         let apic_base = 0xFEE0_0000u64;
         let virt_base = crate::memory::phys_to_virt(apic_base).unwrap_or(apic_base);
@@ -85,19 +83,19 @@ pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
         core::ptr::write_volatile(svr_ptr, svr);
     }
     
+    // 3. Tell Core 0 we successfully woke up
+    crate::smp::AP_READY.store(true, core::sync::atomic::Ordering::SeqCst);
     crate::smp::ACTIVE_CORES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    crate::serial_println!("[SMP] Core {} Interrupt Pipeline Online and Armed!", logical_id);
 
+    // 4. Turn on hardware interrupts (so Core 1 can receive Ethernet IRQs)
     x86_64::instructions::interrupts::enable();
 
-    // 👉 THE MISSING LINK: Hijack Core 1! 
-    // Since Core 1 has no timer interrupt, we bypass the scheduler and force it into the network loop!
+    // 5. Core 1 drops straight into the network loop silently!
     if logical_id == 1 {
-        crate::serial_println!("[SMP] Core 1 bypassing scheduler and hijacking Network Thread!");
-        crate::network_thread(); // This is an infinite loop, Core 1 will stay here forever!
+        crate::network_thread(); 
     }
 
-    // Cores 2-7 will fall through to this sleep loop
+    // Cores 2-7 sleep peacefully
     loop {
         x86_64::instructions::hlt();
     }

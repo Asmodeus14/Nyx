@@ -51,14 +51,14 @@ pub struct Task {
     pub stack_ptr: u64,     
     pub active: bool,
     pub tickets: usize,  
-    pub core_id: usize, // --- NEW: Which CPU core this task is pinned to ---
+    pub core_id: usize, 
     pub fd_table: [Option<Arc<OpenFile>>; 32], 
 }
 
 pub struct Scheduler {
     pub tasks: Vec<Task>,
-    pub current_task_idx: usize, // Kept for legacy syscall compatibility
-    pub core_task_idx: [usize; 32], // Tracks the current task for up to 32 cores
+    pub current_task_idx: usize, 
+    pub core_task_idx: [usize; 32], 
     rng: QuantumRng,
 }
 
@@ -72,15 +72,15 @@ impl Scheduler {
         }
     }
 
-    // Register the booting thread so it doesn't overwrite others
     pub fn register_main_thread(&mut self) {
         let task = Task {
             id: self.tasks.len(),
             stack: Vec::new(), 
             stack_ptr: 0,      
             active: true,
-            tickets: 50,       
-            core_id: 0, // Main thread lives on BSP (Core 0)
+            // 👉 PROPER LOTTERY: Give the GUI overwhelming priority!
+            tickets: 1000,       
+            core_id: 0, 
             fd_table: core::array::from_fn(|_| None), 
         };
         self.tasks.push(task);
@@ -88,7 +88,6 @@ impl Scheduler {
         self.core_task_idx[0] = 0;
     }
 
-    // --- NEW: SPAWN ON CORE METHOD ---
     pub fn spawn_on_core(&mut self, core_id: usize, func: extern "C" fn(), tickets: usize) {
         let stack = Vec::with_capacity(4096 * 8); 
         let stack_bottom = stack.as_ptr() as u64;
@@ -113,14 +112,13 @@ impl Scheduler {
             stack_ptr: sp,
             active: true,
             tickets,
-            core_id, // Pin it to the requested core!
+            core_id, 
             fd_table: core::array::from_fn(|_| None), 
         };
         
         self.tasks.push(task);
     }
 
-    // Legacy spawn wrapper defaults to Core 0
     pub fn spawn(&mut self, func: extern "C" fn(), tickets: usize) {
         self.spawn_on_core(0, func, tickets);
     }
@@ -128,17 +126,14 @@ impl Scheduler {
     pub fn schedule(&mut self, current_rsp: u64) -> u64 {
         if self.tasks.is_empty() { return current_rsp; }
 
-        // Find out which CPU core is currently asking for a task
         let core_id = crate::percpu::current().logical_id;
-        let core_idx = core_id % 32; // Safety boundary
+        let core_idx = core_id % 32; 
         let curr_idx = self.core_task_idx[core_idx];
 
-        // Save the stack pointer of the task that was just interrupted on this core
         if let Some(current) = self.tasks.get_mut(curr_idx) {
             current.stack_ptr = current_rsp;
         }
 
-        // Only lottery against tasks pinned to THIS core
         let total_tickets: usize = self.tasks.iter()
             .filter(|t| t.active && t.core_id == core_id)
             .map(|t| t.tickets)
@@ -148,58 +143,53 @@ impl Scheduler {
             let winning_ticket = self.rng.next_limit(total_tickets);
             let mut counter = 0;
             for (i, task) in self.tasks.iter().enumerate() {
-                if !task.active || task.core_id != core_id { continue; } // Skip other cores' tasks
+                if !task.active || task.core_id != core_id { continue; } 
                 counter += task.tickets;
                 if counter > winning_ticket {
                     self.core_task_idx[core_idx] = i;
-                    self.current_task_idx = i; // Hack for legacy syscalls reading this field
+                    self.current_task_idx = i; 
                     break;
                 }
             }
         }
         
-        // --- TELEMETRY UPDATE ---
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        
         self.tasks[self.core_task_idx[core_idx]].stack_ptr
     }
 }
 
+// --- NEW: COOPERATIVE YIELDING ---
+/// Forces the current task to immediately give up its time slice
+/// by manually triggering the APIC Timer interrupt vector (0x40).
+pub fn yield_now() {
+    unsafe { core::arch::asm!("int 0x40"); }
+}
+
 pub extern "C" fn clock_task() {
-    let mut ticks = 0;
     loop {
-        ticks += 1;
-        unsafe {
-            if let Some(painter) = &mut crate::SCREEN_PAINTER {
-                let time_str = alloc::format!("Time: {:05}", ticks);
-                let x_pos = if painter.width() > 200 { painter.width() - 200 } else { 0 };
-                // Draw in the top right corner
-                painter.draw_string(x_pos, 20, &time_str, crate::gui::Color::CYAN);
-            }
-        }
-        for _ in 0..1_000_000 { core::hint::spin_loop(); }
+        // We have no work to do right now, so we instantly yield 
+        // the CPU back to the scheduler! Zero wasted cycles.
+        crate::scheduler::yield_now();
     }
 }
 
 pub extern "C" fn background_worker() {
     loop {
-        // 1. Process Dynamic OS Jobs
         let job_opt = x86_64::instructions::interrupts::without_interrupts(|| {
             let mut queue = JOB_QUEUE.lock();
             if !queue.is_empty() { Some(queue.remove(0)) } else { None }
         });
 
-        if let Some(job) = job_opt { 
-            job(); 
-        } 
+        if let Some(job) = job_opt { job(); } 
         
-        // 2. Let the Entity breathe and evolve
         crate::entity::state::evolve_state();
         
-        // 3. Poll the Network DMA Rings! 
-        crate::drivers::net::poll_network();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            crate::drivers::net::poll_network();
+        });
         
-        // 4. Yield Control
-        x86_64::instructions::hlt();
+        // PROPER SCHEDULING: We did our quick background tasks.
+        // Instead of halting the whole core, we yield back to the GUI!
+        crate::scheduler::yield_now();
     }
 }

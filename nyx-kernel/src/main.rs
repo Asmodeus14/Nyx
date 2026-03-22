@@ -141,7 +141,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::percpu::init(&apic_ids);
         crate::memory::identity_map_low_memory();
         
-        // Initialize the TSC-based time system and the IOAPIC
+        // time::init() takes over the APIC timer to measure CPU speed.
         crate::time::init();
         crate::ioapic::init();
         
@@ -149,12 +149,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::ioapic::route_irq(1, 0, crate::interrupts::InterruptIndex::Keyboard as u8);
         crate::ioapic::route_irq(12, 0, crate::interrupts::InterruptIndex::Mouse as u8);
 
-        // Turn on hardware interrupts!
-        x86_64::instructions::interrupts::enable();
-        
         // Wake the Application Processors!
         crate::smp::init_aps(&apic_ids);
-        // ---------------------------------------
+
+        // Turn on hardware interrupts!
+        x86_64::instructions::interrupts::enable();
+
+        // ❌ Note: The init_timer call was explicitly removed from here to prevent boot deadlocks!
 
         crate::pci::enumerate_pci();
     } else {
@@ -168,16 +169,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unsafe {
         crate::serial_println!("[SCHEDULER] Spawning Threads...");
         let mut scheduler = crate::scheduler::Scheduler::new();
+        
+        // 👉 HYBRID SCHEDULING: GUI thread is given 1000 tickets automatically.
         scheduler.register_main_thread();
         
         // PINNING CORES
-        scheduler.spawn_on_core(0, crate::scheduler::clock_task, 50);
-        scheduler.spawn_on_core(0, crate::scheduler::background_worker, 10);
+        // 👉 GUI gets 1000 weight. These get 1 weight.
+        // They will run cooperatively and instantly yield back to the GUI!
+        scheduler.spawn_on_core(0, crate::scheduler::clock_task, 1);
+        scheduler.spawn_on_core(0, crate::scheduler::background_worker, 1);
         
-        // 👉 PROPER SMP: The Network thread operates safely on Core 1 now!
+        // The Network thread operates safely on Core 1!
         scheduler.spawn_on_core(1, network_thread, 1000); 
         
-        crate::serial_println!("[SMP] ✅ GUI + Clock on Core 0");
+        crate::serial_println!("[SMP] ✅ GUI + Background Tasks on Core 0");
         crate::serial_println!("[SMP] ✅ Ethernet TCP/IP + MSI on Core 1");
 
         crate::scheduler::SCHEDULER = Some(scheduler);
@@ -203,8 +208,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     interrupts::init_syscalls(); 
 
-    // 👉 Launching the GUI and jumping to Ring 3
     crate::serial_println!("[OS] Handing control to Ring 3...");
+
+    // 👉 THE ULTIMATE FIX: Arm Core 0's timer NOW. 
+    // The OS is fully built, so preemption is finally safe!
+    crate::apic::init_timer(0x40);
+
+    // Launching the GUI and jumping to Ring 3
     enter_userspace_trampoline();
 
     // The main thread drops into this loop if userspace exits
@@ -214,8 +224,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 // --- HYBRID NETWORK THREAD ---
 pub extern "C" fn network_thread() {
     loop {
-        // 1. Always process the network stack (clears ARP queues and forged replies)
-        crate::drivers::net::poll_network();
+        // Disable interrupts while locking the network driver!
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // 1. Always process the network stack (clears ARP queues and forged replies)
+            crate::drivers::net::poll_network();
+        });
         
         // 2. Clear the hardware pending flag if an interrupt hit
         crate::drivers::net::NETWORK_PENDING.store(false, core::sync::atomic::Ordering::Release);

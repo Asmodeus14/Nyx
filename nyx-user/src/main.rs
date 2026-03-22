@@ -22,7 +22,6 @@ use apps::bootlog::BootlogApp;
 use gfx::draw;
 use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
-
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
@@ -33,18 +32,15 @@ const MAX_WINDOWS: usize = 7;
 pub extern "C" fn _start() -> ! {
     // ---------------------------------------------------------
     // NEW: DYNAMIC HEAP INITIALIZATION
-    // Request 2048 pages (8 MB) from the Kernel dynamically
     const HEAP_PAGES: usize = 2048; 
     let heap_start = sys_alloc_pages(HEAP_PAGES);
     
     if heap_start == 0 { 
-        // If the kernel returns 0, we are Out of Memory. Abort.
         sys_print("FATAL: Failed to allocate userspace heap!\n");
         sys_exit(1); 
     }
     
     unsafe { 
-        // Give the memory to the linked-list allocator!
         ALLOCATOR.lock().init(heap_start as usize, HEAP_PAGES * 4096); 
     }
     // ---------------------------------------------------------
@@ -95,9 +91,8 @@ pub extern "C" fn _start() -> ! {
     let mut my_monitor = SysMonitor::new();
     let mut my_sysinfo = SysInfoApp::new();
     let mut my_bootlog = BootlogApp::new();
-// ============================================================
-    // --- PHASE 4 PREP: THE LINUX DRM HANDSHAKE ---
-    // ============================================================
+    
+    // --- DRM HANDSHAKE ---
     #[repr(C)]
     #[derive(Debug, Default)]
     pub struct DrmVersion {
@@ -114,14 +109,11 @@ pub extern "C" fn _start() -> ! {
 
     sys_print("Attempting to open DRM device...\n");
     let gpu_fd = sys_open("/dev/dri/card0");
-    
     if gpu_fd >= 0 {
-        // 1. Allocate empty buffers for the kernel to fill with strings
         let mut name_buf = [0u8; 32];
         let mut date_buf = [0u8; 32];
         let mut desc_buf = [0u8; 64];
 
-        // 2. Set up the struct with pointers to our empty buffers
         let mut version = DrmVersion {
             version_major: 0, version_minor: 0, version_patchlevel: 0,
             name_len: name_buf.len(), name: name_buf.as_mut_ptr(),
@@ -129,26 +121,17 @@ pub extern "C" fn _start() -> ! {
             desc_len: desc_buf.len(), desc: desc_buf.as_mut_ptr(),
         };
 
-        // 3. The exact hex code Mesa uses to ask "Who are you?"
         const DRM_IOCTL_VERSION: usize = 0xC0406400;
-        
-        // 4. Send it to the kernel!
         let result = sys_ioctl(gpu_fd, DRM_IOCTL_VERSION, &mut version as *mut DrmVersion as usize);
-        
         if result >= 0 {
             let name_str = core::str::from_utf8(&name_buf[..version.name_len]).unwrap_or("err");
             let desc_str = core::str::from_utf8(&desc_buf[..version.desc_len]).unwrap_or("err");
-            
             let msg = alloc::format!("[DRM] Handshake Success!\n[DRM] Kernel replied -> Driver: {} v{}.{}.{} ({})\n> ", 
                 name_str, version.version_major, version.version_minor, version.version_patchlevel, desc_str);
             my_terminal.write_str(&msg);
-        } else {
-            my_terminal.write_str("[DRM] Handshake Failed!\n> ");
-        }
-    } else {
-        my_terminal.write_str("[DRM] Failed to open /dev/dri/card0.\n> ");
-    }
-    // ============================================================
+        } else { my_terminal.write_str("[DRM] Handshake Failed!\n> "); }
+    } else { my_terminal.write_str("[DRM] Failed to open /dev/dri/card0.\n> "); }
+
     let mut show_start_menu = false;
     let mut is_dragging = false;
     let mut is_resizing = false;
@@ -195,7 +178,11 @@ pub extern "C" fn _start() -> ! {
             my_monitor.update_stats();
 
             for w in windows.iter() {
-                if w.id == 1 && w.exists {
+                if w.id == 1 && w.exists { mark_dirty(w.x, w.y, w.w, w.h); }
+                
+                // 👉 THE REFRESH FIX: Poll the kernel for new logs!
+                if w.id == 6 && w.exists {
+                    my_bootlog.refresh();
                     mark_dirty(w.x, w.y, w.w, w.h);
                 }
             }
@@ -224,7 +211,7 @@ pub extern "C" fn _start() -> ! {
 
             if show_start_menu {
                 let menu_w = 150;
-                let menu_h = 280; // Expanded to fit 7 items
+                let menu_h = 280; 
                 let menu_x = 10;
                 let menu_y = screen_h - TASKBAR_H - menu_h;
 
@@ -316,6 +303,8 @@ pub extern "C" fn _start() -> ! {
                         let ry = my.saturating_sub(wy);
                         if wid == 3 { my_editor.handle_click(rx, ry, ww); }
                         if wid == 4 { my_explorer.handle_click(rx, ry, ww); }
+                        // 👉 THE CLICK HOOK: Pass scroll clicks to BootlogApp!
+                        if wid == 6 { my_bootlog.handle_click(mx, my, wx, wy, ww, wh); }
                     }
                     mark_dirty(wx, wy, ww, wh);
                     needs_redraw = true;
