@@ -12,7 +12,6 @@ use x86_64::VirtAddr;
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-// We keep the legacy PICs around strictly to keep them masked/disabled.
 pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 lazy_static! {
@@ -26,17 +25,12 @@ lazy_static! {
         idt.page_fault.set_handler_fn(pf_handler);
         idt.general_protection_fault.set_handler_fn(gpf_handler);
         
-        // --- PHASE 3: APIC TIMER -> CONTEXT SWITCHER ---
-        // We bypass standard Rust interrupt handlers and jump directly 
-        // to our assembly stub to swap the stack pointers!
         unsafe {
             idt[0x40].set_handler_addr(VirtAddr::new(timer_interrupt_stub as *const () as u64));
         }
         
         idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Mouse.as_usize()].set_handler_fn(mouse_interrupt_handler);
-        
-        // --- MSI ETHERNET HANDLER ---
         idt[0x30].set_handler_fn(ethernet_interrupt_handler);
         
         unsafe {
@@ -53,7 +47,7 @@ pub fn init_idt() { IDT.load(); }
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {
-    Timer = PIC_1_OFFSET, // Legacy, unused
+    Timer = PIC_1_OFFSET,
     Keyboard = PIC_1_OFFSET + 1,
     Mouse = PIC_2_OFFSET + 4,
 }
@@ -79,11 +73,17 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
         cr2, error_code, stack_frame.instruction_pointer.as_u64());
 }
 
-// --- CONTEXT SWITCH ASSEMBLY STUB ---
+// ─────────────────────────────────────────────────────────────────────────
+// SMP TIMER STUB
+// ─────────────────────────────────────────────────────────────────────────
 core::arch::global_asm!(r#"
 .intel_syntax noprefix
 .global timer_interrupt_stub
 timer_interrupt_stub:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
     push rax
     push rbx
     push rcx
@@ -101,9 +101,7 @@ timer_interrupt_stub:
     push r15
 
     mov rdi, rsp
-    
     call timer_context_switch
-    
     mov rsp, rax
 
     pop r15
@@ -122,37 +120,20 @@ timer_interrupt_stub:
     pop rbx
     pop rax
 
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 "#);
 
 extern "C" { fn timer_interrupt_stub(); }
 
-// --- PHASE 3: RUST CONTEXT SWITCH HANDLER ---
-// --- RUST CONTEXT SWITCH HANDLER ---
 #[no_mangle]
 pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
-    // 1. Acknowledge the hardware interrupt immediately
     crate::apic::end_of_interrupt();
-
-    // 2. Safely check if we are on Core 0 via hardware MSR
-    let is_bsp = unsafe {
-        (x86_64::registers::model_specific::Msr::new(0x1B).read() & (1 << 8)) != 0
-    };
-
-    // 3. Drive the scheduler!
-    if is_bsp {
-        // ❌ DELIBERATELY REMOVED crate::time::tick() !!
-        // It occasionally locked the system clock and caused a micro-deadlock.
-        unsafe {
-            if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
-                return scheduler.schedule(current_rsp);
-            }
-        }
-    }
-    
-    current_rsp
+    crate::percpu::current().scheduler.schedule(current_rsp)
 }
-
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
@@ -179,10 +160,15 @@ pub struct SyscallStackFrame {
     pub rax: u64,
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// SMP SYSCALL STUB
+// ─────────────────────────────────────────────────────────────────────────
 core::arch::global_asm!(r#"
 .intel_syntax noprefix
 .global syscall_handler_asm
 syscall_handler_asm:
+    swapgs
+
     push rax
     push rdi
     push rsi
@@ -206,6 +192,7 @@ syscall_handler_asm:
     pop rdi
     pop rax
     
+    swapgs
     iretq
 "#);
 
@@ -224,7 +211,18 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         0 => {}, 
         1 => { // sys_draw_rect
              if let Some(p) = unsafe { &mut crate::SCREEN_PAINTER } {
-                 let rect = Rect { x: arg1 as usize, y: arg2 as usize, w: arg3 as usize, h: arg4 as usize };
+                 let screen_w = p.info.width;
+                 let screen_h = p.info.height;
+                 
+                 // 🚨 THE FIX: Completely clamp the coordinates so userspace can never overflow the VGA buffer
+                 let start_x = core::cmp::min(arg1 as usize, screen_w);
+                 let start_y = core::cmp::min(arg2 as usize, screen_h);
+                 let max_w = screen_w.saturating_sub(start_x);
+                 let max_h = screen_h.saturating_sub(start_y);
+                 let w = core::cmp::min(arg3 as usize, max_w);
+                 let h = core::cmp::min(arg4 as usize, max_h);
+                 
+                 let rect = Rect { x: start_x, y: start_y, w, h };
                  let color_code = arg5 as u8;
                  let color = match color_code {
                      0 => Color::BLACK, 1 => Color::BLUE, 2 => Color::GREEN, 3 => Color::CYAN,
@@ -267,16 +265,21 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  } else { frame.rax = 0; }
              } else { frame.rax = 0; }
         },
-        9 => {
+        9 => { // sys_mmap
             let fd = arg1 as usize;
             let size = arg2 as usize;
             let offset = arg3 as usize;
 
             unsafe {
-                if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
-                    let curr_idx = scheduler.current_task_idx;
-                    let task = &mut scheduler.tasks[curr_idx];
+                let percpu = crate::percpu::current();
+                let core_id = percpu.logical_id;
+                let scheduler = &mut percpu.scheduler;
+                
+                // 🚨 THE FIX: Use the stable core_task_idx tracker to prevent out of bounds panics
+                let curr_idx = scheduler.core_task_idx[core_id % 32];
 
+                if curr_idx < scheduler.tasks.len() {
+                    let task = &mut scheduler.tasks[curr_idx];
                     if fd < 32 {
                         if let Some(open_file) = &task.fd_table[fd] {
                             match open_file.node.mmap(offset, size) {
@@ -316,7 +319,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     unsafe {
                         let len = name.len();
                         let src = name.as_bytes();
-                        for i in 0..len { *buf_ptr.add(i) = src[i]; }
+                        
+                        // 🚨 THE FIX: Reverted the bad clamp. We copy the full file name!
+                        for i in 0..len { 
+                            *buf_ptr.add(i) = src[i]; 
+                        }
+                        
                         frame.rax = len as u64;
                     }
                 } else { frame.rax = 0; }
@@ -350,15 +358,18 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             use core::sync::atomic::Ordering;
             frame.rax = crate::scheduler::CONTEXT_SWITCHES.load(Ordering::Relaxed);
         },
-        15 => {
+        15 => { // sys_open_file
             let path_slice = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
                 if let Some(vnode) = crate::vfs::VFS.open_path(path) {
                     unsafe {
-                        if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
-                            let curr_idx = scheduler.current_task_idx;
+                        let percpu = crate::percpu::current();
+                        let core_id = percpu.logical_id;
+                        let scheduler = &mut percpu.scheduler;
+                        let curr_idx = scheduler.core_task_idx[core_id % 32];
+                        
+                        if curr_idx < scheduler.tasks.len() {
                             let task = &mut scheduler.tasks[curr_idx];
-                            
                             let mut allocated_fd = -1;
                             for i in 3..32 {
                                 if task.fd_table[i].is_none() {
@@ -373,16 +384,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = (-1isize) as u64; } 
             } else { frame.rax = (-1isize) as u64; }
         },
-        16 => {
+        16 => { // sys_ioctl
             let fd = arg1 as usize;
             let request = arg2 as usize;
             let ioctl_arg = arg3 as usize;
             
             unsafe {
-                if let Some(scheduler) = &mut crate::scheduler::SCHEDULER {
-                    let curr_idx = scheduler.current_task_idx;
+                let percpu = crate::percpu::current();
+                let core_id = percpu.logical_id;
+                let scheduler = &mut percpu.scheduler;
+                let curr_idx = scheduler.core_task_idx[core_id % 32];
+                
+                if curr_idx < scheduler.tasks.len() {
                     let task = &mut scheduler.tasks[curr_idx];
-                    
                     if fd < 32 {
                         if let Some(open_file) = &task.fd_table[fd] {
                             match open_file.node.ioctl(request, ioctl_arg) {
@@ -391,13 +405,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                             }
                         } else { frame.rax = (-1isize) as u64; }
                     } else { frame.rax = (-1isize) as u64; }
-                }
+                } else { frame.rax = (-1isize) as u64; }
             }
         },
         17 => {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
-            
             let mcfg = unsafe { crate::acpi::ACPI_INFO.mcfg_addr.unwrap_or(0) };
             let madt = unsafe { crate::acpi::ACPI_INFO.madt_addr.unwrap_or(0) };
             
@@ -408,17 +421,15 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             
             let bytes = info.as_bytes();
             let len = core::cmp::min(bytes.len(), buf_len);
-            unsafe {
-                for i in 0..len { *buf_ptr.add(i) = bytes[i]; }
-            }
+            unsafe { for i in 0..len { *buf_ptr.add(i) = bytes[i]; } }
             frame.rax = len as u64;
         },
-        18 => {
+        18 => { // sys_boot_log
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
-            
             unsafe {
-                let log_len = crate::serial::BOOT_LOG_IDX;
+                // 🚨 THE FIX: Clamp the boot log so userspace can't read out-of-bounds array data
+                let log_len = core::cmp::min(crate::serial::BOOT_LOG_IDX, 8192);
                 let copy_len = core::cmp::min(buf_len, log_len);
                 
                 for i in 0..copy_len {
@@ -437,23 +448,17 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         20 => {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
-            
             if buf_len >= 32 { 
                 unsafe {
                     let seed = &crate::entity::seed::GENETIC_SEED;
-                    for i in 0..32 {
-                        *buf_ptr.add(i) = seed[i];
-                    }
+                    for i in 0..32 { *buf_ptr.add(i) = seed[i]; }
                 }
                 frame.rax = 1; 
-            } else {
-                frame.rax = 0; 
-            }
+            } else { frame.rax = 0; }
         },
         21 => {
             let buf_ptr = arg1 as *mut f32;
             let buf_len = arg2 as usize;
-            
             if buf_len >= 4 {
                 unsafe {
                     *buf_ptr.add(0) = crate::entity::state::ENTITY_STATE.get_energy();
@@ -462,9 +467,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     *buf_ptr.add(3) = crate::entity::state::ENTITY_STATE.get_curiosity();
                 }
                 frame.rax = 1; 
-            } else {
-                frame.rax = 0; 
-            }
+            } else { frame.rax = 0; }
         },
         22 => {
             use core::sync::atomic::Ordering;
@@ -475,18 +478,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 }
 
 extern "x86-interrupt" fn ethernet_interrupt_handler(_stack: InterruptStackFrame) {
-    // 1. Use try_lock! If the network thread is currently polling, we just skip the ACK.
-    // This prevents the interrupt handler from deadlocking the CPU!
-    if let Some(mut driver_guard) = crate::drivers::net::NET_DRIVER.try_lock() {
-        if let Some(driver) = driver_guard.as_mut() {
-            driver.ack_interrupt();
-        }
+    //  THE FIX: Bind the lock guard first, then access the Option inside it
+    let mut driver_guard = crate::drivers::net::NET_DRIVER.lock();
+    if let Some(driver) = driver_guard.as_mut() {
+        driver.ack_interrupt();
     }
     
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
     crate::drivers::net::NETWORK_PENDING.store(true, core::sync::atomic::Ordering::Release);
     crate::apic::end_of_interrupt();
-    
-    // 2. NEVER PRINT INSIDE A HIGH-SPEED INTERRUPT HANDLER!
-    // crate::serial_println!("[IRQ] Ethernet handled on core...");
 }

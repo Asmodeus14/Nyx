@@ -46,10 +46,8 @@ pub fn init_aps(apic_ids: &[u32]) {
         crate::apic::send_sipi(apic_id, trampoline_vector);
         crate::time::sleep_ms(1); // Wait 200us minimum
         
-        // Second SIPI just in case it missed the first
         crate::apic::send_sipi(apic_id, trampoline_vector);
         
-        // Wait maximum 500ms for the core to check in.
         let mut timeout = 0;
         while !AP_READY.load(Ordering::SeqCst) && timeout < 500 {
             crate::time::sleep_ms(1);
@@ -68,10 +66,20 @@ pub fn init_aps(apic_ids: &[u32]) {
 
 #[no_mangle]
 pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
-    // 1. Load IDT for this core
+    // 1. Establish Per-CPU access immediately
+    crate::gdt::load_kernel_gs(logical_id);
+    
+    // 2. Load THIS core's specific GDT and TSS to secure Ring 0 transitions
+    crate::percpu::current().gdt_state.load();
+
+    // 3. Load IDT for this core
     crate::interrupts::init_idt();
 
-    // 2. Enable Local APIC for this core
+    // 🚨 THE MISSING PIECE: Configure the local Syscall MSRs (LSTAR, STAR, FMASK)
+    // Core 1 is now legally licensed to transition from Ring 3 to Ring 0!
+    crate::interrupts::init_syscalls();
+
+    // 4. Enable Local APIC for this core
     unsafe {
         let apic_base = 0xFEE0_0000u64;
         let virt_base = crate::memory::phys_to_virt(apic_base).unwrap_or(apic_base);
@@ -83,19 +91,18 @@ pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
         core::ptr::write_volatile(svr_ptr, svr);
     }
     
-    // 3. Tell Core 0 we successfully woke up
+    // 5. Tell Core 0 we successfully woke up
     crate::smp::AP_READY.store(true, core::sync::atomic::Ordering::SeqCst);
     crate::smp::ACTIVE_CORES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    // 4. Turn on hardware interrupts (so Core 1 can receive Ethernet IRQs)
+    // 6. Arm the APIC timer so this core actually ticks and calls the scheduler
+    crate::apic::init_timer(0x40);
+
+    // 7. Turn on hardware interrupts
     x86_64::instructions::interrupts::enable();
 
-    // 5. Core 1 drops straight into the network loop silently!
-    if logical_id == 1 {
-        crate::network_thread(); 
-    }
-
-    // Cores 2-7 sleep peacefully
+    // 8. Idle loop. The core sleeps here until the timer interrupt fires 
+    // pulling it into the scheduler to fetch tasks from the GLOBAL_RUNQUEUE.
     loop {
         x86_64::instructions::hlt();
     }

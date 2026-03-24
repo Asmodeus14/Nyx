@@ -69,11 +69,18 @@ pub struct NvmeStream {
     driver: NvmeDriver,
     position: u64,
     partition_offset: u64,
+    // 🚨 STACK FIX: A dedicated HEAP buffer to prevent stack blowouts during FAT traversal
+    temp_block: Vec<u8>, 
 }
 
 impl NvmeStream {
     pub fn new(driver: NvmeDriver, partition_offset: u64) -> Self {
-        Self { driver, position: 0, partition_offset }
+        Self { 
+            driver, 
+            position: 0, 
+            partition_offset, 
+            temp_block: alloc::vec![0u8; 4096] // Allocated safely on the heap
+        }
     }
 }
 
@@ -84,12 +91,12 @@ impl Read for NvmeStream {
         if buf.len() == 0 { return Ok(0); }
         let current_lba = self.partition_offset + (self.position / BLOCK_SIZE);
         let offset_in_block = (self.position % BLOCK_SIZE) as usize;
-        let mut temp_block = [0u8; 4096]; 
         
-        if self.driver.read_block(current_lba, &mut temp_block) {
+        // Use the pre-allocated heap buffer instead of the stack
+        if self.driver.read_block(current_lba, &mut self.temp_block) {
             let bytes_available = (BLOCK_SIZE as usize) - offset_in_block;
             let bytes_to_copy = cmp::min(buf.len(), bytes_available);
-            buf[..bytes_to_copy].copy_from_slice(&temp_block[offset_in_block..offset_in_block+bytes_to_copy]);
+            buf[..bytes_to_copy].copy_from_slice(&self.temp_block[offset_in_block..offset_in_block+bytes_to_copy]);
             self.position += bytes_to_copy as u64;
             Ok(bytes_to_copy)
         } else {
@@ -102,16 +109,15 @@ impl Write for NvmeStream {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         let current_lba = self.partition_offset + (self.position / BLOCK_SIZE);
         let offset_in_block = (self.position % BLOCK_SIZE) as usize;
-        let mut temp_block = [0u8; 4096];
         
-        if !self.driver.read_block(current_lba, &mut temp_block) { return Err(()); }
+        if !self.driver.read_block(current_lba, &mut self.temp_block) { return Err(()); }
         
         let bytes_available = (BLOCK_SIZE as usize) - offset_in_block;
         let bytes_to_copy = cmp::min(buf.len(), bytes_available);
         
-        temp_block[offset_in_block..offset_in_block+bytes_to_copy].copy_from_slice(&buf[..bytes_to_copy]);
+        self.temp_block[offset_in_block..offset_in_block+bytes_to_copy].copy_from_slice(&buf[..bytes_to_copy]);
         
-        if self.driver.write_block(current_lba, &temp_block) {
+        if self.driver.write_block(current_lba, &self.temp_block) {
             self.position += bytes_to_copy as u64;
             Ok(bytes_to_copy)
         } else {
@@ -145,18 +151,31 @@ impl FileSystem {
     }
 
     pub fn init(&mut self, mut driver: NvmeDriver) {
-        let mut sector0 = [0u8; 4096];
+        crate::serial_println!("[FS] Initializing FileSystem Subsystem...");
+        
+        // 🚨 STACK FIX: Safely allocate blocks on the heap to save the kernel stack!
+        let mut sector0 = alloc::vec![0u8; 4096];
+        
+        crate::serial_println!("[FS] Finding active namespace...");
         let _ = driver.find_active_namespace();
-        if !driver.read_block(0, &mut sector0) { return; }
+        
+        crate::serial_println!("[FS] Reading MBR/Sector 0...");
+        if !driver.read_block(0, &mut sector0) { 
+            crate::serial_println!("[FS] ERR: Failed to read MBR/Sector 0.");
+            return; 
+        }
 
         let mut partition_start_lba = 0;
         let part_type = sector0[0x1BE + 4];
 
         if part_type == 0xEE { 
-             let mut gpt_header = [0u8; 4096];
+             crate::serial_println!("[FS] GPT Detected. Parsing headers...");
+             let mut gpt_header = alloc::vec![0u8; 4096];
+             
              if driver.read_block(1, &mut gpt_header) {
                  let entry_list_lba = u64::from_le_bytes(gpt_header[72..80].try_into().unwrap());
-                 let mut entry_block = [0u8; 4096];
+                 let mut entry_block = alloc::vec![0u8; 4096];
+                 
                  if driver.read_block(entry_list_lba, &mut entry_block) {
                      for i in 0..4 { 
                          let offset = i * 128;
@@ -169,15 +188,43 @@ impl FileSystem {
                  }
              }
         } else { 
+             crate::serial_println!("[FS] Standard MBR Detected.");
              partition_start_lba = u32::from_le_bytes([sector0[0x1BE+8], sector0[0x1BE+9], sector0[0x1BE+10], sector0[0x1BE+11]]) as u64;
         }
 
-        if partition_start_lba == 0 { return; }
+        if partition_start_lba == 0 { 
+            crate::serial_println!("[FS] No valid partition found. Drive is raw.");
+            return; 
+        }
 
+        crate::serial_println!("[FS] Partition found at LBA {}. Verifying Boot Sector...", partition_start_lba);
+        let mut boot_sector = alloc::vec![0u8; 4096];
+        if !driver.read_block(partition_start_lba, &mut boot_sector) { 
+            crate::serial_println!("[FS] Failed to read boot sector at LBA {}.", partition_start_lba);
+            return; 
+        }
+        
+        // 🚨 FAT32 Safety Valve: Prevent Infinite Loops
+        if boot_sector[510] != 0x55 || boot_sector[511] != 0xAA {
+            crate::serial_println!(
+                "[FS] Invalid FAT signature: {:02X} {:02X} at LBA {}. Aborting mount.",
+                boot_sector[510], boot_sector[511], partition_start_lba
+            );
+            return;
+        }
+
+        crate::serial_println!("[FS] Valid FAT boot sector detected. Mounting...");
         let stream = NvmeStream::new(driver, partition_start_lba);
         let options = fatfs::FsOptions::new().update_accessed_date(true);
-        if let Ok(fs) = fatfs::FileSystem::new(stream, options) {
-            self.inner = Some(fs);
+        
+        match fatfs::FileSystem::new(stream, options) {
+            Ok(fs) => {
+                self.inner = Some(fs);
+                crate::serial_println!("[FS] FAT Filesystem successfully mounted.");
+            },
+            Err(_) => {
+                crate::serial_println!("[FS] ERR: fatfs rejected the volume during mount.");
+            }
         }
     }
 
@@ -210,7 +257,10 @@ impl FileSystem {
             let clean_name = if name.starts_with('/') { &name[1..] } else { name };
             if let Ok(mut file) = root.open_file(clean_name) {
                 let mut buf = Vec::new();
-                let mut temp = [0u8; 512];
+                
+                // 🚨 STACK FIX: Use a heap vector to prevent deep-recursion stack blowouts!
+                let mut temp = alloc::vec![0u8; 512];
+                
                 loop {
                     match file.read(&mut temp) {
                         Ok(0) => break,

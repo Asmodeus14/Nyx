@@ -2,13 +2,14 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(c_variadic)]
+#![feature(naked_functions)] // 🚨 REQUIRED: For our SMP-safe context switchers
 #![allow(static_mut_refs)]
 
 extern crate alloc;
 
 use bootloader_api::{entry_point, BootInfo, config::Mapping, config::BootloaderConfig};
 use x86_64::{VirtAddr, structures::paging::PageTableFlags};
-use crate::gui::{Painter, Color};
+use crate::gui::{Painter, Color, Rect};
 use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::format;
 
@@ -18,13 +19,13 @@ pub mod vga_log;
 pub mod vfs;
 pub mod acpi;
 pub mod apic; 
-pub mod ioapic; // <-- Modern Interrupt Routing
+pub mod ioapic;
 pub mod pci;  
 pub mod drm;  
 pub mod entity; 
 pub mod c_stubs; 
-pub mod percpu; // Phase 1: Per-CPU Architecture
-pub mod smp;    // Phase 2: Symmetric Multiprocessing
+pub mod percpu; 
+pub mod smp;    
 
 mod allocator;
 mod memory;
@@ -93,16 +94,14 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::serial_println!("[INIT] NyxOS Kernel Booting...");
 
-    // 1. Core CPU Architecture Init
-    gdt::init();
+    // 1. Core CPU Architecture Init (Per-core GDT is handled in percpu::init)
     interrupts::init_idt();
     
-    // KILL THE LEGACY PICs!
-    // We mask them completely with 0xFF to prevent ghost interrupts.
+    // Mask legacy PICs completely
     unsafe { 
         let mut pics = interrupts::PICS.lock();
         pics.initialize();
-        pics.write_masks(0xFF, 0xFF);
+        pics.write_masks(0xFF, 0xFF); 
     };
 
     // 2. Memory Subsystem Init
@@ -134,14 +133,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         acpi::init_intel_acpica();
         apic::init();
         
-        // --- PHASE 0, 1 & 2: THE SMP BRINGUP ---
+        // --- THE SMP BRINGUP ---
         let apic_ids = crate::apic::get_cpu_apic_ids();
         
-        // Setup isolated stacks and map the trampoline
+        // Setup isolated stacks, GDTs, and map the trampoline
         crate::percpu::init(&apic_ids);
         crate::memory::identity_map_low_memory();
         
-        // time::init() takes over the APIC timer to measure CPU speed.
         crate::time::init();
         crate::ioapic::init();
         
@@ -152,10 +150,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Wake the Application Processors!
         crate::smp::init_aps(&apic_ids);
 
-        // Turn on hardware interrupts!
+        // Turn on hardware interrupts
         x86_64::instructions::interrupts::enable();
-
-        // ❌ Note: The init_timer call was explicitly removed from here to prevent boot deadlocks!
 
         crate::pci::enumerate_pci();
     } else {
@@ -165,37 +161,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 5. Hardware Drivers Init
     { let mut driver = crate::mouse::MouseDriver::new(); driver.init(); }
 
-    // 6. OS Thread Spawning
+    // 6. OS Thread Spawning (Directly to the SMP GLOBAL_RUNQUEUE)
     unsafe {
         crate::serial_println!("[SCHEDULER] Spawning Threads...");
-        let mut scheduler = crate::scheduler::Scheduler::new();
         
-        // 👉 HYBRID SCHEDULING: GUI thread is given 1000 tickets automatically.
-        scheduler.register_main_thread();
+        crate::scheduler::spawn(crate::scheduler::clock_task, 1);
+        crate::scheduler::spawn(crate::scheduler::background_worker, 1);
+        crate::scheduler::spawn(network_thread, 1000);
         
-        // PINNING CORES
-        // 👉 GUI gets 1000 weight. These get 1 weight.
-        // They will run cooperatively and instantly yield back to the GUI!
-        scheduler.spawn_on_core(0, crate::scheduler::clock_task, 1);
-        scheduler.spawn_on_core(0, crate::scheduler::background_worker, 1);
-        
-        // The Network thread operates safely on Core 1!
-        scheduler.spawn_on_core(1, network_thread, 1000); 
-        
-        crate::serial_println!("[SMP] ✅ GUI + Background Tasks on Core 0");
-        crate::serial_println!("[SMP] ✅ Ethernet TCP/IP + MSI on Core 1");
-
-        crate::scheduler::SCHEDULER = Some(scheduler);
+        crate::serial_println!("[SMP] ✅ Global Work Queue populated");
     }
 
     // 7. Storage and Entity Init
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
     if let Some(ref mut driver) = nvme_driver_opt { driver.create_io_queues(); }
+    
     crate::entity::awaken_entity(&mut nvme_driver_opt);
+    
     if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
 
     // 8. Userspace Setup
     crate::serial_println!("[OS] Loading Userspace Environment...");
+    crate::vga_println!("[OS] Loading Userspace Environment...");
+    
     const PAGE_COUNT: u64 = 8192; 
     let _ = crate::memory::allocate_user_pages(PAGE_COUNT).expect("Alloc User Failed");
     
@@ -206,15 +194,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     USER_ENTRY.store(entry_point_addr, Ordering::SeqCst);
     USER_STACK.store(stack_addr, Ordering::SeqCst);
 
+    // Initialize BSP syscalls
     interrupts::init_syscalls(); 
 
     crate::serial_println!("[OS] Handing control to Ring 3...");
+    crate::vga_println!("[OS] Handing control to Ring 3...");
 
-    // 👉 THE ULTIMATE FIX: Arm Core 0's timer NOW. 
-    // The OS is fully built, so preemption is finally safe!
+    // Arm Core 0's timer so the local scheduler ticks
     crate::apic::init_timer(0x40);
 
-    // Launching the GUI and jumping to Ring 3
+    // Launch GUI and jump to Ring 3 on Core 0
     enter_userspace_trampoline();
 
     // The main thread drops into this loop if userspace exits
@@ -224,17 +213,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 // --- HYBRID NETWORK THREAD ---
 pub extern "C" fn network_thread() {
     loop {
-        // Disable interrupts while locking the network driver!
         x86_64::instructions::interrupts::without_interrupts(|| {
-            // 1. Always process the network stack (clears ARP queues and forged replies)
             crate::drivers::net::poll_network();
         });
         
-        // 2. Clear the hardware pending flag if an interrupt hit
         crate::drivers::net::NETWORK_PENDING.store(false, core::sync::atomic::Ordering::Release);
         
-        // 3. Hybrid Yield: Let Core 1 spin lightly instead of a deep sleep. 
-        for _ in 0..50_000 { core::hint::spin_loop(); }
+        // THE FIX: Remove the 50,000 cycle spin-loop and use cooperative yielding.
+        // Because this thread has 1000 tickets, it will instantly be scheduled again,
+        // resulting in ultra-low latency polling without freezing the core.
+        crate::scheduler::yield_now(); 
     }
 }
 
@@ -266,9 +254,27 @@ unsafe fn load_elf(binary: &[u8]) -> u64 {
     header.e_entry
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 🚨 THE RSOD (RED SCREEN OF DEATH) PANIC HANDLER
+// ─────────────────────────────────────────────────────────────────────────
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     x86_64::instructions::interrupts::disable();
+    
+    // 1. Paint the entire screen stark red
+    unsafe {
+        if let Some(painter) = &mut SCREEN_PAINTER {
+            let width = painter.info.width;
+            let height = painter.info.height;
+            painter.draw_rect(Rect { x: 0, y: 0, w: width, h: height }, Color::RED);
+        }
+    }
+
+    // 2. Print the panic trace to the serial port
     crate::serial_println!("[PANIC] {}", info);
+    
+    // 3. Print the panic trace directly to the red VGA screen
+    crate::vga_println!("\n\n[PANIC] {}", info);
+    
     loop { x86_64::instructions::hlt(); }
 }

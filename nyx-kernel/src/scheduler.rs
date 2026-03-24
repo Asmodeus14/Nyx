@@ -1,18 +1,18 @@
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use x86_64::VirtAddr;
-use crate::gui::Painter; 
+use alloc::collections::VecDeque;
+use crate::vfs::OpenFile; 
 use x86_64::registers::segmentation::{Segment, CS}; 
 use spin::Mutex; 
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::vfs::OpenFile; 
 
-// --- DYNAMIC JOB SYSTEM ---
+// ─────────────────────────────────────────────────────────────────────────
+// SYSTEM GLOBALS & ATOMICS
+// ─────────────────────────────────────────────────────────────────────────
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
-pub static JOB_QUEUE: Mutex<Vec<Job>> = Mutex::new(Vec::new());
+pub static JOB_QUEUE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
 
-// --- TELEMETRY ---
 pub static CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 pub fn submit_job<F>(f: F)
@@ -21,12 +21,49 @@ where
 {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut queue = JOB_QUEUE.lock();
-        queue.push(Box::new(f));
+        queue.push_back(Box::new(f)); 
     });
 }
 
-pub static mut SCHEDULER: Option<Scheduler> = None;
+// ─────────────────────────────────────────────────────────────────────────
+// SMP GLOBAL RUNQUEUE
+// ─────────────────────────────────────────────────────────────────────────
+pub static GLOBAL_RUNQUEUE: Mutex<VecDeque<Task>> = Mutex::new(VecDeque::new());
 
+unsafe impl Send for Task {}
+
+pub fn spawn_any_core(func: extern "C" fn(), tickets: usize) {
+    let len = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut q = GLOBAL_RUNQUEUE.lock();
+        q.push_back(Task::new(func, tickets)); 
+        q.len()
+    });  
+    
+    crate::serial_println!(
+        "[SCHED] Task added to Global Queue by core {} | queue size now {}",
+        crate::percpu::current().logical_id,
+        len
+    );
+}
+
+pub fn spawn(func: extern "C" fn(), tickets: usize) {
+    spawn_any_core(func, tickets);
+}
+
+pub fn spawn_pinned(core_id: usize, func: extern "C" fn(), tickets: usize) {
+    let _len = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut q = GLOBAL_RUNQUEUE.lock();
+        let mut task = Task::new(func, tickets);
+        // Force this task to a specific physical core
+        task.core_id = core_id; 
+        q.push_back(task); 
+        q.len()
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SCHEDULER CORE
+// ─────────────────────────────────────────────────────────────────────────
 struct QuantumRng { seed: u64 }
 impl QuantumRng {
     fn new(seed: u64) -> Self { Self { seed } }
@@ -35,14 +72,6 @@ impl QuantumRng {
         self.seed
     }
     fn next_limit(&mut self, limit: usize) -> usize { (self.next() as usize) % limit }
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct TaskContext {
-    r15: u64, r14: u64, r13: u64, r12: u64, r11: u64,
-    r10: u64, r9: u64,  r8: u64,  rdi: u64, rsi: u64,
-    rdx: u64, rcx: u64, rbx: u64, rax: u64, rbp: u64,
 }
 
 pub struct Task {
@@ -55,41 +84,11 @@ pub struct Task {
     pub fd_table: [Option<Arc<OpenFile>>; 32], 
 }
 
-pub struct Scheduler {
-    pub tasks: Vec<Task>,
-    pub current_task_idx: usize, 
-    pub core_task_idx: [usize; 32], 
-    rng: QuantumRng,
-}
-
-impl Scheduler {
-    pub fn new() -> Self {
-        Self {
-            tasks: Vec::new(),
-            current_task_idx: 0,
-            core_task_idx: [0; 32],
-            rng: QuantumRng::new(12345),
-        }
-    }
-
-    pub fn register_main_thread(&mut self) {
-        let task = Task {
-            id: self.tasks.len(),
-            stack: Vec::new(), 
-            stack_ptr: 0,      
-            active: true,
-            // 👉 PROPER LOTTERY: Give the GUI overwhelming priority!
-            tickets: 1000,       
-            core_id: 0, 
-            fd_table: core::array::from_fn(|_| None), 
-        };
-        self.tasks.push(task);
-        self.current_task_idx = 0; 
-        self.core_task_idx[0] = 0;
-    }
-
-    pub fn spawn_on_core(&mut self, core_id: usize, func: extern "C" fn(), tickets: usize) {
-        let stack = Vec::with_capacity(4096 * 8); 
+impl Task {
+    pub fn new(func: extern "C" fn(), tickets: usize) -> Self {
+        let mut stack = Vec::with_capacity(4096 * 8); 
+        unsafe { stack.set_len(4096 * 8); } 
+        
         let stack_bottom = stack.as_ptr() as u64;
         let stack_top = stack_bottom + stack.capacity() as u64;
         let mut sp = stack_top & !0xF;
@@ -104,38 +103,93 @@ impl Scheduler {
             sp -= 120; // Saved Registers
         }
 
-        core::mem::forget(stack.clone()); 
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1000);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) as usize;
 
-        let task = Task {
-            id: self.tasks.len(),
+        Task {
+            id,
             stack, 
             stack_ptr: sp,
             active: true,
             tickets,
-            core_id, 
+            core_id: usize::MAX,
             fd_table: core::array::from_fn(|_| None), 
-        };
-        
-        self.tasks.push(task);
+        }
+    }
+}
+
+pub struct Scheduler {
+    pub tasks: Vec<Task>,
+    pub current_task_idx: usize, 
+    pub core_task_idx: [usize; 32], 
+    rng: QuantumRng,
+}
+
+impl Scheduler {
+    pub fn new() -> Self {
+        Self {
+            tasks: Vec::with_capacity(256),
+            current_task_idx: 0,
+            core_task_idx: [usize::MAX; 32], 
+            rng: QuantumRng::new(12345),
+        }
     }
 
-    pub fn spawn(&mut self, func: extern "C" fn(), tickets: usize) {
-        self.spawn_on_core(0, func, tickets);
+    pub fn register_main_thread(&mut self) {
+        let task = Task {
+            id: self.tasks.len(),
+            stack: Vec::new(), 
+            stack_ptr: 0,      
+            active: true,
+            tickets: 1000, 
+            core_id: usize::MAX, 
+            fd_table: core::array::from_fn(|_| None), 
+        };
+        self.tasks.push(task);
+        self.current_task_idx = 0; 
+        self.core_task_idx = [0; 32]; 
     }
 
     pub fn schedule(&mut self, current_rsp: u64) -> u64 {
-        if self.tasks.is_empty() { return current_rsp; }
-
         let core_id = crate::percpu::current().logical_id;
         let core_idx = core_id % 32; 
         let curr_idx = self.core_task_idx[core_idx];
 
-        if let Some(current) = self.tasks.get_mut(curr_idx) {
-            current.stack_ptr = current_rsp;
+        // 1. Save current state
+        if curr_idx != usize::MAX && curr_idx < self.tasks.len() {
+            if let Some(current) = self.tasks.get_mut(curr_idx) {
+                current.stack_ptr = current_rsp;
+            }
         }
 
+        // 🚨 LOAD BALANCER (CFS-Lite)
+        let active_tasks = self.tasks.iter().filter(|t| t.active).count();
+
+        if active_tasks < 4 {
+            if let Some(mut global_queue) = GLOBAL_RUNQUEUE.try_lock() {
+                if let Some(mut new_task) = global_queue.pop_front() { 
+                    if self.tasks.len() < self.tasks.capacity() {
+                        
+                        // 🚨 THE FIX: Only claim the task if it wasn't explicitly pinned!
+                        if new_task.core_id == usize::MAX {
+                            new_task.core_id = core_id; 
+                        }
+                        
+                        self.tasks.push(new_task);
+                        
+                        if curr_idx == usize::MAX {
+                            self.core_task_idx[core_idx] = self.tasks.len() - 1;
+                        }
+                    } else {
+                        global_queue.push_front(new_task);
+                    }
+                }
+            }
+        }
+
+        // 2. Lottery Scheduling
         let total_tickets: usize = self.tasks.iter()
-            .filter(|t| t.active && t.core_id == core_id)
+            .filter(|t| t.active && (t.core_id == core_id || t.core_id == usize::MAX))
             .map(|t| t.tickets)
             .sum();
 
@@ -143,7 +197,9 @@ impl Scheduler {
             let winning_ticket = self.rng.next_limit(total_tickets);
             let mut counter = 0;
             for (i, task) in self.tasks.iter().enumerate() {
-                if !task.active || task.core_id != core_id { continue; } 
+                if !task.active || (task.core_id != core_id && task.core_id != usize::MAX) { 
+                    continue; 
+                } 
                 counter += task.tickets;
                 if counter > winning_ticket {
                     self.core_task_idx[core_idx] = i;
@@ -154,21 +210,40 @@ impl Scheduler {
         }
         
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        self.tasks[self.core_task_idx[core_idx]].stack_ptr
+        
+        let raw_idx = self.core_task_idx[core_idx];
+
+        let safe_idx = if raw_idx != usize::MAX 
+            && raw_idx < self.tasks.len() 
+            && self.tasks[raw_idx].active 
+            && (self.tasks[raw_idx].core_id == core_id || self.tasks[raw_idx].core_id == usize::MAX)
+        {
+            raw_idx
+        } else {
+            match self.tasks.iter().position(|t| t.active && (t.core_id == core_id || t.core_id == usize::MAX)) {
+                Some(i) => {
+                    self.core_task_idx[core_idx] = i; 
+                    i
+                },
+                None => return current_rsp, 
+            }
+        };
+
+        if let Some(next_task) = self.tasks.get(safe_idx) {
+            next_task.stack_ptr
+        } else {
+            current_rsp
+        }
     }
 }
 
-// --- NEW: COOPERATIVE YIELDING ---
-/// Forces the current task to immediately give up its time slice
-/// by manually triggering the APIC Timer interrupt vector (0x40).
 pub fn yield_now() {
     unsafe { core::arch::asm!("int 0x40"); }
 }
 
 pub extern "C" fn clock_task() {
     loop {
-        // We have no work to do right now, so we instantly yield 
-        // the CPU back to the scheduler! Zero wasted cycles.
+        unsafe { x86_64::instructions::hlt(); }
         crate::scheduler::yield_now();
     }
 }
@@ -177,19 +252,18 @@ pub extern "C" fn background_worker() {
     loop {
         let job_opt = x86_64::instructions::interrupts::without_interrupts(|| {
             let mut queue = JOB_QUEUE.lock();
-            if !queue.is_empty() { Some(queue.remove(0)) } else { None }
+            queue.pop_front()
         });
 
         if let Some(job) = job_opt { job(); } 
-        
         crate::entity::state::evolve_state();
         
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            crate::drivers::net::poll_network();
-        });
+        // 🚨 THE FIX: Deleted the duplicate `poll_network()` call here!
+        // Core 1 will no longer fight Core 0 for the network lock.
         
-        // PROPER SCHEDULING: We did our quick background tasks.
-        // Instead of halting the whole core, we yield back to the GUI!
+        for _ in 0..10_000 { core::hint::spin_loop(); }
+
+        unsafe { x86_64::instructions::hlt(); }
         crate::scheduler::yield_now();
     }
 }
