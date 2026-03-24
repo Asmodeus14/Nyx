@@ -34,7 +34,8 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 sha3 = { version = "0.10", default-features = false }
 
 aml = "0.16.4"
-smoltcp = { version = "0.9.1", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-icmp", "socket-tcp"] }
+
+smoltcp = { version = "0.9.1", default-features = false, features = ["alloc", "log", "medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp"] }
 
 # --- FIX: Use GIT dependency for fatfs 0.4-dev ---
 # This version includes the modern IO traits and removes the broken core_io dependency.

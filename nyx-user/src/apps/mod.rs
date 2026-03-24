@@ -5,3 +5,4 @@ pub mod explorer;
 pub mod monitor;
 pub mod sysinfo;   
 pub mod bootlog;   
+pub mod netchat;

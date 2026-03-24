@@ -19,19 +19,20 @@ use apps::explorer::Explorer;
 use apps::monitor::SysMonitor;
 use apps::sysinfo::SysInfoApp;
 use apps::bootlog::BootlogApp;
+// 🚨 IMPORT YOUR NEW APP
+use apps::netchat::NetChatApp; 
 use gfx::draw;
 use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-const MAX_WINDOWS: usize = 7; 
+// 🚨 BUMPED MAX_WINDOWS to 8
+const MAX_WINDOWS: usize = 8; 
 
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    // ---------------------------------------------------------
-    // NEW: DYNAMIC HEAP INITIALIZATION
     const HEAP_PAGES: usize = 2048; 
     let heap_start = sys_alloc_pages(HEAP_PAGES);
     
@@ -40,10 +41,7 @@ pub extern "C" fn _start() -> ! {
         sys_exit(1); 
     }
     
-    unsafe { 
-        ALLOCATOR.lock().init(heap_start as usize, HEAP_PAGES * 4096); 
-    }
-    // ---------------------------------------------------------
+    unsafe { ALLOCATOR.lock().init(heap_start as usize, HEAP_PAGES * 4096); }
 
     let (screen_w, screen_h, screen_stride) = sys_get_screen_info();
     if screen_w == 0 || screen_h == 0 { sys_exit(1); }
@@ -79,9 +77,11 @@ pub extern "C" fn _start() -> ! {
         Window { id: 3, x: 200, y: 100, w: 600, h: 450, title: "NyxPad", active: false, exists: false },
         Window { id: 4, x: 150, y: 150, w: 500, h: 400, title: "File Explorer", active: false, exists: true }, 
         Window { id: 5, x: 250, y: 150, w: 400, h: 250, title: "Hardware Profile", active: false, exists: false },
-        Window { id: 6, x: 100, y: 80, w: 800, h: 500, title: "Kernel Boot Logs (dmesg)", active: false, exists: false },
+        Window { id: 6, x: 100, y: 80, w: 800, h: 500, title: "Kernel Boot Logs", active: false, exists: false },
+        // 🚨 ADDED NETCHAT WINDOW (ID 7)
+        Window { id: 7, x: 300, y: 150, w: 450, h: 350, title: "NetChat", active: false, exists: false },
     ];
-    let mut z_order = [0, 1, 2, 3, 4, 5, 6];
+    let mut z_order = [0, 1, 2, 3, 4, 5, 6, 7]; // Added 7
 
     // --- APP INITIALIZATION ---
     let mut my_terminal = Terminal::new();
@@ -92,32 +92,26 @@ pub extern "C" fn _start() -> ! {
     let mut my_sysinfo = SysInfoApp::new();
     let mut my_bootlog = BootlogApp::new();
     
+    // 🚨 INIT NETCHAT
+    let mut my_netchat = NetChatApp::new();
+    my_netchat.init(); 
+
     // --- DRM HANDSHAKE ---
     #[repr(C)]
     #[derive(Debug, Default)]
     pub struct DrmVersion {
-        pub version_major: i32,
-        pub version_minor: i32,
-        pub version_patchlevel: i32,
-        pub name_len: usize,
-        pub name: *mut u8,
-        pub date_len: usize,
-        pub date: *mut u8,
-        pub desc_len: usize,
-        pub desc: *mut u8,
+        pub version_major: i32, pub version_minor: i32, pub version_patchlevel: i32,
+        pub name_len: usize, pub name: *mut u8, pub date_len: usize, pub date: *mut u8,
+        pub desc_len: usize, pub desc: *mut u8,
     }
 
     sys_print("Attempting to open DRM device...\n");
     let gpu_fd = sys_open("/dev/dri/card0");
     if gpu_fd >= 0 {
-        let mut name_buf = [0u8; 32];
-        let mut date_buf = [0u8; 32];
-        let mut desc_buf = [0u8; 64];
-
+        let mut name_buf = [0u8; 32]; let mut date_buf = [0u8; 32]; let mut desc_buf = [0u8; 64];
         let mut version = DrmVersion {
             version_major: 0, version_minor: 0, version_patchlevel: 0,
-            name_len: name_buf.len(), name: name_buf.as_mut_ptr(),
-            date_len: date_buf.len(), date: date_buf.as_mut_ptr(),
+            name_len: name_buf.len(), name: name_buf.as_mut_ptr(), date_len: date_buf.len(), date: date_buf.as_mut_ptr(),
             desc_len: desc_buf.len(), desc: desc_buf.as_mut_ptr(),
         };
 
@@ -133,14 +127,10 @@ pub extern "C" fn _start() -> ! {
     } else { my_terminal.write_str("[DRM] Failed to open /dev/dri/card0.\n> "); }
 
     let mut show_start_menu = false;
-    let mut is_dragging = false;
-    let mut is_resizing = false;
+    let mut is_dragging = false; let mut is_resizing = false;
     let mut target_idx = 0; 
-    let mut drag_off_x = 0;
-    let mut drag_off_y = 0;
-    let mut prev_left = false;
-    let mut prev_mx = 0;
-    let mut prev_my = 0;
+    let mut drag_off_x = 0; let mut drag_off_y = 0;
+    let mut prev_left = false; let mut prev_mx = 0; let mut prev_my = 0;
     let mut prev_active_idx = 0;
     
     let mut last_frame = sys_get_time();
@@ -157,8 +147,7 @@ pub extern "C" fn _start() -> ! {
         last_frame = now;
 
         let (mx_raw, my_raw, left, _right) = sys_get_mouse();
-        let mx = mx_raw.clamp(0, screen_w - 1);
-        let my = my_raw.clamp(0, screen_h - 1);
+        let mx = mx_raw.clamp(0, screen_w - 1); let my = my_raw.clamp(0, screen_h - 1);
         
         let mut mark_dirty = |x: usize, y: usize, w: usize, h: usize| {
             let pad = 20;
@@ -167,6 +156,14 @@ pub extern "C" fn _start() -> ! {
             dirty_min_x = dirty_min_x.min(sx); dirty_min_y = dirty_min_y.min(sy);
             dirty_max_x = dirty_max_x.max(ex); dirty_max_y = dirty_max_y.max(ey);
         };
+
+        // 🚨 FAST POLL: Check network every frame so we don't miss packets!
+        if windows[7].exists {
+            if my_netchat.update() {
+                mark_dirty(windows[7].x, windows[7].y, windows[7].w, windows[7].h);
+                needs_redraw = true;
+            }
+        }
 
         if now / 1000 != last_second {
             last_second = now / 1000;
@@ -179,8 +176,6 @@ pub extern "C" fn _start() -> ! {
 
             for w in windows.iter() {
                 if w.id == 1 && w.exists { mark_dirty(w.x, w.y, w.w, w.h); }
-                
-                // 👉 THE REFRESH FIX: Poll the kernel for new logs!
                 if w.id == 6 && w.exists {
                     my_bootlog.refresh();
                     mark_dirty(w.x, w.y, w.w, w.h);
@@ -189,19 +184,22 @@ pub extern "C" fn _start() -> ! {
             needs_redraw = true;
         }
 
+        // 🚨 ROUTE KEYBOARD TO NETCHAT
         if let Some(c) = sys_read_key() {
             if windows[0].active && windows[0].exists {
                 my_terminal.handle_key(c);
                 mark_dirty(windows[0].x, windows[0].y, windows[0].w, windows[0].h);
-                if c == '\n' { 
-                    mark_dirty(0, 0, 300, screen_h - TASKBAR_H); 
-                    my_explorer.refresh(); 
-                }
+                if c == '\n' { mark_dirty(0, 0, 300, screen_h - TASKBAR_H); my_explorer.refresh(); }
                 needs_redraw = true;
             } 
             else if windows[3].active && windows[3].exists {
                 my_editor.handle_key(c);
                 mark_dirty(windows[3].x, windows[3].y, windows[3].w, windows[3].h);
+                needs_redraw = true;
+            }
+            else if windows[7].active && windows[7].exists {
+                my_netchat.handle_key(c);
+                mark_dirty(windows[7].x, windows[7].y, windows[7].w, windows[7].h);
                 needs_redraw = true;
             }
         }
@@ -210,10 +208,8 @@ pub extern "C" fn _start() -> ! {
             let mut handled = false;
 
             if show_start_menu {
-                let menu_w = 150;
-                let menu_h = 280; 
-                let menu_x = 10;
-                let menu_y = screen_h - TASKBAR_H - menu_h;
+                let menu_w = 150; let menu_h = 320; // 🚨 Increased height for new app
+                let menu_x = 10; let menu_y = screen_h - TASKBAR_H - menu_h;
 
                 if mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h {
                     let item_idx = (my - menu_y) / 40;
@@ -225,12 +221,12 @@ pub extern "C" fn _start() -> ! {
                         4 => launch_app(&mut windows, &mut z_order, 2, &mut mark_dirty), 
                         5 => launch_app(&mut windows, &mut z_order, 5, &mut mark_dirty),
                         6 => launch_app(&mut windows, &mut z_order, 6, &mut mark_dirty),
+                        7 => launch_app(&mut windows, &mut z_order, 7, &mut mark_dirty), // 🚨 Launch NetChat
                         _ => {}
                     }
                     show_start_menu = false;
                     mark_dirty(menu_x, menu_y, menu_w, menu_h);
-                    needs_redraw = true;
-                    handled = true;
+                    needs_redraw = true; handled = true;
                 } else {
                     show_start_menu = false;
                     mark_dirty(menu_x, menu_y, menu_w, menu_h);
@@ -241,10 +237,9 @@ pub extern "C" fn _start() -> ! {
             if !handled && my >= screen_h - TASKBAR_H {
                 if mx < 100 { 
                     show_start_menu = !show_start_menu;
-                    let menu_h = 280; 
+                    let menu_h = 320; 
                     mark_dirty(10, screen_h - TASKBAR_H - menu_h, 150, menu_h + TASKBAR_H);
-                    needs_redraw = true;
-                    handled = true;
+                    needs_redraw = true; handled = true;
                 }
             }
 
@@ -256,20 +251,14 @@ pub extern "C" fn _start() -> ! {
                     if !w.exists { continue; }
                     
                     if mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h {
-                        hit_z_index = Some(i);
-                        break; 
+                        hit_z_index = Some(i); break; 
                     }
                 }
 
                 if let Some(i) = hit_z_index {
                     let idx = z_order[i];
-                    
                     let old_w_idx = prev_active_idx;
-                    let old_x = windows[old_w_idx].x;
-                    let old_y = windows[old_w_idx].y;
-                    let old_w_val = windows[old_w_idx].w;
-                    let old_h_val = windows[old_w_idx].h;
-                    mark_dirty(old_x, old_y, old_w_val, old_h_val);
+                    mark_dirty(windows[old_w_idx].x, windows[old_w_idx].y, windows[old_w_idx].w, windows[old_w_idx].h);
 
                     for j in i..(MAX_WINDOWS-1) { z_order[j] = z_order[j+1]; }
                     z_order[MAX_WINDOWS-1] = idx;
@@ -278,10 +267,8 @@ pub extern "C" fn _start() -> ! {
                     windows[idx].active = true;
                     prev_active_idx = idx; target_idx = idx;
 
-                    let wx = windows[idx].x;
-                    let wy = windows[idx].y;
-                    let ww = windows[idx].w;
-                    let wh = windows[idx].h;
+                    let wx = windows[idx].x; let wy = windows[idx].y;
+                    let ww = windows[idx].w; let wh = windows[idx].h;
                     let wid = windows[idx].id;
 
                     if mx >= wx + ww - 35 && mx <= wx + ww - 5 && my >= wy + 5 && my <= wy + 25 {
@@ -299,20 +286,16 @@ pub extern "C" fn _start() -> ! {
                         drag_off_y = my as isize - wy as isize;
                     }
                     else {
-                        let rx = mx.saturating_sub(wx);
-                        let ry = my.saturating_sub(wy);
+                        let rx = mx.saturating_sub(wx); let ry = my.saturating_sub(wy);
                         if wid == 3 { my_editor.handle_click(rx, ry, ww); }
                         if wid == 4 { my_explorer.handle_click(rx, ry, ww); }
-                        // 👉 THE CLICK HOOK: Pass scroll clicks to BootlogApp!
                         if wid == 6 { my_bootlog.handle_click(mx, my, wx, wy, ww, wh); }
                     }
                     mark_dirty(wx, wy, ww, wh);
                     needs_redraw = true;
                 }
             }
-        } else if !left {
-            is_dragging = false; is_resizing = false;
-        }
+        } else if !left { is_dragging = false; is_resizing = false; }
 
         if is_dragging {
             let win = &mut windows[target_idx];
@@ -326,19 +309,14 @@ pub extern "C" fn _start() -> ! {
         if is_resizing {
             let win = &mut windows[target_idx];
             mark_dirty(win.x, win.y, win.w, win.h);
-            let new_right = mx as isize + drag_off_x;
-            let new_bottom = my as isize + drag_off_y;
+            let new_right = mx as isize + drag_off_x; let new_bottom = my as isize + drag_off_y;
             win.w = (new_right - win.x as isize).max(300).min((screen_w - win.x) as isize) as usize;
             win.h = (new_bottom - win.y as isize).max(200).min((screen_h - TASKBAR_H - win.y) as isize) as usize;
             mark_dirty(win.x, win.y, win.w, win.h);
             needs_redraw = true;
         }
 
-        if mx != prev_mx || my != prev_my { 
-            mark_dirty(prev_mx, prev_my, 15, 15); 
-            mark_dirty(mx, my, 15, 15); 
-            needs_redraw = true; 
-        }
+        if mx != prev_mx || my != prev_my { mark_dirty(prev_mx, prev_my, 15, 15); mark_dirty(mx, my, 15, 15); needs_redraw = true; }
         prev_left = left;
 
         if needs_redraw && dirty_max_x > dirty_min_x {
@@ -357,7 +335,6 @@ pub extern "C" fn _start() -> ! {
                         my_monitor.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
                     } else if windows[idx].id == 2 {
                         draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 50, "NyxOS Help", 0xFFFFFFFF);
-                        draw::draw_text(&mut back_buffer, screen_w, screen_h, windows[idx].x + 20, windows[idx].y + 70, "v0.6 Beta", 0xFFAAAAAA);
                     } else if windows[idx].id == 3 {
                         my_editor.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     } else if windows[idx].id == 4 {
@@ -366,31 +343,29 @@ pub extern "C" fn _start() -> ! {
                         my_sysinfo.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y);
                     } else if windows[idx].id == 6 {
                         my_bootlog.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
+                    } else if windows[idx].id == 7 {
+                        // 🚨 DRAW NETCHAT
+                        my_netchat.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     }
                 }
             }
             
             draw_taskbar(&mut back_buffer, screen_w, screen_h);
             Clock::draw(&mut back_buffer, screen_w, screen_h);
-            
-            if show_start_menu {
-                draw_start_menu(&mut back_buffer, screen_w, screen_h);
-            }
-
+            if show_start_menu { draw_start_menu(&mut back_buffer, screen_w, screen_h); }
             draw_cursor(&mut back_buffer, screen_w, screen_h, mx, my);
             
             present_rect(front_buffer, &back_buffer, screen_w, screen_stride, screen_h, dx, dy, dw, dh);
             prev_mx = mx; prev_my = my;
-            
-            dirty_min_x = screen_w; dirty_min_y = screen_h;
-            dirty_max_x = 0; dirty_max_y = 0;
+            dirty_min_x = screen_w; dirty_min_y = screen_h; dirty_max_x = 0; dirty_max_y = 0;
         }
     }
 }
 
 fn draw_start_menu(fb: &mut [u32], w: usize, h: usize) {
     let menu_w = 150;
-    let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help", "Hardware Info", "Boot Logs"];
+    // 🚨 ADDED "NetChat" to the items list
+    let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help", "Hardware Info", "Boot Logs", "NetChat"];
     let item_h = 40;
     let menu_h = items.len() * item_h;
     let x = 10;
@@ -419,18 +394,12 @@ fn launch_app(
         if w.id == id_to_launch { arr_idx = i; break; }
     }
     
-    let (wx, wy, ww, wh) = {
-        let w = &windows[arr_idx];
-        (w.x, w.y, w.w, w.h)
-    };
+    let (wx, wy, ww, wh) = { let w = &windows[arr_idx]; (w.x, w.y, w.w, w.h) };
     mark_dirty(wx, wy, ww, wh);
-
     windows[arr_idx].exists = true; 
     
     let mut z_pos = 0;
-    for (i, &idx) in z_order.iter().enumerate() {
-        if idx == arr_idx { z_pos = i; break; }
-    }
+    for (i, &idx) in z_order.iter().enumerate() { if idx == arr_idx { z_pos = i; break; } }
     for j in z_pos..(MAX_WINDOWS-1) { z_order[j] = z_order[j+1]; }
     z_order[MAX_WINDOWS-1] = arr_idx;
 
@@ -440,9 +409,7 @@ fn launch_app(
 fn draw_desktop_icons(fb: &mut [u32], w: usize, h: usize) {
     use crate::syscalls::{sys_fs_count, sys_fs_get_name};
     let count = sys_fs_count("/"); 
-    let mut icon_x = 20;
-    let mut icon_y = 20;
-    let grid_h = 100; 
+    let mut icon_x = 20; let mut icon_y = 20; let grid_h = 100; 
 
     for i in 0..count {
         let mut name_buf = [0u8; 32];

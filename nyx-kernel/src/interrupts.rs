@@ -9,6 +9,11 @@ use x86_64::PrivilegeLevel;
 use alloc::format;
 use x86_64::VirtAddr;
 
+// 🚨 NEW IMPORTS FOR SOCKET SYSCALLS
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use crate::scheduler::{FileDescriptor, KernelSocket, SocketKind};
+use alloc::sync::Arc;
+
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
@@ -214,7 +219,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  let screen_w = p.info.width;
                  let screen_h = p.info.height;
                  
-                 // 🚨 THE FIX: Completely clamp the coordinates so userspace can never overflow the VGA buffer
                  let start_x = core::cmp::min(arg1 as usize, screen_w);
                  let start_y = core::cmp::min(arg2 as usize, screen_h);
                  let max_w = screen_w.saturating_sub(start_x);
@@ -274,14 +278,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 let percpu = crate::percpu::current();
                 let core_id = percpu.logical_id;
                 let scheduler = &mut percpu.scheduler;
-                
-                // 🚨 THE FIX: Use the stable core_task_idx tracker to prevent out of bounds panics
                 let curr_idx = scheduler.core_task_idx[core_id % 32];
 
                 if curr_idx < scheduler.tasks.len() {
                     let task = &mut scheduler.tasks[curr_idx];
                     if fd < 32 {
-                        if let Some(open_file) = &task.fd_table[fd] {
+                        // 🚨 THE FIX: Match against the new FileDescriptor::File enum!
+                        if let Some(FileDescriptor::File(open_file)) = &task.fd_table[fd] {
                             match open_file.node.mmap(offset, size) {
                                 Ok(phys_addr) => {
                                     if let Ok(virt_addr) = crate::memory::map_user_mmio(phys_addr, size) {
@@ -319,12 +322,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     unsafe {
                         let len = name.len();
                         let src = name.as_bytes();
-                        
-                        // 🚨 THE FIX: Reverted the bad clamp. We copy the full file name!
-                        for i in 0..len { 
-                            *buf_ptr.add(i) = src[i]; 
-                        }
-                        
+                        for i in 0..len { *buf_ptr.add(i) = src[i]; }
                         frame.rax = len as u64;
                     }
                 } else { frame.rax = 0; }
@@ -350,9 +348,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  let mut fs = crate::fs::FS.lock();
                  let success = fs.write_file(name, data_slice);
                  frame.rax = if success { 1 } else { 0 }; 
-             } else {
-                 frame.rax = 0;
-             }
+             } else { frame.rax = 0; }
         },
         14 => { 
             use core::sync::atomic::Ordering;
@@ -373,7 +369,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                             let mut allocated_fd = -1;
                             for i in 3..32 {
                                 if task.fd_table[i].is_none() {
-                                    task.fd_table[i] = Some(alloc::sync::Arc::new(crate::vfs::OpenFile::new(vnode)));
+                                    // 🚨 THE FIX: Wrap the OpenFile inside FileDescriptor::File!
+                                    task.fd_table[i] = Some(FileDescriptor::File(Arc::new(crate::vfs::OpenFile::new(vnode))));
                                     allocated_fd = i as isize;
                                     break;
                                 }
@@ -398,7 +395,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 if curr_idx < scheduler.tasks.len() {
                     let task = &mut scheduler.tasks[curr_idx];
                     if fd < 32 {
-                        if let Some(open_file) = &task.fd_table[fd] {
+                        // 🚨 THE FIX: Match against FileDescriptor::File
+                        if let Some(FileDescriptor::File(open_file)) = &task.fd_table[fd] {
                             match open_file.node.ioctl(request, ioctl_arg) {
                                 Ok(res) => frame.rax = res as u64,
                                 Err(e) => frame.rax = e as u64,
@@ -428,13 +426,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
             unsafe {
-                // 🚨 THE FIX: Clamp the boot log so userspace can't read out-of-bounds array data
                 let log_len = core::cmp::min(crate::serial::BOOT_LOG_IDX, 8192);
                 let copy_len = core::cmp::min(buf_len, log_len);
-                
-                for i in 0..copy_len {
-                    *buf_ptr.add(i) = crate::serial::BOOT_LOG[i];
-                }
+                for i in 0..copy_len { *buf_ptr.add(i) = crate::serial::BOOT_LOG[i]; }
                 frame.rax = copy_len as u64;
             }
         },
@@ -445,7 +439,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 Err(_) => frame.rax = 0, 
             }
         },
-        20 => {
+        20 => { // sys_genetic_seed
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
             if buf_len >= 32 { 
@@ -456,7 +450,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 1; 
             } else { frame.rax = 0; }
         },
-        21 => {
+        21 => { // sys_entity_state
             let buf_ptr = arg1 as *mut f32;
             let buf_len = arg2 as usize;
             if buf_len >= 4 {
@@ -469,16 +463,160 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 1; 
             } else { frame.rax = 0; }
         },
-        22 => {
+        22 => { // sys_active_cores
             use core::sync::atomic::Ordering;
             frame.rax = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst) as u64;
         },
+        // 🚨 NETWORK POSIX SYSCALLS (Moved to 23+ to avoid overwriting your entity systems!)
+        23 => frame.rax = sys_socket(arg1, arg2, arg3) as u64,
+        24 => frame.rax = sys_connect(arg1 as usize, arg2 as u32, arg3 as u16) as u64,
+        25 => frame.rax = sys_send(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64,
+        26 => frame.rax = sys_recv(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,
         _ => {}
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// NETWORK POSIX SYSCALL IMPLEMENTATIONS
+// ─────────────────────────────────────────────────────────────────────────
+pub extern "C" fn sys_socket(_domain: u64, typ: u64, _protocol: u64) -> i64 {
+    if typ != 1 { return -1; } 
+
+    let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+    
+    if sockets_lock.is_none() {
+        *sockets_lock = Some(smoltcp::iface::SocketSet::new(alloc::vec![]));
+    }
+
+    if let Some(sockets) = sockets_lock.as_mut() {
+        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
+            alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8], 
+            alloc::vec![0; 2048]
+        );
+        let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(
+            alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8], 
+            alloc::vec![0; 2048]
+        );
+
+        let mut socket = smoltcp::socket::udp::Socket::new(rx_buffer, tx_buffer);
+
+        // 🚨 THE FIX: Bind the socket to a random local port so smoltcp is legally allowed to transmit!
+        let local_port = 49152 + (crate::time::get_ticks() % 10000) as u16;
+        let _ = socket.bind(local_port);
+
+        let handle = sockets.add(socket);
+        let ks = KernelSocket { kind: SocketKind::Udp(handle), local_port, remote: None };
+
+        unsafe {
+            let percpu = crate::percpu::current();
+            let core_id = percpu.logical_id;
+            let scheduler = &mut percpu.scheduler;
+            let curr_idx = scheduler.core_task_idx[core_id % 32];
+            
+            if curr_idx < scheduler.tasks.len() {
+                let task = &mut scheduler.tasks[curr_idx];
+                for i in 3..32 {
+                    if task.fd_table[i].is_none() {
+                        task.fd_table[i] = Some(FileDescriptor::Socket(Arc::new(Mutex::new(ks))));
+                        return i as i64;
+                    }
+                }
+            }
+        }
+    }
+    -1
+}
+
+pub extern "C" fn sys_connect(fd: usize, ip: u32, port: u16) -> i64 {
+    unsafe {
+        let percpu = crate::percpu::current();
+        let core_id = percpu.logical_id;
+        let scheduler = &mut percpu.scheduler;
+        let curr_idx = scheduler.core_task_idx[core_id % 32];
+        
+        if curr_idx < scheduler.tasks.len() {
+            let task = &mut scheduler.tasks[curr_idx];
+            if fd < 32 {
+                if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
+                    let mut sock = sock_mtx.lock();
+                    let addr = IpAddress::Ipv4(Ipv4Address::from_bytes(&ip.to_be_bytes()));
+                    sock.remote = Some(IpEndpoint::new(addr, port));
+                    return 0; 
+                }
+            }
+        }
+    }
+    -1
+}
+
+pub extern "C" fn sys_send(fd: usize, buf_ptr: *const u8, len: usize) -> i64 {
+    let user_buf = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
+    
+    unsafe {
+        let percpu = crate::percpu::current();
+        let core_id = percpu.logical_id;
+        let scheduler = &mut percpu.scheduler;
+        let curr_idx = scheduler.core_task_idx[core_id % 32];
+        
+        if curr_idx < scheduler.tasks.len() {
+            let task = &mut scheduler.tasks[curr_idx];
+            if fd < 32 {
+                if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
+                    let sock = sock_mtx.lock();
+                    let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+                    
+                    if let Some(sockets) = sockets_lock.as_mut() {
+                        if let SocketKind::Udp(handle) = sock.kind {
+                            let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                            if let Some(endpoint) = sock.remote {
+                                if socket.send_slice(user_buf, endpoint).is_ok() {
+                                    return len as i64;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    -1
+}
+
+pub extern "C" fn sys_recv(fd: usize, buf_ptr: *mut u8, max_len: usize) -> i64 {
+    unsafe {
+        let percpu = crate::percpu::current();
+        let core_id = percpu.logical_id;
+        let scheduler = &mut percpu.scheduler;
+        let curr_idx = scheduler.core_task_idx[core_id % 32];
+        
+        if curr_idx < scheduler.tasks.len() {
+            let task = &mut scheduler.tasks[curr_idx];
+            if fd < 32 {
+                if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
+                    let sock = sock_mtx.lock();
+                    let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+                    
+                    if let Some(sockets) = sockets_lock.as_mut() {
+                        if let SocketKind::Udp(handle) = sock.kind {
+                            let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                            if let Ok((data, _meta)) = socket.recv() {
+                                let copy_len = core::cmp::min(data.len(), max_len);
+                                core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len);
+                                return copy_len as i64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    -1 
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// HARDWARE INTERRUPTS
+// ─────────────────────────────────────────────────────────────────────────
 extern "x86-interrupt" fn ethernet_interrupt_handler(_stack: InterruptStackFrame) {
-    //  THE FIX: Bind the lock guard first, then access the Option inside it
     let mut driver_guard = crate::drivers::net::NET_DRIVER.lock();
     if let Some(driver) = driver_guard.as_mut() {
         driver.ack_interrupt();
