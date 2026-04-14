@@ -7,15 +7,10 @@ use core::convert::TryInto;
 use crate::drivers::nvme::NvmeDriver;
 use fatfs::{Read, Write, Seek, SeekFrom, IoBase};
 
-// 🚨 Standard FAT32 Sector Size
 const FAT_SECTOR_SIZE: u64 = 512; 
-// 🚨 Hardware NVMe Block Size (Your driver forces this)
 const NVME_BLOCK_SIZE: u64 = 4096; 
 const MAGIC_SIG: &[u8; 4] = b"NYXZ";
 
-// ==========================================
-// NYX NATIVE LOSSLESS COMPRESSION ENGINE
-// ==========================================
 fn nyx_compress(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
@@ -49,14 +44,11 @@ fn nyx_decompress(data: &[u8]) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-// ==========================================
-// NVME TO FAT32 TRANSLATION STREAM
-// ==========================================
 pub struct NvmeStream {
     driver: NvmeDriver,
-    position: u64, // Byte position
-    partition_offset_sectors: u64, // In 512-byte FAT sectors
-    temp_block: Vec<u8>, // 4096 byte heap buffer
+    position: u64, 
+    partition_offset_sectors: u64, 
+    temp_block: Vec<u8>, 
 }
 
 impl NvmeStream {
@@ -75,20 +67,14 @@ impl IoBase for NvmeStream { type Error = (); }
 impl Read for NvmeStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         if buf.len() == 0 { return Ok(0); }
-        
-        // 1. Calculate absolute byte position on disk
         let absolute_byte_pos = (self.partition_offset_sectors * FAT_SECTOR_SIZE) + self.position;
-        
-        // 2. Translate to 4096-byte NVMe LBA
         let nvme_lba = absolute_byte_pos / NVME_BLOCK_SIZE;
         let offset_in_nvme_block = (absolute_byte_pos % NVME_BLOCK_SIZE) as usize;
         
-        // 3. Read the 4K block
         if self.driver.read_block(nvme_lba, &mut self.temp_block) {
             let bytes_available = (NVME_BLOCK_SIZE as usize) - offset_in_nvme_block;
             let bytes_to_copy = cmp::min(buf.len(), bytes_available);
             
-            // 4. Copy only the requested chunk
             buf[..bytes_to_copy].copy_from_slice(&self.temp_block[offset_in_nvme_block..offset_in_nvme_block+bytes_to_copy]);
             self.position += bytes_to_copy as u64;
             Ok(bytes_to_copy)
@@ -104,7 +90,6 @@ impl Write for NvmeStream {
         let nvme_lba = absolute_byte_pos / NVME_BLOCK_SIZE;
         let offset_in_nvme_block = (absolute_byte_pos % NVME_BLOCK_SIZE) as usize;
         
-        // Read-Modify-Write cycle for 4K NVMe blocks
         if !self.driver.read_block(nvme_lba, &mut self.temp_block) { return Err(()); }
         
         let bytes_available = (NVME_BLOCK_SIZE as usize) - offset_in_nvme_block;
@@ -133,9 +118,6 @@ impl Seek for NvmeStream {
     }
 }
 
-// ==========================================
-// FILE SYSTEM MANAGER
-// ==========================================
 pub struct FileSystem {
     pub inner: Option<fatfs::FileSystem<NvmeStream, fatfs::NullTimeProvider, fatfs::LossyOemCpConverter>>,
     cache_path: String,
@@ -161,13 +143,7 @@ impl FileSystem {
 
         if part_type == 0xEE { 
              crate::serial_println!("[FS] GPT Detected. Parsing headers...");
-             let mut gpt_header = alloc::vec![0u8; 4096];
-             
-             // GPT Header is usually at 512-byte LBA 1, but for NVMe with 4K blocks, it's still in NVMe block 0!
-             // So we parse `sector0` again, looking at offset 512.
              let entry_list_lba = u64::from_le_bytes(sector0[512+72..512+80].try_into().unwrap());
-             
-             // Assuming partition entries are in the next 4K block (NVMe LBA 1)
              let mut entry_block = alloc::vec![0u8; 4096];
              if driver.read_block(1, &mut entry_block) {
                  for i in 0..4 { 
@@ -187,37 +163,35 @@ impl FileSystem {
         if partition_start_lba == 0 { 
             crate::serial_println!("[FS] No valid partition found. Drive is raw."); return; 
         }
-
-        crate::serial_println!("[FS] Partition found at FAT LBA {}. Verifying...", partition_start_lba);
         
         let nvme_boot_lba = (partition_start_lba * FAT_SECTOR_SIZE) / NVME_BLOCK_SIZE;
         let boot_offset = ((partition_start_lba * FAT_SECTOR_SIZE) % NVME_BLOCK_SIZE) as usize;
         
         let mut boot_sector = alloc::vec![0u8; 4096];
-        if !driver.read_block(nvme_boot_lba, &mut boot_sector) { 
-            crate::serial_println!("[FS] Failed to read boot sector."); return; 
-        }
+        if !driver.read_block(nvme_boot_lba, &mut boot_sector) { return; }
         
-        if boot_sector[boot_offset + 510] != 0x55 || boot_sector[boot_offset + 511] != 0xAA {
-            crate::serial_println!("[FS] Invalid FAT signature. Aborting mount."); return;
-        }
+        if boot_sector[boot_offset + 510] != 0x55 || boot_sector[boot_offset + 511] != 0xAA { return; }
 
         crate::serial_println!("[FS] Valid FAT boot sector detected. Mounting...");
         let stream = NvmeStream::new(driver, partition_start_lba);
         let options = fatfs::FsOptions::new().update_accessed_date(true);
         
-        match fatfs::FileSystem::new(stream, options) {
-            Ok(fs) => {
-                self.inner = Some(fs);
-                crate::serial_println!("[FS] FAT Filesystem successfully mounted.");
-            },
-            Err(_) => crate::serial_println!("[FS] ERR: fatfs rejected the volume."),
+        if let Ok(fs) = fatfs::FileSystem::new(stream, options) {
+            self.inner = Some(fs);
+            crate::serial_println!("[FS] FAT Filesystem successfully mounted.");
         }
     }
 
     pub fn ls(&mut self, path: &str) -> Vec<String> {
         if !self.cache_path.is_empty() && self.cache_path == path { return self.cache_files.clone(); }
         let mut list = Vec::new();
+        
+        // 🚨 VIRTUAL FILESYSTEM INJECTION
+        if path == "/" || path.is_empty() {
+            list.push(String::from("hello.elf"));
+            list.push(String::from("nyx-user.bin")); 
+        }
+
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
             let res = if path == "/" || path.is_empty() { Ok(root) } else { root.open_dir(path) };
@@ -236,6 +210,14 @@ impl FileSystem {
     }
 
     pub fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
+        // 🚨 VIRTUAL FILE INTERCEPT
+        if name == "hello.elf" || name == "/hello.elf" {
+            return Some(include_bytes!("hello.elf").to_vec());
+        }
+        if name == "nyx-user.bin" || name == "/nyx-user.bin" {
+            return Some(include_bytes!("nyx-user.bin").to_vec());
+        }
+
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
             let clean_name = if name.starts_with('/') { &name[1..] } else { name };

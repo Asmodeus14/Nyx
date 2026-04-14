@@ -26,12 +26,11 @@ const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
 const ENOSYS: i64 = -38; 
 
-// 🚨 True POSIX sockaddr_in struct mapping
 #[repr(C)]
 pub struct SockAddrIn {
     pub sin_family: u16,
     pub sin_port: u16,
-    pub sin_addr: [u8; 4], // Network byte order
+    pub sin_addr: [u8; 4],
     pub sin_zero: [u8; 8],
 }
 
@@ -417,19 +416,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
     let arg5 = frame.r8;
 
     match id {
-        0 => { // POSIX: read(fd, buf, len)
+        0 => { 
             let fd = arg1 as usize;
             let buf_ptr = arg2 as *mut u8;
             let len = arg3 as usize;
             frame.rax = sys_read_internal(fd, buf_ptr, len) as u64;
         },
-        1 => { // POSIX: write(fd, buf, len)
+        1 => { 
             let fd = arg1 as usize;
             let buf_ptr = arg2 as *const u8;
             let len = arg3 as usize;
             frame.rax = sys_write_internal(fd, buf_ptr, len) as u64;
         },
-        2 => { // POSIX: open(path)
+        2 => { 
             let buf_ptr = arg1 as *const u8;
             let len = arg2 as usize;
             
@@ -456,7 +455,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EBADF as u64; } 
             } else { frame.rax = EINVAL as u64; }
         },
-        3 => { // POSIX: close(fd)
+        3 => { 
             let fd = arg1 as usize;
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
@@ -465,7 +464,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if fd < 32 { task.fd_table[fd] = None; }
             frame.rax = 0;
         },
-        9 => { // POSIX: mmap(...)
+        9 => { 
             let addr = arg1 as u64;    
             let size = arg2 as usize;  
             let fd = arg5 as isize;    
@@ -505,7 +504,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EBADF as u64; } 
             }
         },
-        16 => { // POSIX: ioctl(fd, request, arg)
+        16 => { 
             let fd = arg1 as usize;
             let request = arg2 as usize;
             let ioctl_arg = arg3 as usize;
@@ -524,9 +523,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
         41 => frame.rax = sys_socket(arg1, arg2, arg3) as u64,
         42 => frame.rax = sys_connect(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64,
-        44 => frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64, // Route send() -> write()
-        45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,   // Route recv() -> read()
-        59 => { // POSIX: execve(path)
+        44 => frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64, 
+        45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,   
+        59 => { 
             let buf_ptr = arg1 as *const u8;
             let len = arg2 as usize;
             
@@ -534,10 +533,17 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             
             let path_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
-                let mut fs = crate::fs::FS.lock();
-                if let Some(elf_data) = fs.read_file(path) {
+                // Fetch the ELF data and drop the FS lock immediately
+                let elf_data_opt = {
+                    let mut fs = crate::fs::FS.lock();
+                    fs.read_file(path)
+                };
+                
+                if let Some(elf_data) = elf_data_opt {
                     if let Ok(entry_point) = crate::process::load_elf(&elf_data) {
-                        let user_stack = crate::memory::allocate_user_pages_at(0x7FFF_0000_0000, 4).unwrap() + (4 * 4096); 
+                        // 🚨 THE FIX: Ignore the error if the memory is already allocated!
+                        let _ = crate::memory::allocate_user_pages_at(0x7FFF_0000_0000, 4); 
+                        let user_stack = 0x7FFF_0000_0000 + (4 * 4096); 
                         frame.rcx = entry_point;
                         unsafe { 
                             percpu.user_rsp = user_stack; 
@@ -552,12 +558,38 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EINVAL as u64; }
             } else { frame.rax = EINVAL as u64; }
         },
-        60 => { // POSIX: exit(status)
+        60 => { 
             let exit_code = arg1 as i64;
-            crate::vga_println!("\n[USERSPACE] Program Exited (Code: {}). CPU Halting.", exit_code);
+            crate::vga_println!("\n[USERSPACE] Program Exited (Code: {}). Respawning GUI...", exit_code);
+            
+            // Fetch GUI ELF data and drop the FS lock
+            let elf_data_opt = {
+                let mut fs = crate::fs::FS.lock();
+                fs.read_file("nyx-user.bin")
+            };
+
+            if let Some(elf_data) = elf_data_opt {
+                if let Ok(entry_point) = crate::process::load_elf(&elf_data) {
+                    // 🚨 THE FIX: Ignore the error if the memory is already allocated!
+                    let _ = crate::memory::allocate_user_pages_at(0x7FFF_0000_0000, 4); 
+                    let user_stack = 0x7FFF_0000_0000 + (4 * 4096); 
+                    frame.rcx = entry_point;
+                    unsafe { 
+                        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                        if curr_idx < percpu.scheduler.tasks.len() {
+                            let task = &mut percpu.scheduler.tasks[curr_idx];
+                            task.mmap_bump = 0x4000_0000_0000 + (curr_idx as u64 * 0x1_0000_0000);
+                        }
+                        percpu.user_rsp = user_stack; 
+                    } 
+                    frame.rax = 0;
+                    return; // Jump straight back into the fresh desktop!
+                }
+            }
+            
+            // If the GUI file genuinely cannot be found, halt to prevent a boot-loop.
             loop { unsafe { x86_64::instructions::hlt(); } }
         },
-        // System calls below 500+ are custom NyxOS GUI extensions
         501 => { 
              unsafe {
                  if let Some(p) = &mut crate::SCREEN_PAINTER {
@@ -620,8 +652,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if !is_valid_user_ptr(buf_ptr, len) { frame.rax = EFAULT as u64; return; }
             let slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
             if let Ok(path) = core::str::from_utf8(slice) {
-                if path == "/" { frame.rax = 5; } 
-                else { frame.rax = crate::fs::FS.lock().ls(path).len() as u64; }
+                frame.rax = crate::fs::FS.lock().ls(path).len() as u64; 
             } else { frame.rax = 0; }
         },
         511 => { 
@@ -634,28 +665,16 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
             let path_slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
-                if path == "/" {
-                    let virtual_files = ["boot.efi", "nyx_core.sys", "hardware.log", "config.ini", "readme.txt"];
-                    if idx < virtual_files.len() {
-                        let name = virtual_files[idx];
-                        unsafe {
-                            let len = name.len();
-                            for (i, b) in name.bytes().enumerate() { *buf_ptr.add(i) = b; }
-                            frame.rax = len as u64;
-                        }
-                    } else { frame.rax = 0; }
-                } else {
-                    let mut fs = crate::fs::FS.lock();
-                    let files = fs.ls(path);
-                    if idx < files.len() {
-                        let name = &files[idx];
-                        unsafe {
-                            let len = name.len();
-                            for (i, b) in name.bytes().enumerate() { *buf_ptr.add(i) = b; }
-                            frame.rax = len as u64;
-                        }
-                    } else { frame.rax = 0; }
-                }
+                let mut fs = crate::fs::FS.lock();
+                let files = fs.ls(path);
+                if idx < files.len() {
+                    let name = &files[idx];
+                    unsafe {
+                        let len = name.len();
+                        for (i, b) in name.bytes().enumerate() { *buf_ptr.add(i) = b; }
+                        frame.rax = len as u64;
+                    }
+                } else { frame.rax = 0; }
             } else { frame.rax = 0; }
         },
         517 => {
@@ -724,7 +743,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
     }
 }
 
-// 🚨 THE FIX: Universal File Descriptors! read() natively routes to socket recv()
 fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
     if !is_valid_user_ptr(buf_ptr, len) { return EFAULT as isize; }
     if len == 0 || fd >= 32 { return EBADF as isize; }
@@ -767,7 +785,6 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
     EBADF as isize 
 }
 
-// 🚨 THE FIX: Universal File Descriptors! write() natively routes to socket send()
 fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
     if !is_valid_user_ptr(buf_ptr, len) { return EFAULT as isize; }
     if len == 0 || fd >= 32 { return EBADF as isize; }
@@ -780,8 +797,18 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
     if curr_idx >= percpu.scheduler.tasks.len() { return EBADF as isize; }
     
-    let mut bytes_sent = EAGAIN as isize;
     let buf_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
+
+    // 🚨 STDOUT/STDERR FALLBACK: Route FD 1 & 2 directly to the screen and serial!
+    if fd == 1 || fd == 2 {
+        if let Ok(s) = core::str::from_utf8(buf_slice) {
+            crate::serial_print!("{}", s); 
+            crate::vga_println!("{}", s); 
+        }
+        return len as isize;
+    }
+
+    let mut bytes_sent = EAGAIN as isize;
     let task = &mut percpu.scheduler.tasks[curr_idx];
     
     if let Some(fd_enum) = &task.fd_table[fd] {
@@ -844,7 +871,6 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
     -24 // EMFILE
 }
 
-// 🚨 THE FIX: True POSIX sys_connect implementing standard struct sockaddr_in!
 pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -> i64 {
     if addr_len < 16 || !is_valid_user_ptr(addr_ptr, addr_len) { return EFAULT; }
     
@@ -857,7 +883,7 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
     if curr_idx >= percpu.scheduler.tasks.len() { return EBADF; }
     
     let sockaddr = unsafe { &*(addr_ptr as *const SockAddrIn) };
-    if sockaddr.sin_family != 2 { return EINVAL; } // POSIX: AF_INET = 2
+    if sockaddr.sin_family != 2 { return EINVAL; }
 
     let port = u16::from_be(sockaddr.sin_port);
     let ip = sockaddr.sin_addr;

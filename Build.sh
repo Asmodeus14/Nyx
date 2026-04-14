@@ -16,6 +16,10 @@ rm -f nyx-kernel/src/nyx-user.bin
 echo "--- Copying Binary ---"
 cp target/x86_64-unknown-none/release/nyx-user nyx-kernel/src/nyx-user.bin
 
+
+echo "--- Copying Native C App ---"
+cp nyx-c/hello.elf nyx-kernel/src/hello.elf
+
 # 4. Verify the Copy
 echo "--- verifying nyx-user.bin ELF Headers ---"
 readelf -h nyx-kernel/src/nyx-user.bin | grep "Entry point"

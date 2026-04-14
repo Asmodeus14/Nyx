@@ -149,6 +149,11 @@ pub fn sys_alloc_pages(pages: usize) -> u64 {
     syscall(519, pages as u64, 0, 0, 0, 0, 0)
 }
 
+// Added standard POSIX execve to launch ELF files!
+pub fn sys_execve(path: &str) -> i64 {
+    syscall(SYS_EXECVE, path.as_ptr() as u64, path.len() as u64, 0, 0, 0, 0) as i64
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // POSIX SAFE NETWORK ABSTRACTION
 // ─────────────────────────────────────────────────────────────────────────
