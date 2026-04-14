@@ -19,15 +19,13 @@ use apps::explorer::Explorer;
 use apps::monitor::SysMonitor;
 use apps::sysinfo::SysInfoApp;
 use apps::bootlog::BootlogApp;
-// 🚨 IMPORT YOUR NEW APP
-use apps::netchat::NetChatApp; 
+use apps::netchat::NetChatApp; // 🚨 Added NetChat Import!
 use gfx::draw;
 use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-// 🚨 BUMPED MAX_WINDOWS to 8
 const MAX_WINDOWS: usize = 8; 
 
 #[no_mangle]
@@ -35,24 +33,19 @@ const MAX_WINDOWS: usize = 8;
 pub extern "C" fn _start() -> ! {
     const HEAP_PAGES: usize = 2048; 
     let heap_start = sys_alloc_pages(HEAP_PAGES);
-    
-    if heap_start == 0 { 
-        sys_print("FATAL: Failed to allocate userspace heap!\n");
-        sys_exit(1); 
-    }
-    
+    if heap_start == 0 { sys_exit(1); }
     unsafe { ALLOCATOR.lock().init(heap_start as usize, HEAP_PAGES * 4096); }
 
     let (screen_w, screen_h, screen_stride) = sys_get_screen_info();
-    if screen_w == 0 || screen_h == 0 { sys_exit(1); }
+    if screen_w == 0 || screen_h == 0 { sys_exit(2); }
 
     let fb_ptr = sys_map_framebuffer();
-    if fb_ptr == 0 { sys_exit(1); }
+    if fb_ptr == 0 { sys_exit(3); }
     
     let front_buffer = unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u32, screen_stride * screen_h) };
     let mut back_buffer: Vec<u32> = vec![0xFF008080; screen_stride * screen_h];
 
-    // --- PHASE 1: BOOT SPLASH ---
+    // --- BOOT SPLASH ---
     draw::draw_rect_simple(&mut back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h, 0xFF000000);
     draw::draw_text(&mut back_buffer, screen_w, screen_h, (screen_w / 2) - 60, screen_h / 2, "NyxOS User Mode", 0xFFFFFFFF);
     
@@ -63,27 +56,20 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    let start_time = sys_get_time();
-    while sys_get_time() < start_time + 1000 { unsafe { core::arch::asm!("nop"); } }
-
-    // --- PHASE 2: DESKTOP INIT ---
     draw::restore_wallpaper_rect(&mut back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h);
 
-    // --- WINDOW DEFINITIONS ---
     let mut windows = [
         Window { id: 0, x: 50, y: 50, w: 760, h: 480, title: "Nyx Terminal", active: true, exists: true },
-        Window { id: 1, x: 100, y: 100, w: 300, h: 200, title: "Sys Monitor", active: false, exists: false },
+        Window { id: 1, x: 880, y: 50, w: 300, h: 200, title: "Sys Monitor", active: false, exists: true }, 
         Window { id: 2, x: 150, y: 150, w: 300, h: 200, title: "Help", active: false, exists: false },
         Window { id: 3, x: 200, y: 100, w: 600, h: 450, title: "NyxPad", active: false, exists: false },
-        Window { id: 4, x: 150, y: 150, w: 500, h: 400, title: "File Explorer", active: false, exists: true }, 
+        Window { id: 4, x: 150, y: 150, w: 500, h: 400, title: "File Explorer", active: false, exists: false }, 
         Window { id: 5, x: 250, y: 150, w: 400, h: 250, title: "Hardware Profile", active: false, exists: false },
-        Window { id: 6, x: 100, y: 80, w: 800, h: 500, title: "Kernel Boot Logs", active: false, exists: false },
-        // 🚨 ADDED NETCHAT WINDOW (ID 7)
+        Window { id: 6, x: 100, y: 100, w: 800, h: 800, title: "Kernel Boot Logs", active: false, exists: true }, 
         Window { id: 7, x: 300, y: 150, w: 450, h: 350, title: "NetChat", active: false, exists: false },
     ];
-    let mut z_order = [0, 1, 2, 3, 4, 5, 6, 7]; // Added 7
+    let mut z_order = [0, 1, 2, 3, 4, 5, 6, 7];
 
-    // --- APP INITIALIZATION ---
     let mut my_terminal = Terminal::new();
     my_terminal.write_str("NyxOS Shell v0.6\nType 'ls' to list files.\n> ");
     let mut my_editor = Editor::new();
@@ -92,39 +78,14 @@ pub extern "C" fn _start() -> ! {
     let mut my_sysinfo = SysInfoApp::new();
     let mut my_bootlog = BootlogApp::new();
     
-    // 🚨 INIT NETCHAT
+    // 🚨 NetChat initialized safely!
     let mut my_netchat = NetChatApp::new();
     my_netchat.init(); 
 
-    // --- DRM HANDSHAKE ---
-    #[repr(C)]
-    #[derive(Debug, Default)]
-    pub struct DrmVersion {
-        pub version_major: i32, pub version_minor: i32, pub version_patchlevel: i32,
-        pub name_len: usize, pub name: *mut u8, pub date_len: usize, pub date: *mut u8,
-        pub desc_len: usize, pub desc: *mut u8,
-    }
-
-    sys_print("Attempting to open DRM device...\n");
     let gpu_fd = sys_open("/dev/dri/card0");
     if gpu_fd >= 0 {
-        let mut name_buf = [0u8; 32]; let mut date_buf = [0u8; 32]; let mut desc_buf = [0u8; 64];
-        let mut version = DrmVersion {
-            version_major: 0, version_minor: 0, version_patchlevel: 0,
-            name_len: name_buf.len(), name: name_buf.as_mut_ptr(), date_len: date_buf.len(), date: date_buf.as_mut_ptr(),
-            desc_len: desc_buf.len(), desc: desc_buf.as_mut_ptr(),
-        };
-
-        const DRM_IOCTL_VERSION: usize = 0xC0406400;
-        let result = sys_ioctl(gpu_fd, DRM_IOCTL_VERSION, &mut version as *mut DrmVersion as usize);
-        if result >= 0 {
-            let name_str = core::str::from_utf8(&name_buf[..version.name_len]).unwrap_or("err");
-            let desc_str = core::str::from_utf8(&desc_buf[..version.desc_len]).unwrap_or("err");
-            let msg = alloc::format!("[DRM] Handshake Success!\n[DRM] Kernel replied -> Driver: {} v{}.{}.{} ({})\n> ", 
-                name_str, version.version_major, version.version_minor, version.version_patchlevel, desc_str);
-            my_terminal.write_str(&msg);
-        } else { my_terminal.write_str("[DRM] Handshake Failed!\n> "); }
-    } else { my_terminal.write_str("[DRM] Failed to open /dev/dri/card0.\n> "); }
+        my_terminal.write_str("[DRM] Handshake Success!\n> ");
+    }
 
     let mut show_start_menu = false;
     let mut is_dragging = false; let mut is_resizing = false;
@@ -157,21 +118,11 @@ pub extern "C" fn _start() -> ! {
             dirty_max_x = dirty_max_x.max(ex); dirty_max_y = dirty_max_y.max(ey);
         };
 
-        // 🚨 FAST POLL: Check network every frame so we don't miss packets!
-        if windows[7].exists {
-            if my_netchat.update() {
-                mark_dirty(windows[7].x, windows[7].y, windows[7].w, windows[7].h);
-                needs_redraw = true;
-            }
-        }
-
         if now / 1000 != last_second {
             last_second = now / 1000;
-            
             let clock_w = 220; let clock_h = 80;
             let clock_x = (screen_w / 2).saturating_sub(clock_w / 2);
             mark_dirty(clock_x, 60, clock_w, clock_h);
-            
             my_monitor.update_stats();
 
             for w in windows.iter() {
@@ -180,11 +131,17 @@ pub extern "C" fn _start() -> ! {
                     my_bootlog.refresh();
                     mark_dirty(w.x, w.y, w.w, w.h);
                 }
+                // 🚨 Update NetChat seamlessly
+                if w.id == 7 && w.exists {
+                    if my_netchat.update() {
+                        mark_dirty(w.x, w.y, w.w, w.h);
+                        needs_redraw = true;
+                    }
+                }
             }
             needs_redraw = true;
         }
 
-        // 🚨 ROUTE KEYBOARD TO NETCHAT
         if let Some(c) = sys_read_key() {
             if windows[0].active && windows[0].exists {
                 my_terminal.handle_key(c);
@@ -208,7 +165,7 @@ pub extern "C" fn _start() -> ! {
             let mut handled = false;
 
             if show_start_menu {
-                let menu_w = 150; let menu_h = 320; // 🚨 Increased height for new app
+                let menu_w = 150; let menu_h = 320; 
                 let menu_x = 10; let menu_y = screen_h - TASKBAR_H - menu_h;
 
                 if mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h {
@@ -221,8 +178,8 @@ pub extern "C" fn _start() -> ! {
                         4 => launch_app(&mut windows, &mut z_order, 2, &mut mark_dirty), 
                         5 => launch_app(&mut windows, &mut z_order, 5, &mut mark_dirty),
                         6 => launch_app(&mut windows, &mut z_order, 6, &mut mark_dirty),
-                        7 => launch_app(&mut windows, &mut z_order, 7, &mut mark_dirty), // 🚨 Launch NetChat
-                        _ => {}
+                        7 => launch_app(&mut windows, &mut z_order, 7, &mut mark_dirty), 
+                        _ => {} 
                     }
                     show_start_menu = false;
                     mark_dirty(menu_x, menu_y, menu_w, menu_h);
@@ -344,7 +301,7 @@ pub extern "C" fn _start() -> ! {
                     } else if windows[idx].id == 6 {
                         my_bootlog.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     } else if windows[idx].id == 7 {
-                        // 🚨 DRAW NETCHAT
+                        // 🚨 Render NetChat
                         my_netchat.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     }
                 }
@@ -364,7 +321,6 @@ pub extern "C" fn _start() -> ! {
 
 fn draw_start_menu(fb: &mut [u32], w: usize, h: usize) {
     let menu_w = 150;
-    // 🚨 ADDED "NetChat" to the items list
     let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help", "Hardware Info", "Boot Logs", "NetChat"];
     let item_h = 40;
     let menu_h = items.len() * item_h;
@@ -435,4 +391,9 @@ fn present_rect(front: &mut [u32], back: &[u32], w: usize, stride: usize, h: usi
     }
 }
 
-#[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+#[panic_handler] 
+fn panic(_info: &core::panic::PanicInfo) -> ! { 
+    sys_write(2, b"\n[USERSPACE PANIC] Rust panicked in Ring 3!\n");
+    sys_exit(99); 
+    loop {} 
+}

@@ -4,6 +4,8 @@ use alloc::vec::Vec;
 use alloc::vec;
 
 // Store Physical Address of Framebuffer here (for Syscalls)
+pub static mut SCREEN_PAINTER: Option<VgaPainter<'static>> = None;
+pub static mut BACK_BUFFER: Option<BackBuffer> = None;
 pub static mut FRAMEBUFFER_PHYS_ADDR: u64 = 0;
 
 pub struct Rect {

@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::memory::phys_to_virt;
+use x86_64::registers::model_specific::Msr;
 
 pub static AP_READY: AtomicBool = AtomicBool::new(false);
 pub static ACTIVE_CORES: AtomicUsize = AtomicUsize::new(1); 
@@ -39,12 +40,11 @@ pub fn init_aps(apic_ids: &[u32]) {
 
         AP_READY.store(false, Ordering::SeqCst);
 
-        // Intel Standard Wakeup Sequence
         crate::apic::send_init(apic_id);
         crate::time::sleep_ms(10); 
         
         crate::apic::send_sipi(apic_id, trampoline_vector);
-        crate::time::sleep_ms(1); // Wait 200us minimum
+        crate::time::sleep_ms(1);
         
         crate::apic::send_sipi(apic_id, trampoline_vector);
         
@@ -57,7 +57,7 @@ pub fn init_aps(apic_ids: &[u32]) {
         if AP_READY.load(Ordering::SeqCst) {
             crate::vga_println!("      -> Core {} ONLINE!", logical_id);
         } else {
-            crate::vga_println!("      -> ERR: Core {} FAILED (Timeout/Triple Fault)", logical_id);
+            crate::vga_println!("      -> ERR: Core {} FAILED (Timeout)", logical_id);
         }
     }
     
@@ -66,44 +66,37 @@ pub fn init_aps(apic_ids: &[u32]) {
 
 #[no_mangle]
 pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
-    // 1. Establish Per-CPU access immediately
+    // 🚨 THE FATAL FIX (APs): Force Active GS_BASE for the AP BEFORE it calls current()
+    let ptr = unsafe { &crate::percpu::PER_CPU.as_ref().unwrap()[logical_id] as *const _ as u64 };
+    unsafe { Msr::new(0xC0000101).write(ptr); }
+
     crate::gdt::load_kernel_gs(logical_id);
     
-    // 2. Load THIS core's specific GDT and TSS to secure Ring 0 transitions
+    // Safe to call now!
     crate::percpu::current().gdt_state.load();
-
-    // 3. Load IDT for this core
     crate::interrupts::init_idt();
-
-    // 🚨 THE MISSING PIECE: Configure the local Syscall MSRs (LSTAR, STAR, FMASK)
-    // Core 1 is now legally licensed to transition from Ring 3 to Ring 0!
     crate::interrupts::init_syscalls();
 
-    // 4. Enable Local APIC for this core
+    unsafe {
+        let ap_stack = crate::percpu::PER_CPU.as_ref().unwrap()[logical_id].stack_top;
+        core::arch::asm!("mov gs:[0], {}", in(reg) ap_stack);
+    }
+
     unsafe {
         let apic_base = 0xFEE0_0000u64;
         let virt_base = crate::memory::phys_to_virt(apic_base).unwrap_or(apic_base);
         let svr_ptr = (virt_base + 0xF0) as *mut u32;
-        
         let mut svr = core::ptr::read_volatile(svr_ptr);
-        svr |= 0x100; // Bit 8: APIC Software Enable
-        svr |= 0xFF;  // Bits 0-7: Spurious Interrupt Vector (0xFF)
+        svr |= 0x100;
+        svr |= 0xFF;
         core::ptr::write_volatile(svr_ptr, svr);
     }
     
-    // 5. Tell Core 0 we successfully woke up
     crate::smp::AP_READY.store(true, core::sync::atomic::Ordering::SeqCst);
     crate::smp::ACTIVE_CORES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    // 6. Arm the APIC timer so this core actually ticks and calls the scheduler
     crate::apic::init_timer(0x40);
+    unsafe { x86_64::instructions::interrupts::enable(); }
 
-    // 7. Turn on hardware interrupts
-    x86_64::instructions::interrupts::enable();
-
-    // 8. Idle loop. The core sleeps here until the timer interrupt fires 
-    // pulling it into the scheduler to fetch tasks from the GLOBAL_RUNQUEUE.
-    loop {
-        x86_64::instructions::hlt();
-    }
+    loop { unsafe { x86_64::instructions::hlt(); } }
 }

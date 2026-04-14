@@ -57,8 +57,12 @@ impl MouseDriver {
             status |= 0x02; status &= !0x20;
             self.wait_for_write(); self.command_port.write(0x60);
             self.wait_for_write(); self.data_port.write(status);
-            self.write_mouse(0xFF);
+            
+            // 🚨 THE FIX: 0xF6 (Set Defaults) instead of 0xFF (Reset). 
+            // This prevents the hardware from flooding the buffer with 3 bytes and breaking the packet cycle!
+            self.write_mouse(0xF6);
             self.wait_for_read(); let _ = self.data_port.read();
+            
             self.write_mouse(0xF4);
             self.wait_for_read(); let _ = self.data_port.read();
         }
@@ -70,7 +74,6 @@ impl MouseDriver {
     }
 }
 
-// NOTE: This must match the signature expected by usb.rs
 pub fn update_from_usb(dx: i8, dy: i8, buttons: u8) {
     let mut state = MOUSE_STATE.lock();
     let new_x = state.x as i64 + (dx as i64); 

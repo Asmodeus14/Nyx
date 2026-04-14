@@ -104,6 +104,7 @@ pub fn init_intel_acpica() {
 // ==========================================
 extern "C" {
     fn acpi_wake_cnvi_wifi() -> i32;
+    fn acpi_find_i2c_hid() -> i32; // <--- The new scanner
 }
 
 pub fn power_on_wifi_via_acpi() -> bool {
@@ -111,4 +112,19 @@ pub fn power_on_wifi_via_acpi() -> bool {
     let count = unsafe { acpi_wake_cnvi_wifi() };
     crate::serial_println!("[ACPI] Blasted _PS0 (Power On) to {} hidden hardware nodes!", count);
     true
+}
+
+pub fn scan_for_modern_inputs() {
+    crate::serial_println!("[ACPI] Scanning motherboard for I2C-HID devices (PNP0C50)...");
+    crate::vga_println!("[ACPI] Scanning for I2C Trackpads...");
+    
+    let count = unsafe { acpi_find_i2c_hid() };
+    
+    if count > 0 {
+        crate::serial_println!("[ACPI] SUCCESS: Found {} I2C-HID device(s)!", count);
+        crate::vga_println!("[ACPI] Found {} I2C-HID device(s)!", count);
+    } else {
+        crate::serial_println!("[ACPI] No I2C-HID devices found. It might be USB-based.");
+        crate::vga_println!("[ACPI] No I2C-HID found.");
+    }
 }

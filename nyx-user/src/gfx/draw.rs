@@ -39,6 +39,34 @@ pub fn draw_text(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, text: &
         cx += font::CHAR_WIDTH;
     }
 }
+/// Draws a filled rectangle on the framebuffer with strict bounds checking.
+pub fn draw_rect(
+    fb: &mut [u32], 
+    screen_w: usize, 
+    screen_h: usize, 
+    x: usize, 
+    y: usize, 
+    w: usize, 
+    h: usize, 
+    color: u32
+) {
+    for dy in 0..h {
+        let py = y + dy;
+        // Stop if we go off the bottom of the screen
+        if py >= screen_h { break; } 
+
+        for dx in 0..w {
+            let px = x + dx;
+            // Stop if we go off the right side of the screen
+            if px >= screen_w { break; } 
+
+            let idx = py * screen_w + px;
+            if idx < fb.len() {
+                fb[idx] = color;
+            }
+        }
+    }
+}
 
 /// Restores the wallpaper for a specific dirty rectangle.
 /// UPDATED: Sets the background to PITCH BLACK (0xFF000000) as requested.

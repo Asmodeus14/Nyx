@@ -99,6 +99,7 @@ impl Trb {
     
     pub const CYCLE_BIT: u32 = 1 << 0;
     pub const ENT_BIT: u32 = 1 << 1; 
+    pub const ISP_BIT: u32 = 1 << 2; 
     pub const IDT_BIT: u32 = 1 << 6; 
     pub const IOC_BIT: u32 = 1 << 5;
     pub const BSR_BIT: u32 = 1 << 9; 
@@ -119,22 +120,32 @@ pub struct XhciController {
     runtime: &'static mut RuntimeRegisters,
     doorbell: &'static mut DoorbellRegisters,
     
-    cmd_ring: *mut Trb, event_ring: *mut Trb, erst: *mut ErstEntry, dcbaa: *mut u64,
+    cmd_ring: *mut Trb, 
+    event_ring: *mut Trb, 
+    event_ring_phys: u64, 
+    erst: *mut ErstEntry, 
+    dcbaa: *mut u64,
     scratchpad_array: *mut u64, scratchpad_pages: Vec<*mut u8>,
     
     ep0_rings: Vec<*mut Trb>, 
+    ep0_rings_phys: Vec<u64>, 
     ep0_cycles: Vec<bool>, 
     ep0_indices: Vec<usize>, 
 
     ep1_rings: Vec<*mut Trb>,
+    ep1_rings_phys: Vec<u64>, 
     ep1_cycles: Vec<bool>,
     ep1_indices: Vec<usize>,
     ep1_configured: Vec<bool>,
+    ep1_dci: Vec<u8>, 
+    
+    ep1_halted: Vec<bool>,
     mouse_pending: Vec<bool>, 
+    
+    mouse_buf_virt: Vec<*mut u8>,
+    mouse_buf_phys: Vec<u64>,
 
     cmd_index: usize, cmd_cycle: bool, event_index: usize, event_cycle: bool, ctx_size: usize,
-    mouse_buf_virt: *mut u8,
-    mouse_buf_phys: u64,
 }
 
 unsafe impl Send for XhciController {}
@@ -164,49 +175,63 @@ impl XhciController {
 
         let cmd_ring = Self::alloc_aligned(4096, 64)? as *mut Trb;
         let event_ring = Self::alloc_aligned(4096, 64)? as *mut Trb;
+        let event_ring_phys = crate::memory::virt_to_phys(event_ring as u64).unwrap();
+        
         let erst = Self::alloc_aligned(core::mem::size_of::<ErstEntry>(), 64)? as *mut ErstEntry;
         let dcbaa = Self::alloc_aligned(4096, 4096)? as *mut u64;
 
         let max_slots = caps.max_slots() as usize + 1;
         
         let mut ep0_rings = Vec::with_capacity(max_slots);
+        let mut ep0_rings_phys = Vec::with_capacity(max_slots);
         let mut ep0_cycles = Vec::with_capacity(max_slots);
         let mut ep0_indices = Vec::with_capacity(max_slots);
 
         let mut ep1_rings = Vec::with_capacity(max_slots);
+        let mut ep1_rings_phys = Vec::with_capacity(max_slots);
         let mut ep1_cycles = Vec::with_capacity(max_slots);
         let mut ep1_indices = Vec::with_capacity(max_slots);
         let mut ep1_configured = Vec::with_capacity(max_slots);
+        let mut ep1_dci = Vec::with_capacity(max_slots);
+        let mut ep1_halted = Vec::with_capacity(max_slots);
         let mut mouse_pending = Vec::with_capacity(max_slots);
+        let mut mouse_buf_virt = Vec::with_capacity(max_slots);
+        let mut mouse_buf_phys = Vec::with_capacity(max_slots);
 
         for _ in 0..max_slots { 
             ep0_rings.push(core::ptr::null_mut()); 
+            ep0_rings_phys.push(0);
             ep0_cycles.push(true); 
             ep0_indices.push(0);
 
             ep1_rings.push(core::ptr::null_mut());
+            ep1_rings_phys.push(0);
             ep1_cycles.push(true);
             ep1_indices.push(0);
             ep1_configured.push(false);
+            ep1_dci.push(0);
+            ep1_halted.push(false);
             mouse_pending.push(false);
+            
+            let virt = Self::alloc_aligned(128, 64)?;
+            let phys = crate::memory::virt_to_phys(virt as u64).unwrap();
+            mouse_buf_virt.push(virt);
+            mouse_buf_phys.push(phys);
         }
-
-        let mouse_buf_virt = Self::alloc_aligned(64, 64)? as *mut u8;
-        let mouse_buf_phys = crate::memory::virt_to_phys(mouse_buf_virt as u64).unwrap();
 
         Ok(Self {
             base, caps, op, runtime, doorbell,
-            cmd_ring, event_ring, erst, dcbaa,
+            cmd_ring, event_ring, event_ring_phys, erst, dcbaa,
             scratchpad_array: core::ptr::null_mut(), scratchpad_pages: Vec::new(),
-            ep0_rings, ep0_cycles, ep0_indices, 
-            ep1_rings, ep1_cycles, ep1_indices, ep1_configured, mouse_pending,
+            ep0_rings, ep0_rings_phys, ep0_cycles, ep0_indices, 
+            ep1_rings, ep1_rings_phys, ep1_cycles, ep1_indices, ep1_configured, ep1_dci,
+            ep1_halted, mouse_pending, mouse_buf_virt, mouse_buf_phys,
             cmd_index: 0, cmd_cycle: true, event_index: 0, event_cycle: true,
             ctx_size: caps.context_size(),
-            mouse_buf_virt, mouse_buf_phys,
         })
     }
 
-    unsafe fn push_ring_trb(ring_ptr: *mut Trb, idx: &mut usize, cycle: &mut bool, trb: Trb) {
+    unsafe fn push_ring_trb(ring_ptr: *mut Trb, ring_phys: u64, idx: &mut usize, cycle: &mut bool, trb: Trb) {
         let dest = ring_ptr.add(*idx);
         let mut new_trb = trb;
         if *cycle { new_trb.control |= Trb::CYCLE_BIT; } else { new_trb.control &= !Trb::CYCLE_BIT; }
@@ -216,9 +241,8 @@ impl XhciController {
         *idx += 1;
         if *idx == 255 {
             let link = ring_ptr.add(255);
-            let phys = crate::memory::virt_to_phys(ring_ptr as u64).unwrap();
             let mut link_trb = Trb::new();
-            link_trb.parameter = phys;
+            link_trb.parameter = ring_phys; 
             link_trb.control = Trb::TYPE_LINK | Trb::ENT_BIT; 
             if *cycle { link_trb.control |= Trb::CYCLE_BIT; } else { link_trb.control &= !Trb::CYCLE_BIT; }
             *link = link_trb;
@@ -229,60 +253,47 @@ impl XhciController {
     }
 
     unsafe fn push_ep0_trb(&mut self, slot_id: usize, trb: Trb) {
-        Self::push_ring_trb(self.ep0_rings[slot_id], &mut self.ep0_indices[slot_id], &mut self.ep0_cycles[slot_id], trb);
+        Self::push_ring_trb(self.ep0_rings[slot_id], self.ep0_rings_phys[slot_id], &mut self.ep0_indices[slot_id], &mut self.ep0_cycles[slot_id], trb);
     }
 
     unsafe fn push_ep1_trb(&mut self, slot_id: usize, trb: Trb) {
-        Self::push_ring_trb(self.ep1_rings[slot_id], &mut self.ep1_indices[slot_id], &mut self.ep1_cycles[slot_id], trb);
+        Self::push_ring_trb(self.ep1_rings[slot_id], self.ep1_rings_phys[slot_id], &mut self.ep1_indices[slot_id], &mut self.ep1_cycles[slot_id], trb);
     }
 
-    // FIX: Added TIMEOUT Loop to avoid Infinite Freeze during BIOS Handoff
-    unsafe fn perform_bios_handoff(&self, log_win: &mut crate::window::Window) {
+    unsafe fn perform_bios_handoff(&self) {
         let mut xecp_offset = self.caps.xecp();
-        let mut timeout = 10000000; // Safety timeout
+        let mut timeout = 10000000; 
 
         while xecp_offset != 0 {
             let cap_ptr = self.base.add((xecp_offset << 2) as usize) as *mut u32;
             let cap_val = read_volatile(cap_ptr);
             if ((cap_val & 0xFF) as u8) == 1 { 
-                log_win.buffer.push(alloc::string::String::from("BIOS Handoff..."));
+                crate::serial_println!("[USB] Requesting BIOS Handoff...");
                 if (cap_val & (1 << 16)) != 0 {
                     write_volatile(cap_ptr, cap_val | (1 << 24));
-                    
-                    // Wait with timeout
                     let mut t = 0;
                     while t < 1000000 {
                          if (read_volatile(cap_ptr) & (1 << 16)) == 0 { break; } 
-                         core::hint::spin_loop();
-                         t += 1;
+                         core::hint::spin_loop(); t += 1;
                     }
-
                     t = 0;
                     while (read_volatile(cap_ptr) & (1 << 24)) == 0 { 
-                        if t > 5000000 { 
-                            log_win.buffer.push(alloc::string::String::from("BIOS Handoff Timeout!"));
-                            break; 
-                        }
-                        core::hint::spin_loop(); 
-                        t += 1;
+                        if t > 5000000 { break; }
+                        core::hint::spin_loop(); t += 1;
                     }
-                    log_win.buffer.push(alloc::string::String::from("BIOS Released."));
+                    crate::serial_println!("[USB] BIOS Released xHCI controller.");
                 } else { write_volatile(cap_ptr, cap_val | (1 << 24)); }
                 break;
             }
             let next = (cap_val >> 8) & 0xFF;
             if next == 0 { break; }
             xecp_offset += next;
-            
             timeout -= 1;
-            if timeout == 0 {
-                log_win.buffer.push(alloc::string::String::from("BIOS Cap Loop Timeout"));
-                break;
-            }
+            if timeout == 0 { break; }
         }
     }
 
-    unsafe fn init_scratchpads(&mut self, _log_win: &mut crate::window::Window) -> Result<(), &'static str> {
+    unsafe fn init_scratchpads(&mut self) -> Result<(), &'static str> {
         let count = self.caps.max_scratchpads();
         if count > 0 {
             self.scratchpad_array = Self::alloc_aligned(4096, 4096)? as *mut u64;
@@ -298,33 +309,39 @@ impl XhciController {
         Ok(())
     }
 
-    pub fn init(&mut self, log_win: &mut crate::window::Window) -> Result<(), &'static str> {
+    pub fn init(&mut self) -> Result<(), &'static str> {
         unsafe {
-            self.perform_bios_handoff(log_win);
-            self.repaint(log_win);
+            self.perform_bios_handoff();
+            
+            // 🚨 1. HALT THE CONTROLLER: Kill the BIOS ghost session
+            let mut cmd = self.op.read_usbcmd();
+            cmd &= !CMD_RUN; 
+            self.op.write_usbcmd(cmd);
+            for _ in 0..100000 { if (self.op.read_usbsts() & STS_HALT) != 0 { break; } core::hint::spin_loop(); }
+
+            // 🚨 2. SECURE RESET: Wipe all hardware states
             let mut cmd = self.op.read_usbcmd();
             cmd |= CMD_HCRST;
             self.op.write_usbcmd(cmd);
             for _ in 0..100000 { if (self.op.read_usbcmd() & CMD_HCRST) == 0 { break; } core::hint::spin_loop(); }
             for _ in 0..100000 { if (self.op.read_usbsts() & STS_CNR) == 0 { break; } core::hint::spin_loop(); }
-            self.init_scratchpads(log_win)?;
+            
+            self.init_scratchpads()?;
             
             for i in 0..256 { *self.cmd_ring.add(i) = Trb::new(); }
             let phys_cmd = crate::memory::virt_to_phys(self.cmd_ring as u64).unwrap();
             let link = &mut *self.cmd_ring.add(255);
-            link.parameter = phys_cmd;
-            link.control = Trb::TYPE_LINK | Trb::CYCLE_BIT | Trb::ENT_BIT; 
+            link.parameter = phys_cmd; link.control = Trb::TYPE_LINK | Trb::CYCLE_BIT | Trb::ENT_BIT; 
             Self::clflush_range(self.cmd_ring as u64, 4096);
             self.op.write_crcr(phys_cmd | 1); 
 
             for i in 0..256 { *self.event_ring.add(i) = Trb::new(); }
             Self::clflush_range(self.event_ring as u64, 4096);
-            let phys_evt = crate::memory::virt_to_phys(self.event_ring as u64).unwrap();
-            (*self.erst).base_addr = phys_evt; (*self.erst).size = 256;
+            (*self.erst).base_addr = self.event_ring_phys; (*self.erst).size = 256;
             Self::clflush_range(self.erst as u64, 64);
             let ir0 = &mut self.runtime.ir[0];
             ir0.erstba = crate::memory::virt_to_phys(self.erst as u64).unwrap();
-            ir0.erstsz = 1; ir0.erdp = phys_evt | 8; ir0.iman = 2; ir0.imod = 4000;
+            ir0.erstsz = 1; ir0.erdp = self.event_ring_phys | 8; ir0.iman = 2; ir0.imod = 4000;
 
             let phys_dcbaa = crate::memory::virt_to_phys(self.dcbaa as u64).unwrap();
             self.op.write_dcbaap(phys_dcbaa);
@@ -340,8 +357,7 @@ impl XhciController {
             
             let mut started = false;
             for _ in 0..100_000_000 {
-                let sts = self.op.read_usbsts();
-                if (sts & STS_HALT) == 0 { started = true; break; }
+                if (self.op.read_usbsts() & STS_HALT) == 0 { started = true; break; }
                 core::hint::spin_loop();
             }
             if !started { return Err("Ctlr Halted"); }
@@ -360,17 +376,16 @@ impl XhciController {
                 self.cmd_cycle = !self.cmd_cycle;
             }
             self.doorbell.ring(0, 0);
+            
             let mut noop_ok = false;
-            // Lowered wait time for NoOp
-            for _ in 0..200_000 { if let Some(_) = self.check_event(log_win) { noop_ok = true; break; } core::hint::spin_loop(); }
-            if noop_ok { log_win.buffer.push(alloc::string::String::from("NoOp: OK")); } 
-            else { log_win.buffer.push(alloc::string::String::from("NoOp: Fail")); }
-            self.repaint(log_win);
+            for _ in 0..200_000 { if let Some(_) = self.check_event_sync() { noop_ok = true; break; } core::hint::spin_loop(); }
+            if noop_ok { crate::serial_println!("[USB] NoOp Command Successful."); } 
+            else { crate::serial_println!("[USB] WARNING: NoOp Command Failed."); }
         }
         Ok(())
     }
 
-    pub fn enable_slot(&mut self, log_win: &mut crate::window::Window) -> Result<u8, &'static str> {
+    pub fn enable_slot(&mut self) -> Result<u8, &'static str> {
         unsafe {
             let trb = &mut *self.cmd_ring.add(self.cmd_index);
             trb.parameter = 0; trb.status = 0;
@@ -386,13 +401,13 @@ impl XhciController {
                 self.cmd_cycle = !self.cmd_cycle;
             }
             self.doorbell.ring(0, 0); 
-            // Reduced Timeout
-            for _ in 0..500_000 { if let Some(slot) = self.check_event(log_win) { return Ok(slot); } core::hint::spin_loop(); }
+            for _ in 0..500_000 { if let Some(slot) = self.check_event_sync() { return Ok(slot); } core::hint::spin_loop(); }
         }
         Err("Cmd Timeout")
     }
 
-    unsafe fn check_event(&mut self, log_win: &mut crate::window::Window) -> Option<u8> {
+    // 🚨 FIX: Strict Synchronous Event Checker that ignores background polling noise
+    unsafe fn check_event_sync(&mut self) -> Option<u8> {
         for _ in 0..16 { 
             let trb_ptr = self.event_ring.add(self.event_index);
             Self::clflush(trb_ptr as *const u8); 
@@ -400,71 +415,88 @@ impl XhciController {
             if ((trb.control & 1) != 0) != self.event_cycle { return None; }
             self.event_index = (self.event_index + 1) % 256;
             if self.event_index == 0 { self.event_cycle = !self.event_cycle; }
+            
             let ir0 = &mut self.runtime.ir[0];
-            let phys = crate::memory::virt_to_phys(self.event_ring.add(self.event_index) as u64).unwrap();
+            let phys = self.event_ring_phys + (self.event_index as u64 * 16);
             ir0.erdp = phys | 8; ir0.iman = 3;
+            
             let type_ = (trb.control >> 10) & 0x3F;
-            if type_ == 33 || type_ == 32 { 
-                let code = (trb.status >> 24) & 0xFF;
-                let slot = ((trb.control >> 24) & 0xFF) as u8;
-                if code == 1 || code == 0 || code == 13 { return Some(slot); }
+            let code = (trb.status >> 24) & 0xFF;
+            let slot = ((trb.control >> 24) & 0xFF) as u8;
+
+            if type_ == 33 { // Command Completion Event
+                if code == 1 || code == 0 { return Some(slot); }
                 else { 
-                    log_win.buffer.push(alloc::format!("Err: {} Typ: {} Sl: {}", code, type_, slot));
-                    self.repaint(log_win);
+                    crate::serial_println!("[USB] EVENT ERROR: Code {} Slot {}", code, slot);
                     return None; 
                 }
+            } else if type_ == 32 {
+                // Background transfer event arrived during init. Drop it safely.
+                continue;
             }
         }
         None
     }
 
-    // --- NON-BLOCKING POLL: PROCESS ALL EVENTS ---
-    pub fn poll_mouse(&mut self, target_slot: u8) {
+    pub fn poll_all_mice(&mut self) {
         unsafe {
-            // 1. Drain Event Ring completely (process all completions for ALL slots)
-            for _ in 0..32 { // Process up to 32 events per tick
+            for _ in 0..32 { 
                 if let Some((event_slot, code)) = self.check_event_async() {
-                    // Update pending state for whichever slot reported in
-                    if (event_slot as usize) < self.mouse_pending.len() {
-                        self.mouse_pending[event_slot as usize] = false;
+                    if event_slot == 255 { continue; } 
+                    let s = event_slot as usize;
+                    if s < self.mouse_pending.len() {
+                        self.mouse_pending[s] = false;
                         
-                        // If success (1) or Short Packet (13), read the data
-                        if code == 1 || code == 13 || code == 0 {
-                            // Note: Buffer is shared, so this assumes the last interrupt overwrote it.
-                            // Ideally each slot has its own buffer, but for simple mice this is 'okay'.
-                            let buffer = self.mouse_buf_virt;
+                        if code != 1 && code != 13 && code != 0 {
+                            if !self.ep1_halted[s] {
+                                crate::serial_println!("[USB] Endpoint Halted on Slot {} (Code {}). Halting Polling Ring.", s, code);
+                                self.ep1_halted[s] = true;
+                            }
+                        } else {
+                            let buffer = self.mouse_buf_virt[s];
                             Self::clflush(buffer);
                             
-                            let buttons = *buffer.add(0);
-                            let dx = *buffer.add(1) as i8;
-                            let dy = *buffer.add(2) as i8;
+                            let b0 = *buffer.add(0);
+                            let b1 = *buffer.add(1);
+                            let b2 = *buffer.add(2);
+                            let b3 = *buffer.add(3);
+                            let b4 = *buffer.add(4);
+                            let b5 = *buffer.add(5);
                             
-                            if dx != 0 || dy != 0 || buttons != 0 {
+                            if b0 != 0 || b1 != 0 || b2 != 0 || b3 != 0 {
+                                crate::serial_println!("[USB] HID [{}]: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", s, b0, b1, b2, b3, b4, b5);
+                                
+                                let buttons = b1;
+                                let dx = b2 as i8; 
+                                let dy = b3 as i8;
+                                
                                 crate::mouse::update_from_usb(dx, dy, buttons);
                             }
                         }
                     }
                 } else {
-                    break; // No more events
+                    break; 
                 }
             }
 
-            // 2. Submit new request for the TARGET slot (if idle)
-            let s_id = target_slot as usize;
-            if s_id < self.ep1_configured.len() && self.ep1_configured[s_id] && !self.mouse_pending[s_id] {
-                let ring = self.ep1_rings[s_id];
-                if ring.is_null() { return; } 
+            for s_id in 1..self.ep1_configured.len() {
+                if self.ep1_configured[s_id] && !self.mouse_pending[s_id] && !self.ep1_halted[s_id] {
+                    let ring = self.ep1_rings[s_id];
+                    if ring.is_null() { continue; } 
 
-                let phys_buf = self.mouse_buf_phys;
-                let mut trb = Trb::new();
-                trb.parameter = phys_buf;
-                trb.status = 8; 
-                trb.control = Trb::TYPE_NORMAL | Trb::IOC_BIT | (1 << 16); 
-                
-                self.push_ep1_trb(s_id, trb);
-                self.doorbell.ring(s_id, 3); // DCI 3 = EP1 IN
-                
-                self.mouse_pending[s_id] = true;
+                    let phys_buf = self.mouse_buf_phys[s_id];
+                    let mut trb = Trb::new();
+                    trb.parameter = phys_buf;
+                    trb.status = 128; 
+                    trb.control = Trb::TYPE_NORMAL | Trb::IOC_BIT | Trb::ISP_BIT; 
+                    
+                    self.push_ep1_trb(s_id, trb);
+                    
+                    let dci = self.ep1_dci[s_id] as u32;
+                    self.doorbell.ring(s_id, dci); 
+                    
+                    self.mouse_pending[s_id] = true;
+                }
             }
         }
     }
@@ -473,15 +505,13 @@ impl XhciController {
         let trb_ptr = self.event_ring.add(self.event_index);
         let trb = read_volatile(trb_ptr);
 
-        if ((trb.control & 1) != 0) != self.event_cycle { 
-            return None; 
-        }
+        if ((trb.control & 1) != 0) != self.event_cycle { return None; }
 
         self.event_index = (self.event_index + 1) % 256;
         if self.event_index == 0 { self.event_cycle = !self.event_cycle; }
 
         let ir0 = &mut self.runtime.ir[0];
-        let phys = crate::memory::virt_to_phys(self.event_ring.add(self.event_index) as u64).unwrap();
+        let phys = self.event_ring_phys + (self.event_index as u64 * 16);
         ir0.erdp = phys | 8; ir0.iman = 3;
 
         let type_ = (trb.control >> 10) & 0x3F;
@@ -490,74 +520,46 @@ impl XhciController {
             let slot = ((trb.control >> 24) & 0xFF) as u8;
             return Some((slot, code as u8));
         }
-        // Advance but ignore non-transfer events
-        None
+        
+        Some((255, 255))
     }
 
-    pub fn set_configuration(&mut self, slot_id: u8, log_win: &mut crate::window::Window) -> Result<(), &'static str> {
+    pub fn get_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8, read_len: u16) -> Result<[u8; 128], &'static str> {
         unsafe {
             let s_id = slot_id as usize;
-            let mut setup = Trb::new(); setup.parameter = 0x0000_0000_0001_0900; setup.status = 8; setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
-            self.push_ep0_trb(s_id, setup);
-            let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
-            self.push_ep0_trb(s_id, status);
-            self.doorbell.ring(s_id, 1);
-            for _ in 0..2_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
-        }
-        Err("Cfg Timeout")
-    }
-
-    pub fn set_idle(&mut self, slot_id: u8, log_win: &mut crate::window::Window) -> Result<(), &'static str> {
-        unsafe {
-            let s_id = slot_id as usize;
-            let mut setup = Trb::new(); setup.parameter = 0x0000_0000_0000_0A21; setup.status = 8; setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
-            self.push_ep0_trb(s_id, setup);
-            let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
-            self.push_ep0_trb(s_id, status);
-            self.doorbell.ring(s_id, 1);
-            for _ in 0..2_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
-        }
-        Err("Idle Timeout")
-    }
-
-    pub fn set_boot_protocol(&mut self, slot_id: u8, log_win: &mut crate::window::Window) -> Result<(), &'static str> {
-        unsafe {
-            let s_id = slot_id as usize;
-            let mut setup = Trb::new(); setup.parameter = 0x0000_0000_0000_0B21; setup.status = 8; setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
-            self.push_ep0_trb(s_id, setup);
-            let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
-            self.push_ep0_trb(s_id, status);
-            self.doorbell.ring(s_id, 1);
-            for _ in 0..2_000_000 { if let Some(id) = self.check_event(log_win) { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
-        }
-        Err("Proto Timeout")
-    }
-
-    pub fn get_descriptor(&mut self, slot_id: u8, log_win: &mut crate::window::Window, short_read: bool) -> Result<u8, &'static str> {
-        unsafe {
-            let s_id = slot_id as usize;
-            let len = if short_read { 8 } else { 18 };
-            let buffer = Self::alloc_aligned(len as usize, 64)? as *mut u8;
+            let buffer = Self::alloc_aligned(read_len as usize, 64)? as *mut u8;
             let phys_buf = crate::memory::virt_to_phys(buffer as u64).unwrap();
-            let mut setup = Trb::new(); let param_low = 0x0100_0680; let param_high = (len as u64) << 48; setup.parameter = param_high | param_low; setup.status = 8; setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
+            
+            let mut setup = Trb::new(); 
+            let param_low = 0x0680 | ((desc_index as u64) << 16) | ((desc_type as u64) << 24);
+            let param_high = (read_len as u64) << 48;
+            setup.parameter = param_high | param_low; 
+            setup.status = 8; 
+            setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
             self.push_ep0_trb(s_id, setup);
-            let mut data = Trb::new(); data.parameter = phys_buf; data.status = len; data.control = Trb::TYPE_DATA | (1 << 16);
+            
+            let mut data = Trb::new(); 
+            data.parameter = phys_buf; 
+            data.status = read_len as u32; 
+            data.control = Trb::TYPE_DATA | (1 << 16); // DIR = IN
             self.push_ep0_trb(s_id, data);
-            let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT;
+            
+            let mut status = Trb::new(); 
+            status.parameter = 0; 
+            status.status = 0; 
+            status.control = Trb::TYPE_STATUS | Trb::IOC_BIT; // DIR = OUT
             self.push_ep0_trb(s_id, status);
+            
             self.doorbell.ring(s_id, 1); 
+            
             for _ in 0..2_000_000 {
-                if let Some(id) = self.check_event(log_win) {
+                if let Some(id) = self.check_event_sync() {
                     if id == 0 { return Err("Desc Fail"); }
-                    Self::clflush(buffer); 
-                    let max_p = *buffer.add(7);
-                    if !short_read {
-                        let vid = (*buffer.add(8) as u16) | ((*buffer.add(9) as u16) << 8);
-                        let pid = (*buffer.add(10) as u16) | ((*buffer.add(11) as u16) << 8);
-                        log_win.buffer.push(alloc::format!("S{}: {:x}:{:x} MP:{}", slot_id, vid, pid, max_p));
-                        self.repaint(log_win);
-                    }
-                    return Ok(max_p);
+                    
+                    let mut result = [0u8; 128];
+                    let copy_len = core::cmp::min(read_len as usize, 128);
+                    for i in 0..copy_len { result[i] = *buffer.add(i); }
+                    return Ok(result);
                 }
                 core::hint::spin_loop();
             }
@@ -565,39 +567,91 @@ impl XhciController {
         Err("Desc Timeout")
     }
 
-    pub fn configure_interrupt_endpoint(&mut self, slot_id: u8, log_win: &mut crate::window::Window) -> Result<(), &'static str> {
+    pub fn set_configuration(&mut self, slot_id: u8) -> Result<(), &'static str> {
+        unsafe {
+            let s_id = slot_id as usize;
+            let mut setup = Trb::new(); setup.parameter = 0x0000_0000_0001_0900; setup.status = 8; setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
+            self.push_ep0_trb(s_id, setup);
+            let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
+            self.push_ep0_trb(s_id, status);
+            self.doorbell.ring(s_id, 1);
+            for _ in 0..2_000_000 { if let Some(id) = self.check_event_sync() { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+        }
+        Err("Cfg Timeout")
+    }
+
+    pub fn set_idle(&mut self, slot_id: u8) -> Result<(), &'static str> {
+        unsafe {
+            let s_id = slot_id as usize;
+            let mut setup = Trb::new(); setup.parameter = 0x0000_0000_0000_0A21; setup.status = 8; setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
+            self.push_ep0_trb(s_id, setup);
+            let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
+            self.push_ep0_trb(s_id, status);
+            self.doorbell.ring(s_id, 1);
+            for _ in 0..2_000_000 { if let Some(id) = self.check_event_sync() { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+        }
+        Err("Idle Timeout")
+    }
+
+    pub fn set_boot_protocol(&mut self, slot_id: u8) -> Result<(), &'static str> {
+        unsafe {
+            let s_id = slot_id as usize;
+            let mut setup = Trb::new(); setup.parameter = 0x0000_0000_0000_0B21; setup.status = 8; setup.control = Trb::TYPE_SETUP | Trb::IDT_BIT;
+            self.push_ep0_trb(s_id, setup);
+            let mut status = Trb::new(); status.parameter = 0; status.status = 0; status.control = Trb::TYPE_STATUS | Trb::IOC_BIT | (1 << 16);
+            self.push_ep0_trb(s_id, status);
+            self.doorbell.ring(s_id, 1);
+            for _ in 0..2_000_000 { if let Some(id) = self.check_event_sync() { if id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+        }
+        Err("Proto Timeout")
+    }
+
+    pub fn configure_interrupt_endpoint(&mut self, slot_id: u8, max_packet: u16, interval: u8, dci: u8) -> Result<(), &'static str> {
         unsafe {
             let s_id = slot_id as usize;
             
             let ep1_ring = Self::alloc_aligned(4096, 64)? as *mut Trb;
+            let ep1_ring_phys = crate::memory::virt_to_phys(ep1_ring as u64).unwrap();
             for i in 0..256 { *ep1_ring.add(i) = Trb::new(); }
             let link = &mut *ep1_ring.add(255);
-            link.parameter = crate::memory::virt_to_phys(ep1_ring as u64).unwrap();
+            link.parameter = ep1_ring_phys;
             link.control = Trb::TYPE_LINK | Trb::ENT_BIT; 
             Self::clflush_range(ep1_ring as u64, 4096);
             
             self.ep1_rings[s_id] = ep1_ring;
+            self.ep1_rings_phys[s_id] = ep1_ring_phys; 
             self.ep1_cycles[s_id] = true;
             self.ep1_indices[s_id] = 0;
+            self.ep1_dci[s_id] = dci; 
 
             let in_ctx_mem = Self::alloc_aligned(self.ctx_size * 34, 64)?;
             let phys_in = crate::memory::virt_to_phys(in_ctx_mem as u64).unwrap();
             
             let icc_ptr = in_ctx_mem as *mut u32; 
             *icc_ptr.add(0) = 0; 
-            *icc_ptr.add(1) = (1 << 3) | (1 << 0); // Add EP1 (DCI 3) & Slot
+            *icc_ptr.add(1) = (1 << dci) | (1 << 0); 
 
-            let slot_ptr = in_ctx_mem.add(self.ctx_size) as *mut SlotContext;
-            (*slot_ptr).info1 = (1 << 27) | (3 << 27); // Context Entries = 3
+            // Safely retrieve the existing Slot Context so we don't corrupt the Speed/Route maps!
+            let out_ctx_phys = *self.dcbaa.add(s_id);
+            let out_ctx_virt = crate::memory::phys_to_virt(out_ctx_phys).unwrap() as *const u8;
+            let out_slot_ptr = out_ctx_virt.add(self.ctx_size) as *const SlotContext;
 
-            let ep1_ptr = in_ctx_mem.add(self.ctx_size * 4) as *mut EndpointContext; 
+            let in_slot_ptr = in_ctx_mem.add(self.ctx_size) as *mut SlotContext;
+            (*in_slot_ptr).info1 = (*out_slot_ptr).info1;
+            (*in_slot_ptr).info2 = (*out_slot_ptr).info2;
+            (*in_slot_ptr).ttd   = (*out_slot_ptr).ttd;
+
+            let current_entries = ((*in_slot_ptr).info1 >> 27) & 0x1F;
+            let new_entries = if (dci as u32) > current_entries { dci as u32 } else { current_entries };
+            (*in_slot_ptr).info1 = ((*in_slot_ptr).info1 & !(0x1F << 27)) | (new_entries << 27);
+
+            let ep_idx = dci as usize + 1;
+            let ep_ptr = in_ctx_mem.add(self.ctx_size * ep_idx) as *mut EndpointContext; 
             
-            // FIX: info1=Interval, info2=Type/MaxPacket
-            (*ep1_ptr).info1 = (8 << 16); 
-            (*ep1_ptr).info2 = (8 << 16) | (7 << 3) | (3 << 1); 
-            
-            (*ep1_ptr).tr_dequeue = crate::memory::virt_to_phys(ep1_ring as u64).unwrap() | 1; 
-            (*ep1_ptr).avg_trb_len = 8;
+            (*ep_ptr).info1 = (interval as u32) << 16; 
+            (*ep_ptr).info2 = ((max_packet as u32) << 16) | (7 << 3) | (3 << 1); 
+            (*ep_ptr).tr_dequeue = ep1_ring_phys | 1; 
+            (*ep_ptr).avg_trb_len = max_packet as u32;
 
             Self::clflush_range(in_ctx_mem as u64, self.ctx_size * 34);
 
@@ -619,21 +673,19 @@ impl XhciController {
             self.doorbell.ring(0, 0);
 
             for _ in 0..2_000_000 {
-                if let Some(id) = self.check_event(log_win) {
+                if let Some(id) = self.check_event_sync() {
                     if id == slot_id { 
-                        log_win.buffer.push(alloc::string::String::from("EP1: Config"));
-                        self.ep1_configured[s_id] = true;
-                        self.repaint(log_win);
+                        crate::serial_println!("[USB] EP Configured on Slot {}: DCI={} MaxPacket={} Interval={}", slot_id, dci, max_packet, interval);
                         return Ok(()); 
                     }
                 }
                 core::hint::spin_loop();
             }
         }
-        Err("EP1 Fail")
+        Err("EP Fail")
     }
 
-    pub fn address_device(&mut self, slot_id: u8, port_id: u8, speed: u8, log_win: &mut crate::window::Window, bsr: bool, packet_size_override: Option<u32>) -> Result<(), &'static str> {
+    pub fn address_device(&mut self, slot_id: u8, port_id: u8, speed: u8, bsr: bool, packet_size_override: Option<u32>) -> Result<(), &'static str> {
         unsafe {
             if *self.dcbaa.add(slot_id as usize) == 0 {
                 let out_ctx_mem = Self::alloc_aligned(self.ctx_size * 33, 64)?;
@@ -646,16 +698,27 @@ impl XhciController {
             let slot_ptr = in_ctx_mem.add(self.ctx_size) as *mut SlotContext;
             (*slot_ptr).info1 = (1 << 27) | ((speed as u32) << 20); 
             (*slot_ptr).info2 = (port_id as u32) << 16; 
+            
             let ep0_ptr = in_ctx_mem.add(self.ctx_size * 2) as *mut EndpointContext;
-            let max_packet: u32 = if let Some(sz) = packet_size_override { sz } else { match speed { 1 => 8, 3 | 4 => 512, _ => 64 } };
+            
+            let mut max_packet: u32 = if let Some(sz) = packet_size_override { sz } else { match speed { 1 => 8, 3 | 4 => 512, _ => 64 } };
+            if speed == 4 && max_packet == 9 { max_packet = 512; } 
+
             (*ep0_ptr).info1 = 0; (*ep0_ptr).info2 = (max_packet << 16) | (4 << 3) | (3 << 1); (*ep0_ptr).avg_trb_len = 8;
             
             let ep_ring = Self::alloc_aligned(4096, 64)? as *mut Trb;
+            let ep_ring_phys = crate::memory::virt_to_phys(ep_ring as u64).unwrap(); 
             for i in 0..256 { *ep_ring.add(i) = Trb::new(); } 
-            let link = &mut *ep_ring.add(255); link.parameter = crate::memory::virt_to_phys(ep_ring as u64).unwrap(); link.control = Trb::TYPE_LINK | Trb::CYCLE_BIT | Trb::ENT_BIT;
+            let link = &mut *ep_ring.add(255); 
+            link.parameter = ep_ring_phys; 
+            link.control = Trb::TYPE_LINK | Trb::CYCLE_BIT | Trb::ENT_BIT;
             Self::clflush_range(ep_ring as u64, 4096);
-            self.ep0_rings[slot_id as usize] = ep_ring; self.ep0_cycles[slot_id as usize] = true; self.ep0_indices[slot_id as usize] = 0; 
-            (*ep0_ptr).tr_dequeue = crate::memory::virt_to_phys(ep_ring as u64).unwrap() | 1; 
+            
+            self.ep0_rings[slot_id as usize] = ep_ring; 
+            self.ep0_rings_phys[slot_id as usize] = ep_ring_phys; 
+            self.ep0_cycles[slot_id as usize] = true; 
+            self.ep0_indices[slot_id as usize] = 0; 
+            (*ep0_ptr).tr_dequeue = ep_ring_phys | 1; 
             Self::clflush_range(in_ctx_mem as u64, self.ctx_size * 34);
 
             let trb = &mut *self.cmd_ring.add(self.cmd_index);
@@ -673,17 +736,29 @@ impl XhciController {
                 self.cmd_cycle = !self.cmd_cycle;
             }
             self.doorbell.ring(0, 0); 
-            // Reduced Timeout
-            for _ in 0..5_000_000 { if let Some(s_id) = self.check_event(log_win) { if s_id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
+            for _ in 0..5_000_000 { if let Some(s_id) = self.check_event_sync() { if s_id == slot_id { return Ok(()); } } core::hint::spin_loop(); }
         }
         Err("Addr Timeout")
     }
 
-    pub fn check_ports(&mut self, log_win: &mut crate::window::Window) {
+    pub fn check_ports(&mut self) {
         unsafe {
             let max = self.caps.max_ports();
-            // FIX: Added limit to Max Ports to prevent scanning ghost ports on some chipsets
-            let limit = if max > 16 { 16 } else { max };
+            let limit = if max > 32 { 32 } else { max };
+
+            crate::serial_println!("[USB] Waking up electrical bus for {} ports...", limit);
+
+            for i in 1..=limit {
+                let idx = (i - 1) as usize * 4;
+                if idx < self.op.portregs.len() {
+                    let portsc = read_volatile(&self.op.portregs[idx]);
+                    if (portsc & (1 << 9)) == 0 {
+                        write_volatile(&mut self.op.portregs[idx], portsc | (1 << 9));
+                    }
+                }
+            }
+
+            for _ in 0..100_000_000 { core::hint::spin_loop(); }
 
             for i in 1..=limit {
                 let idx = (i - 1) as usize * 4;
@@ -691,30 +766,83 @@ impl XhciController {
                 let portsc = read_volatile(&self.op.portregs[idx]);
                 
                 if (portsc & 1) != 0 { 
-                    write_volatile(&mut self.op.portregs[idx], portsc | (1 << 24) | (1 << 20) | (1 << 17)); 
-                    if (portsc & (1<<1)) == 0 { 
-                        write_volatile(&mut self.op.portregs[idx], portsc | (1 << 4)); 
-                        for _ in 0..10_000_000 { if (read_volatile(&self.op.portregs[idx]) & (1<<4)) == 0 { break; } core::hint::spin_loop(); }
-                        for _ in 0..10_000_000 { core::hint::spin_loop(); } // Shortened delay
-                    }
+                    crate::serial_println!("[USB] --- DEVICE DETECTED ON PORT {} ---", i);
+                    
+                    // 🚨 THE FIX: Mask out RW1C and PR bits before clearing so we don't accidentally enable a broken port!
+                    let mut clean_sc = portsc & !((1 << 1) | (1 << 4));
+                    write_volatile(&mut self.op.portregs[idx], clean_sc | (1 << 24) | (1 << 20) | (1 << 17)); 
+                    
+                    // 🚨 Force a true Hardware Reset no matter what the BIOS did
+                    let mut reset_sc = read_volatile(&self.op.portregs[idx]);
+                    reset_sc &= !((1 << 1) | (1 << 24) | (1 << 20) | (1 << 17));
+                    write_volatile(&mut self.op.portregs[idx], reset_sc | (1 << 4)); 
+                    
+                    for _ in 0..20_000_000 { if (read_volatile(&self.op.portregs[idx]) & (1<<4)) == 0 { break; } core::hint::spin_loop(); }
+                    for _ in 0..20_000_000 { core::hint::spin_loop(); }
+                    
                     if (read_volatile(&self.op.portregs[idx]) & (1<<1)) != 0 {
                         let speed = (read_volatile(&self.op.portregs[idx]) >> 10) & 0xF; 
-                        log_win.buffer.push(alloc::format!("P{} Spd{}", i, speed));
-                        self.repaint(log_win);
                         
-                        // We use a safe wrapper logic here to prevent infinite chains
-                        if let Ok(id) = self.enable_slot(log_win) {
+                        if let Ok(id) = self.enable_slot() {
                             if id > 0 { 
-                                if self.address_device(id, i as u8, speed as u8, log_win, true, None).is_ok() {
-                                    if let Ok(real_mp) = self.get_descriptor(id, log_win, true) {
-                                        if self.address_device(id, i as u8, speed as u8, log_win, false, Some(real_mp as u32)).is_ok() {
-                                            let _ = self.get_descriptor(id, log_win, false);
-                                            let _ = self.set_configuration(id, log_win);
-                                            // Reduced Wait
-                                            for _ in 0..1_000_000 { core::hint::spin_loop(); }
-                                            let _ = self.set_idle(id, log_win);
-                                            let _ = self.set_boot_protocol(id, log_win);
-                                            let _ = self.configure_interrupt_endpoint(id, log_win);
+                                if let Ok(dev_desc) = self.get_descriptor(id, 1, 0, 18) {
+                                    let real_mp = dev_desc[7] as u32;
+                                    let vid = (dev_desc[8] as u16) | ((dev_desc[9] as u16) << 8);
+                                    let pid = (dev_desc[10] as u16) | ((dev_desc[11] as u16) << 8);
+                                    
+                                    crate::serial_println!("[USB] Port {} (Slot {}) -> Vendor {:04x} : Product {:04x}", i, id, vid, pid);
+                                    
+                                    if self.address_device(id, i as u8, speed as u8, false, Some(real_mp)).is_ok() {
+                                        
+                                        if vid == 0x0c45 || vid == 0x8087 {
+                                            crate::serial_println!("[USB] Skipping incompatible hardware on Slot {}.", id);
+                                        } else {
+                                            let mut ep_max_packet: u16 = 64;
+                                            let mut ep_interval: u8 = 10;
+                                            let mut ep_dci: u8 = 3; 
+                                            
+                                            if let Ok(cfg_desc) = self.get_descriptor(id, 2, 0, 128) {
+                                                let total_len = (cfg_desc[2] as u16) | ((cfg_desc[3] as u16) << 8);
+                                                let scan_len = core::cmp::min(total_len as usize, 128);
+                                                
+                                                let mut scan_idx = 0;
+                                                while scan_idx < scan_len {
+                                                    let desc_len = cfg_desc[scan_idx] as usize;
+                                                    if desc_len == 0 { break; }
+                                                    let desc_type = cfg_desc[scan_idx + 1];
+                                                    
+                                                    if desc_type == 5 { 
+                                                        let ep_addr = cfg_desc[scan_idx + 2];
+                                                        let attr = cfg_desc[scan_idx + 3];
+                                                        
+                                                        if (ep_addr & 0x80) != 0 && (attr & 3) == 3 {
+                                                            ep_max_packet = (cfg_desc[scan_idx + 4] as u16) | ((cfg_desc[scan_idx + 5] as u16) << 8);
+                                                            ep_max_packet &= 0x07FF; 
+                                                            ep_interval = cfg_desc[scan_idx + 6];
+                                                            
+                                                            let ep_num = ep_addr & 0x0F;
+                                                            ep_dci = (ep_num * 2) + 1; 
+                                                            break; 
+                                                        }
+                                                    }
+                                                    scan_idx += desc_len;
+                                                }
+                                            }
+                                            
+                                            if self.configure_interrupt_endpoint(id, ep_max_packet, ep_interval, ep_dci).is_ok() {
+                                                for _ in 0..5_000_000 { core::hint::spin_loop(); }
+                                                
+                                                if self.set_configuration(id).is_ok() {
+                                                    for _ in 0..5_000_000 { core::hint::spin_loop(); }
+                                                    
+                                                    if self.set_boot_protocol(id).is_err() {
+                                                        crate::serial_println!("[USB] Note: Trackpad on Slot {} rejected Legacy Protocol.", id);
+                                                    }
+                                                    let _ = self.set_idle(id);
+                                                    
+                                                    self.ep1_configured[id as usize] = true;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -722,16 +850,6 @@ impl XhciController {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    fn repaint(&self, win: &crate::window::Window) {
-        unsafe {
-            if let Some(bb) = &mut crate::BACK_BUFFER {
-                crate::window::WINDOW_MANAGER.lock().draw(bb);
-                win.draw(bb, true);
-                if let Some(s) = &mut crate::SCREEN_PAINTER { bb.present(s); }
             }
         }
     }

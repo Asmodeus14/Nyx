@@ -4,7 +4,7 @@ set -e
 # 1. Clean and Build User App (Force new address)
 echo "--- Building User App ---"
 cd nyx-user
-cargo clean
+# cargo clean  # (Uncomment if you want a fresh build every time)
 cargo build --release --target x86_64-unknown-none
 cd ..
 
@@ -12,12 +12,12 @@ cd ..
 rm -f nyx-kernel/src/nyx-user.bin
 
 # 3. COPY NEW ELF BINARY
-# CRITICAL: Use 'cp' to keep ELF Headers! Do not use objcopy!
+# Since you have a Cargo Workspace, the target folder is at the root!
 echo "--- Copying Binary ---"
 cp target/x86_64-unknown-none/release/nyx-user nyx-kernel/src/nyx-user.bin
 
-# 4. Verify the Copy (Debug)
-echo "--- verifying nyx-user.bin ---"
+# 4. Verify the Copy
+echo "--- verifying nyx-user.bin ELF Headers ---"
 readelf -h nyx-kernel/src/nyx-user.bin | grep "Entry point"
 
 # 5. Rebuild and Run Kernel

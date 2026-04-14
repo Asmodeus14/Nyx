@@ -1,30 +1,23 @@
 ENTRY(_start)
 
 SECTIONS {
-    /* FIX: Load at 32MB (0x2000000) to match Kernel ELF Loader expectations */
-    . = 0x2000000;
+    /* 🚨 CRITICAL FIX: Push userspace up to 1GB to avoid kernel collision! */
+    . = 0x40000000;
 
-    .text : {
-        /* Ensure entry point is first */
-        *(.text.entry) 
-        *(.text*)
+    .text : ALIGN(4K) {
+        *(.text.entry)
+        *(.text .text.*)
     }
 
-    .rodata : {
-        *(.rodata*)
+    .rodata : ALIGN(4K) {
+        *(.rodata .rodata.*)
     }
 
-    .data : {
-        *(.data*)
+    .data : ALIGN(4K) {
+        *(.data .data.*)
     }
 
-    .bss : {
-        *(.bss*)
-    }
-
-    /DISCARD/ : {
-        *(.eh_frame)
-        *(.comment)
-        *(.note*)
+    .bss : ALIGN(4K) {
+        *(.bss .bss.*)
     }
 }

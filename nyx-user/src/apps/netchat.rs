@@ -4,6 +4,9 @@ use alloc::format;
 use crate::syscalls::UdpSocket;
 use crate::gfx::draw;
 
+// Standard POSIX Error Codes
+const EAGAIN: i64 = -11;
+
 pub struct NetChatApp {
     socket: Option<UdpSocket>,
     status_log: String,
@@ -40,48 +43,51 @@ impl NetChatApp {
             }
             self.socket = Some(sock);
         } else {
-            self.status_log = "Failed to allocate Socket FD.".into();
+            self.status_log = "Failed to allocate socket.".into();
         }
     }
 
-    /// Handles typing and sending messages
-    pub fn handle_key(&mut self, c: char) {
-        if c == '\n' {
-            if !self.current_input.is_empty() {
-                // Send over network
-                if let Some(sock) = &self.socket {
-                    let mut payload = self.current_input.clone();
-                    payload.push('\n');
-                    sock.send(payload.as_bytes());
-                }
-                
-                // Add to local UI and clear input
-                self.messages.push(format!("You: {}", self.current_input));
-                self.current_input.clear();
-            }
-        } else if c == '\x08' { // Backspace
-            self.current_input.pop();
-        } else {
-            self.current_input.push(c);
-        }
-    }
-
-    /// Polls for incoming network packets. Returns true if the window needs a UI redraw.
+    /// Called every frame by the window manager
     pub fn update(&mut self) -> bool {
         let mut got_new_data = false;
+        
         if let Some(sock) = &self.socket {
-            let mut rx_buf = [0u8; 512];
+            let mut buf = [0u8; 2048];
             
-            // Non-blocking poll for incoming data
-            let bytes_read = sock.recv(&mut rx_buf);
+            // 🚨 THE CONTRACT: Receive data and capture the signed return value
+            let ret = sock.recv(&mut buf);
             
-            if bytes_read > 0 {
-                if let Ok(text) = core::str::from_utf8(&rx_buf[..bytes_read as usize]) {
+            // 1. Check for Errors or Empty Buffers FIRST
+            if ret < 0 {
+                if ret == EAGAIN {
+                    // This is perfectly fine. It's a non-blocking socket and no packet has arrived yet.
+                    // We just return false and let the UI render normally.
+                    return false; 
+                } else {
+                    // A genuine hardware or network error occurred (e.g., EBADF or ENOMEM).
+                    self.status_log = format!("Network Error: Code {}", ret);
+                    return true; // Return true to force a UI redraw with the error message
+                }
+            }
+            
+            // 2. Handle Connection Closed
+            if ret == 0 {
+                self.status_log = "Connection closed by peer.".into();
+                return true; 
+            }
+
+            // 3. Safe Processing: We know `ret` is > 0, so casting to usize is mathematically safe!
+            let size = ret as usize;
+            
+            // 4. Parse the safe buffer
+            if let Ok(text) = core::str::from_utf8(&buf[..size]) {
+                if !text.trim().is_empty() {
                     self.messages.push(format!("Host: {}", text.trim_end()));
                     got_new_data = true;
                 }
             }
         }
+        
         got_new_data
     }
     
@@ -108,10 +114,37 @@ impl NetChatApp {
 
         // Draw input box area at the bottom
         let input_y = y + h - 25;
-        draw::draw_rect_simple(fb, screen_w, screen_h, x + 5, input_y - 5, w - 10, 25, 0xFF111111);
+        draw::draw_rect(fb, screen_w, screen_h, x + 5, input_y - 5, w - 10, 25, 0xFF222222);
         
-        let cursor = if (crate::syscalls::sys_get_time() / 500) % 2 == 0 { "_" } else { " " };
-        let prompt = format!("> {}{}", self.current_input, cursor);
-        draw::draw_text(fb, screen_w, screen_h, pad_x, input_y, &prompt, 0xFFFFFF00);
+        // Blink cursor logic
+        let ticks = unsafe { crate::syscalls::sys_get_time() };
+        let show_cursor = (ticks % 1000) < 500;
+        
+        let display_text = if show_cursor {
+            format!("> {}_", self.current_input)
+        } else {
+            format!("> {}", self.current_input)
+        };
+        
+        draw::draw_text(fb, screen_w, screen_h, pad_x, input_y, &display_text, 0xFFFFFFFF);
+    }
+    
+    pub fn handle_key(&mut self, c: char) {
+        if c == '\n' {
+            if !self.current_input.is_empty() {
+                // Send the message across the network!
+                if let Some(sock) = &self.socket {
+                    let msg = format!("{}\n", self.current_input);
+                    sock.send(msg.as_bytes());
+                }
+                
+                self.messages.push(format!("You: {}", self.current_input));
+                self.current_input.clear();
+            }
+        } else if c == '\x08' { // Backspace
+            self.current_input.pop();
+        } else {
+            self.current_input.push(c);
+        }
     }
 }
