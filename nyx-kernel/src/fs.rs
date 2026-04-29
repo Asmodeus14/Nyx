@@ -1,14 +1,14 @@
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::vec::Vec;
 use spin::Mutex;
 use core::cmp;
 use core::convert::TryInto;
-
 use crate::drivers::nvme::NvmeDriver;
 use fatfs::{Read, Write, Seek, SeekFrom, IoBase};
 
-const FAT_SECTOR_SIZE: u64 = 512; 
-const NVME_BLOCK_SIZE: u64 = 4096; 
+const FAT_SECTOR_SIZE: u64 = 512;
+const NVME_BLOCK_SIZE: u64 = 4096;
 const MAGIC_SIG: &[u8; 4] = b"NYXZ";
 
 fn nyx_compress(data: &[u8]) -> Vec<u8> {
@@ -18,6 +18,7 @@ fn nyx_compress(data: &[u8]) -> Vec<u8> {
         let current = data[i];
         let mut run_len = 1;
         while i + run_len < data.len() && data[i + run_len] == current && run_len < 255 { run_len += 1; }
+        
         if run_len >= 4 || current == 0xFD {
             out.push(0xFD); out.push(run_len as u8); out.push(current);
             i += run_len;
@@ -46,9 +47,9 @@ fn nyx_decompress(data: &[u8]) -> Result<Vec<u8>, ()> {
 
 pub struct NvmeStream {
     driver: NvmeDriver,
-    position: u64, 
-    partition_offset_sectors: u64, 
-    temp_block: Vec<u8>, 
+    position: u64,
+    partition_offset_sectors: u64,
+    temp_block: Vec<u8>,
 }
 
 impl NvmeStream {
@@ -67,6 +68,7 @@ impl IoBase for NvmeStream { type Error = (); }
 impl Read for NvmeStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         if buf.len() == 0 { return Ok(0); }
+        
         let absolute_byte_pos = (self.partition_offset_sectors * FAT_SECTOR_SIZE) + self.position;
         let nvme_lba = absolute_byte_pos / NVME_BLOCK_SIZE;
         let offset_in_nvme_block = (absolute_byte_pos % NVME_BLOCK_SIZE) as usize;
@@ -141,21 +143,22 @@ impl FileSystem {
         let mut partition_start_lba = 0;
         let part_type = sector0[0x1BE + 4];
 
-        if part_type == 0xEE { 
+        if part_type == 0xEE {
              crate::serial_println!("[FS] GPT Detected. Parsing headers...");
              let entry_list_lba = u64::from_le_bytes(sector0[512+72..512+80].try_into().unwrap());
              let mut entry_block = alloc::vec![0u8; 4096];
+             
              if driver.read_block(1, &mut entry_block) {
-                 for i in 0..4 { 
+                 for i in 0..4 {
                      let offset = i * 128;
                      let type_guid_first = u64::from_le_bytes(entry_block[offset..offset+8].try_into().unwrap());
                      if type_guid_first != 0 {
                          partition_start_lba = u64::from_le_bytes(entry_block[offset+32..offset+40].try_into().unwrap());
-                         break; 
+                         break;
                      }
                  }
              }
-        } else { 
+        } else {
              crate::serial_println!("[FS] Standard MBR Detected.");
              partition_start_lba = u32::from_le_bytes([sector0[0x1BE+8], sector0[0x1BE+9], sector0[0x1BE+10], sector0[0x1BE+11]]) as u64;
         }
@@ -173,6 +176,7 @@ impl FileSystem {
         if boot_sector[boot_offset + 510] != 0x55 || boot_sector[boot_offset + 511] != 0xAA { return; }
 
         crate::serial_println!("[FS] Valid FAT boot sector detected. Mounting...");
+
         let stream = NvmeStream::new(driver, partition_start_lba);
         let options = fatfs::FsOptions::new().update_accessed_date(true);
         
@@ -184,12 +188,14 @@ impl FileSystem {
 
     pub fn ls(&mut self, path: &str) -> Vec<String> {
         if !self.cache_path.is_empty() && self.cache_path == path { return self.cache_files.clone(); }
+        
         let mut list = Vec::new();
         
-        // 🚨 VIRTUAL FILESYSTEM INJECTION
+        // 🚨 VIRTUAL FILESYSTEM INJECTION (The RAM Disk Cheat) 🚨
         if path == "/" || path.is_empty() {
             list.push(String::from("hello.elf"));
-            list.push(String::from("nyx-user.bin")); 
+            list.push(String::from("nyx-user.bin"));
+            list.push(String::from("rust.elf")); // <-- NOW VISIBLE IN `ls`!
         }
 
         if let Some(fs) = &self.inner {
@@ -199,28 +205,37 @@ impl FileSystem {
                 for entry in dir.iter() {
                     if let Ok(e) = entry { 
                         let mut name = e.file_name();
-                        if e.is_dir() { name.push('/'); } 
+                        if e.is_dir() { name.push('/'); }
                         list.push(name); 
                     }
                 }
             }
         }
-        self.cache_path = String::from(path); self.cache_files = list.clone();
+        
+        self.cache_path = String::from(path); 
+        self.cache_files = list.clone();
         list
     }
 
     pub fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
-        // 🚨 VIRTUAL FILE INTERCEPT
+        // 🚨 VIRTUAL FILE INTERCEPT (The RAM Disk Cheat) 🚨
         if name == "hello.elf" || name == "/hello.elf" {
-            return Some(include_bytes!("hello.elf").to_vec());
+            return Some(crate::HELLO_BIN.to_vec());
         }
         if name == "nyx-user.bin" || name == "/nyx-user.bin" {
-            return Some(include_bytes!("nyx-user.bin").to_vec());
+            // Note: If you renamed the INIT_FS variable in main, you can intercept it here too, 
+            // but the kernel bootstraps it directly in main() anyway.
+            return None; 
+        }
+        if name == "rust.elf" || name == "/rust.elf" {
+            return Some(crate::RUST_BIN.to_vec());
         }
 
+        // --- ACTUAL NVMe HARDWARE FATFS READ ---
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
             let clean_name = if name.starts_with('/') { &name[1..] } else { name };
+            
             if let Ok(mut file) = root.open_file(clean_name) {
                 let mut buf = Vec::new();
                 let mut temp = alloc::vec![0u8; 4096];
@@ -231,6 +246,7 @@ impl FileSystem {
                         Err(_) => return None,
                     }
                 }
+                
                 if buf.len() >= 4 && &buf[0..4] == MAGIC_SIG {
                     match nyx_decompress(&buf[4..]) {
                         Ok(decompressed) => return Some(decompressed),
@@ -244,14 +260,16 @@ impl FileSystem {
 
     pub fn write_file(&mut self, name: &str, data: &[u8]) -> bool {
         self.cache_path.clear(); 
+        
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
             let clean_name = if name.starts_with('/') { &name[1..] } else { name };
+            
             let compressed_payload = nyx_compress(data);
             let mut final_data = Vec::with_capacity(4 + compressed_payload.len());
             final_data.extend_from_slice(MAGIC_SIG);
             final_data.extend_from_slice(&compressed_payload);
-
+            
             match root.create_file(clean_name) {
                 Ok(mut file) => return file.write_all(&final_data).is_ok(),
                 Err(_) => return false,

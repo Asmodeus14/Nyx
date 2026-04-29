@@ -50,12 +50,14 @@ use x86_64::PrivilegeLevel;
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config.mappings.framebuffer = Mapping::Dynamic; 
+    config.mappings.framebuffer = Mapping::Dynamic;
     config
 };
 
 static INIT_FS: &[u8] = include_bytes!("nyx-user.bin");
 pub static HELLO_BIN: &[u8] = include_bytes!("hello.elf");
+// 🚨 THE RUST APP INJECTION 🚨
+pub static RUST_BIN: &[u8] = include_bytes!("rust.elf");
 
 lazy_static::lazy_static! {
     static ref TSS: TaskStateSegment = {
@@ -113,12 +115,12 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unsafe { crate::memory::BOOTLOADER_CR3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64(); }
-
     crate::serial_println!("[BOOT] NyxOS Kernel Starting...");
     crate::vga_println!("[BOOT] NyxOS Kernel Boot Sequence Initiated...");
 
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     unsafe { crate::memory::PHYS_MEM_OFFSET = phys_mem_offset.as_u64(); }
+
     let mut mapper = unsafe { memory::init(phys_mem_offset, &boot_info.memory_regions) };
     
     allocator::init_heap(&mut mapper, &mut memory::MEMORY_MANAGER.lock().as_mut().unwrap().frame_allocator).unwrap();
@@ -127,12 +129,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let info = fb.info();
         let raw_buffer = fb.buffer_mut();
         let fb_virt_ptr = raw_buffer.as_ptr() as u64;
-
+        
         unsafe { 
-            crate::gui::SCREEN_PAINTER = Some(gui::VgaPainter { buffer: raw_buffer, info }); 
-            if let Some(phys) = crate::memory::virt_to_phys(fb_virt_ptr) { crate::gui::FRAMEBUFFER_PHYS_ADDR = phys; } 
-            else { crate::gui::FRAMEBUFFER_PHYS_ADDR = fb_virt_ptr; }
+             crate::gui::SCREEN_PAINTER = Some(gui::VgaPainter { buffer: raw_buffer, info });
+             if let Some(phys) = crate::memory::virt_to_phys(fb_virt_ptr) { crate::gui::FRAMEBUFFER_PHYS_ADDR = phys; }
+             else { crate::gui::FRAMEBUFFER_PHYS_ADDR = fb_virt_ptr; }
         }
+        
         crate::window::WINDOW_MANAGER.lock().set_resolution(info.width, info.height);
         
         {
@@ -163,10 +166,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         acpi::init(rsdp_addr);
         acpi::init_intel_acpica();
         acpi::scan_for_modern_inputs();
-
         apic::init();
         crate::apic::init_timer(0x40);
-
         let apic_ids = crate::apic::get_cpu_apic_ids();
         percpu::init(&apic_ids);
         crate::memory::identity_map_low_memory();
@@ -191,14 +192,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(ref mut driver) = nvme_driver_opt { driver.create_io_queues(); }
     
     crate::entity::awaken_entity(&mut nvme_driver_opt);
+
     if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    // ==========================================
     // PID 1 BOOTSTRAPPER (Init Process)
-    // ─────────────────────────────────────────────────────────────────────────
+    // ==========================================
     crate::vga_println!("[BOOT] Bootstrapping PID 1 (Init Process)...");
 
-    // 🚨 FATAL CRASH FIX 1: Prevent Pre-Flight Preemption Strikes!
+    //   FATAL CRASH FIX 1: Prevent Pre-Flight Preemption Strikes!
     // We must disable hardware interrupts before adding PID 1 to the scheduler. 
     // If the timer ticks while we are setting up the GUI, the scheduler will 
     // try to switch to an empty stack and Triple Fault!
@@ -206,7 +208,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let mut init_process = crate::process::Process::new().expect("Failed to create init process");
     
-    // 🚨 FATAL CRASH FIX 2: State Synchronization
+    //   FATAL CRASH FIX 2: State Synchronization
     // Because we use `enter_userspace` to manually jump into the GUI without 
     // using the scheduler to start it, we MUST manually flag it as 'Running'.
     // Otherwise, on the first timer tick, the scheduler won't save its registers!
@@ -238,6 +240,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let stack_top = (stack_base + (stack_pages as u64 * 4096)) & !0xF;
 
     interrupts::init_syscalls();
+
     unsafe { percpu.user_rsp = stack_top; } 
 
     unsafe {
@@ -275,4 +278,6 @@ pub fn trigger_rsod(msg: &str) -> ! {
 }
 
 #[alloc_error_handler]
-fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! { panic!("Alloc Error: {:?}", layout); }
+fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
+    panic!("Alloc Error: {:?}", layout);
+}

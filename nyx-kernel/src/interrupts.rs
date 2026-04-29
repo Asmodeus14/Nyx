@@ -37,7 +37,7 @@ pub struct SockAddrIn {
 
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
     let start = ptr as u64;
-    // PIE FIX: Allow reading from address 0x0 so the C program can find its strings!
+    // PIE FIX: Allow reading from address 0x0
     if start == 0 && len == 0 { return false; }
     if let Some(end) = start.checked_add(len as u64) {
         return end <= 0x0000_7FFF_FFFF_FFFF;
@@ -313,7 +313,7 @@ pub fn init_syscalls() {
     }
 }
 
-// FULL TRAPFRAME: Preserves all 15 registers so the Child process doesn't get Amnesia!
+// FULL TRAPFRAME
 #[repr(C)]
 pub struct SyscallStackFrame {
     pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
@@ -329,7 +329,6 @@ syscall_handler_asm:
     mov gs:[8], rsp   
     mov rsp, gs:[0]   
 
-    // THE FORK FIX: Push ALL registers identical to the hardware timer
     push rax
     push rbx
     push rcx
@@ -364,7 +363,6 @@ syscall_handler_asm:
     fxrstor [rsp]
     mov rsp, rax
 
-    // Restore ALL registers
     pop r15
     pop r14
     pop r13
@@ -478,10 +476,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EBADF as u64; } 
             }
         },
-        12 => { // SYS_BRK (Data Segment Break for libc)
-            // Trick musl into falling back to mmap
-            frame.rax = 0; 
-        },
+        
+        // --- POSIX COMPATIBILITY STUBS FOR LIBC AND RUST ---
+        10 => { frame.rax = 0; }, // SYS_MPROTECT
+        12 => { frame.rax = 0; }, // SYS_BRK (Forces malloc to use mmap)
+        13 => { frame.rax = 0; }, // SYS_RT_SIGACTION
+        14 => { frame.rax = 0; }, // SYS_RT_SIGPROCMASK
+        
         16 => { // SYS_IOCTL (I/O Control)
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
@@ -499,22 +500,20 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 }
             } else { frame.rax = EBADF as u64; }
         },
-        20 => { // SYS_WRITEV 
+        
+        20 => { // SYS_WRITEV (Vector Write)
             let fd = arg1 as usize;
             let iov_ptr = arg2 as *const u64; 
             let iovcnt = arg3 as usize;
             
-            // Each iovec struct is 16 bytes (8 bytes for base pointer, 8 bytes for length)
             if !is_valid_user_ptr(iov_ptr as *const u8, iovcnt * 16) { 
                 frame.rax = EFAULT as u64; 
                 return; 
             }
             
             let mut total_written = 0isize;
-            
             for i in 0..iovcnt {
                 unsafe {
-                    // Read the base memory address and length of the current buffer chunk
                     let base = *iov_ptr.add(i * 2);
                     let len = *iov_ptr.add(i * 2 + 1) as usize;
                     
@@ -530,6 +529,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
             frame.rax = total_written as u64;
         },
+        
         22 => { // SYS_PIPE
             let fd_array_ptr = arg1 as *mut i32;
             if !is_valid_user_ptr(fd_array_ptr as *const u8, 8) { frame.rax = EFAULT as u64; return; }
@@ -650,8 +650,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if let Ok(raw_path) = core::str::from_utf8(path_slice) {
                 
                 let path = raw_path.trim_matches(char::from(0)).trim();
+                
+                // Add rust.elf to RAM Disk loader!
                 let elf_data_opt = if path.contains("hello.elf") {
                     Some(alloc::vec::Vec::from(crate::HELLO_BIN))
+                } else if path.contains("rust.elf") {
+                    Some(alloc::vec::Vec::from(crate::RUST_BIN))
                 } else {
                     let mut fs = crate::fs::FS.lock(); 
                     fs.read_file(path)
@@ -674,9 +678,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                             frame.rcx = entry_point;
                             frame.r11 = 0x202; 
                             
-                            // 🚨 THE MUSL POSIX STACK FIX 🚨
-                            // We lower the stack by 32 bytes and push a 0-filled 
-                            // environment so Musl's `_start` reads valid terminators!
+                            // POSIX STACK FIX: Required for musl and Rust std::rt
                             let initial_rsp = user_stack_top - 32;
                             unsafe {
                                 let stack_ptr = initial_rsp as *mut u64;
@@ -705,7 +707,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             crate::serial_println!("[PID {}] Exited (Code: {})", task.pid, exit_code); 
             task.state = crate::scheduler::TaskState::Zombie; 
 
-            // FD WIPE FIX: Destroys PipeWrite and signals EOF to Terminal!
             for i in 0..32 { task.fd_table[i] = None; }
             crate::memory::clear_user_address_space(task.cr3);
 
@@ -714,7 +715,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 loop { core::arch::asm!("hlt") }
             }
         },
-        158 => { // SYS_ARCH_PRCTL (TLS Support for musl libc)
+        131 => { frame.rax = 0; }, // SYS_SIGALTSTACK
+        158 => { // SYS_ARCH_PRCTL (TLS Support)
             let code = arg1;
             let addr = arg2;
             if code == 0x1002 { // ARCH_SET_FS
@@ -724,9 +726,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = EINVAL as u64;
             }
         },
-        218 => { // SYS_SET_TID_ADDRESS (Set Thread ID for musl)
-            frame.rax = 1;
+        218 => { frame.rax = 1; }, // SYS_SET_TID_ADDRESS
+        318 => { // SYS_GETRANDOM (Required for Rust HashMaps)
+            let buf_ptr = arg1 as *mut u8;
+            let len = arg2 as usize;
+            if is_valid_user_ptr(buf_ptr, len) {
+                unsafe { core::ptr::write_bytes(buf_ptr, 42, len); }
+                frame.rax = len as u64;
+            } else {
+                frame.rax = EFAULT as u64;
+            }
         },
+        
+        // --- CUSTOM NYXOS SYSCALLS ---
         501 => { 
              unsafe {
                  if let Some(p) = &mut crate::SCREEN_PAINTER {

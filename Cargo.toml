@@ -4,7 +4,7 @@ members = [
     "compiler",
     "runner",
     "nyx-user"
-]
+, "nyx-rust-app"]
 
 # NEW: Force Cargo to ONLY build the kernel by default
 default-members = ["nyx-kernel"]

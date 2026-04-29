@@ -1459,6 +1459,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-rust-app"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-user"
 version = "0.1.0"
 dependencies = [
