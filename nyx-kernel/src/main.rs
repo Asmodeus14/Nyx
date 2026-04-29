@@ -55,6 +55,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 
 static INIT_FS: &[u8] = include_bytes!("nyx-user.bin");
+pub static HELLO_BIN: &[u8] = include_bytes!("hello.elf");
 
 lazy_static::lazy_static! {
     static ref TSS: TaskStateSegment = {
@@ -111,6 +112,8 @@ pub fn init_hardened_gdt() {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    unsafe { crate::memory::BOOTLOADER_CR3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64(); }
+
     crate::serial_println!("[BOOT] NyxOS Kernel Starting...");
     crate::vga_println!("[BOOT] NyxOS Kernel Boot Sequence Initiated...");
 
@@ -132,7 +135,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         crate::window::WINDOW_MANAGER.lock().set_resolution(info.width, info.height);
         
-        // 🚨 THE FIX: Unlock the mouse boundaries to match your actual laptop screen!
         {
             let mut mouse_state = crate::mouse::MOUSE_STATE.lock();
             mouse_state.screen_width = info.width;
@@ -145,17 +147,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     init_hardened_gdt(); 
     interrupts::init_idt();
 
-    // WAKE UP THE PS/2 TRACKPAD EMULATOR USING YOUR DRIVER
     crate::vga_println!("[BOOT] Initializing PS/2 Legacy Trackpad Emulator...");
     crate::serial_println!("[BOOT] Initializing PS/2 Legacy Trackpad Emulator...");
     let mut ps2_mouse = crate::mouse::MouseDriver::new();
     ps2_mouse.init();
 
-    // Forcefully Disable the Legacy 8259 PIC so it doesn't freeze your IOAPIC line!
     unsafe { 
         let mut pics = interrupts::PICS.lock();
         pics.initialize(); 
-        pics.write_masks(0xFF, 0xFF); // MASK ALL INTERRUPTS
+        pics.write_masks(0xFF, 0xFF); 
     }
     x86_64::instructions::interrupts::enable();
 
@@ -165,13 +165,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         acpi::scan_for_modern_inputs();
 
         apic::init();
+        crate::apic::init_timer(0x40);
+
         let apic_ids = crate::apic::get_cpu_apic_ids();
         percpu::init(&apic_ids);
         crate::memory::identity_map_low_memory();
         time::init();
         ioapic::init();
         
-        // Route the IRQs to the IOAPIC
         let bsp_apic_id = apic_ids[0] as u8;
         crate::ioapic::route_irq(1, bsp_apic_id, crate::interrupts::InterruptIndex::Keyboard as u8);
         crate::ioapic::route_irq(12, bsp_apic_id, crate::interrupts::InterruptIndex::Mouse as u8);
@@ -192,22 +193,52 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::entity::awaken_entity(&mut nvme_driver_opt);
     if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
 
-    crate::vga_println!("[BOOT] Core initialized. Parsing Userspace ELF...");
-    let entry_point = process::load_elf(INIT_FS).expect("ELF Parse Fail");
+    // ─────────────────────────────────────────────────────────────────────────
+    // PID 1 BOOTSTRAPPER (Init Process)
+    // ─────────────────────────────────────────────────────────────────────────
+    crate::vga_println!("[BOOT] Bootstrapping PID 1 (Init Process)...");
+
+    // 🚨 FATAL CRASH FIX 1: Prevent Pre-Flight Preemption Strikes!
+    // We must disable hardware interrupts before adding PID 1 to the scheduler. 
+    // If the timer ticks while we are setting up the GUI, the scheduler will 
+    // try to switch to an empty stack and Triple Fault!
+    x86_64::instructions::interrupts::disable();
+
+    let mut init_process = crate::process::Process::new().expect("Failed to create init process");
+    
+    // 🚨 FATAL CRASH FIX 2: State Synchronization
+    // Because we use `enter_userspace` to manually jump into the GUI without 
+    // using the scheduler to start it, we MUST manually flag it as 'Running'.
+    // Otherwise, on the first timer tick, the scheduler won't save its registers!
+    init_process.state = crate::scheduler::TaskState::Running;
+
+    let init_cr3 = init_process.cr3.as_u64();
+    let init_kernel_stack = init_process.kernel_stack_top;
+
+    let percpu = crate::percpu::current();
+    percpu.scheduler.tasks.push(init_process);
+    percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32] = 0;
+
+    unsafe {
+        // Swap to the new isolated address space!
+        core::arch::asm!("mov cr3, {}", in(reg) init_cr3);
+        
+        // Point the syscall gateway (gs:[0]) to PID 1's secure kernel stack
+        let percpu_base = percpu as *const _ as *mut u64;
+        *percpu_base = init_kernel_stack;
+    }
+
+    // Now that we are in PID 1's memory space, load the GUI ELF into it
+    crate::vga_println!("[BOOT] Loading GUI into PID 1...");
+    let entry_point = crate::process::load_elf(INIT_FS).expect("ELF Parse Fail");
 
     let stack_base = 0x7FFF_0000_0000;
     let stack_pages = 16;
-    let allocated_stack = memory::allocate_user_pages_at(stack_base, stack_pages).expect("Stack Map Fail");
-    let stack_top = (allocated_stack + (stack_pages as u64 * 4096)) & !0xF;
+    crate::memory::allocate_user_pages_at(stack_base, stack_pages).expect("Stack Map Fail");
+    let stack_top = (stack_base + (stack_pages as u64 * 4096)) & !0xF;
 
     interrupts::init_syscalls();
-    unsafe { percpu::current().user_rsp = stack_top; } 
-
-    unsafe {
-        let mut k_rsp: u64;
-        core::arch::asm!("mov {}, rsp", out(reg) k_rsp);
-        core::arch::asm!("mov gs:[0], {}", in(reg) k_rsp);
-    }
+    unsafe { percpu.user_rsp = stack_top; } 
 
     unsafe {
         let mut cr4 = Cr4::read();
@@ -217,6 +248,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     crate::vga_println!("[BOOT] Jumping to Ring 3 (Entry: {:#x})...", entry_point);
+    
+    // enter_userspace uses an iretq with RFLAGS 0x202, which automatically re-enables
+    // hardware interrupts the exact microsecond the GUI instruction pointer starts!
     unsafe { process::enter_userspace(entry_point, stack_top); }
 }
 

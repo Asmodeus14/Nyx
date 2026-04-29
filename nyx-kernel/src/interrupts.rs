@@ -24,6 +24,7 @@ const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
 const EFAULT: i64 = -14; 
 const EINVAL: i64 = -22;
+const EMFILE: i64 = -24;
 const ENOSYS: i64 = -38; 
 
 #[repr(C)]
@@ -36,7 +37,8 @@ pub struct SockAddrIn {
 
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
     let start = ptr as u64;
-    if start < 0x1000 { return false; }
+    // PIE FIX: Allow reading from address 0x0 so the C program can find its strings!
+    if start == 0 && len == 0 { return false; }
     if let Some(end) = start.checked_add(len as u64) {
         return end <= 0x0000_7FFF_FFFF_FFFF;
     }
@@ -99,17 +101,20 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
     let cr3 = x86_64::registers::control::Cr3::read();
     
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
-        crate::vga_println!("\n[SEGFAULT] User Process Terminated. Invalid Memory Access at: {:?}", cr2);
-        
+        crate::serial_println!("\n[SEGFAULT] User Process Terminated. Invalid Memory Access at: {:?}", cr2);
+
         if GsBase::read().as_u64() != 0 {
             let percpu = crate::percpu::current();
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx < percpu.scheduler.tasks.len() {
-                percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Empty; 
+                percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Zombie; 
+                crate::memory::clear_user_address_space(percpu.scheduler.tasks[curr_idx].cr3);
             }
         }
-        unsafe { core::arch::asm!("int 0x40"); } 
-        loop { unsafe { core::arch::asm!("hlt") } }
+        unsafe { 
+            x86_64::instructions::interrupts::enable();
+            loop { core::arch::asm!("hlt") } 
+        }
     } else {
         if !was_user && (stack_frame.code_segment & 3) == 3 { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
         panic!("KERNEL PAGE FAULT\nAddr: {:?}\nError: {:?}\nIP: {:#x}\nCS: {:#x}\nCR3: {:?}", 
@@ -247,39 +252,8 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
     crate::apic::end_of_interrupt();
-
-    let kernel_cr3 = KERNEL_CR3.load(Ordering::Relaxed);
-    if kernel_cr3 == 0 { return current_rsp; }
-
-    let mut user_cr3: u64 = 0;
-    let swapped = {
-        unsafe { core::arch::asm!("mov {}, cr3", out(reg) user_cr3, options(nomem, nostack, preserves_flags)); }
-        if user_cr3 != kernel_cr3 {
-            unsafe { core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3, options(nostack, preserves_flags)); }
-            true
-        } else { false }
-    };
-
-    if GsBase::read().as_u64() == 0 { 
-        if swapped { unsafe { core::arch::asm!("mov cr3, {}", in(reg) user_cr3, options(nostack, preserves_flags)); } }
-        return current_rsp; 
-    }
-
-    let percpu = crate::percpu::current();
-    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-    
-    if curr_idx >= percpu.scheduler.tasks.len() {
-        if swapped { unsafe { core::arch::asm!("mov cr3, {}", in(reg) user_cr3, options(nostack, preserves_flags)); } }
-        return current_rsp; 
-    }
-
-    let new_rsp = percpu.scheduler.schedule(current_rsp);
-
-    if swapped {
-        unsafe { core::arch::asm!("mov cr3, {}", in(reg) user_cr3, options(nostack, preserves_flags)); }
-    }
-
-    new_rsp
+    if x86_64::registers::model_specific::GsBase::read().as_u64() == 0 { return current_rsp; }
+    crate::percpu::current().scheduler.schedule(current_rsp)
 }
 
 #[no_mangle]
@@ -303,9 +277,7 @@ pub extern "C" fn mouse_handler_impl() {
 #[no_mangle]
 pub extern "C" fn ethernet_handler_impl() {
     if let Some(mut driver_guard) = crate::drivers::net::NET_DRIVER.try_lock() {
-        if let Some(driver) = driver_guard.as_mut() {
-            driver.ack_interrupt();
-        }
+        if let Some(driver) = driver_guard.as_mut() { driver.ack_interrupt(); }
     }
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
     crate::drivers::net::NETWORK_PENDING.store(true, core::sync::atomic::Ordering::Release);
@@ -341,30 +313,38 @@ pub fn init_syscalls() {
     }
 }
 
+// FULL TRAPFRAME: Preserves all 15 registers so the Child process doesn't get Amnesia!
 #[repr(C)]
 pub struct SyscallStackFrame {
-    pub rax: u64, pub rdi: u64, pub rsi: u64, pub rdx: u64,
-    pub rcx: u64, pub r8:  u64, pub r9:  u64, pub r10: u64, pub r11: u64, 
+    pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
+    pub r11: u64, pub r10: u64, pub r9:  u64, pub r8:  u64,
+    pub rdi: u64, pub rsi: u64, pub rbp: u64, pub rdx: u64,
+    pub rcx: u64, pub rbx: u64, pub rax: u64, 
 }
 
 core::arch::global_asm!(r#"
 .global syscall_handler_asm
 syscall_handler_asm:
     swapgs
-
     mov gs:[8], rsp   
     mov rsp, gs:[0]   
 
-    sub rsp, 72
-    mov [rsp + 64], r11
-    mov [rsp + 56], r10
-    mov [rsp + 48], r9
-    mov [rsp + 40], r8
-    mov [rsp + 32], rcx
-    mov [rsp + 24], rdx
-    mov [rsp + 16], rsi
-    mov [rsp + 8],  rdi
-    mov [rsp + 0],  rax
+    // THE FORK FIX: Push ALL registers identical to the hardware timer
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
 
     mov rax, rsp
     mov rdi, rsp
@@ -384,16 +364,22 @@ syscall_handler_asm:
     fxrstor [rsp]
     mov rsp, rax
 
-    mov rax, [rsp + 0]
-    mov rdi, [rsp + 8]
-    mov rsi, [rsp + 16]
-    mov rdx, [rsp + 24]
-    mov rcx, [rsp + 32]
-    mov r8,  [rsp + 40]
-    mov r9,  [rsp + 48]
-    mov r10, [rsp + 56]
-    mov r11, [rsp + 64]
-    add rsp, 72
+    // Restore ALL registers
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
 
     mov rsp, gs:[8]
     swapgs
@@ -402,6 +388,8 @@ syscall_handler_asm:
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
+    // DEADLOCK FIX: Kept atomic. NO `enable()` here!
+    
     if !is_valid_user_ptr(frame.rcx as *const u8, 1) { frame.rcx = 0; }
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { frame.rax = ENOSYS as u64; return; }
     if GsBase::read().as_u64() == 0 { frame.rax = ENOSYS as u64; return; }
@@ -416,18 +404,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
     let arg5 = frame.r8;
 
     match id {
-        0 => { 
-            let fd = arg1 as usize;
-            let buf_ptr = arg2 as *mut u8;
-            let len = arg3 as usize;
-            frame.rax = sys_read_internal(fd, buf_ptr, len) as u64;
-        },
-        1 => { 
-            let fd = arg1 as usize;
-            let buf_ptr = arg2 as *const u8;
-            let len = arg3 as usize;
-            frame.rax = sys_write_internal(fd, buf_ptr, len) as u64;
-        },
+        0 => { frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64; },
+        1 => { frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64; },
         2 => { 
             let buf_ptr = arg1 as *const u8;
             let len = arg2 as usize;
@@ -456,12 +434,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             } else { frame.rax = EINVAL as u64; }
         },
         3 => { 
-            let fd = arg1 as usize;
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
-            
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            if fd < 32 { task.fd_table[fd] = None; }
+            if arg1 < 32 { task.fd_table[arg1 as usize] = None; }
             frame.rax = 0;
         },
         9 => { 
@@ -505,90 +481,190 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         },
         16 => { 
-            let fd = arg1 as usize;
-            let request = arg2 as usize;
-            let ioctl_arg = arg3 as usize;
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
-            
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            if fd < 32 {
-                if let Some(FileDescriptor::File(open_file)) = &task.fd_table[fd] {
-                    match open_file.node.ioctl(request, ioctl_arg) {
+            
+            if arg1 < 32 {
+                if let Some(FileDescriptor::File(open_file)) = &task.fd_table[arg1 as usize] {
+                    match open_file.node.ioctl(arg2 as usize, arg3 as usize) {
                         Ok(res) => frame.rax = res as u64,
                         Err(e) => frame.rax = e as u64,
                     }
                 } else { frame.rax = EBADF as u64; }
             } else { frame.rax = EBADF as u64; }
         },
+        22 => { // SYS_PIPE
+            let fd_array_ptr = arg1 as *mut i32;
+            if !is_valid_user_ptr(fd_array_ptr as *const u8, 8) { frame.rax = EFAULT as u64; return; }
+            
+            let pipe = alloc::sync::Arc::new(spin::Mutex::new(alloc::collections::VecDeque::<u8>::new()));
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            
+            let mut read_fd = -1;
+            let mut write_fd = -1;
+            for i in 3..32 {
+                if task.fd_table[i].is_none() {
+                    if read_fd == -1 { read_fd = i as i32; }
+                    else if write_fd == -1 { write_fd = i as i32; break; }
+                }
+            }
+            if read_fd != -1 && write_fd != -1 {
+                task.fd_table[read_fd as usize] = Some(crate::scheduler::FileDescriptor::PipeRead(pipe.clone()));
+                task.fd_table[write_fd as usize] = Some(crate::scheduler::FileDescriptor::PipeWrite(pipe));
+                unsafe {
+                    *fd_array_ptr.add(0) = read_fd;
+                    *fd_array_ptr.add(1) = write_fd;
+                }
+                frame.rax = 0;
+            } else { frame.rax = EMFILE as u64; }
+        },
+        33 => { // SYS_DUP2
+            let oldfd = arg1 as usize;
+            let newfd = arg2 as usize;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            
+            if oldfd < 32 && newfd < 32 {
+                if let Some(fd_obj) = task.fd_table[oldfd].clone() {
+                    task.fd_table[newfd] = Some(fd_obj);
+                    frame.rax = newfd as u64;
+                } else { frame.rax = EBADF as u64; }
+            } else { frame.rax = EBADF as u64; }
+        },
         41 => frame.rax = sys_socket(arg1, arg2, arg3) as u64,
         42 => frame.rax = sys_connect(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64,
         44 => frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64, 
-        45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,   
-        59 => { 
+        45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,
+        57 => { // SYS_FORK
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ENOSYS as u64; return; }
+            
+            let mut child = crate::process::Process::new().expect("Failed to create child process");
+            
+            {
+                let parent = &percpu.scheduler.tasks[curr_idx];
+                child.parent_pid = Some(parent.pid);
+                crate::memory::clone_user_address_space(parent.cr3, child.cr3);
+
+                for i in 0..32 {
+                    if let Some(fd) = &parent.fd_table[i] {
+                        child.fd_table[i] = Some(fd.clone());
+                    }
+                }
+            }
+
+            let stack_top = child.kernel_stack_top;
+            let iretq_ptr = stack_top - 40;
+            unsafe {
+                let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+                iret_slice[0] = frame.rcx;         
+                iret_slice[1] = 0x33;              
+                iret_slice[2] = frame.r11 | 0x200; 
+                iret_slice[3] = percpu.user_rsp;   
+                iret_slice[4] = 0x2B;              
+            }
+
+            let regs_ptr = iretq_ptr - 120;
+            unsafe {
+                let regs = core::slice::from_raw_parts_mut(regs_ptr as *mut u64, 15);
+                regs[0] = frame.r15;
+                regs[1] = frame.r14;
+                regs[2] = frame.r13;
+                regs[3] = frame.r12;
+                regs[4] = frame.r11; 
+                regs[5] = frame.r10; 
+                regs[6] = frame.r9;  
+                regs[7] = frame.r8;  
+                regs[8] = frame.rdi; 
+                regs[9] = frame.rsi; 
+                regs[10] = frame.rbp; 
+                regs[11] = frame.rdx; 
+                regs[12] = frame.rcx; 
+                regs[13] = frame.rbx; 
+                regs[14] = 0; 
+            }
+
+            let fxsave_ptr = (regs_ptr - 512) & !0xF;
+            unsafe {
+                core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
+                *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+            }
+
+            let final_rsp = fxsave_ptr - 16;
+            unsafe {
+                let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+                bottom[0] = regs_ptr; 
+                bottom[1] = 0;        
+            }
+
+            child.saved_rsp = final_rsp;
+            frame.rax = child.pid;
+            
+            percpu.scheduler.tasks.push(child);
+        },   
+        59 => { // SYS_EXECVE
             let buf_ptr = arg1 as *const u8;
             let len = arg2 as usize;
             
             if !is_valid_user_ptr(buf_ptr, len) { frame.rax = EFAULT as u64; return; }
             
             let path_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
-            if let Ok(path) = core::str::from_utf8(path_slice) {
-                // Fetch the ELF data and drop the FS lock immediately
-                let elf_data_opt = {
-                    let mut fs = crate::fs::FS.lock();
+            if let Ok(raw_path) = core::str::from_utf8(path_slice) {
+                
+                let path = raw_path.trim_matches(char::from(0)).trim();
+                let elf_data_opt = if path.contains("hello.elf") {
+                    Some(alloc::vec::Vec::from(crate::HELLO_BIN))
+                } else {
+                    let mut fs = crate::fs::FS.lock(); 
                     fs.read_file(path)
                 };
                 
                 if let Some(elf_data) = elf_data_opt {
-                    if let Ok(entry_point) = crate::process::load_elf(&elf_data) {
-                        // 🚨 THE FIX: Ignore the error if the memory is already allocated!
-                        let _ = crate::memory::allocate_user_pages_at(0x7FFF_0000_0000, 4); 
-                        let user_stack = 0x7FFF_0000_0000 + (4 * 4096); 
-                        frame.rcx = entry_point;
-                        unsafe { 
-                            percpu.user_rsp = user_stack; 
-                            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-                            if curr_idx < percpu.scheduler.tasks.len() {
-                                let task = &mut percpu.scheduler.tasks[curr_idx];
-                                task.mmap_bump = 0x4000_0000_0000 + (curr_idx as u64 * 0x1_0000_0000);
-                            }
-                        } 
-                        frame.rax = 0; 
-                    } else { frame.rax = EINVAL as u64; }
-                } else { frame.rax = EINVAL as u64; }
-            } else { frame.rax = EINVAL as u64; }
-        },
-        60 => { 
-            let exit_code = arg1 as i64;
-            crate::vga_println!("\n[USERSPACE] Program Exited (Code: {}). Respawning GUI...", exit_code);
-            
-            // Fetch GUI ELF data and drop the FS lock
-            let elf_data_opt = {
-                let mut fs = crate::fs::FS.lock();
-                fs.read_file("nyx-user.bin")
-            };
+                    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                    let task = &mut percpu.scheduler.tasks[curr_idx];
 
-            if let Some(elf_data) = elf_data_opt {
-                if let Ok(entry_point) = crate::process::load_elf(&elf_data) {
-                    // 🚨 THE FIX: Ignore the error if the memory is already allocated!
-                    let _ = crate::memory::allocate_user_pages_at(0x7FFF_0000_0000, 4); 
-                    let user_stack = 0x7FFF_0000_0000 + (4 * 4096); 
-                    frame.rcx = entry_point;
-                    unsafe { 
-                        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-                        if curr_idx < percpu.scheduler.tasks.len() {
-                            let task = &mut percpu.scheduler.tasks[curr_idx];
-                            task.mmap_bump = 0x4000_0000_0000 + (curr_idx as u64 * 0x1_0000_0000);
+                    crate::memory::clear_user_address_space(task.cr3);
+
+                    match crate::process::load_elf(&elf_data) {
+                        Ok(entry_point) => {
+                            let user_stack_base = 0x7FFF_0000_0000;
+                            crate::memory::allocate_user_pages_at(user_stack_base, 4).expect("Failed stack allocation");
+                            let user_stack_top = user_stack_base + (4 * 4096); 
+                            
+                            task.mmap_bump = 0x4000_0000_0000;
+
+                            frame.rcx = entry_point;
+                            frame.r11 = 0x202; 
+                            
+                            unsafe { percpu.user_rsp = user_stack_top; } 
+                            return; 
+                        },
+                        Err(e) => {
+                            crate::serial_println!("\n[KERNEL] Execve Failed: {}", e);
+                            frame.rax = EINVAL as u64;
                         }
-                        percpu.user_rsp = user_stack; 
-                    } 
-                    frame.rax = 0;
-                    return; // Jump straight back into the fresh desktop!
-                }
-            }
+                    }
+                } else { frame.rax = EINVAL as u64; } 
+            } else { frame.rax = EINVAL as u64; } 
+        },
+        60 => { // SYS_EXIT 
+            let exit_code = arg1 as i64;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            let task = &mut percpu.scheduler.tasks[curr_idx];
             
-            // If the GUI file genuinely cannot be found, halt to prevent a boot-loop.
-            loop { unsafe { x86_64::instructions::hlt(); } }
+            crate::serial_println!("[PID {}] Exited (Code: {})", task.pid, exit_code); 
+            task.state = crate::scheduler::TaskState::Zombie; 
+
+            // FD WIPE FIX: Destroys PipeWrite and signals EOF to Terminal!
+            for i in 0..32 { task.fd_table[i] = None; }
+            crate::memory::clear_user_address_space(task.cr3);
+
+            unsafe {
+                x86_64::instructions::interrupts::enable();
+                loop { core::arch::asm!("hlt") }
+            }
         },
         501 => { 
              unsafe {
@@ -768,18 +844,36 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                 let sock = sock_mtx.lock();
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
                 if let Some(sockets) = sockets_lock.as_mut() {
-                    if let SocketKind::Udp(handle) = sock.kind {
-                        let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
-                        if let Ok((data, _meta)) = socket.recv() {
-                            let copy_len = core::cmp::min(data.len(), len);
-                            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
-                            return copy_len as isize;
-                        } else {
-                            return EAGAIN as isize; 
-                        }
+                    let handle = match sock.kind { SocketKind::Udp(h) => h };
+                    let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                    if let Ok((data, _meta)) = socket.recv() {
+                        let copy_len = core::cmp::min(data.len(), len);
+                        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
+                        return copy_len as isize;
                     }
                 }
-            }
+                return EAGAIN as isize; 
+            },
+            FileDescriptor::PipeRead(pipe_mtx) => {
+                let mut pipe = pipe_mtx.lock();
+                let mut bytes_read = 0;
+                while bytes_read < len {
+                    if let Some(b) = pipe.pop_front() {
+                        unsafe { *buf_ptr.add(bytes_read) = b; }
+                        bytes_read += 1;
+                    } else { break; }
+                }
+                
+                if bytes_read == 0 { 
+                    if alloc::sync::Arc::strong_count(pipe_mtx) == 1 {
+                        return 0; // EOF
+                    } else {
+                        return EAGAIN as isize; 
+                    }
+                }
+                return bytes_read as isize;
+            },
+            FileDescriptor::PipeWrite(_) => return EBADF as isize,
         }
     }
     EBADF as isize 
@@ -796,45 +890,58 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
     
     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
     if curr_idx >= percpu.scheduler.tasks.len() { return EBADF as isize; }
+    let task = &mut percpu.scheduler.tasks[curr_idx];
     
     let buf_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
 
-    // 🚨 STDOUT/STDERR FALLBACK: Route FD 1 & 2 directly to the screen and serial!
-    if fd == 1 || fd == 2 {
-        if let Ok(s) = core::str::from_utf8(buf_slice) {
-            crate::serial_print!("{}", s); 
-            crate::vga_println!("{}", s); 
-        }
-        return len as isize;
-    }
-
     let mut bytes_sent = EAGAIN as isize;
-    let task = &mut percpu.scheduler.tasks[curr_idx];
-    
+    let mut trigger_net_poll = false;
+
     if let Some(fd_enum) = &task.fd_table[fd] {
         match fd_enum {
-            FileDescriptor::File(open_file) => {
-                return open_file.write(buf_slice) as isize;
-            },
+            FileDescriptor::File(open_file) => return open_file.write(buf_slice) as isize,
             FileDescriptor::Socket(sock_mtx) => {
                 let sock = sock_mtx.lock();
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
                 if let Some(sockets) = sockets_lock.as_mut() {
-                    if let SocketKind::Udp(handle) = sock.kind {
-                        let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
-                        if let Some(endpoint) = sock.remote {
-                            if socket.send_slice(buf_slice, endpoint).is_ok() { 
-                                bytes_sent = buf_slice.len() as isize; 
-                            }
+                    let handle = match sock.kind { SocketKind::Udp(h) => h };
+                    let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                    if let Some(endpoint) = sock.remote {
+                        if socket.send_slice(buf_slice, endpoint).is_ok() { 
+                            bytes_sent = buf_slice.len() as isize;
+                            // 🚨 DEADLOCK FIX: Flag the poll, but drop the locks first!
+                            trigger_net_poll = true; 
                         }
                     }
                 }
-            }
+            },
+            FileDescriptor::PipeWrite(pipe_mtx) => {
+                let mut pipe = pipe_mtx.lock();
+                for &b in buf_slice { pipe.push_back(b); }
+                return len as isize;
+            },
+            FileDescriptor::PipeRead(_) => return EBADF as isize,
         }
     }
-    
-    if bytes_sent > 0 { crate::drivers::net::poll_network(); }
-    bytes_sent
+
+    // Safely hit the hardware network driver now that all locks are dropped!
+    if trigger_net_poll {
+        crate::drivers::net::poll_network();
+        return bytes_sent;
+    }
+
+    if bytes_sent != (EAGAIN as isize) {
+        return bytes_sent;
+    }
+
+    if fd == 1 || fd == 2 {
+        if let Ok(s) = core::str::from_utf8(buf_slice) {
+            crate::serial_print!("{}", s); 
+        }
+        return len as isize;
+    }
+
+    EBADF as isize
 }
 
 pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {

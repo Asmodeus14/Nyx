@@ -193,7 +193,7 @@ pub fn init_timer(vector: u8) {
         let tpr_ptr = (apic_virt + 0x80) as *mut u32;
         core::ptr::write_volatile(tpr_ptr, 0);
 
-        // Divide Configuration Register
+        // Divide Configuration Register (Divide by 16)
         let dcr_ptr = (apic_virt + 0x3E0) as *mut u32;
         core::ptr::write_volatile(dcr_ptr, 0x3);
 
@@ -201,8 +201,8 @@ pub fn init_timer(vector: u8) {
         let lvt_timer_ptr = (apic_virt + 0x320) as *mut u32;
         core::ptr::write_volatile(lvt_timer_ptr, 0x20000 | (vector as u32));
 
-        // 👉 THE FIX: A safer, slightly slower tick rate for GUI rendering
+        //  THE SCHEDULER FIX: Set the initial count to a fast 1ms tick rate!
         let icr_ptr = (apic_virt + 0x380) as *mut u32;
-        core::ptr::write_volatile(icr_ptr, 0x0100_0000); 
+        core::ptr::write_volatile(icr_ptr, 0x0000_A000); 
     }
 }

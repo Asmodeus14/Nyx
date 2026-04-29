@@ -153,6 +153,21 @@ pub fn sys_alloc_pages(pages: usize) -> u64 {
 pub fn sys_execve(path: &str) -> i64 {
     syscall(SYS_EXECVE, path.as_ptr() as u64, path.len() as u64, 0, 0, 0, 0) as i64
 }
+// Added standard POSIX fork to clone processes!
+pub fn sys_fork() -> i64 {
+    syscall(SYS_FORK, 0, 0, 0, 0, 0, 0) as i64
+}
+
+pub const SYS_PIPE: u64 = 22;
+pub const SYS_DUP2: u64 = 33;
+
+pub fn sys_pipe(fds: &mut [i32; 2]) -> i64 {
+    syscall(SYS_PIPE, fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0) as i64
+}
+
+pub fn sys_dup2(oldfd: i64, newfd: i64) -> i64 {
+    syscall(SYS_DUP2, oldfd as u64, newfd as u64, 0, 0, 0, 0) as i64
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // POSIX SAFE NETWORK ABSTRACTION

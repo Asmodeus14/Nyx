@@ -1,5 +1,7 @@
-use x86_64::VirtAddr;
+use x86_64::{PhysAddr, VirtAddr};
 use alloc::vec::Vec;
+use crate::scheduler::{FileDescriptor, TaskState};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -45,8 +47,13 @@ pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
         let offset = ph_offset + (i as usize * ph_size);
         let phdr = unsafe { &*(file_data.as_ptr().add(offset) as *const Elf64_Phdr) };
 
-        if phdr.p_type == 1 {
-            if phdr.p_vaddr < 0x4000_0000 { return Err("Security Violation"); }
+        if phdr.p_type == 1 { // PT_LOAD Segment
+            // 🚨 PIE FIX: Allow modern GCC binaries to load at address 0x0.
+            // We only block them from loading into the Top Half (Kernel Space).
+            if phdr.p_vaddr >= 0x0000_7FFF_FFFF_FFFF { 
+                return Err("Security Violation: Cannot load into Kernel Space"); 
+            }
+            
             let start_page = phdr.p_vaddr & !0xFFF; 
             let end_page = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFF; 
             let num_pages = ((end_page - start_page) / 4096) as usize;
@@ -74,23 +81,63 @@ pub unsafe fn enter_userspace(entry: u64, stack: u64) -> ! {
         "cli",           
         "mov ds, ax",    
         "mov es, ax",
-        
         "swapgs",        
-        
         "push rax",      // SS (0x28 | 3 = 0x2B)
         "push rcx",      // RSP 
         "push r11",      // RFLAGS (0x202)
         "push rdx",      // CS (0x30 | 3 = 0x33)
         "push r8",       // RIP
-        
         "iretq",
-        
-        //  MATCHING THE 9-SLOT GDT
-        in("rax") 0x2B_u64,   // 0x28 (User Data) | 3
+        in("rax") 0x2B_u64,   
         in("rcx") stack,
         in("r11") 0x202_u64,
-        in("rdx") 0x33_u64,   // 0x30 (User Code 64) | 3
+        in("rdx") 0x33_u64,   
         in("r8") entry,      
         options(noreturn)
     );
+}
+
+static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+
+pub struct Process {
+    pub pid: u64,
+    pub parent_pid: Option<u64>,
+    pub cr3: PhysAddr,               
+    pub saved_rsp: u64,              
+    pub kernel_stack_top: u64,       
+    pub mmap_bump: u64,
+    pub fd_table: [Option<FileDescriptor>; 32],
+    pub state: TaskState,
+}
+
+impl Process {
+    pub fn new() -> Result<Self, &'static str> {
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        let pml4_frame = crate::memory::allocate_frame().ok_or("OOM: CR3 allocation failed")?;
+        
+        crate::memory::clone_kernel_page_table(pml4_frame.start_address());
+
+        // 🚨 TELEPORT FIX: Ensure the new Kernel Stack maps to the Child's Brain
+        let kernel_stack = unsafe {
+            let old_cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+            let child_cr3 = pml4_frame.start_address().as_u64();
+            
+            core::arch::asm!("mov cr3, {}", in(reg) child_cr3);
+            let stack = crate::memory::allocate_kernel_stack(4);
+            core::arch::asm!("mov cr3, {}", in(reg) old_cr3);
+            
+            stack
+        };
+
+        Ok(Process {
+            pid,
+            parent_pid: None,
+            cr3: pml4_frame.start_address(),
+            saved_rsp: kernel_stack, 
+            kernel_stack_top: kernel_stack,
+            mmap_bump: 0x4000_0000_0000, 
+            fd_table: core::array::from_fn(|_| None),
+            state: TaskState::Ready,
+        })
+    }
 }

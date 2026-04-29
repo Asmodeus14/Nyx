@@ -8,6 +8,7 @@ use crate::syscalls;
 pub struct Terminal {
     pub history: Vec<String>,
     pub current_line: String,
+    pub active_child_fd: Option<i64>, // 🚨 Tracks the Read-End of the Pipe
 }
 
 impl Terminal {
@@ -15,6 +16,30 @@ impl Terminal {
         Self {
             history: Vec::new(),
             current_line: String::new(),
+            active_child_fd: None,
+        }
+    }
+
+    // 🚨 NON-BLOCKING POLL: Reads bytes from the C program without freezing the GUI!
+    pub fn pump_pipe(&mut self) {
+        if let Some(fd) = self.active_child_fd {
+            let mut buf = [0u8; 256];
+            let bytes_read = syscalls::sys_read(fd, &mut buf);
+            
+            if bytes_read > 0 {
+                // We caught text from the C program!
+                if let Ok(s) = core::str::from_utf8(&buf[..bytes_read as usize]) {
+                    self.write_str(s);
+                }
+            } else if bytes_read == 0 { 
+                // EOF: The child program exited and the kernel destroyed the write-pipe!
+                syscalls::sys_close(fd);
+                self.active_child_fd = None;
+            } else if bytes_read != -11 { 
+                // Error (Not EAGAIN)
+                syscalls::sys_close(fd);
+                self.active_child_fd = None;
+            }
         }
     }
 
@@ -41,83 +66,69 @@ impl Terminal {
         let cmd = cmd.trim();
         
         if cmd == "help" {
-            self.write_str("Available commands:");
-            self.write_str("  help       - Show this message");
-            self.write_str("  clear      - Clear the terminal");
-            self.write_str("  ls         - List files on NVMe");
-            self.write_str("  run <file> - Execute an ELF binary (e.g., 'run hello.elf')");
-            self.write_str("  lspci      - List PCI devices (Hardware Scan)");
-            self.write_str("  uptime     - Show system uptime");
-            self.write_str("  dmesg      - Display kernel boot logs");
-            self.write_str("  entity     - Commune with the Nyx Entity");
+            self.write_str("Commands: clear, ls, lspci, uptime, dmesg, entity, run <file>");
         } 
         else if cmd == "clear" {
             self.history.clear();
         } 
-        // 🚨 ADDED THE RUN COMMAND FOR NATIVE C EXECUTABLES
+        // 🚨 POSIX PIPELINE IMPLEMENTATION 🚨
         else if cmd.starts_with("run ") {
             let filename = &cmd[4..];
-            self.write_str(&format!("Allocating Ring 3 memory for {}...", filename));
+            let mut pipe_fds = [-1; 2];
             
-            let ret = syscalls::sys_execve(filename);
-            
-            if ret < 0 {
-                self.write_str(&format!("ERR: Failed to execute {}. Code: {}", filename, ret));
+            // 1. Create the Shared Pipe
+            if syscalls::sys_pipe(&mut pipe_fds) == 0 {
+                let read_fd = pipe_fds[0] as i64;
+                let write_fd = pipe_fds[1] as i64;
+                
+                let pid = syscalls::sys_fork();
+                
+                if pid == 0 {
+                    // CHILD PROCESS: Override STDOUT (FD 1) with the Pipe!
+                    syscalls::sys_dup2(write_fd, 1);
+                    syscalls::sys_close(read_fd); 
+                    
+                    syscalls::sys_execve(filename);
+                    syscalls::sys_exit(-1);
+                } else if pid > 0 {
+                    // PARENT PROCESS (GUI): Save the Read-End and wait!
+                    syscalls::sys_close(write_fd); 
+                    self.active_child_fd = Some(read_fd);
+                } else {
+                    self.write_str("ERR: Fork failed!");
+                }
+            } else {
+                self.write_str("ERR: Pipe creation failed!");
             }
         }
         else if cmd == "ls" {
             let count = syscalls::sys_fs_count("/");
-            if count == 0 {
-                self.write_str("Directory is empty.");
-            } else {
+            if count == 0 { self.write_str("Directory is empty."); } else {
                 for i in 0..count {
                     let mut buf = [0u8; 64];
                     let len = syscalls::sys_fs_get_name("/", i, &mut buf);
-                    if len > 0 {
-                        if let Ok(name) = core::str::from_utf8(&buf[..len]) {
-                            self.history.push(String::from(name));
-                        }
-                    }
+                    if len > 0 { if let Ok(name) = core::str::from_utf8(&buf[..len]) { self.history.push(String::from(name)); } }
                 }
             }
         } 
         else if cmd == "lspci" || cmd == "hwinfo" {
             let mut buf = [0u8; 1024]; 
             let len = syscalls::sys_get_hw_info(&mut buf);
-            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-                self.write_str(s);
-            }
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) { self.write_str(s); }
         } 
         else if cmd == "uptime" {
             let ticks = syscalls::sys_get_time();
-            let seconds = ticks / 1000;
-            self.write_str(&format!("Uptime: {} seconds ({} ticks)", seconds, ticks));
+            self.write_str(&format!("Uptime: {} seconds ({} ticks)", ticks / 1000, ticks));
         }
         else if cmd == "dmesg" {
             let mut buf = [0u8; 1024];
             let len = syscalls::sys_get_boot_logs(&mut buf);
-            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-                self.write_str(s);
-            }
-        } 
-        else if cmd == "entity" || cmd == "soul" {
-            let mut entity_dna = [0u8; 32];
-            if syscalls::sys_get_entity_state(&mut entity_dna) {
-                let mut hex_string = String::new();
-                for byte in entity_dna.iter() {
-                    let _ = write!(&mut hex_string, "{:02X}", byte);
-                }
-                self.write_str("Nyx Entity Awakened.");
-                self.write_str(&format!("Genetic Seed (DNA): {}", hex_string));
-            } else {
-                self.write_str("ERR: Failed to commune with the Entity. Is it born yet?");
-            }
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) { self.write_str(s); }
         } 
         else if cmd.starts_with("echo ") {
             self.write_str(&cmd[5..]);
         } 
-        else if cmd == "" {
-        } 
+        else if cmd == "" { } 
         else {
             self.write_str(&format!("Command not found: {}", cmd));
         }
