@@ -388,8 +388,6 @@ syscall_handler_asm:
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
-    // DEADLOCK FIX: Kept atomic. NO `enable()` here!
-    
     if !is_valid_user_ptr(frame.rcx as *const u8, 1) { frame.rcx = 0; }
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { frame.rax = ENOSYS as u64; return; }
     if GsBase::read().as_u64() == 0 { frame.rax = ENOSYS as u64; return; }
@@ -480,7 +478,11 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EBADF as u64; } 
             }
         },
-        16 => { 
+        12 => { // SYS_BRK (Data Segment Break for libc)
+            // Trick musl into falling back to mmap
+            frame.rax = 0; 
+        },
+        16 => { // SYS_IOCTL (I/O Control)
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
@@ -491,8 +493,42 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                         Ok(res) => frame.rax = res as u64,
                         Err(e) => frame.rax = e as u64,
                     }
-                } else { frame.rax = EBADF as u64; }
+                } else { 
+                    // ENOTTY (-25). Tells libc it's writing to a pipe, forcing flush
+                    frame.rax = -25isize as u64; 
+                }
             } else { frame.rax = EBADF as u64; }
+        },
+        20 => { // SYS_WRITEV 
+            let fd = arg1 as usize;
+            let iov_ptr = arg2 as *const u64; 
+            let iovcnt = arg3 as usize;
+            
+            // Each iovec struct is 16 bytes (8 bytes for base pointer, 8 bytes for length)
+            if !is_valid_user_ptr(iov_ptr as *const u8, iovcnt * 16) { 
+                frame.rax = EFAULT as u64; 
+                return; 
+            }
+            
+            let mut total_written = 0isize;
+            
+            for i in 0..iovcnt {
+                unsafe {
+                    // Read the base memory address and length of the current buffer chunk
+                    let base = *iov_ptr.add(i * 2);
+                    let len = *iov_ptr.add(i * 2 + 1) as usize;
+                    
+                    if len > 0 {
+                        let written = sys_write_internal(fd, base as *const u8, len);
+                        if written < 0 {
+                            if total_written == 0 { total_written = written; }
+                            break;
+                        }
+                        total_written += written;
+                    }
+                }
+            }
+            frame.rax = total_written as u64;
         },
         22 => { // SYS_PIPE
             let fd_array_ptr = arg1 as *mut i32;
@@ -583,7 +619,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 regs[11] = frame.rdx; 
                 regs[12] = frame.rcx; 
                 regs[13] = frame.rbx; 
-                regs[14] = 0; 
+                regs[14] = 0; // The child receives PID 0!
             }
 
             let fxsave_ptr = (regs_ptr - 512) & !0xF;
@@ -638,7 +674,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                             frame.rcx = entry_point;
                             frame.r11 = 0x202; 
                             
-                            unsafe { percpu.user_rsp = user_stack_top; } 
+                            // 🚨 THE MUSL POSIX STACK FIX 🚨
+                            // We lower the stack by 32 bytes and push a 0-filled 
+                            // environment so Musl's `_start` reads valid terminators!
+                            let initial_rsp = user_stack_top - 32;
+                            unsafe {
+                                let stack_ptr = initial_rsp as *mut u64;
+                                *stack_ptr.add(0) = 0; // argc = 0
+                                *stack_ptr.add(1) = 0; // argv NULL terminator
+                                *stack_ptr.add(2) = 0; // envp NULL terminator
+                                *stack_ptr.add(3) = 0; // auxv AT_NULL terminator
+                                
+                                percpu.user_rsp = initial_rsp; 
+                            } 
                             return; 
                         },
                         Err(e) => {
@@ -665,6 +713,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 x86_64::instructions::interrupts::enable();
                 loop { core::arch::asm!("hlt") }
             }
+        },
+        158 => { // SYS_ARCH_PRCTL (TLS Support for musl libc)
+            let code = arg1;
+            let addr = arg2;
+            if code == 0x1002 { // ARCH_SET_FS
+                unsafe { x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr)); }
+                frame.rax = 0;
+            } else {
+                frame.rax = EINVAL as u64;
+            }
+        },
+        218 => { // SYS_SET_TID_ADDRESS (Set Thread ID for musl)
+            frame.rax = 1;
         },
         501 => { 
              unsafe {
@@ -909,8 +970,7 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
                     if let Some(endpoint) = sock.remote {
                         if socket.send_slice(buf_slice, endpoint).is_ok() { 
                             bytes_sent = buf_slice.len() as isize;
-                            // 🚨 DEADLOCK FIX: Flag the poll, but drop the locks first!
-                            trigger_net_poll = true; 
+                            trigger_net_poll = true;
                         }
                     }
                 }
@@ -924,7 +984,6 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
         }
     }
 
-    // Safely hit the hardware network driver now that all locks are dropped!
     if trigger_net_poll {
         crate::drivers::net::poll_network();
         return bytes_sent;
