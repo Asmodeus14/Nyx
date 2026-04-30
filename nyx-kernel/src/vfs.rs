@@ -13,7 +13,6 @@ pub trait VNode: Send + Sync {
     fn ioctl(&self, _request: usize, _arg: usize) -> Result<usize, isize> {
         Err(-1) // -ENOSYS
     }
-
     /// Memory Mapping for VRAM
     fn mmap(&self, _offset: usize, _size: usize) -> Result<u64, isize> {
         Err(-1) // -ENOSYS
@@ -52,6 +51,7 @@ impl OpenFile {
 // ==========================================
 // MOCK IMPLEMENTATIONS FOR ROUTING DEMO
 // ==========================================
+
 pub struct NvmeFile {
     pub name: String,
     pub data: Mutex<Vec<u8>>,
@@ -72,17 +72,20 @@ impl VNode for NvmeFile {
             data.resize(offset + buf.len(), 0);
         }
         data[offset..offset + buf.len()].copy_from_slice(buf);
+        
+        // 🚨 THE REAL DISK FIX 🚨
+        // We actually write the changes to the NVMe FAT32 filesystem now!
+        crate::fs::FS.lock().write_file(&self.name, &data);
+        
         buf.len()
     }
 }
 
 pub struct DrmDevice;
-
 impl VNode for DrmDevice {
     fn ioctl(&self, request: usize, arg: usize) -> Result<usize, isize> {
         crate::drm::handle_drm_ioctl(request, arg)
     }
-
     fn mmap(&self, offset: usize, size: usize) -> Result<u64, isize> {
         crate::serial_println!("[DRM] Mesa requested mmap! Offset: {:#x}, Size: {}", offset, size);
         Ok(0x1234_0000) 
@@ -92,6 +95,7 @@ impl VNode for DrmDevice {
 // ==========================================
 // THE GLOBAL VFS ROUTER
 // ==========================================
+
 pub struct VfsManager {
     gpu_device: Arc<DrmDevice>,
 }
@@ -105,10 +109,15 @@ impl VfsManager {
         crate::serial_println!("[VFS] Intercepting open req for: {}", path);
         if path == "/dev/dri/card0" {
             return Some(self.gpu_device.clone() as Arc<dyn VNode>);
-        } 
+        }
+        
+        // 🚨 THE REAL DISK FIX 🚨
+        // Try to load existing data from the NVMe filesystem. If it doesn't exist, start empty.
+        let existing_data = crate::fs::FS.lock().read_file(path).unwrap_or_else(|| Vec::new());
+        
         let mock_file = Arc::new(NvmeFile {
             name: String::from(path),
-            data: Mutex::new(Vec::new()),
+            data: Mutex::new(existing_data),
         });
         Some(mock_file as Arc<dyn VNode>)
     }

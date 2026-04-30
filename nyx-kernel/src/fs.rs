@@ -8,7 +8,7 @@ use crate::drivers::nvme::NvmeDriver;
 use fatfs::{Read, Write, Seek, SeekFrom, IoBase};
 
 const FAT_SECTOR_SIZE: u64 = 512;
-const NVME_BLOCK_SIZE: u64 = 4096;
+const NVME_BLOCK_SIZE: u64 = 512; 
 const MAGIC_SIG: &[u8; 4] = b"NYXZ";
 
 fn nyx_compress(data: &[u8]) -> Vec<u8> {
@@ -58,7 +58,9 @@ impl NvmeStream {
             driver, 
             position: 0, 
             partition_offset_sectors, 
-            temp_block: alloc::vec![0u8; NVME_BLOCK_SIZE as usize] 
+            // 🚨 DMA SAFETY: Always allocate 4096 bytes for NVMe hardware transfers, 
+            // even if the logical block size is only 512.
+            temp_block: alloc::vec![0u8; 4096] 
         }
     }
 }
@@ -124,11 +126,17 @@ pub struct FileSystem {
     pub inner: Option<fatfs::FileSystem<NvmeStream, fatfs::NullTimeProvider, fatfs::LossyOemCpConverter>>,
     cache_path: String,
     cache_files: Vec<String>,
+    pub ram_disk: Vec<(String, Vec<u8>)>,
 }
 
 impl FileSystem {
     pub const fn new() -> Self { 
-        Self { inner: None, cache_path: String::new(), cache_files: Vec::new() } 
+        Self { 
+            inner: None, 
+            cache_path: String::new(), 
+            cache_files: Vec::new(),
+            ram_disk: Vec::new()
+        } 
     }
 
     pub fn init(&mut self, mut driver: NvmeDriver) {
@@ -144,19 +152,39 @@ impl FileSystem {
         let part_type = sector0[0x1BE + 4];
 
         if part_type == 0xEE {
-             crate::serial_println!("[FS] GPT Detected. Parsing headers...");
-             let entry_list_lba = u64::from_le_bytes(sector0[512+72..512+80].try_into().unwrap());
-             let mut entry_block = alloc::vec![0u8; 4096];
+             crate::serial_println!("[FS] GPT Detected. Scanning full 512-byte Partition Array...");
+             let mut partition_found_count = 0;
              
-             if driver.read_block(1, &mut entry_block) {
-                 for i in 0..4 {
-                     let offset = i * 128;
-                     let type_guid_first = u64::from_le_bytes(entry_block[offset..offset+8].try_into().unwrap());
-                     if type_guid_first != 0 {
-                         partition_start_lba = u64::from_le_bytes(entry_block[offset+32..offset+40].try_into().unwrap());
-                         break;
+             for gpt_lba in 2..=9 {
+                 let mut entry_block = alloc::vec![0u8; 4096];
+                 
+                 if driver.read_block(gpt_lba, &mut entry_block) {
+                     for i in 0..4 {
+                         let offset = i * 128;
+                         let type_guid_first = u64::from_le_bytes(entry_block[offset..offset+8].try_into().unwrap());
+                         
+                         if type_guid_first != 0 {
+                             partition_found_count += 1;
+                             let lba = u64::from_le_bytes(entry_block[offset+32..offset+40].try_into().unwrap());
+                             crate::serial_println!("[FS] Checking Partition {} at LBA: {}", partition_found_count, lba);
+                             
+                             let nvme_boot_lba = (lba * FAT_SECTOR_SIZE) / NVME_BLOCK_SIZE;
+                             let boot_offset = ((lba * FAT_SECTOR_SIZE) % NVME_BLOCK_SIZE) as usize;
+                             
+                             let mut boot_sector = alloc::vec![0u8; 4096];
+                             if driver.read_block(nvme_boot_lba, &mut boot_sector) {
+                                 if boot_sector[boot_offset + 510] == 0x55 && boot_sector[boot_offset + 511] == 0xAA {
+                                     partition_start_lba = lba;
+                                     crate::serial_println!("[FS] -> SUCCESS: Found FAT32 Boot Sector!");
+                                     break;
+                                 } else {
+                                     crate::serial_println!("[FS] -> Skipping (Not FAT32 formatted)");
+                                 }
+                             }
+                         }
                      }
                  }
+                 if partition_start_lba != 0 { break; }
              }
         } else {
              crate::serial_println!("[FS] Standard MBR Detected.");
@@ -164,7 +192,14 @@ impl FileSystem {
         }
 
         if partition_start_lba == 0 { 
-            crate::serial_println!("[FS] No valid partition found. Drive is raw."); return; 
+            crate::serial_println!("[FS] No FAT32 partition found. Probing NVMe for unallocated space..."); 
+            
+            if let Some(safe_lba) = crate::partitioner::NyxPartitioner::find_free_space(&mut driver) {
+                crate::serial_println!("[FS] READY TO FORMAT: Gap secured at LBA {}.", safe_lba);
+            }
+            
+            crate::serial_println!("[FS] Falling back to RAM Disk.");
+            return; 
         }
         
         let nvme_boot_lba = (partition_start_lba * FAT_SECTOR_SIZE) / NVME_BLOCK_SIZE;
@@ -175,14 +210,20 @@ impl FileSystem {
         
         if boot_sector[boot_offset + 510] != 0x55 || boot_sector[boot_offset + 511] != 0xAA { return; }
 
-        crate::serial_println!("[FS] Valid FAT boot sector detected. Mounting...");
+        crate::serial_println!("[FS] Valid FAT boot sector verified. Mounting NVMe...");
 
         let stream = NvmeStream::new(driver, partition_start_lba);
         let options = fatfs::FsOptions::new().update_accessed_date(true);
         
-        if let Ok(fs) = fatfs::FileSystem::new(stream, options) {
-            self.inner = Some(fs);
-            crate::serial_println!("[FS] FAT Filesystem successfully mounted.");
+        // 🚨 ADDED ERROR CATCHING 🚨
+        match fatfs::FileSystem::new(stream, options) {
+            Ok(fs) => {
+                self.inner = Some(fs);
+                crate::serial_println!("[FS] FAT Filesystem successfully mounted.");
+            },
+            Err(e) => {
+                crate::serial_println!("[FS] CRITICAL: fatfs failed to mount. Error: {:?}", e);
+            }
         }
     }
 
@@ -191,11 +232,10 @@ impl FileSystem {
         
         let mut list = Vec::new();
         
-        // 🚨 VIRTUAL FILESYSTEM INJECTION (The RAM Disk Cheat) 🚨
         if path == "/" || path.is_empty() {
             list.push(String::from("hello.elf"));
             list.push(String::from("nyx-user.bin"));
-            list.push(String::from("rust.elf")); // <-- NOW VISIBLE IN `ls`!
+            list.push(String::from("rust.elf")); 
         }
 
         if let Some(fs) = &self.inner {
@@ -206,7 +246,18 @@ impl FileSystem {
                     if let Ok(e) = entry { 
                         let mut name = e.file_name();
                         if e.is_dir() { name.push('/'); }
-                        list.push(name); 
+                        if !list.contains(&name) {
+                            list.push(name); 
+                        }
+                    }
+                }
+            }
+        } else {
+            // ONLY load RAM disk if NVMe is offline
+            if path == "/" || path.is_empty() {
+                for file in self.ram_disk.iter() {
+                    if !list.contains(&file.0) {
+                        list.push(file.0.clone());
                     }
                 }
             }
@@ -218,24 +269,14 @@ impl FileSystem {
     }
 
     pub fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
-        // 🚨 VIRTUAL FILE INTERCEPT (The RAM Disk Cheat) 🚨
-        if name == "hello.elf" || name == "/hello.elf" {
-            return Some(crate::HELLO_BIN.to_vec());
-        }
-        if name == "nyx-user.bin" || name == "/nyx-user.bin" {
-            // Note: If you renamed the INIT_FS variable in main, you can intercept it here too, 
-            // but the kernel bootstraps it directly in main() anyway.
-            return None; 
-        }
-        if name == "rust.elf" || name == "/rust.elf" {
-            return Some(crate::RUST_BIN.to_vec());
-        }
+        if name == "hello.elf" || name == "/hello.elf" { return Some(crate::HELLO_BIN.to_vec()); }
+        if name == "nyx-user.bin" || name == "/nyx-user.bin" { return None; }
+        if name == "rust.elf" || name == "/rust.elf" { return Some(crate::RUST_BIN.to_vec()); }
 
-        // --- ACTUAL NVMe HARDWARE FATFS READ ---
+        let clean_name = if name.starts_with('/') { &name[1..] } else { name };
+
         if let Some(fs) = &self.inner {
             let root = fs.root_dir();
-            let clean_name = if name.starts_with('/') { &name[1..] } else { name };
-            
             if let Ok(mut file) = root.open_file(clean_name) {
                 let mut buf = Vec::new();
                 let mut temp = alloc::vec![0u8; 4096];
@@ -254,28 +295,61 @@ impl FileSystem {
                     }
                 } else { return Some(buf); }
             }
+            return None; // Ensure it doesn't fall back to RAM if NVMe is mounted
+        }
+
+        // Fallback to RAM Disk ONLY if NVMe is offline
+        for file in self.ram_disk.iter() {
+            if file.0 == clean_name {
+                return Some(file.1.clone());
+            }
         }
         None
     }
 
     pub fn write_file(&mut self, name: &str, data: &[u8]) -> bool {
         self.cache_path.clear(); 
+        let clean_name = if name.starts_with('/') { &name[1..] } else { name };
         
         if let Some(fs) = &self.inner {
+            crate::serial_println!("[FS] Attempting physical NVMe write for: {}", clean_name);
             let root = fs.root_dir();
-            let clean_name = if name.starts_with('/') { &name[1..] } else { name };
-            
             let compressed_payload = nyx_compress(data);
             let mut final_data = Vec::with_capacity(4 + compressed_payload.len());
             final_data.extend_from_slice(MAGIC_SIG);
             final_data.extend_from_slice(&compressed_payload);
             
             match root.create_file(clean_name) {
-                Ok(mut file) => return file.write_all(&final_data).is_ok(),
-                Err(_) => return false,
+                Ok(mut file) => {
+                    match file.write_all(&final_data) {
+                        Ok(_) => crate::serial_println!("[FS] SUCCESS: Bytes pushed to NVMe stream."),
+                        Err(_) => crate::serial_println!("[FS] ERR: NVMe Stream rejected write."),
+                    }
+                    let _ = file.flush();
+                    crate::serial_println!("[FS] FAT32 directory entry closed.");
+                },
+                Err(_) => {
+                    crate::serial_println!("[FS] ERR: fatfs could not allocate file!");
+                    return false;
+                }
+            }
+            return true; 
+        }
+        
+        crate::serial_println!("[FS] NVMe offline. Storing in volatile RAM Disk.");
+        let mut found = false;
+        for file in self.ram_disk.iter_mut() {
+            if file.0 == clean_name {
+                file.1 = data.to_vec();
+                found = true;
+                break;
             }
         }
-        false
+        if !found {
+            self.ram_disk.push((String::from(clean_name), data.to_vec()));
+        }
+        
+        true 
     }
 }
 

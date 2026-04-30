@@ -36,6 +36,7 @@ pub mod entity;
 pub mod c_stubs;
 pub mod drm;
 pub mod usb;
+pub mod partitioner;
 
 pub use gui::{SCREEN_PAINTER, BACK_BUFFER};
 

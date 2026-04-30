@@ -125,6 +125,18 @@ impl Terminal {
             let len = syscalls::sys_get_boot_logs(&mut buf);
             if let Ok(s) = core::str::from_utf8(&buf[..len]) { self.write_str(s); }
         } 
+        else if cmd == "entity" {
+            let mut seed = [0u8; 32];
+            if syscalls::sys_get_entity_state(&mut seed) {
+                let mut hex_str = String::new();
+                for b in seed.iter() {
+                    let _ = core::fmt::write(&mut hex_str, format_args!("{:02X}", b));
+                }
+                self.write_str(&format!("Genetic Seed: [{}]", hex_str));
+            } else {
+                self.write_str("Entity seed not locked or unavailable.");
+            }
+        }
         else if cmd.starts_with("echo ") {
             self.write_str(&cmd[5..]);
         } 
