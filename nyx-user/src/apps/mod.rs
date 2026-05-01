@@ -6,3 +6,5 @@ pub mod monitor;
 pub mod sysinfo;   
 pub mod bootlog;   
 pub mod netchat;
+pub mod fetch;
+pub mod https;

@@ -10,14 +10,17 @@ use x86_64::VirtAddr;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use crate::scheduler::{FileDescriptor, KernelSocket, SocketKind};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU16, Ordering};
 use x86_64::registers::model_specific::GsBase;
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
-
 pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+
 pub static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+
+// 🚨 Atomic counter prevents Ephemeral Port exhaustion!
+static NEXT_LOCAL_PORT: AtomicU16 = AtomicU16::new(49152);
 
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
@@ -37,7 +40,6 @@ pub struct SockAddrIn {
 
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
     let start = ptr as u64;
-    // PIE FIX: Allow reading from address 0x0
     if start == 0 && len == 0 { return false; }
     if let Some(end) = start.checked_add(len as u64) {
         return end <= 0x0000_7FFF_FFFF_FFFF;
@@ -96,13 +98,11 @@ extern "x86-interrupt" fn gpf_handler(stack_frame: InterruptStackFrame, error_co
 extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     let was_user = (stack_frame.code_segment & 3) == 3;
     if was_user { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
-
     let cr2 = x86_64::registers::control::Cr2::read();
     let cr3 = x86_64::registers::control::Cr3::read();
     
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
         crate::serial_println!("\n[SEGFAULT] User Process Terminated. Invalid Memory Access at: {:?}", cr2);
-
         if GsBase::read().as_u64() != 0 {
             let percpu = crate::percpu::current();
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
@@ -135,7 +135,7 @@ timer_interrupt_stub:
     mov rax, rsp
     and rsp, -16
     sub rsp, 512
-    fxsave [rsp]   
+    fxsave [rsp]
     
     sub rsp, 8
     push rax
@@ -149,10 +149,8 @@ timer_interrupt_stub:
     
     fxrstor [rsp]
     mov rsp, rbx
-
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
     pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
-
     test qword ptr [rsp + 8], 3
     jz 2f
     swapgs
@@ -167,7 +165,6 @@ keyboard_interrupt_stub:
 1:
     push rax; push rbx; push rcx; push rdx; push rbp; push rsi; push rdi
     push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
-
     mov rax, rsp
     and rsp, -16
     
@@ -179,7 +176,6 @@ keyboard_interrupt_stub:
     mov rsp, rax
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
     pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
-
     test qword ptr [rsp + 8], 3
     jz 2f
     swapgs
@@ -194,7 +190,6 @@ mouse_interrupt_stub:
 1:
     push rax; push rbx; push rcx; push rdx; push rbp; push rsi; push rdi
     push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
-
     mov rax, rsp
     and rsp, -16
     
@@ -206,7 +201,6 @@ mouse_interrupt_stub:
     mov rsp, rax
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
     pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
-
     test qword ptr [rsp + 8], 3
     jz 2f
     swapgs
@@ -221,7 +215,6 @@ ethernet_interrupt_stub:
 1:
     push rax; push rbx; push rcx; push rdx; push rbp; push rsi; push rdi
     push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
-
     mov rax, rsp
     and rsp, -16
     
@@ -233,7 +226,6 @@ ethernet_interrupt_stub:
     mov rsp, rax
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
     pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
-
     test qword ptr [rsp + 8], 3
     jz 2f
     swapgs
@@ -287,17 +279,14 @@ pub extern "C" fn ethernet_handler_impl() {
 pub fn init_syscalls() {
     use x86_64::registers::model_specific::{Efer, EferFlags, Msr};
     use x86_64::registers::rflags::RFlags;
-
     let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
     KERNEL_CR3.store(cr3, Ordering::SeqCst);
-
     unsafe {
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0);
         cr0 &= !(1 << 2); 
         cr0 |= (1 << 1) | (1 << 5); 
         core::arch::asm!("mov cr0, {}", in(reg) cr0);
-
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4);
         cr4 |= (1 << 9) | (1 << 10); 
@@ -313,7 +302,6 @@ pub fn init_syscalls() {
     }
 }
 
-// FULL TRAPFRAME
 #[repr(C)]
 pub struct SyscallStackFrame {
     pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
@@ -326,8 +314,8 @@ core::arch::global_asm!(r#"
 .global syscall_handler_asm
 syscall_handler_asm:
     swapgs
-    mov gs:[8], rsp   
-    mov rsp, gs:[0]   
+    mov gs:[8], rsp       
+    mov rsp, gs:[0]       
 
     push rax
     push rbx
@@ -391,7 +379,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
     if GsBase::read().as_u64() == 0 { frame.rax = ENOSYS as u64; return; }
     
     let percpu = crate::percpu::current();
-
     let id = frame.rax;
     let arg1 = frame.rdi;
     let arg2 = frame.rsi;
@@ -429,22 +416,40 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EBADF as u64; } 
             } else { frame.rax = EINVAL as u64; }
         },
-        3 => { 
+        3 => { // SYS_CLOSE
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            if arg1 < 32 { task.fd_table[arg1 as usize] = None; }
+            if arg1 < 32 { 
+                // 🚨 Cleanly tear down TCP sockets to avoid Windows NAT exhaustion!
+                if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[arg1 as usize] {
+                    let sock = sock_mtx.lock();
+                    if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
+                        match sock.kind {
+                            SocketKind::Tcp(handle) => {
+                                let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                socket.abort(); // Send TCP RST
+                                sockets.remove(handle); // Free the memory
+                            },
+                            SocketKind::Udp(handle) => {
+                                sockets.remove(handle);
+                            }
+                        }
+                    }
+                }
+                task.fd_table[arg1 as usize] = None; 
+            }
             frame.rax = 0;
         },
         9 => { 
-            let addr = arg1 as u64;    
-            let size = arg2 as usize;  
-            let fd = arg5 as isize;    
-            let offset = frame.r9 as usize; 
-
+            let addr = arg1 as u64;       
+            let size = arg2 as usize;     
+            let fd = arg5 as isize;       
+            let offset = frame.r9 as usize;
+            
             if size == 0 || size > 0x200_0000 { frame.rax = ENOMEM as u64; return; }
-
             let num_pages = (size + 0xFFF) / 0x1000;
+
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             
@@ -477,13 +482,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         },
         
-        // --- POSIX COMPATIBILITY STUBS FOR LIBC AND RUST ---
         10 => { frame.rax = 0; }, // SYS_MPROTECT
-        12 => { frame.rax = 0; }, // SYS_BRK (Forces malloc to use mmap)
+        12 => { frame.rax = 0; }, // SYS_BRK 
         13 => { frame.rax = 0; }, // SYS_RT_SIGACTION
         14 => { frame.rax = 0; }, // SYS_RT_SIGPROCMASK
         
-        16 => { // SYS_IOCTL (I/O Control)
+        16 => { // SYS_IOCTL 
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
@@ -495,13 +499,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                         Err(e) => frame.rax = e as u64,
                     }
                 } else { 
-                    // ENOTTY (-25). Tells libc it's writing to a pipe, forcing flush
-                    frame.rax = -25isize as u64; 
+                    frame.rax = -25isize as u64; // ENOTTY
                 }
             } else { frame.rax = EBADF as u64; }
         },
         
-        20 => { // SYS_WRITEV (Vector Write)
+        20 => { // SYS_WRITEV 
             let fd = arg1 as usize;
             let iov_ptr = arg2 as *const u64; 
             let iovcnt = arg3 as usize;
@@ -569,10 +572,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EBADF as u64; }
             } else { frame.rax = EBADF as u64; }
         },
+
         41 => frame.rax = sys_socket(arg1, arg2, arg3) as u64,
         42 => frame.rax = sys_connect(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64,
         44 => frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64, 
         45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,
+
         57 => { // SYS_FORK
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ENOSYS as u64; return; }
@@ -583,7 +588,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 let parent = &percpu.scheduler.tasks[curr_idx];
                 child.parent_pid = Some(parent.pid);
                 crate::memory::clone_user_address_space(parent.cr3, child.cr3);
-
                 for i in 0..32 {
                     if let Some(fd) = &parent.fd_table[i] {
                         child.fd_table[i] = Some(fd.clone());
@@ -601,7 +605,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 iret_slice[3] = percpu.user_rsp;   
                 iret_slice[4] = 0x2B;              
             }
-
             let regs_ptr = iretq_ptr - 120;
             unsafe {
                 let regs = core::slice::from_raw_parts_mut(regs_ptr as *mut u64, 15);
@@ -621,13 +624,11 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 regs[13] = frame.rbx; 
                 regs[14] = 0; // The child receives PID 0!
             }
-
             let fxsave_ptr = (regs_ptr - 512) & !0xF;
             unsafe {
                 core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
                 *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
             }
-
             let final_rsp = fxsave_ptr - 16;
             unsafe {
                 let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
@@ -651,7 +652,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 
                 let path = raw_path.trim_matches(char::from(0)).trim();
                 
-                // Add rust.elf to RAM Disk loader!
                 let elf_data_opt = if path.contains("hello.elf") {
                     Some(alloc::vec::Vec::from(crate::HELLO_BIN))
                 } else if path.contains("rust.elf") {
@@ -670,27 +670,29 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     match crate::process::load_elf(&elf_data) {
                         Ok(entry_point) => {
                             let user_stack_base = 0x7FFF_0000_0000;
-                            crate::memory::allocate_user_pages_at(user_stack_base, 4).expect("Failed stack allocation");
-                            let user_stack_top = user_stack_base + (4 * 4096); 
                             
+                            // 🚨 BUMP TO 32 PAGES (128KB)
+                            crate::memory::allocate_user_pages_at(user_stack_base, 32).expect("Failed stack allocation");
+                            let user_stack_top = user_stack_base + (32 * 4096);
+                              
                             task.mmap_bump = 0x4000_0000_0000;
-
                             frame.rcx = entry_point;
-                            frame.r11 = 0x202; 
+                            frame.r11 = 0x202;  
                             
-                            // POSIX STACK FIX: Required for musl and Rust std::rt
-                            let initial_rsp = user_stack_top - 32;
+                            // 🚨 THE ABI FIX: Subtract 40 bytes (32 bytes of args + 8 byte dummy return address)
+                            let initial_rsp = (user_stack_top & !0xF) - 40; 
                             unsafe {
                                 let stack_ptr = initial_rsp as *mut u64;
-                                *stack_ptr.add(0) = 0; // argc = 0
-                                *stack_ptr.add(1) = 0; // argv NULL terminator
-                                *stack_ptr.add(2) = 0; // envp NULL terminator
-                                *stack_ptr.add(3) = 0; // auxv AT_NULL terminator
+                                *stack_ptr.add(0) = 0; // Dummy Return Address (Forces RSP to end in 8!)
+                                *stack_ptr.add(1) = 0; // argc = 0
+                                *stack_ptr.add(2) = 0; // argv NULL terminator
+                                *stack_ptr.add(3) = 0; // envp NULL terminator
+                                *stack_ptr.add(4) = 0; // auxv AT_NULL terminator
                                 
                                 percpu.user_rsp = initial_rsp; 
-                            } 
-                            return; 
-                        },
+                            }
+                             return; 
+                         },
                         Err(e) => {
                             crate::serial_println!("\n[KERNEL] Execve Failed: {}", e);
                             frame.rax = EINVAL as u64;
@@ -699,6 +701,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = EINVAL as u64; } 
             } else { frame.rax = EINVAL as u64; } 
         },
+
         60 => { // SYS_EXIT 
             let exit_code = arg1 as i64;
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
@@ -706,7 +709,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             
             crate::serial_println!("[PID {}] Exited (Code: {})", task.pid, exit_code); 
             task.state = crate::scheduler::TaskState::Zombie; 
-
             for i in 0..32 { task.fd_table[i] = None; }
             crate::memory::clear_user_address_space(task.cr3);
 
@@ -715,6 +717,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 loop { core::arch::asm!("hlt") }
             }
         },
+
         131 => { frame.rax = 0; }, // SYS_SIGALTSTACK
         158 => { // SYS_ARCH_PRCTL (TLS Support)
             let code = arg1;
@@ -739,25 +742,25 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
         
         // --- CUSTOM NYXOS SYSCALLS ---
-        501 => { 
-             unsafe {
-                 if let Some(p) = &mut crate::SCREEN_PAINTER {
-                     let screen_w = p.info.width;
-                     let screen_h = p.info.height;
-                     let start_x = core::cmp::min(arg1 as usize, screen_w);
-                     let start_y = core::cmp::min(arg2 as usize, screen_h);
-                     let max_w = screen_w.saturating_sub(start_x);
-                     let max_h = screen_h.saturating_sub(start_y);
-                     let w = core::cmp::min(arg3 as usize, max_w);
-                     let h = core::cmp::min(arg4 as usize, max_h);
-                     let rect = Rect { x: start_x, y: start_y, w, h };
-                     let color = match arg5 as u8 {
-                         0 => Color::BLACK, 1 => Color::BLUE, 2 => Color::GREEN, 3 => Color::CYAN,
-                         4 => Color::RED, 5 => Color::BLUE, 14 => Color::YELLOW, _ => Color::WHITE,
-                     };
-                     p.draw_rect(rect, color);
-                 }
-             }
+        501 => {  
+            unsafe { 
+                if let Some(p) = &mut crate::SCREEN_PAINTER { 
+                    let screen_w = p.info.width; 
+                    let screen_h = p.info.height; 
+                    let start_x = core::cmp::min(arg1 as usize, screen_w); 
+                    let start_y = core::cmp::min(arg2 as usize, screen_h); 
+                    let max_w = screen_w.saturating_sub(start_x); 
+                    let max_h = screen_h.saturating_sub(start_y); 
+                    let w = core::cmp::min(arg3 as usize, max_w); 
+                    let h = core::cmp::min(arg4 as usize, max_h); 
+                    let rect = Rect { x: start_x, y: start_y, w, h }; 
+                    let color = match arg5 as u8 { 
+                        0 => Color::BLACK, 1 => Color::BLUE, 2 => Color::GREEN, 3 => Color::CYAN, 
+                        4 => Color::RED, 5 => Color::BLUE, 14 => Color::YELLOW, _ => Color::WHITE, 
+                    }; 
+                    p.draw_rect(rect, color); 
+                } 
+            }
         },
         504 => { 
             let mut lo: u32;
@@ -772,27 +775,27 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
         506 => { if let Some(c) = crate::shell::pop_key() { frame.rax = c as u64; } else { frame.rax = 0; } },
         507 => { 
-            unsafe {
-                 if let Some(p) = &crate::SCREEN_PAINTER {
-                     if is_valid_user_ptr(arg1 as *const u8, 8) && is_valid_user_ptr(arg2 as *const u8, 8) && is_valid_user_ptr(arg3 as *const u8, 8) {
-                         *(arg1 as *mut u64) = p.info.width as u64;
-                         *(arg2 as *mut u64) = p.info.height as u64;
-                         *(arg3 as *mut u64) = if p.info.stride > 0 { p.info.stride } else { p.info.width } as u64;
-                         frame.rax = 1; 
-                     } else { frame.rax = EFAULT as u64; }
-                 } else { frame.rax = 0; }
+            unsafe { 
+                if let Some(p) = &crate::SCREEN_PAINTER { 
+                    if is_valid_user_ptr(arg1 as *const u8, 8) && is_valid_user_ptr(arg2 as *const u8, 8) && is_valid_user_ptr(arg3 as *const u8, 8) { 
+                        *(arg1 as *mut u64) = p.info.width as u64; 
+                        *(arg2 as *mut u64) = p.info.height as u64; 
+                        *(arg3 as *mut u64) = if p.info.stride > 0 { p.info.stride } else { p.info.width } as u64; 
+                        frame.rax = 1; 
+                    } else { frame.rax = EFAULT as u64; } 
+                } else { frame.rax = 0; }
             }
         },
         508 => { 
-            unsafe {
-                 if let Some(p) = &mut crate::SCREEN_PAINTER {
-                     let virt_start = p.buffer.as_ptr() as u64;
-                     if let Some(phys) = crate::memory::virt_to_phys(virt_start) {
-                         if let Ok(user_virt) = crate::memory::map_user_framebuffer(phys, (p.buffer.len() * 4) as u64) {
-                             frame.rax = user_virt; 
-                         } else { frame.rax = 0; }
-                     } else { frame.rax = 0; }
-                 } else { frame.rax = 0; }
+            unsafe { 
+                if let Some(p) = &mut crate::SCREEN_PAINTER { 
+                    let virt_start = p.buffer.as_ptr() as u64; 
+                    if let Some(phys) = crate::memory::virt_to_phys(virt_start) { 
+                        if let Ok(user_virt) = crate::memory::map_user_framebuffer(phys, (p.buffer.len() * 4) as u64) { 
+                            frame.rax = user_virt; 
+                        } else { frame.rax = 0; } 
+                    } else { frame.rax = 0; } 
+                } else { frame.rax = 0; }
             }
         },
         510 => { 
@@ -809,9 +812,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let buf_ptr = arg2 as *mut u8;
             let path_ptr = arg3 as *const u8;
             let path_len = arg4 as usize;
-
             if !is_valid_user_ptr(path_ptr, path_len) || !is_valid_user_ptr(buf_ptr, 256) { frame.rax = EFAULT as u64; return; }
-
             let path_slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
                 let mut fs = crate::fs::FS.lock();
@@ -830,7 +831,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
             if !is_valid_user_ptr(buf_ptr, buf_len) { frame.rax = EFAULT as u64; return; }
-
             let mcfg = unsafe { crate::acpi::ACPI_INFO.mcfg_addr.unwrap_or(0) };
             let madt = unsafe { crate::acpi::ACPI_INFO.madt_addr.unwrap_or(0) };
             let info = format!("Hardware Discovery Report:\nMCFG: {:#x}\nMADT: {:#x}", mcfg, madt);
@@ -843,7 +843,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
             if !is_valid_user_ptr(buf_ptr, buf_len) { frame.rax = EFAULT as u64; return; }
-
             unsafe {
                 let log_len = core::cmp::min(crate::serial::BOOT_LOG_IDX, 8192);
                 let copy_len = core::cmp::min(buf_len, log_len);
@@ -861,7 +860,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let task = &mut percpu.scheduler.tasks[curr_idx];
             let target_addr = task.mmap_bump;
             task.mmap_bump += (num_pages as u64) * 0x1000;
-
             match crate::memory::allocate_user_pages_at(target_addr, num_pages) {
                 Ok(mapped_addr) => frame.rax = mapped_addr,
                 Err(_) => frame.rax = 0, 
@@ -917,12 +915,27 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                 let sock = sock_mtx.lock();
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
                 if let Some(sockets) = sockets_lock.as_mut() {
-                    let handle = match sock.kind { SocketKind::Udp(h) => h };
-                    let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
-                    if let Ok((data, _meta)) = socket.recv() {
-                        let copy_len = core::cmp::min(data.len(), len);
-                        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
-                        return copy_len as isize;
+                    match sock.kind {
+                        SocketKind::Udp(handle) => {
+                            let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                            if let Ok((data, _meta)) = socket.recv() {
+                                let copy_len = core::cmp::min(data.len(), len);
+                                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
+                                return copy_len as isize;
+                            }
+                        },
+                        SocketKind::Tcp(handle) => {
+                            let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                            if socket.can_recv() {
+                                let user_slice = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                                if let Ok(received) = socket.recv_slice(user_slice) {
+                                    if received > 0 { return received as isize; }
+                                }
+                            } else if !socket.may_recv() {
+                                // 🚨 FIX 2: Tell user-space the connection closed! (EOF)
+                                return 0; 
+                            }
+                        }
                     }
                 }
                 return EAGAIN as isize; 
@@ -967,25 +980,35 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
     
     let buf_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
 
-    let mut bytes_sent = EAGAIN as isize;
-    let mut trigger_net_poll = false;
-
     if let Some(fd_enum) = &task.fd_table[fd] {
         match fd_enum {
             FileDescriptor::File(open_file) => return open_file.write(buf_slice) as isize,
             FileDescriptor::Socket(sock_mtx) => {
+                // 🚨 FIX 3: Automatically poll the network on write! (Removes the need for dummy byte stealing)
+                crate::drivers::net::poll_network(); 
                 let sock = sock_mtx.lock();
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
                 if let Some(sockets) = sockets_lock.as_mut() {
-                    let handle = match sock.kind { SocketKind::Udp(h) => h };
-                    let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
-                    if let Some(endpoint) = sock.remote {
-                        if socket.send_slice(buf_slice, endpoint).is_ok() { 
-                            bytes_sent = buf_slice.len() as isize;
-                            trigger_net_poll = true;
+                    match sock.kind {
+                        SocketKind::Udp(handle) => {
+                            let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                            if let Some(endpoint) = sock.remote {
+                                if socket.send_slice(buf_slice, endpoint).is_ok() {
+                                    return buf_slice.len() as isize;
+                                }
+                            }
+                        },
+                        SocketKind::Tcp(handle) => {
+                            let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                            if socket.can_send() {
+                                if let Ok(sent) = socket.send_slice(buf_slice) {
+                                    return sent as isize;
+                                }
+                            }
                         }
                     }
                 }
+                return EAGAIN as isize;
             },
             FileDescriptor::PipeWrite(pipe_mtx) => {
                 let mut pipe = pipe_mtx.lock();
@@ -996,40 +1019,40 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
         }
     }
 
-    if trigger_net_poll {
-        crate::drivers::net::poll_network();
-        return bytes_sent;
-    }
-
-    if bytes_sent != (EAGAIN as isize) {
-        return bytes_sent;
-    }
-
     if fd == 1 || fd == 2 {
         if let Ok(s) = core::str::from_utf8(buf_slice) {
             crate::serial_print!("{}", s); 
         }
         return len as isize;
     }
-
     EBADF as isize
 }
 
 pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
     let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
     if sockets_lock.is_none() { *sockets_lock = Some(smoltcp::iface::SocketSet::new(alloc::vec![])); }
-
+    
     if let Some(sockets) = sockets_lock.as_mut() {
-        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8], alloc::vec![0; 2048]);
-        let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8], alloc::vec![0; 2048]);
+        // Fetch a perfectly unique port every time
+        let local_port = NEXT_LOCAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        
+        let handle = if _typ == 1 {
+            // 🚨 BUMPED TCP WINDOW FROM 4KB TO 32KB TO HOLD GIANT SSL CERTIFICATES!
+            let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
+            let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
+            let socket = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
+            sockets.add(socket)
+        } else {
+            let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8], alloc::vec![0; 2048]);
+            let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8], alloc::vec![0; 2048]);
+            let mut socket = smoltcp::socket::udp::Socket::new(rx_buffer, tx_buffer);
+            let _ = socket.bind(local_port);
+            sockets.add(socket)
+        };
 
-        let mut socket = smoltcp::socket::udp::Socket::new(rx_buffer, tx_buffer);
-        let local_port = 49152 + (crate::time::get_ticks() % 10000) as u16;
-        let _ = socket.bind(local_port);
-
-        let handle = sockets.add(socket);
-        let ks = KernelSocket { kind: SocketKind::Udp(handle), local_port, remote: None };
-
+        let kind = if _typ == 1 { SocketKind::Tcp(handle) } else { SocketKind::Udp(handle) };
+        let ks = KernelSocket { kind, local_port, remote: None };
+        
         if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return EBADF; }
         let percpu = crate::percpu::current();
         let p_addr = percpu as *const _ as u64;
@@ -1062,16 +1085,33 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
     
     let sockaddr = unsafe { &*(addr_ptr as *const SockAddrIn) };
     if sockaddr.sin_family != 2 { return EINVAL; }
-
     let port = u16::from_be(sockaddr.sin_port);
     let ip = sockaddr.sin_addr;
-
     let task = &mut percpu.scheduler.tasks[curr_idx];
+    
     if fd < 32 {
         if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
             let mut sock = sock_mtx.lock();
             let addr = IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
             sock.remote = Some(IpEndpoint::new(addr, port));
+            
+            if let SocketKind::Tcp(handle) = sock.kind {
+                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+                let mut iface_lock = crate::drivers::net::NET_IFACE.lock(); 
+                
+                if let (Some(sockets), Some(iface)) = (sockets_lock.as_mut(), iface_lock.as_mut()) {
+                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                    let local_port = sock.local_port;
+                    
+                    if socket.connect(iface.context(), IpEndpoint::new(addr, port), local_port).is_err() {
+                        return -11; // EAGAIN
+                    }
+                }
+            }
+            
+            // 🚨 INSTANT PACKET FIRE 🚨
+            crate::drivers::net::poll_network();
+            
             return 0; 
         }
     }

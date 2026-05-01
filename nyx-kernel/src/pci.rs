@@ -188,17 +188,22 @@ fn enumerate_pci_legacy() {
                         }
 
                         use smoltcp::iface::{Config, Interface};
-                        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+                        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
                         let hw_addr = HardwareAddress::Ethernet(EthernetAddress::from_bytes(&eth_driver.mac_address));
                         let mut config = Config::new();
                         config.hardware_addr = Some(hw_addr);
                         
                         let mut iface = Interface::new(config, &mut eth_driver);
-                        let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 1, 99), 24);
+                        
+                        // 🚨 FIX 1: Set NyxOS IP to match the Windows ICS subnet (192.168.137.x)
+                        let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 137, 99), 24);
                         iface.update_ip_addrs(|ip_addrs| {
                             ip_addrs.push(ip_addr).expect("Failed to assign IP");
                         });
+
+                        // 🚨 FIX 2: Route all external traffic to the Windows ICS Gateway
+                        iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(192, 168, 137, 1)).unwrap();
 
                         *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
                         *crate::drivers::net::NET_IFACE.lock() = Some(iface);
@@ -354,17 +359,22 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                     }
 
                                     use smoltcp::iface::{Config, Interface};
-                                    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+                                    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
                                     let hw_addr = HardwareAddress::Ethernet(EthernetAddress::from_bytes(&eth_driver.mac_address));
                                     let mut config = Config::new();
                                     config.hardware_addr = Some(hw_addr);
                                     
                                     let mut iface = Interface::new(config, &mut eth_driver);
-                                    let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 1, 99), 24);
+                                    
+                                    // 🚨 FIX 1: Set NyxOS IP to match the Windows ICS subnet (192.168.137.x)
+                                    let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 137, 99), 24);
                                     iface.update_ip_addrs(|ip_addrs| {
                                         ip_addrs.push(ip_addr).expect("Failed to assign IP");
                                     });
+
+                                    // 🚨 FIX 2: Route all external traffic to the Windows ICS Gateway
+                                    iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(192, 168, 137, 1)).unwrap();
 
                                     *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
                                     *crate::drivers::net::NET_IFACE.lock() = Some(iface);

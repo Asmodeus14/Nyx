@@ -172,7 +172,40 @@ pub fn sys_dup2(oldfd: i64, newfd: i64) -> i64 {
 // ─────────────────────────────────────────────────────────────────────────
 // POSIX SAFE NETWORK ABSTRACTION
 // ─────────────────────────────────────────────────────────────────────────
+// POSIX SAFE NETWORK ABSTRACTION
+pub fn sys_socket(domain: u64, typ: u64, protocol: u64) -> i64 {
+    let mut ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") 41u64 => ret, // <-- Explicit u64
+            in("rdi") domain,
+            in("rsi") typ,
+            in("rdx") protocol,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    ret as i64
+}
 
+pub fn sys_connect(fd: i64, addr: *const u8, len: usize) -> i64 {
+    let mut ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") 42u64 => ret, // <-- Explicit u64
+            in("rdi") fd as u64,
+            in("rsi") addr as u64,
+            in("rdx") len as u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    ret as i64
+}
 #[repr(C)]
 pub struct sockaddr_in {
     pub sin_family: u16,
@@ -221,4 +254,21 @@ impl UdpSocket {
     pub fn recv(&self, buf: &mut [u8]) -> i64 {
         sys_read(self.fd, buf)
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────── Crypto Syscalls (for Terminal DNA & Stats)
+pub fn sys_getrandom(buf: &mut [u8]) -> i64 {
+    let mut ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") 318u64 => ret, // Syscall 318
+            in("rdi") buf.as_mut_ptr() as u64,
+            in("rsi") buf.len() as u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    ret as i64
 }

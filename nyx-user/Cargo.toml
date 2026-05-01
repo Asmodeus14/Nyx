@@ -13,5 +13,11 @@ pc-keyboard = "0.7.0"
 # Font Bitmap Data (Used by gfx/font.rs and gfx/draw.rs)
 noto-sans-mono-bitmap = { version = "0.2.0", features = ["size_32"] }
 
+# Bare-metal TLS implementation
+embedded-tls = { version = "0.17.0", default-features = false }
+
+# RNG traits required by embedded-tls
+rand_core = { version = "0.6.4", default-features = false }
+embedded-io = "0.6.1"
 [profile.release]
 panic = "abort"

@@ -1,14 +1,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
-use core::fmt::Write;
 use crate::gfx::draw;
 use crate::syscalls;
 
 pub struct Terminal {
     pub history: Vec<String>,
     pub current_line: String,
-    pub active_child_fd: Option<i64>, // 🚨 Tracks the Read-End of the Pipe
+    pub active_child_fd: Option<i64>, 
 }
 
 impl Terminal {
@@ -20,23 +19,19 @@ impl Terminal {
         }
     }
 
-    // 🚨 NON-BLOCKING POLL: Reads bytes from the C program without freezing the GUI!
     pub fn pump_pipe(&mut self) {
         if let Some(fd) = self.active_child_fd {
             let mut buf = [0u8; 256];
             let bytes_read = syscalls::sys_read(fd, &mut buf);
             
             if bytes_read > 0 {
-                // We caught text from the C program!
                 if let Ok(s) = core::str::from_utf8(&buf[..bytes_read as usize]) {
                     self.write_str(s);
                 }
             } else if bytes_read == 0 { 
-                // EOF: The child program exited and the kernel destroyed the write-pipe!
                 syscalls::sys_close(fd);
                 self.active_child_fd = None;
             } else if bytes_read != -11 { 
-                // Error (Not EAGAIN)
                 syscalls::sys_close(fd);
                 self.active_child_fd = None;
             }
@@ -66,17 +61,15 @@ impl Terminal {
         let cmd = cmd.trim();
         
         if cmd == "help" {
-            self.write_str("Commands: clear, ls, lspci, uptime, dmesg, entity, run <file>");
+            self.write_str("Commands: clear, ls, lspci, uptime, dmesg, entity, run <file>, fetch, https");
         } 
         else if cmd == "clear" {
             self.history.clear();
         } 
-        // 🚨 POSIX PIPELINE IMPLEMENTATION 🚨
         else if cmd.starts_with("run ") {
             let filename = &cmd[4..];
             let mut pipe_fds = [-1; 2];
             
-            // 1. Create the Shared Pipe
             if syscalls::sys_pipe(&mut pipe_fds) == 0 {
                 let read_fd = pipe_fds[0] as i64;
                 let write_fd = pipe_fds[1] as i64;
@@ -84,14 +77,12 @@ impl Terminal {
                 let pid = syscalls::sys_fork();
                 
                 if pid == 0 {
-                    // CHILD PROCESS: Override STDOUT (FD 1) with the Pipe!
                     syscalls::sys_dup2(write_fd, 1);
                     syscalls::sys_close(read_fd); 
                     
                     syscalls::sys_execve(filename);
                     syscalls::sys_exit(-1);
                 } else if pid > 0 {
-                    // PARENT PROCESS (GUI): Save the Read-End and wait!
                     syscalls::sys_close(write_fd); 
                     self.active_child_fd = Some(read_fd);
                 } else {
@@ -130,7 +121,10 @@ impl Terminal {
             if syscalls::sys_get_entity_state(&mut seed) {
                 let mut hex_str = String::new();
                 for b in seed.iter() {
-                    let _ = core::fmt::write(&mut hex_str, format_args!("{:02X}", b));
+                    // Quick hex formatting without relying on core::fmt directly
+                    let hex_chars = b"0123456789ABCDEF";
+                    hex_str.push(hex_chars[(b >> 4) as usize] as char);
+                    hex_str.push(hex_chars[(b & 0x0F) as usize] as char);
                 }
                 self.write_str(&format!("Genetic Seed: [{}]", hex_str));
             } else {
@@ -139,7 +133,18 @@ impl Terminal {
         }
         else if cmd.starts_with("echo ") {
             self.write_str(&cmd[5..]);
-        } 
+        }
+        else if cmd == "fetch" {
+            self.write_str(">>> Dialing 192.168.1.100:80 via TCP...");
+            let response = crate::apps::fetch::run_nyxfetch();
+            self.write_str(&response);
+        }
+        // 🚨 THE NEW SECURE TLS COMMAND 🚨
+        else if cmd == "https" {
+            self.write_str(">>> Initializing TLS 1.3 to 1.1.1.1:443...");
+            let response = crate::apps::https::run_https_fetch();
+            self.write_str(&response);
+        }
         else if cmd == "" { } 
         else {
             self.write_str(&format!("Command not found: {}", cmd));

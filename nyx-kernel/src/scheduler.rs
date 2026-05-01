@@ -19,6 +19,7 @@ pub enum TaskState {
 #[derive(Clone)]
 pub enum SocketKind {
     Udp(smoltcp::iface::SocketHandle),
+    Tcp(smoltcp::iface::SocketHandle),
 }
 
 pub struct KernelSocket {
