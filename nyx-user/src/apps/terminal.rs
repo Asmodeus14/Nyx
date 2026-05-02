@@ -78,7 +78,7 @@ impl Terminal {
                 
                 if pid == 0 {
                     syscalls::sys_dup2(write_fd, 1);
-                    syscalls::sys_close(read_fd); 
+                    syscalls::sys_close(read_fd);
                     
                     syscalls::sys_execve(filename);
                     syscalls::sys_exit(-1);
@@ -121,7 +121,6 @@ impl Terminal {
             if syscalls::sys_get_entity_state(&mut seed) {
                 let mut hex_str = String::new();
                 for b in seed.iter() {
-                    // Quick hex formatting without relying on core::fmt directly
                     let hex_chars = b"0123456789ABCDEF";
                     hex_str.push(hex_chars[(b >> 4) as usize] as char);
                     hex_str.push(hex_chars[(b & 0x0F) as usize] as char);
@@ -134,16 +133,46 @@ impl Terminal {
         else if cmd.starts_with("echo ") {
             self.write_str(&cmd[5..]);
         }
-        else if cmd == "fetch" {
-            self.write_str(">>> Dialing 192.168.1.100:80 via TCP...");
-            let response = crate::apps::fetch::run_nyxfetch();
-            self.write_str(&response);
-        }
-        // 🚨 THE NEW SECURE TLS COMMAND 🚨
-        else if cmd == "https" {
-            self.write_str(">>> Initializing TLS 1.3 to 1.1.1.1:443...");
-            let response = crate::apps::https::run_https_fetch();
-            self.write_str(&response);
+        
+        // --- THE FIX: ASYNCHRONOUS NETWORK COMMANDS ---
+        else if cmd == "fetch" || cmd == "https" {
+            if cmd == "fetch" {
+                self.write_str(">>> Dialing 192.168.1.100:80 via TCP...");
+            } else {
+                self.write_str(">>> Initializing TLS 1.3 to 1.1.1.1:443...");
+            }
+
+            let mut pipe_fds = [-1; 2];
+            if syscalls::sys_pipe(&mut pipe_fds) == 0 {
+                let read_fd = pipe_fds[0] as i64;
+                let write_fd = pipe_fds[1] as i64;
+                
+                let pid = syscalls::sys_fork();
+                
+                if pid == 0 { // CHILD PROCESS
+                    syscalls::sys_close(read_fd);
+                    
+                    // Run the heavy networking task
+                    let response = if cmd == "fetch" {
+                        crate::apps::fetch::run_nyxfetch()
+                    } else {
+                        crate::apps::https::run_https_fetch("cloudflare.com")
+                    };
+                    
+                    // Pipe the result back to the Terminal UI and exit safely
+                    syscalls::sys_write(write_fd, response.as_bytes());
+                    syscalls::sys_close(write_fd);
+                    syscalls::sys_exit(0);
+                } else if pid > 0 { // PARENT PROCESS (UI)
+                    syscalls::sys_close(write_fd); 
+                    // Tell the Terminal to poll this FD every frame in `pump_pipe`
+                    self.active_child_fd = Some(read_fd); 
+                } else {
+                    self.write_str("ERR: Fork failed!");
+                }
+            } else {
+                self.write_str("ERR: Pipe creation failed!");
+            }
         }
         else if cmd == "" { } 
         else {

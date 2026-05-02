@@ -15,11 +15,11 @@ use x86_64::registers::model_specific::GsBase;
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
-pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
+pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 pub static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
-// 🚨 Atomic counter prevents Ephemeral Port exhaustion!
+// Atomic counter prevents Ephemeral Port exhaustion!
 static NEXT_LOCAL_PORT: AtomicU16 = AtomicU16::new(49152);
 
 const EBADF: i64 = -9;
@@ -107,10 +107,39 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
             let percpu = crate::percpu::current();
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx < percpu.scheduler.tasks.len() {
-                percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Zombie; 
-                crate::memory::clear_user_address_space(percpu.scheduler.tasks[curr_idx].cr3);
+                let task = &mut percpu.scheduler.tasks[curr_idx];
+                
+                // 1. Teardown sockets safely via Arc strong count
+                for i in 0..32 { 
+                    if let Some(crate::scheduler::FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
+                        if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
+                            let sock = sock_mtx.lock();
+                            if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
+                                match sock.kind {
+                                    crate::scheduler::SocketKind::Tcp(handle) => {
+                                        let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                        socket.abort();
+                                        sockets.remove(handle);
+                                    },
+                                    crate::scheduler::SocketKind::Udp(handle) => { sockets.remove(handle); }
+                                }
+                            }
+                        }
+                    }
+                    task.fd_table[i] = None; 
+                }
+
+                // 2. Shred ONLY the user memory tables securely. Do NOT swap CR3 to prevent kernel stack dropout.
+                crate::memory::clear_user_address_space(task.cr3);
+                
+                // 3. Mark as Zombie at the very end
+                task.state = crate::scheduler::TaskState::Zombie;
             }
         }
+        
+        // THE DEADLOCK FIX: Tell the APIC the interrupt is over so the Timer can fire!
+        crate::apic::end_of_interrupt();
+        
         unsafe { 
             x86_64::instructions::interrupts::enable();
             loop { core::arch::asm!("hlt") } 
@@ -118,7 +147,7 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
     } else {
         if !was_user && (stack_frame.code_segment & 3) == 3 { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
         panic!("KERNEL PAGE FAULT\nAddr: {:?}\nError: {:?}\nIP: {:#x}\nCS: {:#x}\nCR3: {:?}", 
-            cr2, error_code, stack_frame.instruction_pointer.as_u64(), stack_frame.code_segment, cr3);
+             cr2, error_code, stack_frame.instruction_pointer.as_u64(), stack_frame.code_segment, cr3);
     }
 }
 
@@ -244,8 +273,37 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
     crate::apic::end_of_interrupt();
-    if x86_64::registers::model_specific::GsBase::read().as_u64() == 0 { return current_rsp; }
-    crate::percpu::current().scheduler.schedule(current_rsp)
+    
+    // Safety check: Don't schedule if percpu isn't loaded
+    if x86_64::registers::model_specific::GsBase::read().as_u64() == 0 { 
+        return current_rsp; 
+    }
+    
+    let percpu = crate::percpu::current();
+    let new_rsp = percpu.scheduler.schedule(current_rsp);
+    
+    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if curr_idx < percpu.scheduler.tasks.len() {
+        let task = &percpu.scheduler.tasks[curr_idx];
+        let task_stack = task.kernel_stack_top;
+        
+        unsafe {
+            // THE CRITICAL FIX: Swap CR3 to the new task's Address Space!
+            let current_cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+            if current_cr3 != task.cr3.as_u64() {
+                core::arch::asm!("mov cr3, {}", in(reg) task.cr3.as_u64());
+            }
+
+            // Update Syscall and Hardware Interrupt Stacks
+            let percpu_base = percpu as *const _ as *mut u64;
+            *percpu_base = task_stack;
+            
+            let tss_ptr = percpu.gdt_state.tss as *const _ as *mut x86_64::structures::tss::TaskStateSegment;
+            (*tss_ptr).privilege_stack_table[0] = x86_64::VirtAddr::new(task_stack);
+        }
+    }
+    
+    new_rsp
 }
 
 #[no_mangle]
@@ -279,24 +337,30 @@ pub extern "C" fn ethernet_handler_impl() {
 pub fn init_syscalls() {
     use x86_64::registers::model_specific::{Efer, EferFlags, Msr};
     use x86_64::registers::rflags::RFlags;
+
     let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
     KERNEL_CR3.store(cr3, Ordering::SeqCst);
+
     unsafe {
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0);
         cr0 &= !(1 << 2); 
         cr0 |= (1 << 1) | (1 << 5); 
         core::arch::asm!("mov cr0, {}", in(reg) cr0);
+
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4);
         cr4 |= (1 << 9) | (1 << 10); 
         core::arch::asm!("mov cr4, {}", in(reg) cr4);
 
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
+
         let mut star_msr = Msr::new(0xC0000081);
         star_msr.write((0x20_u64 << 48) | (0x08_u64 << 32)); 
+
         let mut lstar_msr = Msr::new(0xC0000082);
         lstar_msr.write(syscall_handler_asm as *const () as u64);
+
         let mut fmask_msr = Msr::new(0xC0000084);
         fmask_msr.write(RFlags::INTERRUPT_FLAG.bits());
     }
@@ -314,9 +378,9 @@ core::arch::global_asm!(r#"
 .global syscall_handler_asm
 syscall_handler_asm:
     swapgs
-    mov gs:[8], rsp       
-    mov rsp, gs:[0]       
-
+    mov gs:[8], rsp           
+    mov rsp, gs:[0]           
+    
     push rax
     push rbx
     push rcx
@@ -420,8 +484,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
+
             if arg1 < 32 { 
-                // 🚨 Cleanly tear down TCP sockets to avoid Windows NAT exhaustion!
+                // Cleanly tear down TCP sockets to avoid Windows NAT exhaustion!
                 if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[arg1 as usize] {
                     let sock = sock_mtx.lock();
                     if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
@@ -445,7 +510,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let addr = arg1 as u64;       
             let size = arg2 as usize;     
             let fd = arg5 as isize;       
-            let offset = frame.r9 as usize;
+            let offset = frame.r9 as usize;     
             
             if size == 0 || size > 0x200_0000 { frame.rax = ENOMEM as u64; return; }
             let num_pages = (size + 0xFFF) / 0x1000;
@@ -538,17 +603,20 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if !is_valid_user_ptr(fd_array_ptr as *const u8, 8) { frame.rax = EFAULT as u64; return; }
             
             let pipe = alloc::sync::Arc::new(spin::Mutex::new(alloc::collections::VecDeque::<u8>::new()));
+
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             let task = &mut percpu.scheduler.tasks[curr_idx];
             
             let mut read_fd = -1;
             let mut write_fd = -1;
+
             for i in 3..32 {
                 if task.fd_table[i].is_none() {
                     if read_fd == -1 { read_fd = i as i32; }
                     else if write_fd == -1 { write_fd = i as i32; break; }
                 }
             }
+
             if read_fd != -1 && write_fd != -1 {
                 task.fd_table[read_fd as usize] = Some(crate::scheduler::FileDescriptor::PipeRead(pipe.clone()));
                 task.fd_table[write_fd as usize] = Some(crate::scheduler::FileDescriptor::PipeWrite(pipe));
@@ -559,9 +627,11 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 0;
             } else { frame.rax = EMFILE as u64; }
         },
+
         33 => { // SYS_DUP2
             let oldfd = arg1 as usize;
             let newfd = arg2 as usize;
+
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             let task = &mut percpu.scheduler.tasks[curr_idx];
             
@@ -587,7 +657,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             {
                 let parent = &percpu.scheduler.tasks[curr_idx];
                 child.parent_pid = Some(parent.pid);
+                child.mmap_bump = parent.mmap_bump; // <--- THE CRASH FIX
                 crate::memory::clone_user_address_space(parent.cr3, child.cr3);
+
                 for i in 0..32 {
                     if let Some(fd) = &parent.fd_table[i] {
                         child.fd_table[i] = Some(fd.clone());
@@ -597,6 +669,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
             let stack_top = child.kernel_stack_top;
             let iretq_ptr = stack_top - 40;
+
             unsafe {
                 let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
                 iret_slice[0] = frame.rcx;         
@@ -605,6 +678,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 iret_slice[3] = percpu.user_rsp;   
                 iret_slice[4] = 0x2B;              
             }
+
             let regs_ptr = iretq_ptr - 120;
             unsafe {
                 let regs = core::slice::from_raw_parts_mut(regs_ptr as *mut u64, 15);
@@ -624,11 +698,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 regs[13] = frame.rbx; 
                 regs[14] = 0; // The child receives PID 0!
             }
+
             let fxsave_ptr = (regs_ptr - 512) & !0xF;
             unsafe {
                 core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
                 *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
             }
+
             let final_rsp = fxsave_ptr - 16;
             unsafe {
                 let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
@@ -640,7 +716,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = child.pid;
             
             percpu.scheduler.tasks.push(child);
-        },   
+        },
+          
         59 => { // SYS_EXECVE
             let buf_ptr = arg1 as *const u8;
             let len = arg2 as usize;
@@ -671,15 +748,16 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                         Ok(entry_point) => {
                             let user_stack_base = 0x7FFF_0000_0000;
                             
-                            // 🚨 BUMP TO 32 PAGES (128KB)
+                            // BUMP TO 32 PAGES (128KB)
                             crate::memory::allocate_user_pages_at(user_stack_base, 32).expect("Failed stack allocation");
                             let user_stack_top = user_stack_base + (32 * 4096);
                               
                             task.mmap_bump = 0x4000_0000_0000;
+
                             frame.rcx = entry_point;
-                            frame.r11 = 0x202;  
+                            frame.r11 = 0x202;                              
                             
-                            // 🚨 THE ABI FIX: Subtract 40 bytes (32 bytes of args + 8 byte dummy return address)
+                            // THE ABI FIX: Subtract 40 bytes (32 bytes of args + 8 byte dummy return address)
                             let initial_rsp = (user_stack_top & !0xF) - 40; 
                             unsafe {
                                 let stack_ptr = initial_rsp as *mut u64;
@@ -690,9 +768,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                                 *stack_ptr.add(4) = 0; // auxv AT_NULL terminator
                                 
                                 percpu.user_rsp = initial_rsp; 
-                            }
-                             return; 
-                         },
+                            } 
+                            return; 
+                          },
                         Err(e) => {
                             crate::serial_println!("\n[KERNEL] Execve Failed: {}", e);
                             frame.rax = EINVAL as u64;
@@ -702,16 +780,47 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             } else { frame.rax = EINVAL as u64; } 
         },
 
-        60 => { // SYS_EXIT 
+        60 => { // SYS_EXIT
+            // 0. DISABLE INTERRUPTS to prevent getting buried alive!
+            x86_64::instructions::interrupts::disable();
+
             let exit_code = arg1 as i64;
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             let task = &mut percpu.scheduler.tasks[curr_idx];
             
-            crate::serial_println!("[PID {}] Exited (Code: {})", task.pid, exit_code); 
-            task.state = crate::scheduler::TaskState::Zombie; 
-            for i in 0..32 { task.fd_table[i] = None; }
+            crate::serial_println!("[PID {}] Exited (Code: {})", task.pid, exit_code);
+            
+            // 1. Safe FD Teardown using Arc Reference Counting
+            for i in 0..32 { 
+                if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
+                    if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
+                        let sock = sock_mtx.lock();
+                        if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
+                            match sock.kind {
+                                SocketKind::Tcp(handle) => {
+                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                    socket.abort(); // Send TCP RST
+                                    sockets.remove(handle); // Free the memory
+                                },
+                                SocketKind::Udp(handle) => {
+                                    sockets.remove(handle);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Safely drop our reference to the FD
+                task.fd_table[i] = None; 
+            }
+
+            // 2. Shred ONLY the user memory tables securely. 
+            // DO NOT swap CR3 to KERNEL_CR3, or the CPU will instantly Triple Fault when trying to use the stack!
             crate::memory::clear_user_address_space(task.cr3);
 
+            // 3. Mark as Zombie at the VERY END, once all locks are released
+            task.state = crate::scheduler::TaskState::Zombie;
+            
+            // 4. Re-enable interrupts and wait for the scheduler to context-switch away natively
             unsafe {
                 x86_64::instructions::interrupts::enable();
                 loop { core::arch::asm!("hlt") }
@@ -719,6 +828,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
 
         131 => { frame.rax = 0; }, // SYS_SIGALTSTACK
+
         158 => { // SYS_ARCH_PRCTL (TLS Support)
             let code = arg1;
             let addr = arg2;
@@ -729,7 +839,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = EINVAL as u64;
             }
         },
+
         218 => { frame.rax = 1; }, // SYS_SET_TID_ADDRESS
+
         318 => { // SYS_GETRANDOM (Required for Rust HashMaps)
             let buf_ptr = arg1 as *mut u8;
             let len = arg2 as usize;
@@ -742,26 +854,28 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
         
         // --- CUSTOM NYXOS SYSCALLS ---
-        501 => {  
-            unsafe { 
-                if let Some(p) = &mut crate::SCREEN_PAINTER { 
-                    let screen_w = p.info.width; 
-                    let screen_h = p.info.height; 
-                    let start_x = core::cmp::min(arg1 as usize, screen_w); 
-                    let start_y = core::cmp::min(arg2 as usize, screen_h); 
-                    let max_w = screen_w.saturating_sub(start_x); 
-                    let max_h = screen_h.saturating_sub(start_y); 
-                    let w = core::cmp::min(arg3 as usize, max_w); 
-                    let h = core::cmp::min(arg4 as usize, max_h); 
-                    let rect = Rect { x: start_x, y: start_y, w, h }; 
-                    let color = match arg5 as u8 { 
-                        0 => Color::BLACK, 1 => Color::BLUE, 2 => Color::GREEN, 3 => Color::CYAN, 
-                        4 => Color::RED, 5 => Color::BLUE, 14 => Color::YELLOW, _ => Color::WHITE, 
-                    }; 
-                    p.draw_rect(rect, color); 
-                } 
-            }
+        501 => { 
+             unsafe {
+                 if let Some(p) = &mut crate::SCREEN_PAINTER {
+                     let screen_w = p.info.width;
+                     let screen_h = p.info.height;
+                     let start_x = core::cmp::min(arg1 as usize, screen_w);
+                     let start_y = core::cmp::min(arg2 as usize, screen_h);
+                     let max_w = screen_w.saturating_sub(start_x);
+                     let max_h = screen_h.saturating_sub(start_y);
+                     let w = core::cmp::min(arg3 as usize, max_w);
+                     let h = core::cmp::min(arg4 as usize, max_h);
+
+                     let rect = Rect { x: start_x, y: start_y, w, h };
+                     let color = match arg5 as u8 {
+                         0 => Color::BLACK, 1 => Color::BLUE, 2 => Color::GREEN, 3 => Color::CYAN,
+                         4 => Color::RED, 5 => Color::BLUE, 14 => Color::YELLOW, _ => Color::WHITE,
+                     };
+                     p.draw_rect(rect, color);
+                 }
+             }
         },
+
         504 => { 
             let mut lo: u32;
             let mut hi: u32;
@@ -769,35 +883,40 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let tsc = ((hi as u64) << 32) | (lo as u64);
             frame.rax = tsc / 2_000_000; 
         },
+
         505 => { 
             let m = crate::mouse::MOUSE_STATE.lock();
             frame.rax = (m.x as u64) << 32 | (m.y as u64) << 16 | (if m.left_click {1} else {0}) << 1 | (if m.right_click {1} else {0});
         },
+
         506 => { if let Some(c) = crate::shell::pop_key() { frame.rax = c as u64; } else { frame.rax = 0; } },
+
         507 => { 
-            unsafe { 
-                if let Some(p) = &crate::SCREEN_PAINTER { 
-                    if is_valid_user_ptr(arg1 as *const u8, 8) && is_valid_user_ptr(arg2 as *const u8, 8) && is_valid_user_ptr(arg3 as *const u8, 8) { 
-                        *(arg1 as *mut u64) = p.info.width as u64; 
-                        *(arg2 as *mut u64) = p.info.height as u64; 
-                        *(arg3 as *mut u64) = if p.info.stride > 0 { p.info.stride } else { p.info.width } as u64; 
-                        frame.rax = 1; 
-                    } else { frame.rax = EFAULT as u64; } 
-                } else { frame.rax = 0; }
+             unsafe {
+                 if let Some(p) = &crate::SCREEN_PAINTER {
+                     if is_valid_user_ptr(arg1 as *const u8, 8) && is_valid_user_ptr(arg2 as *const u8, 8) && is_valid_user_ptr(arg3 as *const u8, 8) {
+                         *(arg1 as *mut u64) = p.info.width as u64;
+                         *(arg2 as *mut u64) = p.info.height as u64;
+                         *(arg3 as *mut u64) = if p.info.stride > 0 { p.info.stride } else { p.info.width } as u64;
+                         frame.rax = 1;
+                     } else { frame.rax = EFAULT as u64; }
+                 } else { frame.rax = 0; }
             }
         },
+
         508 => { 
-            unsafe { 
-                if let Some(p) = &mut crate::SCREEN_PAINTER { 
-                    let virt_start = p.buffer.as_ptr() as u64; 
-                    if let Some(phys) = crate::memory::virt_to_phys(virt_start) { 
-                        if let Ok(user_virt) = crate::memory::map_user_framebuffer(phys, (p.buffer.len() * 4) as u64) { 
-                            frame.rax = user_virt; 
-                        } else { frame.rax = 0; } 
-                    } else { frame.rax = 0; } 
-                } else { frame.rax = 0; }
+             unsafe {
+                 if let Some(p) = &mut crate::SCREEN_PAINTER {
+                     let virt_start = p.buffer.as_ptr() as u64;
+                     if let Some(phys) = crate::memory::virt_to_phys(virt_start) {
+                         if let Ok(user_virt) = crate::memory::map_user_framebuffer(phys, (p.buffer.len() * 4) as u64) {
+                             frame.rax = user_virt;
+                         } else { frame.rax = 0; }
+                     } else { frame.rax = 0; }
+                 } else { frame.rax = 0; }
             }
         },
+
         510 => { 
             let buf_ptr = arg1 as *const u8;
             let len = arg2 as usize;
@@ -807,12 +926,15 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = crate::fs::FS.lock().ls(path).len() as u64; 
             } else { frame.rax = 0; }
         },
+
         511 => { 
             let idx = arg1 as usize;
             let buf_ptr = arg2 as *mut u8;
             let path_ptr = arg3 as *const u8;
             let path_len = arg4 as usize;
+            
             if !is_valid_user_ptr(path_ptr, path_len) || !is_valid_user_ptr(buf_ptr, 256) { frame.rax = EFAULT as u64; return; }
+            
             let path_slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
                 let mut fs = crate::fs::FS.lock();
@@ -827,10 +949,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = 0; }
             } else { frame.rax = 0; }
         },
+
         517 => {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
             if !is_valid_user_ptr(buf_ptr, buf_len) { frame.rax = EFAULT as u64; return; }
+            
             let mcfg = unsafe { crate::acpi::ACPI_INFO.mcfg_addr.unwrap_or(0) };
             let madt = unsafe { crate::acpi::ACPI_INFO.madt_addr.unwrap_or(0) };
             let info = format!("Hardware Discovery Report:\nMCFG: {:#x}\nMADT: {:#x}", mcfg, madt);
@@ -839,10 +963,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             unsafe { for i in 0..len { *buf_ptr.add(i) = bytes[i]; } }
             frame.rax = len as u64;
         },
+
         518 => { 
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;
             if !is_valid_user_ptr(buf_ptr, buf_len) { frame.rax = EFAULT as u64; return; }
+            
             unsafe {
                 let log_len = core::cmp::min(crate::serial::BOOT_LOG_IDX, 8192);
                 let copy_len = core::cmp::min(buf_len, log_len);
@@ -850,6 +976,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = copy_len as u64;
             }
         },
+
         519 => { 
             let num_pages = arg1 as usize;
             if num_pages == 0 || num_pages > 8192 { frame.rax = 0; return; }
@@ -860,11 +987,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let task = &mut percpu.scheduler.tasks[curr_idx];
             let target_addr = task.mmap_bump;
             task.mmap_bump += (num_pages as u64) * 0x1000;
+
             match crate::memory::allocate_user_pages_at(target_addr, num_pages) {
                 Ok(mapped_addr) => frame.rax = mapped_addr,
                 Err(_) => frame.rax = 0, 
             }
         },
+
         520 => { 
             let buf_ptr = arg1 as *mut u8;
             if arg2 as usize >= 32 && is_valid_user_ptr(buf_ptr, 32) { 
@@ -872,6 +1001,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 1; 
             } else { frame.rax = EFAULT as u64; }
         },
+
         521 => { 
             let buf_ptr = arg1 as *mut f32;
             if arg2 as usize >= 4 && is_valid_user_ptr(buf_ptr as *const u8, 16) {
@@ -884,8 +1014,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 1; 
             } else { frame.rax = EFAULT as u64; }
         },
+
         522 => { frame.rax = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst) as u64; },
         523 => { frame.rax = crate::scheduler::CONTEXT_SWITCHES.load(Ordering::Relaxed); },
+
         _ => { frame.rax = EINVAL as u64; }
     }
 }
@@ -913,6 +1045,7 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
             FileDescriptor::Socket(sock_mtx) => {
                 crate::drivers::net::poll_network();
                 let sock = sock_mtx.lock();
+
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
                 if let Some(sockets) = sockets_lock.as_mut() {
                     match sock.kind {
@@ -932,7 +1065,6 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                                     if received > 0 { return received as isize; }
                                 }
                             } else if !socket.may_recv() {
-                                // 🚨 FIX 2: Tell user-space the connection closed! (EOF)
                                 return 0; 
                             }
                         }
@@ -984,10 +1116,11 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
         match fd_enum {
             FileDescriptor::File(open_file) => return open_file.write(buf_slice) as isize,
             FileDescriptor::Socket(sock_mtx) => {
-                // 🚨 FIX 3: Automatically poll the network on write! (Removes the need for dummy byte stealing)
                 crate::drivers::net::poll_network(); 
+
                 let sock = sock_mtx.lock();
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+                
                 if let Some(sockets) = sockets_lock.as_mut() {
                     match sock.kind {
                         SocketKind::Udp(handle) => {
@@ -1033,11 +1166,9 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
     if sockets_lock.is_none() { *sockets_lock = Some(smoltcp::iface::SocketSet::new(alloc::vec![])); }
     
     if let Some(sockets) = sockets_lock.as_mut() {
-        // Fetch a perfectly unique port every time
         let local_port = NEXT_LOCAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         
         let handle = if _typ == 1 {
-            // 🚨 BUMPED TCP WINDOW FROM 4KB TO 32KB TO HOLD GIANT SSL CERTIFICATES!
             let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
             let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
             let socket = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
@@ -1085,8 +1216,10 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
     
     let sockaddr = unsafe { &*(addr_ptr as *const SockAddrIn) };
     if sockaddr.sin_family != 2 { return EINVAL; }
+
     let port = u16::from_be(sockaddr.sin_port);
     let ip = sockaddr.sin_addr;
+
     let task = &mut percpu.scheduler.tasks[curr_idx];
     
     if fd < 32 {
@@ -1097,7 +1230,7 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
             
             if let SocketKind::Tcp(handle) = sock.kind {
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-                let mut iface_lock = crate::drivers::net::NET_IFACE.lock(); 
+                let mut iface_lock = crate::drivers::net::NET_IFACE.lock();
                 
                 if let (Some(sockets), Some(iface)) = (sockets_lock.as_mut(), iface_lock.as_mut()) {
                     let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
@@ -1109,9 +1242,7 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
                 }
             }
             
-            // 🚨 INSTANT PACKET FIRE 🚨
             crate::drivers::net::poll_network();
-            
             return 0; 
         }
     }

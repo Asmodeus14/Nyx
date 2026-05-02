@@ -113,21 +113,15 @@ pub struct Process {
 impl Process {
     pub fn new() -> Result<Self, &'static str> {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        
+        // THE FIX: Allocate the Kernel Stack FIRST, while still in the Parent's CR3!
+        // This ensures the Kernel Page Tables are updated BEFORE we clone them to the child!
+        let kernel_stack = crate::memory::allocate_kernel_stack(4);
+
         let pml4_frame = crate::memory::allocate_frame().ok_or("OOM: CR3 allocation failed")?;
         
+        // NOW clone the page tables. The child will safely inherit the newly mapped stack.
         crate::memory::clone_kernel_page_table(pml4_frame.start_address());
-
-        // 🚨 TELEPORT FIX: Ensure the new Kernel Stack maps to the Child's Brain
-        let kernel_stack = unsafe {
-            let old_cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
-            let child_cr3 = pml4_frame.start_address().as_u64();
-            
-            core::arch::asm!("mov cr3, {}", in(reg) child_cr3);
-            let stack = crate::memory::allocate_kernel_stack(4);
-            core::arch::asm!("mov cr3, {}", in(reg) old_cr3);
-            
-            stack
-        };
 
         Ok(Process {
             pid,

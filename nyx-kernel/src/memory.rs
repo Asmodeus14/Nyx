@@ -295,75 +295,76 @@ pub fn clone_kernel_page_table(new_pml4_phys: PhysAddr) {
 
 pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
     unsafe {
+        let mut lock = crate::memory::MEMORY_MANAGER.lock();
+        let system = lock.as_mut().expect("Memory System not initialized");
         let offset = PHYS_MEM_OFFSET;
-        let parent_pml4 = (parent_cr3.as_u64() + offset) as *const u64;
-        let child_pml4 = (child_cr3.as_u64() + offset) as *mut u64;
-
         let phys_mask = 0x000FFFFF_FFFFF000;
         let flags_mask = 0xFFF;
 
+        let parent_pml4 = (parent_cr3.as_u64() + offset) as *const u64;
+        let child_pml4 = (child_cr3.as_u64() + offset) as *mut u64;
+
+        // Loop ONLY over the lower half of memory (Userspace: indices 0..256)
         for i4 in 0..256 {
             let pml4_entry = *parent_pml4.add(i4);
             if pml4_entry & 1 == 0 { continue; }
 
-            let parent_pml3_phys = pml4_entry & phys_mask;
-            let child_pml3_frame = allocate_frame().expect("OOM PML3");
-            *child_pml4.add(i4) = child_pml3_frame.start_address().as_u64() | (pml4_entry & flags_mask);
+            let new_pml3 = system.frame_allocator.allocate_frame().expect("OOM: PML3");
+            let child_pml3_ptr = (new_pml3.start_address().as_u64() + offset) as *mut u64;
+            core::ptr::write_bytes(child_pml3_ptr as *mut u8, 0, 4096);
+            *child_pml4.add(i4) = new_pml3.start_address().as_u64() | (pml4_entry & flags_mask);
 
-            let parent_pml3 = (parent_pml3_phys + offset) as *const u64;
-            let child_pml3 = (child_pml3_frame.start_address().as_u64() + offset) as *mut u64;
-            core::ptr::write_bytes(child_pml3, 0, 512 * 8);
+            let parent_pml3_ptr = ((pml4_entry & phys_mask) + offset) as *const u64;
 
             for i3 in 0..512 {
-                let pml3_entry = *parent_pml3.add(i3);
+                let pml3_entry = *parent_pml3_ptr.add(i3);
                 if pml3_entry & 1 == 0 { continue; }
 
-                let parent_pml2_phys = pml3_entry & phys_mask;
-                let child_pml2_frame = allocate_frame().expect("OOM PML2");
-                *child_pml3.add(i3) = child_pml2_frame.start_address().as_u64() | (pml3_entry & flags_mask);
+                let new_pml2 = system.frame_allocator.allocate_frame().expect("OOM: PML2");
+                let child_pml2_ptr = (new_pml2.start_address().as_u64() + offset) as *mut u64;
+                core::ptr::write_bytes(child_pml2_ptr as *mut u8, 0, 4096);
+                *child_pml3_ptr.add(i3) = new_pml2.start_address().as_u64() | (pml3_entry & flags_mask);
 
-                let parent_pml2 = (parent_pml2_phys + offset) as *const u64;
-                let child_pml2 = (child_pml2_frame.start_address().as_u64() + offset) as *mut u64;
-                core::ptr::write_bytes(child_pml2, 0, 512 * 8);
+                let parent_pml2_ptr = ((pml3_entry & phys_mask) + offset) as *const u64;
 
                 for i2 in 0..512 {
-                    let pml2_entry = *parent_pml2.add(i2);
+                    let pml2_entry = *parent_pml2_ptr.add(i2);
                     if pml2_entry & 1 == 0 { continue; }
-                    
-                    // 🚨 THE HUGE PAGE FIX FOR REAL HARDWARE 🚨
-                    // If Bit 7 is set, this is a 2MB Huge Page (likely the GPU Framebuffer).
-                    // We simply shallow-copy the entry so the child inherits the hardware map!
-                    if pml2_entry & (1 << 7) != 0 { 
-                        *child_pml2.add(i2) = pml2_entry;
-                        continue; 
+
+                    // Hardware Framebuffers (Huge Pages). SHALLOW COPY THESE! 
+                    if pml2_entry & (1 << 7) != 0 {
+                        *child_pml2_ptr.add(i2) = pml2_entry;
+                        continue;
                     }
 
-                    let parent_pt_phys = pml2_entry & phys_mask;
-                    let child_pt_frame = allocate_frame().expect("OOM PT");
-                    *child_pml2.add(i2) = child_pt_frame.start_address().as_u64() | (pml2_entry & flags_mask);
+                    let new_pt = system.frame_allocator.allocate_frame().expect("OOM: PT");
+                    let child_pt_ptr = (new_pt.start_address().as_u64() + offset) as *mut u64;
+                    core::ptr::write_bytes(child_pt_ptr as *mut u8, 0, 4096);
+                    *child_pml2_ptr.add(i2) = new_pt.start_address().as_u64() | (pml2_entry & flags_mask);
 
-                    let parent_pt = (parent_pt_phys + offset) as *const u64;
-                    let child_pt = (child_pt_frame.start_address().as_u64() + offset) as *mut u64;
-                    core::ptr::write_bytes(child_pt, 0, 512 * 8);
+                    let parent_pt_ptr = ((pml2_entry & phys_mask) + offset) as *const u64;
 
                     for i1 in 0..512 {
-                        let pt_entry = *parent_pt.add(i1);
+                        let pt_entry = *parent_pt_ptr.add(i1);
                         if pt_entry & 1 == 0 { continue; }
 
-                        // Is this an MMIO or Framebuffer page? (Check NO_CACHE or lacking USER_ACCESSIBLE)
-                        if (pt_entry & 0x4) == 0 || (pt_entry & 0x10) != 0 {
-                            *child_pt.add(i1) = pt_entry; // SHALLOW COPY
-                            continue;
+                        // 🚨 THE CRITICAL FIX: Only deep-copy actual User RAM! 🚨
+                        // We check for USER_ACCESSIBLE (0x4) and ensure it is not an MMIO buffer (0x10 NO_CACHE)
+                        if (pt_entry & 0x4) != 0 && (pt_entry & 0x10) == 0 {
+                            // True User RAM. Deep copy it!
+                            let parent_page_phys = pt_entry & phys_mask;
+                            let child_page_frame = system.frame_allocator.allocate_frame().expect("OOM: Page");
+                            
+                            let dst_ptr = (child_page_frame.start_address().as_u64() + offset) as *mut u8;
+                            let src_ptr = (parent_page_phys + offset) as *const u8;
+                            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
+
+                            *child_pt_ptr.add(i1) = child_page_frame.start_address().as_u64() | (pt_entry & flags_mask);
+                        } else {
+                            // Kernel Heap, MMIO, Framebuffer. SHALLOW COPY!
+                            // This ensures the Kernel Heap is safely shared between processes without duplicating 64MB of RAM!
+                            *child_pt_ptr.add(i1) = pt_entry;
                         }
-
-                        // Otherwise, it is True User RAM. Deep copy it!
-                        let parent_page_phys = pt_entry & phys_mask;
-                        let child_page_frame = allocate_frame().expect("OOM Page");
-                        *child_pt.add(i1) = child_page_frame.start_address().as_u64() | (pt_entry & flags_mask);
-
-                        let parent_page = (parent_page_phys + offset) as *const u8;
-                        let child_page = (child_page_frame.start_address().as_u64() + offset) as *mut u8;
-                        core::ptr::copy_nonoverlapping(parent_page, child_page, 4096);
                     }
                 }
             }
@@ -373,7 +374,7 @@ pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
 
 pub fn clear_user_address_space(cr3_phys: PhysAddr) {
     unsafe {
-        let mut lock = MEMORY_MANAGER.lock();
+        let mut lock = crate::memory::MEMORY_MANAGER.lock();
         let system = lock.as_mut().expect("Memory System not initialized");
         let offset = PHYS_MEM_OFFSET;
         let pml4 = (cr3_phys.as_u64() + offset) as *mut u64;
@@ -382,43 +383,80 @@ pub fn clear_user_address_space(cr3_phys: PhysAddr) {
         for i4 in 0..256 {
             let pml4_entry = *pml4.add(i4);
             if pml4_entry & 1 == 0 { continue; }
-
             let pml3_phys = pml4_entry & phys_mask;
             let pml3 = (pml3_phys + offset) as *mut u64;
 
+            let mut pml3_empty = true;
             for i3 in 0..512 {
                 let pml3_entry = *pml3.add(i3);
                 if pml3_entry & 1 == 0 { continue; }
-
                 let pml2_phys = pml3_entry & phys_mask;
                 let pml2 = (pml2_phys + offset) as *mut u64;
 
+                let mut pml2_empty = true;
                 for i2 in 0..512 {
                     let pml2_entry = *pml2.add(i2);
                     if pml2_entry & 1 == 0 { continue; }
-                    if pml2_entry & (1 << 7) != 0 { continue; }
-
+                    
+                    // Hardware Framebuffers (Huge Pages)
+                    if pml2_entry & (1 << 7) != 0 { 
+                        if pml2_entry & 0x4 != 0 { // If User Accessible, unmap it
+                            *pml2.add(i2) = 0; 
+                        } else {
+                            pml2_empty = false; // Kernel huge page, keep it
+                        }
+                        continue; 
+                    }
+                    
                     let pt_phys = pml2_entry & phys_mask;
                     let pt = (pt_phys + offset) as *mut u64;
 
+                    let mut pt_empty = true;
                     for i1 in 0..512 {
                         let pt_entry = *pt.add(i1);
                         if pt_entry & 1 == 0 { continue; }
-
-                        // 🚨 THE WIPER LOGIC 🚨
-                        // Only free the RAM if it is USER_ACCESSIBLE and NOT hardware MMIO
-                        if (pt_entry & 0x4) != 0 && (pt_entry & 0x10) == 0 {
-                            let page_phys = pt_entry & phys_mask;
-                            system.frame_allocator.deallocate_frame(PhysFrame::containing_address(PhysAddr::new(page_phys)));
-                            *pt.add(i1) = 0; // Erase it from the table
+                        
+                        // Safely wipe ONLY User Accessible pages
+                        if (pt_entry & 0x4) != 0 {
+                            // If NOT NO_CACHE (0x10), it's standard RAM, free the frame
+                            if (pt_entry & 0x10) == 0 {
+                                let page_phys = pt_entry & phys_mask;
+                                use x86_64::structures::paging::PhysFrame;
+                                system.frame_allocator.deallocate_frame(PhysFrame::containing_address(x86_64::PhysAddr::new(page_phys)));
+                            }
+                            *pt.add(i1) = 0; // Safely unmap user page
+                        } else {
+                            pt_empty = false; // A kernel page lives here, DO NOT erase!
                         }
                     }
-                    // NOTE: We intentionally DO NOT free the intermediate PT/PML2 tables here!
-                    // Because the Kernel ELF lives in the lower half of memory, freeing these 
-                    // tables will delete the kernel routing and cause an instant page fault!
+                    
+                    if pt_empty {
+                        use x86_64::structures::paging::PhysFrame;
+                        system.frame_allocator.deallocate_frame(PhysFrame::containing_address(x86_64::PhysAddr::new(pt_phys)));
+                        *pml2.add(i2) = 0;
+                    } else {
+                        pml2_empty = false;
+                    }
+                }
+                
+                if pml2_empty {
+                    use x86_64::structures::paging::PhysFrame;
+                    system.frame_allocator.deallocate_frame(PhysFrame::containing_address(x86_64::PhysAddr::new(pml2_phys)));
+                    *pml3.add(i3) = 0;
+                } else {
+                    pml3_empty = false;
                 }
             }
+            
+            if pml3_empty {
+                use x86_64::structures::paging::PhysFrame;
+                system.frame_allocator.deallocate_frame(PhysFrame::containing_address(x86_64::PhysAddr::new(pml3_phys)));
+                *pml4.add(i4) = 0;
+            }
         }
-        core::arch::asm!("mov cr3, {}", in(reg) cr3_phys.as_u64()); // Flush TLB
+
+        // Flush the TLB
+        let active_cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+        core::arch::asm!("mov cr3, {}", in(reg) active_cr3); 
     }
 }

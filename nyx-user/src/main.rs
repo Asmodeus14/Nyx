@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
-extern crate alloc;
 
+extern crate alloc;
 use linked_list_allocator::LockedHeap;
 use alloc::vec::Vec;
 use alloc::vec;
@@ -20,18 +20,21 @@ use apps::monitor::SysMonitor;
 use apps::sysinfo::SysInfoApp;
 use apps::bootlog::BootlogApp;
 use apps::netchat::NetChatApp;
+use apps::browser::BrowserApp;
+
 use gfx::draw;
 use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-const MAX_WINDOWS: usize = 8;
+const MAX_WINDOWS: usize = 9;
 
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    const HEAP_PAGES: usize = 2048;
+    // 🚨 THE FIX: Bump Userspace Heap from 8MB to 16MB to prevent HTML parsing OOMs!
+    const HEAP_PAGES: usize = 4096;
     let heap_start = sys_alloc_pages(HEAP_PAGES);
     if heap_start == 0 { sys_exit(1); }
     unsafe { ALLOCATOR.lock().init(heap_start as usize, HEAP_PAGES * 4096); }
@@ -58,6 +61,7 @@ pub extern "C" fn _start() -> ! {
     
     draw::restore_wallpaper_rect(&mut back_buffer, screen_w, screen_h, 0, 0, screen_w, screen_h);
     
+    // Setup Windows
     let mut windows = [
         Window { id: 0, x: 50, y: 50, w: 760, h: 480, title: "Nyx Terminal", active: true, exists: true },
         Window { id: 1, x: 880, y: 50, w: 300, h: 200, title: "Sys Monitor", active: false, exists: true },
@@ -67,9 +71,11 @@ pub extern "C" fn _start() -> ! {
         Window { id: 5, x: 250, y: 150, w: 400, h: 250, title: "Hardware Profile", active: false, exists: false },
         Window { id: 6, x: 100, y: 100, w: 800, h: 800, title: "Kernel Boot Logs", active: false, exists: true },
         Window { id: 7, x: 300, y: 150, w: 450, h: 350, title: "NetChat", active: false, exists: false },
+        Window { id: 8, x: 150, y: 100, w: 850, h: 650, title: "NyxBrowser", active: false, exists: false },
     ];
-    let mut z_order = [0, 1, 2, 3, 4, 5, 6, 7];
+    let mut z_order = [0, 1, 2, 3, 4, 5, 6, 7, 8];
     
+    // Initialize Apps
     let mut my_terminal = Terminal::new();
     my_terminal.write_str("NyxOS Shell v0.6\nType 'ls' to list files.\n> ");
     
@@ -78,10 +84,10 @@ pub extern "C" fn _start() -> ! {
     let mut my_monitor = SysMonitor::new();
     let mut my_sysinfo = SysInfoApp::new();
     let mut my_bootlog = BootlogApp::new();
-    
-    // NetChat initialized safely!
     let mut my_netchat = NetChatApp::new();
     my_netchat.init();
+    
+    let mut my_browser = BrowserApp::new(); 
     
     let gpu_fd = sys_open("/dev/dri/card0");
     if gpu_fd >= 0 {
@@ -103,6 +109,7 @@ pub extern "C" fn _start() -> ! {
     let mut dirty_max_x = screen_w; let mut dirty_max_y = screen_h;
     let mut needs_redraw = true;
     
+    // --- MAIN EVENT LOOP ---
     loop {
         let now = sys_get_time();
         if now.wrapping_sub(last_frame) < ms_per_frame { unsafe { core::arch::asm!("nop"); } continue; }
@@ -119,20 +126,29 @@ pub extern "C" fn _start() -> ! {
             dirty_max_x = dirty_max_x.max(ex); dirty_max_y = dirty_max_y.max(ey);
         };
 
-        // 🚨 THE POSIX PIPE FIX 🚨
-        // Poll the pipe at 60 FPS. If the C program sent us text, 
-        // mark the terminal window as dirty and force an instant redraw!
+        // Poll POSIX Pipes for Terminal
         let old_history_len = my_terminal.history.len();
         my_terminal.pump_pipe();
         if my_terminal.history.len() != old_history_len {
             for w in windows.iter() {
-                if w.id == 0 && w.exists { // ID 0 is the Terminal
+                if w.id == 0 && w.exists { 
+                    mark_dirty(w.x, w.y, w.w, w.h);
+                    needs_redraw = true;
+                }
+            }
+        }
+
+        // Poll POSIX Pipes for the Browser
+        if my_browser.pump_pipe() {
+            for w in windows.iter() {
+                if w.id == 8 && w.exists {
                     mark_dirty(w.x, w.y, w.w, w.h);
                     needs_redraw = true;
                 }
             }
         }
         
+        // 1-Second Timer Updates
         if now / 1000 != last_second {
             last_second = now / 1000;
             let clock_w = 220; let clock_h = 80;
@@ -147,7 +163,6 @@ pub extern "C" fn _start() -> ! {
                     my_bootlog.refresh();
                     mark_dirty(w.x, w.y, w.w, w.h);
                 }
-                // Update NetChat seamlessly
                 if w.id == 7 && w.exists {
                     if my_netchat.update() {
                         mark_dirty(w.x, w.y, w.w, w.h);
@@ -158,6 +173,7 @@ pub extern "C" fn _start() -> ! {
             needs_redraw = true;
         }
         
+        // Handle Keyboard Events
         if let Some(c) = sys_read_key() {
             if windows[0].active && windows[0].exists {
                 my_terminal.handle_key(c);
@@ -175,13 +191,20 @@ pub extern "C" fn _start() -> ! {
                 mark_dirty(windows[7].x, windows[7].y, windows[7].w, windows[7].h);
                 needs_redraw = true;
             }
+            else if windows[8].active && windows[8].exists { 
+                my_browser.handle_key(c);
+                mark_dirty(windows[8].x, windows[8].y, windows[8].w, windows[8].h);
+                needs_redraw = true;
+            }
         }
         
+        // Handle Mouse Clicks
         if left && !prev_left {
             let mut handled = false;
             
             if show_start_menu {
-                let menu_w = 150; let menu_h = 320;
+                let menu_w = 150; 
+                let menu_h = 9 * 40;
                 let menu_x = 10; let menu_y = screen_h - TASKBAR_H - menu_h;
                 
                 if mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h {
@@ -195,6 +218,7 @@ pub extern "C" fn _start() -> ! {
                         5 => launch_app(&mut windows, &mut z_order, 5, &mut mark_dirty),
                         6 => launch_app(&mut windows, &mut z_order, 6, &mut mark_dirty),
                         7 => launch_app(&mut windows, &mut z_order, 7, &mut mark_dirty),
+                        8 => launch_app(&mut windows, &mut z_order, 8, &mut mark_dirty),
                         _ => {}
                     }
                     show_start_menu = false;
@@ -210,7 +234,7 @@ pub extern "C" fn _start() -> ! {
             if !handled && my >= screen_h - TASKBAR_H {
                 if mx < 100 {
                     show_start_menu = !show_start_menu;
-                    let menu_h = 320;
+                    let menu_h = 9 * 40; 
                     mark_dirty(10, screen_h - TASKBAR_H - menu_h, 150, menu_h + TASKBAR_H);
                     needs_redraw = true; handled = true;
                 }
@@ -262,6 +286,7 @@ pub extern "C" fn _start() -> ! {
                         if wid == 3 { my_editor.handle_click(rx, ry, ww); }
                         if wid == 4 { my_explorer.handle_click(rx, ry, ww); }
                         if wid == 6 { my_bootlog.handle_click(mx, my, wx, wy, ww, wh); }
+                        if wid == 8 { my_browser.handle_click(rx, ry, ww, wh); }
                     }
                     mark_dirty(wx, wy, ww, wh);
                     needs_redraw = true;
@@ -288,9 +313,12 @@ pub extern "C" fn _start() -> ! {
             needs_redraw = true;
         }
         
-        if mx != prev_mx || my != prev_my { mark_dirty(prev_mx, prev_my, 15, 15); mark_dirty(mx, my, 15, 15); needs_redraw = true; }
+        if mx != prev_mx || my != prev_my { 
+            mark_dirty(prev_mx, prev_my, 15, 15); mark_dirty(mx, my, 15, 15); needs_redraw = true; 
+        }
         prev_left = left;
         
+        // Render pass
         if needs_redraw && dirty_max_x > dirty_min_x {
             let dx = dirty_min_x; let dy = dirty_min_y;
             let dw = dirty_max_x - dx; let dh = dirty_max_y - dy;
@@ -316,8 +344,9 @@ pub extern "C" fn _start() -> ! {
                     } else if windows[idx].id == 6 {
                         my_bootlog.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     } else if windows[idx].id == 7 {
-                        // Render NetChat
                         my_netchat.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
+                    } else if windows[idx].id == 8 {
+                        my_browser.draw(&mut back_buffer, screen_w, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h);
                     }
                 }
             }
@@ -336,7 +365,7 @@ pub extern "C" fn _start() -> ! {
 
 fn draw_start_menu(fb: &mut [u32], w: usize, h: usize) {
     let menu_w = 150;
-    let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help", "Hardware Info", "Boot Logs", "NetChat"];
+    let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help", "Hardware Info", "Boot Logs", "NetChat", "Browser"];
     let item_h = 40;
     let menu_h = items.len() * item_h;
     

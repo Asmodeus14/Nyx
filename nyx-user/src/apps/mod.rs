@@ -8,3 +8,5 @@ pub mod bootlog;
 pub mod netchat;
 pub mod fetch;
 pub mod https;
+pub mod browser;
+pub mod dns;
