@@ -854,28 +854,92 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
         
         // --- CUSTOM NYXOS SYSCALLS ---
-        501 => { 
-             unsafe {
-                 if let Some(p) = &mut crate::SCREEN_PAINTER {
-                     let screen_w = p.info.width;
-                     let screen_h = p.info.height;
-                     let start_x = core::cmp::min(arg1 as usize, screen_w);
-                     let start_y = core::cmp::min(arg2 as usize, screen_h);
-                     let max_w = screen_w.saturating_sub(start_x);
-                     let max_h = screen_h.saturating_sub(start_y);
-                     let w = core::cmp::min(arg3 as usize, max_w);
-                     let h = core::cmp::min(arg4 as usize, max_h);
+        501 => {
+              unsafe {
+                 // Convert your color index to a raw 32-bit hex color for the GPU
+                 let raw_color = match arg5 as u8 {
+                     0 => 0xFF000000, // Black
+                     1 => 0xFF0000FF, // Blue
+                     2 => 0xFF00FF00, // Green
+                     3 => 0xFF00FFFF, // Cyan
+                     4 => 0xFFFF0000, // Red
+                     14 => 0xFFFFFF00, // Yellow
+                     _ => 0xFFFFFFFF, // White
+                 };
 
-                     let rect = Rect { x: start_x, y: start_y, w, h };
-                     let color = match arg5 as u8 {
-                         0 => Color::BLACK, 1 => Color::BLUE, 2 => Color::GREEN, 3 => Color::CYAN,
-                         4 => Color::RED, 5 => Color::BLUE, 14 => Color::YELLOW, _ => Color::WHITE,
-                     };
-                     p.draw_rect(rect, color);
+                 let mut hardware_accelerated = false;
+
+                 // Try to use the GPU first!
+                 if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
+                     if let Some(p) = &crate::gui::SCREEN_PAINTER {
+                         let screen_w = p.info.width as u32;
+                         let screen_h = p.info.height as u32;
+                         let pitch = (p.info.stride * 4) as u32;
+                         
+                         let start_x = core::cmp::min(arg1 as u32, screen_w);
+                         let start_y = core::cmp::min(arg2 as u32, screen_h);
+                         let max_w = screen_w.saturating_sub(start_x);
+                         let max_h = screen_h.saturating_sub(start_y);
+                         let w = core::cmp::min(arg3 as u32, max_w);
+                         let h = core::cmp::min(arg4 as u32, max_h);
+
+                         gpu.fill_rect(start_x, start_y, w, h, raw_color, pitch);
+                         hardware_accelerated = true;
+                     }
+                 }
+
+                 // CPU Fallback (If GPU is offline or not Intel)
+                 if !hardware_accelerated {
+                     if let Some(p) = &mut crate::gui::SCREEN_PAINTER {
+                         let screen_w = p.info.width;
+                         let screen_h = p.info.height;
+                         let start_x = core::cmp::min(arg1 as usize, screen_w);
+                         let start_y = core::cmp::min(arg2 as usize, screen_h);
+                         let max_w = screen_w.saturating_sub(start_x);
+                         let max_h = screen_h.saturating_sub(start_y);
+                         let w = core::cmp::min(arg3 as usize, max_w);
+                         let h = core::cmp::min(arg4 as usize, max_h);
+                         let rect = Rect { x: start_x, y: start_y, w, h };
+                         
+                         let color = match arg5 as u8 {
+                             0 => Color::BLACK, 1 => Color::BLUE, 2 => Color::GREEN, 3 => Color::CYAN,
+                             4 => Color::RED, 5 => Color::BLUE, 14 => Color::YELLOW, _ => Color::WHITE,
+                         };
+                         p.draw_rect(rect, color);
+                     }
                  }
              }
         },
 
+        502 => { // sys_swap_buffers
+             unsafe {
+                 if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
+                     // Because SCREEN_PAINTER is a `static mut`, reading it MUST be inside the unsafe block
+                     if let Some(p) = &crate::gui::SCREEN_PAINTER {
+                         let w = p.info.width as u32;
+                         let h = p.info.height as u32;
+                         let pitch = (p.info.stride * 4) as u32;
+                         
+                         // Copy from GPU Backbuffer (0x900000) to Real Screen (0x100000)
+                         gpu.copy_rect(
+                             0, 0, pitch, 0x900000, 
+                             0, 0, pitch, 0x100000, 
+                             w, h
+                         );
+                     }
+                 }
+             }
+        },
+
+        503 => { // sys_gpu_sync
+             unsafe {
+                 if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
+                     gpu.wait_for_idle();
+                 }
+             }
+        },
+
+        
         504 => { 
             let mut lo: u32;
             let mut hi: u32;
@@ -884,8 +948,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = tsc / 2_000_000; 
         },
 
+        
         505 => { 
             let m = crate::mouse::MOUSE_STATE.lock();
+            
+            // THE FIX: We are using the Software Cursor now, so we DO NOT call the GPU here.
+            // Just pack the coordinates and click states and return them to userspace!
+            
             frame.rax = (m.x as u64) << 32 | (m.y as u64) << 16 | (if m.left_click {1} else {0}) << 1 | (if m.right_click {1} else {0});
         },
 
@@ -905,15 +974,16 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         },
 
         508 => { 
-             unsafe {
-                 if let Some(p) = &mut crate::SCREEN_PAINTER {
-                     let virt_start = p.buffer.as_ptr() as u64;
-                     if let Some(phys) = crate::memory::virt_to_phys(virt_start) {
-                         if let Ok(user_virt) = crate::memory::map_user_framebuffer(phys, (p.buffer.len() * 4) as u64) {
-                             frame.rax = user_virt;
-                         } else { frame.rax = 0; }
-                     } else { frame.rax = 0; }
-                 } else { frame.rax = 0; }
+            unsafe {
+                if let Some(p) = &mut crate::gui::SCREEN_PAINTER {
+                    let virt_start = p.buffer.as_ptr() as u64;
+                    if let Some(phys) = crate::memory::virt_to_phys(virt_start) {
+                        // THE FIX: p.buffer.len() is ALREADY in bytes! Do not multiply by 4!
+                        if let Ok(user_virt) = crate::memory::map_user_framebuffer(phys, p.buffer.len() as u64) {
+                            frame.rax = user_virt;
+                        } else { frame.rax = 0; }
+                    } else { frame.rax = 0; }
+                } else { frame.rax = 0; }
             }
         },
 
@@ -948,6 +1018,15 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     }
                 } else { frame.rax = 0; }
             } else { frame.rax = 0; }
+        },
+
+        513 => { // sys_wait_vsync
+            unsafe {
+                if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
+                    gpu.wait_for_vsync();
+                }
+            }
+            frame.rax = 0;
         },
 
         517 => {

@@ -5,6 +5,7 @@
 #![feature(c_variadic)]
 #![feature(naked_functions)]
 #![allow(static_mut_refs)]
+#![allow(warnings)]
 
 extern crate alloc;
 

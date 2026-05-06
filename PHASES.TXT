@@ -1,0 +1,12 @@
+🗺️ The NyxOS Intel Graphics Roadmap
+Phase 1: PCI + MMIO + Enable Device (We are doing this right now)
+
+Phase 2: GGTT Setup (Global Graphics Translation Table mapping)
+
+Phase 3: Ring Buffer Init (Setting up the BLT command ring)
+
+Phase 4: BLT Fill (Testing the hardware with a solid color fill)
+
+Phase 4.5: Display Engine / Modesetting (Taking control of the physical screen output from UEFI/BIOS)
+
+Phase 5: Render Engine (The massive leap to the 3D pipeline and shaders)

@@ -77,6 +77,10 @@ pub fn sys_exit(code: i64) -> ! {
 // CUSTOM NYX-OS GUI & SYSTEM SYSCALLS
 // ─────────────────────────────────────────────────────────────────────────
 
+pub fn sys_gpu_sync() {
+    syscall(503, 0, 0, 0, 0, 0, 0);
+}
+
 pub fn sys_print(text: &str) {
     sys_write(1, text.as_bytes()); // FD 1 = STDOUT
 }
@@ -109,6 +113,10 @@ pub fn sys_get_entity_stats(stats: &mut [f32; 4]) {
 
 pub fn sys_get_active_cores() -> usize {
     syscall(522, 0, 0, 0, 0, 0, 0) as usize
+}
+
+pub fn sys_wait_vsync() {
+    syscall(513, 0, 0, 0, 0, 0, 0);
 }
 
 pub fn sys_get_mouse() -> (usize, usize, bool, bool) {

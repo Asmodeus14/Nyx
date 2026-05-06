@@ -101,7 +101,6 @@ pub fn enumerate_pci() {
     let header = unsafe { &*(mcfg_virt as *const McfgHeader) };
     let allocations_size = header.length as usize - core::mem::size_of::<McfgHeader>();
     let num_allocations = allocations_size / core::mem::size_of::<McfgAllocation>();
-
     let alloc_ptr = (mcfg_virt + core::mem::size_of::<McfgHeader>() as u64) as *const McfgAllocation;
 
     for i in 0..num_allocations {
@@ -122,7 +121,7 @@ fn enumerate_pci_legacy() {
     for dev in devices {
         match dev.class_id {
             0x02 => {
-                crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id); 
+                crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id);
                 
                 if dev.vendor_id == 0x8086 && dev.device_id == 0x06f0 {
                     crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
@@ -148,6 +147,7 @@ fn enumerate_pci_legacy() {
                         while cap_ptr != 0 {
                             let cap = PciDriver::read_config(dev.bus, dev.device, dev.func, cap_ptr as u8);
                             let cap_id = (cap & 0xFF) as u8;
+
                             if cap_id == 0x05 { 
                                 let msg_ctrl = PciDriver::read_config(dev.bus, dev.device, dev.func, (cap_ptr + 2) as u8);
                                 let is_64bit = (msg_ctrl & (1 << 7)) != 0;
@@ -174,6 +174,7 @@ fn enumerate_pci_legacy() {
                                 msg_ctrl_new |= 1;
                                 let mut cmd_new = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
                                 cmd_new |= 1 << 10;
+
                                 let ctrl_cfg = 0x80000000 | ((dev.bus as u32)<<16) | ((dev.device as u32)<<11) | ((dev.func as u32)<<8) | ((cap_ptr + 2) as u32);
                                 let cmd_cfg  = 0x80000000 | ((dev.bus as u32)<<16) | ((dev.device as u32)<<11) | ((dev.func as u32)<<8) | 0x04;
                                 unsafe {
@@ -189,30 +190,71 @@ fn enumerate_pci_legacy() {
 
                         use smoltcp::iface::{Config, Interface};
                         use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-
                         let hw_addr = HardwareAddress::Ethernet(EthernetAddress::from_bytes(&eth_driver.mac_address));
+
                         let mut config = Config::new();
                         config.hardware_addr = Some(hw_addr);
                         
                         let mut iface = Interface::new(config, &mut eth_driver);
                         
-                        // 🚨 FIX 1: Set NyxOS IP to match the Windows ICS subnet (192.168.137.x)
+                        // FIX 1: Set NyxOS IP to match the Windows ICS subnet (192.168.137.x)
                         let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 137, 99), 24);
                         iface.update_ip_addrs(|ip_addrs| {
                             ip_addrs.push(ip_addr).expect("Failed to assign IP");
                         });
 
-                        // 🚨 FIX 2: Route all external traffic to the Windows ICS Gateway
+                        // FIX 2: Route all external traffic to the Windows ICS Gateway
                         iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(192, 168, 137, 1)).unwrap();
 
                         *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
                         *crate::drivers::net::NET_IFACE.lock() = Some(iface);
                     }
                 }
-            }
+            },
             0x01 => crate::serial_println!("[PCI] Found Mass Storage: Vendor {:#06x}, Device {:#06x}", dev.vendor_id, dev.device_id),
-            0x03 => crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id),
             
+            // --- GPU LEGACY SCANNER FIX ---
+            0x03 => {
+                crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id);
+                
+                if dev.vendor_id == 0x8086 {
+                    crate::serial_println!("[PCI] Intel GPU Detected! Initiating Phase 1 (Legacy)...");
+
+                    // 1. ENABLE THE DEVICE (Bus Master & Memory Space)
+                    let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
+                    cmd |= 0x06; 
+                    let cmd_addr = 0x80000000 | ((dev.bus as u32) << 16) | ((dev.device as u32) << 11) | ((dev.func as u32) << 8) | 0x04;
+                    unsafe { 
+                        Port::<u32>::new(0xCF8).write(cmd_addr); 
+                        Port::<u32>::new(0xCFC).write(cmd); 
+                    }
+                    crate::serial_println!("[PCI] -> Bus Mastering & Memory Space Enabled.");
+
+                    // 2. FIND MMIO BASE (BAR0)
+                    let mmio_phys = driver.get_bar_address(&dev, 0).unwrap_or(0);
+                    crate::serial_println!("[PCI] -> MMIO Physical Address: {:#x}", mmio_phys);
+
+                    // 3. MAP THE MMIO REGISTERS
+                    if mmio_phys != 0 {
+                        // Map 4MB (0x400000) Uncached
+                        if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
+                            crate::serial_println!("[PCI] -> SUCCESS: MMIO Mapped at Virtual Base: {:#x}", mmio_virt);
+                            
+                            // START PHASE 2 & 3: Boot the driver
+                            crate::serial_println!("[PCI] Booting NyxOS Intel GPU Driver Stack...");
+                            let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, dev.device_id);
+                            gpu.initialize();
+                            *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
+                            
+                        } else {
+                            crate::serial_println!("[PCI] -> FATAL: Failed to map Intel GPU MMIO memory!");
+                        }
+                    } else {
+                        crate::serial_println!("[PCI] -> FATAL: Could not read BAR0 for Intel GPU!");
+                    }
+                }
+            },
+
             0x0C => {
                 if dev.subclass_id == 0x03 {
                     let class_sub_prog = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x08);
@@ -232,6 +274,7 @@ fn enumerate_pci_legacy() {
                             if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x10000) } {
                                 crate::serial_println!("[PCI] MMIO Mapped -> Virtual Base: {:#x}", mmio_virt);
                                 crate::serial_println!("[PCI] Booting NyxOS xHCI Driver Stack...");
+
                                 unsafe {
                                     match crate::usb::XhciController::new(mmio_virt) {
                                         Ok(mut controller) => {
@@ -278,8 +321,8 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
 
                         match class_code {
                             0x02 => {
-                                crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id); 
-                                
+                                crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
+                                  
                                 if vendor_id == 0x8086 && device_id == 0x06f0 {
                                     crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
                                 }
@@ -312,13 +355,14 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                         subclass_id: subclass,
                                     };
                                     
-                                    let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(pci_dev, mmio_phys);
+                                    let mut eth_driver = crate::drivers::net::rtl8168::Rtl8168Driver::new(pci_dev.clone(), mmio_phys);
                                     eth_driver.initialize();
 
                                     let mut cap_ptr = (PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, 0x34) & 0xFF) as u8;
                                     while cap_ptr != 0 {
                                         let cap = PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, cap_ptr as u8);
                                         let cap_id = (cap & 0xFF) as u8;
+
                                         if cap_id == 0x05 { 
                                             let msg_ctrl = PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, (cap_ptr + 2) as u8);
                                             let is_64bit = (msg_ctrl & (1 << 7)) != 0;
@@ -345,6 +389,7 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                             msg_ctrl_new |= 1;
                                             let mut cmd_new = PciDriver::read_config(pci_dev.bus, pci_dev.device, pci_dev.func, 0x04);
                                             cmd_new |= 1 << 10;
+
                                             let ctrl_cfg = 0x80000000 | ((pci_dev.bus as u32)<<16) | ((pci_dev.device as u32)<<11) | ((pci_dev.func as u32)<<8) | ((cap_ptr + 2) as u32);
                                             let cmd_cfg  = 0x80000000 | ((pci_dev.bus as u32)<<16) | ((pci_dev.device as u32)<<11) | ((pci_dev.func as u32)<<8) | 0x04;
                                             unsafe {
@@ -360,32 +405,75 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
 
                                     use smoltcp::iface::{Config, Interface};
                                     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-
                                     let hw_addr = HardwareAddress::Ethernet(EthernetAddress::from_bytes(&eth_driver.mac_address));
+
                                     let mut config = Config::new();
                                     config.hardware_addr = Some(hw_addr);
                                     
                                     let mut iface = Interface::new(config, &mut eth_driver);
                                     
-                                    // 🚨 FIX 1: Set NyxOS IP to match the Windows ICS subnet (192.168.137.x)
+                                    // FIX 1: Set NyxOS IP to match the Windows ICS subnet (192.168.137.x)
                                     let ip_addr = IpCidr::new(IpAddress::v4(192, 168, 137, 99), 24);
                                     iface.update_ip_addrs(|ip_addrs| {
                                         ip_addrs.push(ip_addr).expect("Failed to assign IP");
                                     });
 
-                                    // 🚨 FIX 2: Route all external traffic to the Windows ICS Gateway
+                                    // FIX 2: Route all external traffic to the Windows ICS Gateway
                                     iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(192, 168, 137, 1)).unwrap();
 
                                     *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);
                                     *crate::drivers::net::NET_IFACE.lock() = Some(iface);
                                 }
-                            }
+                            },
                             0x01 => crate::serial_println!("[PCI] Found Mass Storage: Vendor {:#06x}, Device {:#06x}", vendor_id, device_id),
-                            0x03 => crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id),
                             
+                            // --- GPU MODERN MCFG SCANNER FIX ---
+                            0x03 => {
+                                crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
+                                
+                                if vendor_id == 0x8086 {
+                                    crate::serial_println!("[PCI] Intel GPU Detected! Initiating Phase 1 (MCFG)...");
+                                    
+                                    // 1. ENABLE THE DEVICE (Bus Master & Memory Space)
+                                    let command_ptr = (device_virt + 0x04) as *mut u16;
+                                    let mut command = unsafe { core::ptr::read_volatile(command_ptr) };
+                                    command |= 0x06; 
+                                    unsafe { core::ptr::write_volatile(command_ptr, command) };
+                                    crate::serial_println!("[PCI] -> Bus Mastering & Memory Space Enabled.");
+
+                                    // 2. FIND MMIO BASE (BAR0)
+                                    let bar0 = unsafe { core::ptr::read_volatile((device_virt + 0x10) as *const u32) };
+                                    let is_64bit = (bar0 & 0b100) != 0;
+                                    let mut mmio_phys = (bar0 & 0xFFFFFFF0) as u64;
+
+                                    if is_64bit {
+                                        let bar1 = unsafe { core::ptr::read_volatile((device_virt + 0x14) as *const u32) };
+                                        mmio_phys |= (bar1 as u64) << 32;
+                                    }
+                                    crate::serial_println!("[PCI] -> MMIO Physical Address: {:#x}", mmio_phys);
+
+                                    // 3. MAP THE MMIO REGISTERS
+                                    if mmio_phys != 0 {
+                                        if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
+                                            crate::serial_println!("[PCI] -> SUCCESS: MMIO Mapped at Virtual Base: {:#x}", mmio_virt);
+                                            
+                                            // START PHASE 2 & 3: Boot the driver
+                                            crate::serial_println!("[PCI] Booting NyxOS Intel GPU Driver Stack...");
+                                            let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, device_id);
+                                            gpu.initialize();
+                                            *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
+                                            
+                                        } else {
+                                            crate::serial_println!("[PCI] -> FATAL: Failed to map Intel GPU MMIO memory!");
+                                        }
+                                    }
+                                }
+                            },
+
                             0x0C => {
                                 if subclass == 0x03 { // Subclass 0x03 = USB
                                     let prog_if = unsafe { core::ptr::read_volatile((device_virt + 9) as *const u8) };
+                                    
                                     if prog_if == 0x30 { // xHCI (USB 3.0)
                                         crate::serial_println!("[PCI] *** FOUND XHCI (USB 3.0) CONTROLLER: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
                                         
@@ -405,6 +493,7 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                         if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x10000) } {
                                             crate::serial_println!("[PCI] MMIO Mapped -> Virtual Base: {:#x}", mmio_virt);
                                             crate::serial_println!("[PCI] Booting NyxOS xHCI Driver Stack...");
+
                                             unsafe {
                                                 match crate::usb::XhciController::new(mmio_virt) {
                                                     Ok(mut controller) => {
