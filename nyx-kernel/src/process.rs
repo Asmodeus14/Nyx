@@ -134,4 +134,22 @@ impl Process {
             state: TaskState::Ready,
         })
     }
+    
+    pub fn new_thread(parent_cr3: PhysAddr) -> Result<Self, &'static str> {
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        
+        // Threads need their own KERNEL stack so they don't corrupt the parent's syscalls
+        let kernel_stack = crate::memory::allocate_kernel_stack(4);
+
+        Ok(Process {
+            pid,
+            parent_pid: None,
+            cr3: parent_cr3, // THE MAGIC: Share the EXACT same memory space!
+            saved_rsp: kernel_stack, 
+            kernel_stack_top: kernel_stack,
+            mmap_bump: 0x4000_0000_0000, 
+            fd_table: core::array::from_fn(|_| None),
+            state: TaskState::Ready,
+        })
+    }
 }

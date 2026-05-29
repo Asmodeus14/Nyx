@@ -1,2 +1,3 @@
 # Rust build outputs
 /target/
+nyx-recv/.venv

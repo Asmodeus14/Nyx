@@ -49,6 +49,8 @@ pub fn syscall(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, ar
     ret
 }
 
+
+
 // ─────────────────────────────────────────────────────────────────────────
 // POSIX STANDARD I/O
 // ─────────────────────────────────────────────────────────────────────────
@@ -223,7 +225,7 @@ pub struct sockaddr_in {
 }
 
 pub struct UdpSocket {
-    fd: i64,
+    pub fd: i64,
 }
 
 impl UdpSocket {
@@ -279,4 +281,29 @@ pub fn sys_getrandom(buf: &mut [u8]) -> i64 {
         );
     }
     ret as i64
+}
+// ────────────────────────────────────────────────────────────────────────Thread Creation Syscall (for Terminal Multithreading)
+
+#[inline(always)]
+pub fn sys_yield() {
+    // Standard POSIX sched_yield is syscall 24
+    syscall(24, 0, 0, 0, 0, 0, 0);
+}
+
+#[inline(always)]
+pub fn sys_spawn_thread(entry_point: extern "C" fn(), stack_top: *mut u8) -> u64 {
+    let mut ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 58, // Our custom SYS_SPAWN_THREAD
+            in("rdi") entry_point as u64,
+            in("rsi") stack_top as u64,
+            out("rcx") _,
+            out("r11") _,
+            lateout("rax") ret,
+            options(nostack)
+        );
+    }
+    ret
 }

@@ -717,6 +717,88 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             
             percpu.scheduler.tasks.push(child);
         },
+        58 => { // SYS_SPAWN_THREAD
+            let entry_point = arg1;
+            let user_stack = arg2;
+
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ENOSYS as u64; return; }
+            
+            let parent_cr3 = percpu.scheduler.tasks[curr_idx].cr3;
+            let mut thread = crate::process::Process::new_thread(parent_cr3).expect("Failed to spawn thread");
+            
+            {
+                let parent = &percpu.scheduler.tasks[curr_idx];
+                thread.parent_pid = Some(parent.pid);
+                thread.mmap_bump = parent.mmap_bump;
+
+                // Share the File Descriptors (Sockets)
+                for i in 0..32 {
+                    if let Some(fd) = &parent.fd_table[i] {
+                        thread.fd_table[i] = Some(fd.clone());
+                    }
+                }
+            }
+
+            let stack_top = thread.kernel_stack_top;
+            let iretq_ptr = stack_top - 40;
+
+            unsafe {
+                let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+                iret_slice[0] = entry_point;       // RIP: Where the thread starts executing
+                iret_slice[1] = 0x33;              // CS: Userspace Code Segment
+                iret_slice[2] = frame.r11 | 0x200; // RFLAGS: Enable Interrupts
+                iret_slice[3] = user_stack;        // RSP: The custom stack we allocated for the thread
+                iret_slice[4] = 0x2B;              // SS: Userspace Stack Segment
+            }
+
+            let regs_ptr = iretq_ptr - 120;
+            unsafe {
+                core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120); // Zero out general registers
+            }
+
+            let fxsave_ptr = (regs_ptr - 512) & !0xF;
+            unsafe {
+                core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
+                *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+            }
+
+            let final_rsp = fxsave_ptr - 16;
+            unsafe {
+                let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+                bottom[0] = regs_ptr; 
+                bottom[1] = 0;        
+            }
+
+            thread.saved_rsp = final_rsp;
+            frame.rax = thread.pid;
+            
+            // --- THE TRUE SMP LOAD BALANCER ---
+            unsafe {
+                let active_cores = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
+                let mut target_core = percpu.logical_id;
+                let mut min_tasks = usize::MAX;
+
+                // 1. Scan all active CPU cores
+                if let Some(all_cores) = &mut crate::percpu::PER_CPU {
+                    for i in 0..active_cores {
+                        let count = all_cores[i].scheduler.tasks.len();
+                        
+                        // 2. Find the core with the lightest workload
+                        if count < min_tasks {
+                            min_tasks = count;
+                            target_core = i;
+                        }
+                    }
+                    
+                    crate::serial_println!("[SMP] Load Balancer: Offloading Thread to Core {} (Tasks: {})", target_core, min_tasks);
+                    
+                    // 3. Inject the thread directly into the idle core's hardware queue!
+                    all_cores[target_core].scheduler.tasks.push(thread);
+                }
+            }
+            // ----------------------------------
+        },
           
         59 => { // SYS_EXECVE
             let buf_ptr = arg1 as *const u8;
