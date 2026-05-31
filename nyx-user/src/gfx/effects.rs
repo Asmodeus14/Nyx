@@ -29,22 +29,30 @@ pub fn blend_color(fg: u32, bg: u32, alpha: u8) -> u32 {
 /// Simple Box Blur (Average of neighbors)
 /// Note: A true Gaussian blur is expensive. 
 /// We simulate it by running a simple "box" average 2-3 times.
-pub fn box_blur(buffer: &mut [u32], w: usize, _h: usize, rect_x: usize, rect_y: usize, rect_w: usize, rect_h: usize, _radius: usize) {
+pub fn box_blur(buffer: &mut [u32], screen_w: usize, screen_h: usize, rect_x: usize, rect_y: usize, rect_w: usize, rect_h: usize, _radius: usize) {
     // 1. Create a temporary buffer for the blur area to avoid reading-while-writing artifacts
     // In a real OS, you'd alloc this. For now, we limit blur area to avoid stack overflow.
     // MAX BLUR AREA: 300x300 (Small clock size)
     const MAX_BLUR_PIXELS: usize = 300 * 300;
     if rect_w * rect_h > MAX_BLUR_PIXELS { return; }
 
+    // Safely clamp the blur region to the screen boundaries so we NEVER read out of bounds
+    let start_y = (rect_y + 1).max(1);
+    let end_y = (rect_y + rect_h).min(screen_h.saturating_sub(1));
+    
+    let start_x = (rect_x + 1).max(1);
+    let end_x = (rect_x + rect_w).min(screen_w.saturating_sub(1));
+
+    if start_y >= end_y || start_x >= end_x { return; }
+
     // Simple "Frosted" effect (Fast 3x3 kernel)
-    // We iterate internal pixels only to avoid boundary checks for speed
-    for y in (rect_y + 1)..(rect_y + rect_h - 1) {
-        for x in (rect_x + 1)..(rect_x + rect_w - 1) {
-            let offset = y * w + x;
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let offset = y * screen_w + x;
             
-            // Sample Up, Down, Left, Right
-            let p1 = buffer[offset - w];
-            let p2 = buffer[offset + w];
+            // Sample Up, Down, Left, Right (mathematically guaranteed to be in bounds now)
+            let p1 = buffer[offset - screen_w];
+            let p2 = buffer[offset + screen_w];
             let p3 = buffer[offset - 1];
             let p4 = buffer[offset + 1];
             let p5 = buffer[offset]; // Center

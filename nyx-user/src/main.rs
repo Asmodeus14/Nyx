@@ -50,11 +50,9 @@ pub fn sys_wait_vsync() {
     syscall(513, 0, 0, 0, 0, 0, 0);
 }
 
-// --- NEW: POWER MANAGEMENT YIELD ---
 pub fn sys_sleep_ms(ms: u64) {
     syscall(525, ms, 0, 0, 0, 0, 0);
 }
-// ----------------------------------------------
 
 #[no_mangle]
 #[link_section = ".text.entry"]
@@ -70,7 +68,6 @@ pub extern "C" fn _start() -> ! {
     let fb_ptr = sys_map_framebuffer();
     if fb_ptr == 0 { sys_exit(3); }
 
-    // Clear the physical screen to dark gray on boot to erase kernel logs
     let hardware_fb = unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u32, screen_stride * screen_h) };
     hardware_fb.fill(0xFF1E1E1E);
 
@@ -119,20 +116,21 @@ pub extern "C" fn _start() -> ! {
         let now = sys_get_time();
         let elapsed = now.wrapping_sub(last_frame);
         
-        // ==========================================
-        // THE HARDWARE POWER MANAGEMENT FIX
-        // ==========================================
         if elapsed < ms_per_frame { 
             let time_to_sleep = ms_per_frame - elapsed;
-            // INSTANTLY yields the CPU back to the kernel, allowing the Idle Task to fire `hlt`!
             sys_sleep_ms(time_to_sleep as u64); 
             continue; 
         }
         
         last_frame = now;
         
-        let (mx_raw, my_raw, left, _) = sys_get_mouse();
-        let mx = mx_raw.clamp(0, screen_w - 1); let my = my_raw.clamp(0, screen_h - 1);
+        // ==========================================
+        // CORRECT MOUSE POLLING: No Loops, Just Absolute State!
+        // ==========================================
+        let (mx_raw, my_raw, left, _right) = sys_get_mouse();
+        
+        let mx = mx_raw.clamp(0, screen_w - 1); 
+        let my = my_raw.clamp(0, screen_h - 1);
         
         let mut mark_dirty = |x: usize, y: usize, w: usize, h: usize| {
             let pad = 20;
@@ -233,8 +231,8 @@ pub extern "C" fn _start() -> ! {
         if is_dragging {
             let win = &mut windows[target_idx];
             let old_x = win.x; let old_y = win.y; let old_w = win.w; let old_h = win.h;
-            win.x = (mx as isize - drag_off_x).clamp(0, (screen_w - win.w) as isize) as usize;
-            win.y = (my as isize - drag_off_y).clamp(0, (screen_h - TASKBAR_H - win.h) as isize) as usize;
+            win.x = (mx as isize - drag_off_x).clamp(0, (screen_w.saturating_sub(win.w)) as isize) as usize;
+            win.y = (my as isize - drag_off_y).clamp(0, (screen_h.saturating_sub(TASKBAR_H + win.h)) as isize) as usize;
             mark_dirty(old_x, old_y, old_w, old_h);
             mark_dirty(win.x, win.y, win.w, win.h);
             needs_redraw = true;
@@ -243,8 +241,8 @@ pub extern "C" fn _start() -> ! {
             let win = &mut windows[target_idx];
             let old_x = win.x; let old_y = win.y; let old_w = win.w; let old_h = win.h;
             let new_right = mx as isize + drag_off_x; let new_bottom = my as isize + drag_off_y;
-            win.w = (new_right - win.x as isize).max(300).min((screen_w - win.x) as isize) as usize;
-            win.h = (new_bottom - win.y as isize).max(200).min((screen_h - TASKBAR_H - win.y) as isize) as usize;
+            win.w = (new_right - win.x as isize).max(300).min((screen_w.saturating_sub(win.x)) as isize) as usize;
+            win.h = (new_bottom - win.y as isize).max(200).min((screen_h.saturating_sub(TASKBAR_H + win.y)) as isize) as usize;
             mark_dirty(old_x, old_y, old_w, old_h);
             mark_dirty(win.x, win.y, win.w, win.h);
             needs_redraw = true;
@@ -358,5 +356,4 @@ fn draw_desktop_icons(fb: &mut [u32], w: usize, h: usize) {
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     sys_write(2, b"\n[USERSPACE PANIC] Rust panicked in Ring 3!\n");
     sys_exit(99);
-    loop {}
 }

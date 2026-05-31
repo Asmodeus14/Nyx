@@ -3,7 +3,6 @@ use noto_sans_mono_bitmap::{get_raster, FontWeight, RasterHeight};
 use alloc::vec::Vec;
 use alloc::vec;
 
-// Store Physical Address of Framebuffer here (for Syscalls)
 pub static mut SCREEN_PAINTER: Option<VgaPainter<'static>> = None;
 pub static mut BACK_BUFFER: Option<BackBuffer> = None;
 pub static mut FRAMEBUFFER_PHYS_ADDR: u64 = 0;
@@ -33,19 +32,15 @@ impl Color {
     pub fn new(r: u8, g: u8, b: u8) -> Self { Self { r, g, b } }
 }
 
-// --- TURBO COPY: Optimized 64-bit Memory Copy ---
-// Uses u64 writes to move 8 bytes at a time, significantly faster than byte-by-byte.
 pub unsafe fn turbo_copy(dest: *mut u8, src: *const u8, count: usize) {
     let mut i = 0;
     
-    // Bulk Copy (u64)
     while i + 8 <= count {
         let val = *(src.add(i) as *const u64);
         *(dest.add(i) as *mut u64) = val;
         i += 8;
     }
 
-    // Trailing Bytes
     while i < count {
         *dest.add(i) = *src.add(i);
         i += 1;
@@ -61,7 +56,6 @@ pub trait Painter {
     fn height(&self) -> usize;
 }
 
-// --- HARDWARE PAINTER (Direct VRAM Access) ---
 pub struct VgaPainter<'a> {
     pub buffer: &'a mut [u8],
     pub info: FrameBufferInfo,
@@ -86,7 +80,8 @@ impl<'a> Painter for VgaPainter<'a> {
             if byte_offset >= self.buffer.len() { break; }
 
             for x in 0..rect.w {
-                if rect.x + x >= self.info.width { break; }
+                // FIX: Use saturating_add to prevent boundary check bypass on underflow
+                if rect.x.saturating_add(x) >= self.info.width { break; }
                 let idx = byte_offset + (x * bpp);
                 
                 if idx + 2 < self.buffer.len() {
@@ -149,7 +144,6 @@ impl<'a> Painter for VgaPainter<'a> {
     }
 }
 
-// --- SOFTWARE BACKBUFFER (Double Buffering) ---
 pub struct BackBuffer {
     pub buffer: Vec<u8>,
     pub info: FrameBufferInfo,
@@ -157,7 +151,6 @@ pub struct BackBuffer {
 
 impl BackBuffer {
     pub fn new(info: FrameBufferInfo) -> Self {
-        // IMPORTANT: We use stride here to match hardware layout exactly
         let size = info.stride * info.height * info.bytes_per_pixel;
         Self {
             buffer: vec![0; size],
@@ -165,7 +158,6 @@ impl BackBuffer {
         }
     }
 
-    // Flips the backbuffer to the screen
     pub fn present(&self, screen: &mut VgaPainter) {
         let len = self.buffer.len().min(screen.buffer.len());
         unsafe {
@@ -202,7 +194,6 @@ impl Painter for BackBuffer {
 
     fn clear(&mut self, color: Color) {
         if color == Color::BLACK {
-            // Turbo Clear (memset 0)
             self.buffer.fill(0);
             return;
         }
@@ -219,7 +210,8 @@ impl Painter for BackBuffer {
             let mut idx = offset * bpp;
 
             for x in 0..rect.w {
-                if rect.x + x >= self.width() { break; }
+                // FIX: Use saturating_add to prevent boundary check bypass on underflow
+                if rect.x.saturating_add(x) >= self.width() { break; }
                 self.put_pixel(idx, color);
                 idx += bpp;
             }

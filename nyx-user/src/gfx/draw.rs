@@ -39,6 +39,7 @@ pub fn draw_text(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, text: &
         cx += font::CHAR_WIDTH;
     }
 }
+
 /// Draws a filled rectangle on the framebuffer with strict bounds checking.
 pub fn draw_rect(
     fb: &mut [u32], 
@@ -83,7 +84,6 @@ pub fn restore_wallpaper_rect(fb: &mut [u32], w: usize, h: usize, x: usize, y: u
     }
 }
 
-
 /// Draws a rounded glass rectangle with a border
 pub fn draw_glass_rounded_rect(
     fb: &mut [u32], 
@@ -95,16 +95,15 @@ pub fn draw_glass_rounded_rect(
     alpha: u8
 ) {
     // 1. Blur the background region (Rectangle)
-    // This creates the "frost" effect.
     for _ in 0..3 {
         box_blur(fb, screen_w, screen_h, x, y, w, h, 1);
     }
 
-    let radius_sq = radius * radius;
     // Pre-calculate border colors
-    // Top/Left is brighter (Light source), Bottom/Right is dimmer
     let border_light = 0x88FFFFFF; 
     let border_dark  = 0x44FFFFFF;
+
+    let r = radius as isize;
 
     // 2. Scan every pixel in the box
     for row in 0..h {
@@ -120,37 +119,35 @@ pub fn draw_glass_rounded_rect(
             let w_i = w as isize;
             let h_i = h as isize;
 
-            // --- Rounded Corner Math ---
+            // --- Rounded Corner Math (Mathematically Safe) ---
             let mut in_corner = false;
             let mut on_border = false;
 
-            // Check Top-Left
-            if cx < radius && cy < radius {
-                let d = (radius - cx - 1).pow(2) + (radius - cy - 1).pow(2);
-                if d > radius_sq { in_corner = true; }      // Outside rounded area
-                else if d >= (radius - 2).pow(2) { on_border = true; } // Edge
-            }
-            // Check Top-Right
-            else if cx >= w_i - radius && cy < radius {
-                let d = (cx - (w_i - radius)).pow(2) + (radius - cy - 1).pow(2);
-                if d > radius_sq { in_corner = true; }
-                else if d >= (radius - 2).pow(2) { on_border = true; }
-            }
-            // Check Bottom-Left
-            else if cx < radius && cy >= h_i - radius {
-                let d = (radius - cx - 1).pow(2) + (cy - (h_i - radius)).pow(2);
-                if d > radius_sq { in_corner = true; }
-                else if d >= (radius - 2).pow(2) { on_border = true; }
-            }
-            // Check Bottom-Right
-            else if cx >= w_i - radius && cy >= h_i - radius {
-                let d = (cx - (w_i - radius)).pow(2) + (cy - (h_i - radius)).pow(2);
-                if d > radius_sq { in_corner = true; }
-                else if d >= (radius - 2).pow(2) { on_border = true; }
-            }
-            // Check Straight Edges
-            else {
-                if col < 1 || col >= w - 1 || row < 1 || row >= h - 1 { on_border = true; }
+            let dist_sq = if cx < r && cy < r {
+                // Top-Left
+                (r - cx - 1).pow(2) + (r - cy - 1).pow(2)
+            } else if cx >= w_i - r && cy < r {
+                // Top-Right
+                (cx - (w_i - r)).pow(2) + (r - cy - 1).pow(2)
+            } else if cx < r && cy >= h_i - r {
+                // Bottom-Left
+                (r - cx - 1).pow(2) + (cy - (h_i - r)).pow(2)
+            } else if cx >= w_i - r && cy >= h_i - r {
+                // Bottom-Right
+                (cx - (w_i - r)).pow(2) + (cy - (h_i - r)).pow(2)
+            } else {
+                // Not near any corner
+                0 
+            };
+
+            if dist_sq > r * r {
+                in_corner = true; 
+            } 
+            else if dist_sq >= (r - 2).max(0).pow(2) && dist_sq <= r * r {
+                on_border = true;
+            } 
+            else if col < 1 || col >= w - 1 || row < 1 || row >= h - 1 {
+                on_border = true;
             }
 
             // 3. Pixel Writing

@@ -5,7 +5,7 @@ use lazy_static::lazy_static;
 use crate::gui::{Painter, Rect, Color, turbo_copy}; 
 use crate::mouse::MouseState;
 use core::fmt::Write; 
-use bootloader_api::info::PixelFormat; // Required for the green-shift fix
+use bootloader_api::info::PixelFormat;
 
 lazy_static! {
     pub static ref WINDOW_MANAGER: Mutex<WindowManager> = Mutex::new(WindowManager::new());
@@ -71,7 +71,8 @@ impl Window {
         painter.draw_rect(Rect::new(self.x + 6, self.y + 6, self.w, self.h), Color::new(5, 5, 5));
 
         let border_color = if is_active { Color::new(200, 200, 200) } else { Color::new(60, 60, 60) };
-        painter.draw_rect(Rect::new(self.x - 2, self.y - 2, self.w + 4, self.h + 4), border_color);
+        // FIX: Use saturating_sub to prevent GPF when dragging past the left/top edges
+        painter.draw_rect(Rect::new(self.x.saturating_sub(2), self.y.saturating_sub(2), self.w + 4, self.h + 4), border_color);
         painter.draw_rect(Rect::new(self.x, self.y, self.w, self.h), self.content_color);
 
         let header_color = if is_active { 
@@ -142,7 +143,6 @@ impl WindowManager {
         }
     }
     
-    // --- THIS IS THE MISSING METHOD CAUSING YOUR ERROR ---
     pub fn console_print(&mut self, c: char) {
         for win in self.windows.iter_mut().rev() {
             if win.window_type == WindowType::DebugLog {
@@ -157,9 +157,7 @@ impl WindowManager {
         self.prev_left = mouse.left_click; self.prev_right = mouse.right_click;
     }
 
-    // Handles both Stride AND Pixel Format (3 vs 4 bytes)
     pub fn draw(&self, painter: &mut crate::gui::BackBuffer) {
-        // Only draw desktop if buffer is ready
         if self.desktop_buffer.len() == self.screen_width * self.screen_height {
             let stride = painter.info.stride;
             let width = self.screen_width;
@@ -169,25 +167,20 @@ impl WindowManager {
 
             match bpp {
                 4 => {
-                    // Optimized path for 32-bit (4 byte) color
                     for y in 0..height {
                         let src_idx = y * width;
                         let dest_offset = (y * stride) * 4;
                         
-                        // Bounds check
                         if src_idx < self.desktop_buffer.len() && dest_offset < painter.buffer.len() {
                             unsafe {
                                 let src_ptr = self.desktop_buffer.as_ptr().add(src_idx) as *const u8;
                                 let dest_ptr = painter.buffer.as_mut_ptr().add(dest_offset);
-                                // We copy exactly 'width' pixels
                                 turbo_copy(dest_ptr, src_ptr, width * 4);
                             }
                         }
                     }
                 },
                 3 => {
-                    // Slow path for 24-bit (3 byte) color
-                    // We must manually convert u32 (0xRRGGBB) -> 3 bytes
                     for y in 0..height {
                         let src_start = y * width;
                         let dest_start = (y * stride) * 3;
@@ -197,7 +190,6 @@ impl WindowManager {
                             let dest_idx = dest_start + (x * 3);
                             
                             if dest_idx + 2 < painter.buffer.len() {
-                                // Extract RGB
                                 let r = ((color >> 16) & 0xFF) as u8;
                                 let g = ((color >> 8) & 0xFF) as u8;
                                 let b = (color & 0xFF) as u8;
@@ -218,13 +210,12 @@ impl WindowManager {
                         }
                     }
                 },
-                _ => {} // Not supported
+                _ => {}
             }
         } else {
             painter.clear(Color::new(0, 0, 30));
         }
 
-        // Draw Kernel Windows
         for (i, w) in self.windows.iter().enumerate() { 
              w.draw(painter, i == self.windows.len()-1); 
         }
