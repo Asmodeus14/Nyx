@@ -1,78 +1,57 @@
-use crate::syscalls::sys_get_context_switches;
+use alloc::format;
 use crate::gfx::draw;
+use crate::syscalls::{sys_get_system_info, SystemInfo, TaskInfo};
 
 pub struct SysMonitor {
-    last_switches: u64,
-    switches_per_sec: u64,
+    info: SystemInfo,
 }
 
 impl SysMonitor {
     pub fn new() -> Self {
-        Self {
-            last_switches: 0,
-            switches_per_sec: 0,
-        }
+        let mut info = unsafe { core::mem::zeroed() };
+        sys_get_system_info(&mut info);
+        Self { info }
     }
 
-    /// Called once per second by the main loop to calculate delta
     pub fn update_stats(&mut self) {
-        let current = sys_get_context_switches();
-        self.switches_per_sec = current.saturating_sub(self.last_switches);
-        self.last_switches = current;
+        sys_get_system_info(&mut self.info);
     }
 
-    /// Renders the monitor content into the window bounds (ZERO ALLOCATIONS)
-    pub fn draw(&mut self, fb: &mut [u32], screen_w: usize, screen_h: usize, window_x: usize, window_y: usize) {
-        let content_x = window_x + 20;
-        let content_y = window_y + 40;
+    pub fn draw(&self, fb: &mut [u32], screen_w: usize, screen_h: usize, x: usize, y: usize) {
+        // Draw Window Background
+        draw::draw_rect(fb, screen_w, screen_h, x, y, 320, 260, 0xFF181818); 
+        draw::draw_rect(fb, screen_w, screen_h, x, y, 320, 25, 0xFF2A2A2A);
+        draw::draw_text(fb, screen_w, screen_h, x + 10, y + 5, "NyxOS Live Telemetry", 0xFFFFFFFF);
+
+        let mut cy = y + 40;
         
-        // We set a fixed "Right Edge" for our numbers so they align perfectly.
-        // 16 chars for the label * 8px = 128px offset. We add 100px for the number box width.
-        let number_right_edge = content_x + 228; 
-
-        // Row 1: Total Switches
-        draw::draw_text(fb, screen_w, screen_h, content_x, content_y, "Total Switches: ", 0xFFFFFFFF); 
-        Self::draw_number_right_aligned(fb, screen_w, screen_h, number_right_edge, content_y, self.last_switches, 0xFFFFFFFF);
-
-        // Row 2: Switches per Second
-        draw::draw_text(fb, screen_w, screen_h, content_x, content_y + 25, "Switches / Sec: ", 0xFFFFFF00); 
-        Self::draw_number_right_aligned(fb, screen_w, screen_h, number_right_edge, content_y + 25, self.switches_per_sec, 0xFFFFFF00);
+        // 1. SILICON THERMALS
+        let temp_color = if self.info.current_temp >= 80 { 0xFFFF3333 } 
+                         else if self.info.current_temp > 60 { 0xFFFFFF33 } 
+                         else { 0xFF33FF33 };
+        draw::draw_text(fb, screen_w, screen_h, x + 15, cy, &format!("Silicon Temp : {} C", self.info.current_temp), temp_color);
+        cy += 25;
         
-        // Row 3: Active Threads
-        draw::draw_text(fb, screen_w, screen_h, content_x, content_y + 50, "Active Threads: 3", 0xFF00FFFF); 
-    }
+        // 2. LIVE SMM FAN TACHOMETER
+        draw::draw_text(fb, screen_w, screen_h, x + 15, cy, &format!("CPU Fan Speed: {} RPM", self.info.cpu_fan_rpm), 0xFF00AAFF);
+        cy += 20;
+        draw::draw_text(fb, screen_w, screen_h, x + 15, cy, &format!("GPU Fan Speed: {} RPM", self.info.gpu_fan_rpm), 0xFF00AAFF);
+        cy += 25;
 
-    // --- MICRO-OPTIMIZATION: Right-Aligned Stack Rendering ---
-    fn draw_number_right_aligned(fb: &mut [u32], w: usize, h: usize, right_x: usize, y: usize, mut val: u64, color: u32) {
-        // Edge case for zero
-        if val == 0 {
-            // '0' is 1 char = 8px wide
-            draw::draw_text(fb, w, h, right_x - 8, y, "0", color);
-            return;
+        // 3. TASK SCHEDULER
+        draw::draw_text(fb, screen_w, screen_h, x + 15, cy, &format!("Total Tasks  : {}", self.info.task_count), 0xFFAAAAAA);
+        cy += 20;
+        
+        draw::draw_rect(fb, screen_w, screen_h, x + 15, cy, 290, 1, 0xFF444444);
+        cy += 10;
+        
+        // Render top 5 active tasks
+        let limit = core::cmp::min(self.info.task_count as usize, 5);
+        for i in 0..limit {
+            let t = &self.info.tasks[i];
+            let name = if let Ok(s) = core::str::from_utf8(&t.name) { s.trim_matches(char::from(0)) } else { "Unknown" };
+            draw::draw_text(fb, screen_w, screen_h, x + 15, cy, &format!("PID {:02} | {} | {} Ticks", t.pid, name, t.cpu_ticks), 0xFF888888);
+            cy += 16;
         }
-
-        // A u64 maxes out at 20 digits, so a 20-byte stack array is perfect.
-        let mut buf = [0u8; 20];
-        let mut i = 20;
-
-        // Extract digits mathematically from right to left
-        while val > 0 {
-            i -= 1;
-            buf[i] = b'0' + (val % 10) as u8;
-            val /= 10;
-        }
-
-        // Calculate how many characters we actually generated
-        let char_count = 20 - i;
-        let text_width = char_count * 8; // Assumes your font is 8 pixels wide
-        
-        // Shift the starting X coordinate left based on the width of the number!
-        let start_x = right_x.saturating_sub(text_width);
-
-        // Unchecked conversion because we mathematically guarantee 0-9 ASCII bounds
-        let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
-        
-        // Draw the cleanly formatted string
-        draw::draw_text(fb, w, h, start_x, y, s, color);
     }
 }

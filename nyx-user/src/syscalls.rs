@@ -1,5 +1,26 @@
 use core::arch::asm;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TaskInfo {
+    pub pid: u64,
+    pub cpu_ticks: u64,
+    pub state: u8, 
+    pub name: [u8; 16],
+}
+
+#[repr(C)]
+pub struct SystemInfo {
+    pub current_temp: u8,
+    pub active_cooling: u8, 
+    pub cpu_fan_rpm: u32,  
+    pub gpu_fan_rpm: u32,
+    pub task_count: u64,
+    pub tasks: [TaskInfo; 64],
+}
+
+
+
 // ─────────────────────────────────────────────────────────────────────────
 // LINUX X86_64 SYSCALL ID CONSTANTS (POSIX)
 // ─────────────────────────────────────────────────────────────────────────
@@ -177,6 +198,34 @@ pub fn sys_pipe(fds: &mut [i32; 2]) -> i64 {
 
 pub fn sys_dup2(oldfd: i64, newfd: i64) -> i64 {
     syscall(SYS_DUP2, oldfd as u64, newfd as u64, 0, 0, 0, 0) as i64
+}
+
+pub fn sys_get_system_info(info_ptr: *mut SystemInfo) -> u64 {
+    unsafe {
+        let mut result: u64;
+        core::arch::asm!(
+            "syscall",
+            in("rax") 524, // <--- THE CORRECTED ID
+            in("rdi") info_ptr as u64,
+            lateout("rax") result,
+            options(nostack, preserves_flags)
+        );
+        result
+    }
+}
+pub fn sys_sleep_ms(ms: u64) {
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 525,
+            in("rdi") ms,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub fn sys_get_dsdt(buf: &mut [u8]) -> usize {
+    syscall(526, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0) as usize
 }
 
 // ─────────────────────────────────────────────────────────────────────────

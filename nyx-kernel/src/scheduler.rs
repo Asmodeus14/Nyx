@@ -32,8 +32,6 @@ pub struct KernelSocket {
 pub enum FileDescriptor {
     File(alloc::sync::Arc<crate::vfs::OpenFile>),
     Socket(alloc::sync::Arc<spin::Mutex<KernelSocket>>),
-    
-    
     PipeRead(alloc::sync::Arc<spin::Mutex<alloc::collections::VecDeque<u8>>>),
     PipeWrite(alloc::sync::Arc<spin::Mutex<alloc::collections::VecDeque<u8>>>),
 }
@@ -60,53 +58,85 @@ impl Scheduler {
     /// selects the next ready process, swaps the hardware memory space (CR3),
     /// and returns the stack pointer of the new process.
     pub fn schedule(&mut self, current_rsp: u64) -> u64 {
-        let logical_id = crate::percpu::current().logical_id as usize % 32;
-        let curr_idx = self.core_task_idx[logical_id];
-
-        // 1. Save the hardware state of the currently running process
-        if curr_idx < self.tasks.len() {
-            let current_process = &mut self.tasks[curr_idx];
-            if current_process.state == TaskState::Running {
-                current_process.saved_rsp = current_rsp;
-                current_process.state = TaskState::Ready;
-            }
-        }
-
         if self.tasks.is_empty() {
             return current_rsp;
         }
 
-        // 2. Simple Round-Robin: Find the next Ready process
+        // --- 1. WAKE UP SLEEPING TASKS ---
+        let mut lo: u32; let mut hi: u32;
+        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+        let current_tsc = ((hi as u64) << 32) | (lo as u64);
+
+        for task in self.tasks.iter_mut() {
+            if task.state == TaskState::Blocked && task.wake_tsc != 0 {
+                if current_tsc >= task.wake_tsc {
+                    task.state = TaskState::Ready;
+                    task.wake_tsc = 0; // Clear the timer
+                }
+            }
+        }
+
+        // --- 2. SAVE HARDWARE STATE ---
+        let logical_id = crate::percpu::current().logical_id as usize % 32;
+        let curr_idx = self.core_task_idx[logical_id];
+
+        if curr_idx < self.tasks.len() {
+            let current_process = &mut self.tasks[curr_idx];
+            
+            // FIX: ALWAYS save the stack pointer so we don't jump backward in time!
+            current_process.saved_rsp = current_rsp;
+            
+            // If it was Running (normal preemption), mark it Ready so it can run again.
+            // If it was Blocked (sys_sleep), we leave it Blocked!
+            if current_process.state == TaskState::Running {
+                current_process.state = TaskState::Ready;
+            }
+        }
+
+        // --- 3. SMART PRIORITY ROUND-ROBIN ---
         let mut next_idx = (curr_idx + 1) % self.tasks.len();
+        let mut fallback_idle_idx = None;
         let mut found = false;
 
         for _ in 0..self.tasks.len() {
-            if self.tasks[next_idx].state == TaskState::Ready || self.tasks[next_idx].state == TaskState::Running {
-                found = true;
-                break;
+            let state = self.tasks[next_idx].state;
+            
+            if state == TaskState::Ready || state == TaskState::Running {
+                // If it's the Idle Task, remember it, but keep looking for real work!
+                if self.tasks[next_idx].is_idle {
+                    fallback_idle_idx = Some(next_idx);
+                } else {
+                    // We found a REAL task! Stop searching.
+                    found = true;
+                    break; 
+                }
             }
             next_idx = (next_idx + 1) % self.tasks.len();
         }
 
         if !found {
-            return current_rsp; // Fallback to current if nothing else is ready
+            // No normal user/kernel tasks are ready to run. Let the CPU sleep!
+            if let Some(idle_idx) = fallback_idle_idx {
+                next_idx = idle_idx;
+            } else {
+                return current_rsp; // Absolute worst-case fallback
+            }
         }
 
-        // 3. Update state
+        // --- 4. UPDATE STATE ---
         self.core_task_idx[logical_id] = next_idx;
         let next_process = &mut self.tasks[next_idx];
         next_process.state = TaskState::Running;
 
-        // 🚨 4. THE HARDWARE BRAIN SWAP 🚨
+        // 🚨 5. THE HARDWARE BRAIN SWAP 🚨
         unsafe {
             // A. Point the Syscall Gateway to this process's specific Kernel Stack.
             // When `syscall` is called, the CPU looks at `gs:[0]`.
             let percpu_base = crate::percpu::current() as *const _ as *mut u64;
             *percpu_base = next_process.kernel_stack_top; 
             
-            // 🚨 B. THE FATAL TSS FIX: Point the Hardware Interrupt Gateway to this process's Kernel Stack!
+            // B. Point the Hardware Interrupt Gateway to this process's Kernel Stack!
             // When a hardware timer interrupts userspace, the CPU reads the TSS to find a secure Ring 0 stack.
-            // This ensures every process pushes its saved state to its own isolated memory, preventing collisions!
             let tss_ptr = crate::percpu::current().gdt_state.tss as *const _ as *mut x86_64::structures::tss::TaskStateSegment;
             (*tss_ptr).privilege_stack_table[0] = x86_64::VirtAddr::new(next_process.kernel_stack_top);
 
@@ -122,7 +152,7 @@ impl Scheduler {
 
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
         
-        // 5. Return the saved stack pointer so the assembly `iretq` resumes the new process
+        // 6. Return the saved stack pointer so the assembly `iretq` resumes the new process
         next_process.saved_rsp
     }
 }

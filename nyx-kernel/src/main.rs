@@ -38,6 +38,8 @@ pub mod c_stubs;
 pub mod drm;
 pub mod usb;
 pub mod partitioner;
+pub mod thermal;
+pub mod laptop_fans;
 
 pub use gui::{SCREEN_PAINTER, BACK_BUFFER};
 use bootloader_api::{entry_point, BootInfo, config::{BootloaderConfig, Mapping}};
@@ -208,15 +210,82 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::disable();
 
     let mut init_process = crate::process::Process::new().expect("Failed to create init process");
-    
     init_process.state = crate::scheduler::TaskState::Running;
+    init_process.name = *b"nyx-gui-session\0";
     
     let init_cr3 = init_process.cr3.as_u64();
     let init_kernel_stack = init_process.kernel_stack_top;
     
     let percpu = crate::percpu::current();
-    percpu.scheduler.tasks.push(init_process);
-    percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32] = 0;
+
+    // ==========================================
+    // SPAWN THE THERMAL GOVERNOR DAEMON
+    // ==========================================
+    crate::vga_println!("[BOOT] Booting Thermal Governor Daemon...");
+    let mut thermal_task = crate::process::Process::new().unwrap();
+    thermal_task.name = *b"thermal-governor";
+    
+    unsafe {
+        let iretq_ptr = thermal_task.kernel_stack_top - 40;
+        let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+        iret_slice[0] = crate::thermal::nyx_task_manager_daemon as u64; // RIP
+        iret_slice[1] = 0x08;              // CS
+        iret_slice[2] = 0x202;             // RFLAGS
+        iret_slice[3] = thermal_task.kernel_stack_top; // RSP
+        iret_slice[4] = 0x10;              // SS
+
+        let regs_ptr = iretq_ptr - 120;
+        core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120); 
+
+        let fxsave_ptr = (regs_ptr - 512) & !0xF;
+        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512); 
+        *(fxsave_ptr as *mut u32).add(6) = 0x1F80; 
+
+        let final_rsp = fxsave_ptr - 16;
+        let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+        bottom[0] = regs_ptr;
+        bottom[1] = 0;
+        thermal_task.saved_rsp = final_rsp;
+    }
+
+    // ==========================================
+    // SPAWN THE IDLE TASK
+    // ==========================================
+    crate::vga_println!("[BOOT] Booting Kernel Idle Task (C-State Manager)...");
+    let mut idle_task = crate::process::Process::new().unwrap();
+    idle_task.name = *b"kernel-idle\0\0\0\0\0";
+    idle_task.is_idle = true; // Flag it so the scheduler skips it when busy!
+
+    unsafe {
+        let iretq_ptr = idle_task.kernel_stack_top - 40;
+        let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+        iret_slice[0] = crate::process::nyx_idle_task as u64; // RIP
+        iret_slice[1] = 0x08;              // CS
+        iret_slice[2] = 0x202;             // RFLAGS
+        iret_slice[3] = idle_task.kernel_stack_top; // RSP
+        iret_slice[4] = 0x10;              // SS
+
+        let regs_ptr = iretq_ptr - 120;
+        core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
+
+        let fxsave_ptr = (regs_ptr - 512) & !0xF;
+        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
+        *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+
+        let final_rsp = fxsave_ptr - 16;
+        let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+        bottom[0] = regs_ptr;
+        bottom[1] = 0;
+        idle_task.saved_rsp = final_rsp;
+    }
+
+    // --- PUSH THE TASKS INTO THE SCHEDULER IN ORDER ---
+    percpu.scheduler.tasks.push(thermal_task); // Index 0
+    percpu.scheduler.tasks.push(idle_task);    // Index 1
+    percpu.scheduler.tasks.push(init_process); // Index 2
+    
+    // Tell the scheduler that we are currently executing the Init Process!
+    percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32] = 2;
 
     unsafe {
         // Swap to the new isolated address space!
@@ -233,11 +302,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     
     let stack_base = 0x7FFF_0000_0000;
     
-    // 🚨 BUMP TO 32 PAGES (128KB) TO PREVENT TLS STACK OVERFLOW
+    // BUMP TO 32 PAGES (128KB) TO PREVENT TLS STACK OVERFLOW
     let stack_pages = 32; 
     crate::memory::allocate_user_pages_at(stack_base, stack_pages).expect("Stack Map Fail");
     
-    // 🚨 THE ABI FIX: Subtract 8 bytes so RSP ends in 8 upon entering _start!
+    // THE ABI FIX: Subtract 8 bytes so RSP ends in 8 upon entering _start!
     let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8; 
 
     interrupts::init_syscalls();

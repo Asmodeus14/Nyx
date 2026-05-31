@@ -388,6 +388,46 @@ impl NetChatApp {
                     else if cmd == "/help" {
                         self.messages.push("[System] Commands: /cast, /snap, /disconnect".into());
                     }
+                    else if cmd == "/dsdt" {
+                        if let Some(sock) = &self.socket {
+                            self.messages.push("[System] Allocating memory for DSDT extraction...".into());
+                            
+                            
+                            //  Allocate 512 KB
+                            let mut dsdt_buf = alloc::vec![0u8; 524288];
+                            let size = crate::syscalls::sys_get_dsdt(&mut dsdt_buf);
+                            
+                            if size > 0 {
+                                self.messages.push(format!("[System] DSDT Size: {} bytes. Beaming to Host...", size));
+                                
+                                let hex_chars = b"0123456789ABCDEF";
+                                let mut chunk = String::with_capacity(1024);
+                                
+                                for &byte in &dsdt_buf[..size] {
+                                    chunk.push(hex_chars[(byte >> 4) as usize] as char);
+                                    chunk.push(hex_chars[(byte & 0x0F) as usize] as char);
+                                    
+                                    // Send over UDP in 1000-byte chunks to respect MTU safely
+                                    if chunk.len() >= 1000 {
+                                        sock.send(chunk.as_bytes());
+                                        crate::syscalls::sys_sleep_ms(2); // Give smoltcp time to dispatch
+                                        chunk.clear();
+                                    }
+                                }
+                                
+                                // Send the remaining bytes
+                                if !chunk.is_empty() {
+                                    sock.send(chunk.as_bytes());
+                                }
+                                
+                                self.messages.push("[System] Payload delivered successfully.".into());
+                            } else {
+                                self.messages.push("[System] ERROR: Failed to extract DSDT from ACPICA.".into());
+                            }
+                        } else {
+                            self.messages.push("[System] You must be connected to a host to exfiltrate.".into());
+                        }
+                    }
                     else if let Some(sock) = &self.socket {
                         sock.send(format!("{}\n", self.current_input).as_bytes());
                         self.messages.push(format!("You: {}", self.current_input));

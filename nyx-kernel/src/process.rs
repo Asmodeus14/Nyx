@@ -48,7 +48,7 @@ pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
         let phdr = unsafe { &*(file_data.as_ptr().add(offset) as *const Elf64_Phdr) };
 
         if phdr.p_type == 1 { // PT_LOAD Segment
-            // 🚨 PIE FIX: Allow modern GCC binaries to load at address 0x0.
+            // PIE FIX: Allow modern GCC binaries to load at address 0x0.
             // We only block them from loading into the Top Half (Kernel Space).
             if phdr.p_vaddr >= 0x0000_7FFF_FFFF_FFFF { 
                 return Err("Security Violation: Cannot load into Kernel Space"); 
@@ -108,19 +108,19 @@ pub struct Process {
     pub mmap_bump: u64,
     pub fd_table: [Option<FileDescriptor>; 32],
     pub state: TaskState,
+    pub cpu_ticks: u64,      
+    pub name: [u8; 16],      
+    pub is_idle: bool, 
+    // --- NEW: WAKE TIMER FOR SYS_SLEEP ---
+    pub wake_tsc: u64, 
 }
 
 impl Process {
     pub fn new() -> Result<Self, &'static str> {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         
-        // THE FIX: Allocate the Kernel Stack FIRST, while still in the Parent's CR3!
-        // This ensures the Kernel Page Tables are updated BEFORE we clone them to the child!
         let kernel_stack = crate::memory::allocate_kernel_stack(4);
-
         let pml4_frame = crate::memory::allocate_frame().ok_or("OOM: CR3 allocation failed")?;
-        
-        // NOW clone the page tables. The child will safely inherit the newly mapped stack.
         crate::memory::clone_kernel_page_table(pml4_frame.start_address());
 
         Ok(Process {
@@ -132,24 +132,40 @@ impl Process {
             mmap_bump: 0x4000_0000_0000, 
             fd_table: core::array::from_fn(|_| None),
             state: TaskState::Ready,
+            cpu_ticks: 0,
+            name: [0; 16],
+            is_idle: false, 
+            wake_tsc: 0, // Default to 0 (Not sleeping)
         })
     }
     
     pub fn new_thread(parent_cr3: PhysAddr) -> Result<Self, &'static str> {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-        
-        // Threads need their own KERNEL stack so they don't corrupt the parent's syscalls
         let kernel_stack = crate::memory::allocate_kernel_stack(4);
 
         Ok(Process {
             pid,
             parent_pid: None,
-            cr3: parent_cr3, // THE MAGIC: Share the EXACT same memory space!
+            cr3: parent_cr3, 
             saved_rsp: kernel_stack, 
             kernel_stack_top: kernel_stack,
             mmap_bump: 0x4000_0000_0000, 
             fd_table: core::array::from_fn(|_| None),
             state: TaskState::Ready,
+            cpu_ticks: 0,
+            name: [0; 16],
+            is_idle: false,
+            wake_tsc: 0, // Default to 0 (Not sleeping)
         })
+    }
+}
+
+// ==========================================
+// THE RING-0 IDLE TASK (PID 0 / C-STATE ENABLER)
+// ==========================================
+pub extern "C" fn nyx_idle_task() {
+    loop {
+        // Halt the physical CPU core. It wakes up instantly when the hardware timer fires!
+        unsafe { x86_64::instructions::hlt(); }
     }
 }

@@ -38,6 +38,25 @@ pub struct SockAddrIn {
     pub sin_zero: [u8; 8],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TaskInfo {
+    pub pid: u64,
+    pub cpu_ticks: u64,
+    pub state: u8, // 0 = Ready, 1 = Running, 2 = Blocked
+    pub name: [u8; 16],
+}
+
+#[repr(C)]
+pub struct SystemInfo {
+    pub current_temp: u8,
+    pub active_cooling: u8, // 1 = On, 0 = Off
+    pub cpu_fan_rpm: u32,  
+    pub gpu_fan_rpm: u32,
+    pub task_count: u64,
+    pub tasks: [TaskInfo; 64],
+}
+
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
     let start = ptr as u64;
     if start == 0 && len == 0 { return false; }
@@ -280,11 +299,21 @@ pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
     }
     
     let percpu = crate::percpu::current();
-    let new_rsp = percpu.scheduler.schedule(current_rsp);
     
+    // --- NEW: TASK MANAGER ACCOUNTING ---
+    // Increment the tick counter BEFORE we schedule a new task!
     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
     if curr_idx < percpu.scheduler.tasks.len() {
-        let task = &percpu.scheduler.tasks[curr_idx];
+        percpu.scheduler.tasks[curr_idx].cpu_ticks += 1;
+    }
+    // ------------------------------------
+
+    let new_rsp = percpu.scheduler.schedule(current_rsp);
+    
+    // Grab the NEXT task that the scheduler just picked
+    let next_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if next_idx < percpu.scheduler.tasks.len() {
+        let task = &percpu.scheduler.tasks[next_idx];
         let task_stack = task.kernel_stack_top;
         
         unsafe {
@@ -1178,6 +1207,85 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
         522 => { frame.rax = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst) as u64; },
         523 => { frame.rax = crate::scheduler::CONTEXT_SWITCHES.load(Ordering::Relaxed); },
+        524 => { 
+            // SYSCALL 524: sys_get_system_info
+            let info_ptr = arg1 as *mut SystemInfo;
+            
+            // SECURITY: Prevent Userspace from tricking the Kernel into overwriting Ring 0 memory!
+            if !is_valid_user_ptr(info_ptr as *const u8, core::mem::size_of::<SystemInfo>()) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
+            
+            unsafe {
+                // 1. Thermal Telemetry
+                let temp = crate::thermal::get_intel_silicon_temp();
+                (*info_ptr).current_temp = temp;
+                (*info_ptr).active_cooling = if temp >= 75 { 1 } else { 0 };
+                
+                // 2. Hardware Fan Telemetry (SMM)
+                (*info_ptr).cpu_fan_rpm = crate::laptop_fans::get_dell_fan_rpm(0);
+                (*info_ptr).gpu_fan_rpm = crate::laptop_fans::get_dell_fan_rpm(1);
+                
+                // 3. Task Scheduler Telemetry
+                let mut count = 0;
+                if let Some(cores) = &crate::percpu::PER_CPU {
+                    for core in cores.iter() {
+                        for task in core.scheduler.tasks.iter() {
+                            if task.cpu_ticks > 0 || task.state == crate::scheduler::TaskState::Running {
+                                if count < 64 {
+                                    (*info_ptr).tasks[count] = TaskInfo {
+                                        pid: task.pid,
+                                        cpu_ticks: task.cpu_ticks,
+                                        state: task.state as u8,
+                                        name: task.name,
+                                    };
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                (*info_ptr).task_count = count as u64;
+            }
+            frame.rax = 0;
+        },
+        525 => { 
+            // SYSCALL 525: sys_sleep_ms
+            // arg1 (rdi) = milliseconds to sleep
+            let ms = arg1 as u64;
+            
+            let mut lo: u32; let mut hi: u32;
+            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+            let start_tsc = ((hi as u64) << 32) | (lo as u64);
+            
+            // Calculate the future timestamp (Assuming a base ~2GHz clock)
+            let wake_tsc = start_tsc + (ms * 2_000_000); 
+
+            // Find the currently running task
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            
+            // Mark it as Blocked so the scheduler completely ignores it!
+            task.state = crate::scheduler::TaskState::Blocked;
+            task.wake_tsc = wake_tsc;
+            
+            // Force an immediate context switch so the CPU drops into the Idle Task
+            unsafe { core::arch::asm!("int 0x40"); } 
+            
+            frame.rax = 0;
+        },
+        526 => { 
+            let buf_ptr = arg1 as *mut u8;
+            let max_len = arg2 as usize;
+            
+            if !is_valid_user_ptr(buf_ptr, max_len) { 
+                frame.rax = EFAULT as u64; 
+                return; 
+            }
+            
+            frame.rax = crate::acpi::get_dsdt_data(buf_ptr, max_len) as u64;
+        },
 
         _ => { frame.rax = EINVAL as u64; }
     }

@@ -297,6 +297,19 @@ fn enumerate_pci_legacy() {
                     } else {
                         crate::serial_println!("[PCI] Found older USB Controller (Non-xHCI). Ignoring.");
                     }
+                } else if dev.subclass_id == 0x05 {
+                    // --- NEW: CATCH THE SMBUS CONTROLLER ---
+                    crate::serial_println!("[PCI] *** FOUND SMBus CONTROLLER (LEGACY): Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id);
+                    
+                    // Read BAR4 (Offset 0x20)
+                    let bar4 = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x20);
+                    
+                    // Bit 0 must be 1 (indicating it's an I/O Port, not MMIO)
+                    if (bar4 & 1) != 0 { 
+                        let smbus_base = (bar4 & 0xFFFC) as u16;
+                        crate::serial_println!("[PCI] -> SMBus I/O Base extracted: {:#06x}", smbus_base);
+                        crate::thermal::scan_smbus(smbus_base);
+                    }
                 }
             },
             _ => {}
@@ -521,6 +534,18 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                             _    => "Unknown USB",
                                         };
                                         crate::serial_println!("[PCI] Found USB Controller: {} | Vendor {:#06x}, Device {:#06x}", controller_type, vendor_id, device_id);
+                                    }
+                                } else if subclass == 0x05 {
+                                    // --- NEW: CATCH THE SMBUS CONTROLLER ---
+                                    crate::serial_println!("[PCI] *** FOUND SMBus CONTROLLER (MCFG): Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
+                                    
+                                    // Read BAR4 (Offset 0x20)
+                                    let bar4 = unsafe { core::ptr::read_volatile((device_virt + 0x20) as *const u32) };
+                                    
+                                    if (bar4 & 1) != 0 { 
+                                        let smbus_base = (bar4 & 0xFFFC) as u16;
+                                        crate::serial_println!("[PCI] -> SMBus I/O Base extracted: {:#06x}", smbus_base);
+                                        crate::thermal::scan_smbus(smbus_base);
                                     }
                                 }
                             },

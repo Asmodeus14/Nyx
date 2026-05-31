@@ -49,6 +49,11 @@ pub fn sys_map_gpu_backbuffer() -> u64 {
 pub fn sys_wait_vsync() {
     syscall(513, 0, 0, 0, 0, 0, 0);
 }
+
+// --- NEW: POWER MANAGEMENT YIELD ---
+pub fn sys_sleep_ms(ms: u64) {
+    syscall(525, ms, 0, 0, 0, 0, 0);
+}
 // ----------------------------------------------
 
 #[no_mangle]
@@ -112,7 +117,18 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         let now = sys_get_time();
-        if now.wrapping_sub(last_frame) < ms_per_frame { unsafe { core::arch::asm!("nop"); } continue; }
+        let elapsed = now.wrapping_sub(last_frame);
+        
+        // ==========================================
+        // THE HARDWARE POWER MANAGEMENT FIX
+        // ==========================================
+        if elapsed < ms_per_frame { 
+            let time_to_sleep = ms_per_frame - elapsed;
+            // INSTANTLY yields the CPU back to the kernel, allowing the Idle Task to fire `hlt`!
+            sys_sleep_ms(time_to_sleep as u64); 
+            continue; 
+        }
+        
         last_frame = now;
         
         let (mx_raw, my_raw, left, _) = sys_get_mouse();
@@ -277,9 +293,6 @@ pub extern "C" fn _start() -> ! {
                 if show_start_menu { draw_start_menu(&mut back_buffer, screen_stride, screen_h); }
                 draw_cursor(&mut back_buffer, screen_stride, screen_h, mx, my);
 
-                // --- V-SYNC REMOVED --- 
-                // We blast the pixels directly to the hardware frame buffer as fast as the PCIe bus allows!
-                
                 let hardware_fb = unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u32, screen_stride * screen_h) };
                 for y in dirty_min_y..dirty_max_y {
                     let start_idx = y * screen_stride + dirty_min_x;

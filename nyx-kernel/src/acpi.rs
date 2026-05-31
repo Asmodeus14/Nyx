@@ -1,8 +1,4 @@
-// Turn off Rust's strict naming rules so it doesn't complain about C-style variable names
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(dead_code)]
+#![allow(warnings)] // <--- THE FIX: Silence all warnings for this module and its included files!
 
 // ==========================================
 // 1. INJECT THE GENERATED C-TO-RUST BINDINGS
@@ -52,7 +48,6 @@ pub fn init_intel_acpica() {
         crate::serial_println!("[ACPI] Extracting MADT for real SMP...");
         let mut madt_header: *mut core::ffi::c_void = core::ptr::null_mut();
         
-        // Ask ACPICA to find the "APIC" table (MADT). Instance 1.
         let get_status = AcpiGetTable(
             b"APIC\0".as_ptr() as *mut i8, 
             1, 
@@ -61,7 +56,6 @@ pub fn init_intel_acpica() {
         
         if get_status == 0 && !madt_header.is_null() {
             let madt_virt = madt_header as u64;
-            // ACPICA maps this for us. We need to find the physical address for our APIC module.
             let madt_phys = crate::memory::virt_to_phys(madt_virt).unwrap_or(madt_virt);
             
             ACPI_INFO.madt_addr = Some(madt_phys);
@@ -69,7 +63,6 @@ pub fn init_intel_acpica() {
         } else {
             crate::serial_println!("[ACPI] WARNING: MADT not found! Status: {}", get_status);
         }
-        // ---------------------------------------
 
         // 3. Build the Hardware Namespace Tree
         crate::serial_println!("[ACPI] Loading Hardware Namespace...");
@@ -104,7 +97,15 @@ pub fn init_intel_acpica() {
 // ==========================================
 extern "C" {
     fn acpi_wake_cnvi_wifi() -> i32;
-    fn acpi_find_i2c_hid() -> i32; // <--- The new scanner
+    fn acpi_find_i2c_hid() -> i32; 
+    
+    // --- NEW: THE ACPICA FAN CONTROLLER ---
+    fn acpi_set_fan_state(turn_on: i32) -> i32;
+    fn acpi_get_system_temp() -> i32;
+}
+
+pub fn get_acpi_temperature() -> u8 {
+    unsafe { acpi_get_system_temp() as u8 }
 }
 
 pub fn power_on_wifi_via_acpi() -> bool {
@@ -126,5 +127,36 @@ pub fn scan_for_modern_inputs() {
     } else {
         crate::serial_println!("[ACPI] No I2C-HID devices found. It might be USB-based.");
         crate::vga_println!("[ACPI] No I2C-HID found.");
+    }
+}
+
+pub fn set_active_cooling(enable: bool) {
+    let state = if enable { 1 } else { 0 };
+    unsafe {
+        acpi_set_fan_state(state);
+    }
+}
+
+pub fn get_dsdt_data(buf_ptr: *mut u8, max_len: usize) -> usize {
+    unsafe {
+        let mut dsdt_header: *mut core::ffi::c_void = core::ptr::null_mut();
+        
+        // Ask Intel ACPICA to find the DSDT table for us
+        let status = AcpiGetTable(
+            b"DSDT\0".as_ptr() as *mut i8, 
+            1, 
+            &mut dsdt_header as *mut _ as *mut *mut _
+        );
+        
+        if status == 0 && !dsdt_header.is_null() {
+            let dsdt_virt = dsdt_header as u64;
+            // Read the length of the table (stored at offset 4 of the header)
+            let length = core::ptr::read_volatile((dsdt_virt + 4) as *const u32) as usize;
+            
+            let copy_len = core::cmp::min(length, max_len);
+            core::ptr::copy_nonoverlapping(dsdt_virt as *const u8, buf_ptr, copy_len);
+            return copy_len;
+        }
+        0
     }
 }
