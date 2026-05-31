@@ -59,7 +59,7 @@ int acpi_find_i2c_hid(void) {
 }
 
 // ==========================================
-// NYXOS ACPI THERMAL & FAN CONTROLLER
+// 3. NYXOS ACPI THERMAL & FAN CONTROLLER
 // ==========================================
 
 // Callback function to evaluate _ON or _OFF on a fan
@@ -121,4 +121,14 @@ int acpi_get_system_temp() {
     
     if (max_temp == 0) return 50; // Safe fallback if BIOS is missing thermal zones
     return (int)max_temp;
+}
+
+// ==========================================
+// 4. ACPICA OSL STUBS
+// ==========================================
+
+// Stub for AcpiOsEnterSleep to satisfy the linker without causing Rust naming collisions
+ACPI_STATUS AcpiOsEnterSleep(UINT8 SleepState, UINT32 RegaValue, UINT32 RegbValue) {
+    // TODO: Implement actual sleep logic for the kernel later
+    return 0; // AE_OK
 }

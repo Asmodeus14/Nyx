@@ -160,3 +160,16 @@ pub fn get_dsdt_data(buf_ptr: *mut u8, max_len: usize) -> usize {
         0
     }
 }
+// ==========================================
+// 5. POWER MANAGEMENT (SLEEP / OFF)
+// ==========================================
+pub fn poweroff() {
+    crate::serial_println!("\n[ACPI] Initiating Emergency Hardware Poweroff (S5)...");
+    unsafe {
+        let s5_state: u8 = 5; 
+        AcpiEnterSleepStatePrep(s5_state);
+        core::arch::asm!("cli", options(nomem, nostack));
+        AcpiEnterSleepState(s5_state);
+        loop { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
+}
