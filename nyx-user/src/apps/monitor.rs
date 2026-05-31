@@ -41,13 +41,11 @@ impl SysMonitor {
         sys_get_system_info(&mut self.info);
     }
 
-    pub fn draw(&self, fb: &mut [u32], screen_w: usize, screen_h: usize, x: usize, y: usize) {
-        // Draw Window Background (Fixed bounds to match main.rs 300x200)
-        draw::draw_rect(fb, screen_w, screen_h, x, y, 300, 200, 0xFF181818); 
-        draw::draw_rect(fb, screen_w, screen_h, x, y, 300, 25, 0xFF2A2A2A);
-        draw::draw_text(fb, screen_w, screen_h, x + 10, y + 5, "NyxOS Live Telemetry", 0xFFFFFFFF);
-
-        let mut cy = y + 40;
+pub fn draw(&self, fb: &mut [u32], screen_w: usize, screen_h: usize, x: usize, y: usize) {
+        // We removed the solid rects! Let `draw_window_rounded` in main.rs handle the background.
+        
+        // Start text lower down so it doesn't overlap the standard window title bar
+        let mut cy = y + 35; 
         
         // 1. SILICON THERMALS
         let temp_color = if self.info.current_temp >= 80 { 0xFFFF3333 } 
@@ -80,7 +78,7 @@ impl SysMonitor {
         cy += 10;
         
         // Render top active tasks
-        let limit = core::cmp::min(self.info.task_count as usize, 4); // Max 4 to fit in 200px height
+        let limit = core::cmp::min(self.info.task_count as usize, 4);
         for i in 0..limit {
             let t = &self.info.tasks[i];
             let name = if let Ok(s) = core::str::from_utf8(&t.name) { s.trim_matches(char::from(0)) } else { "Unknown" };
