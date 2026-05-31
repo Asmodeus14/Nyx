@@ -3,6 +3,7 @@ import struct
 import ctypes
 import pygame
 import threading
+import os
 
 # --- THE WINDOWS BLUR FIX ---
 try:
@@ -21,6 +22,14 @@ render_buffer = bytearray()
 frame_ready = False
 frame_w, frame_h, frame_stride = 0, 0, 0
 
+def is_hex_string(s):
+    """Checks if the string contains only valid hex characters."""
+    try:
+        int(s, 16)
+        return True
+    except ValueError:
+        return False
+
 def network_daemon():
     """Runs on a background thread. Drains the network card at maximum speed."""
     global render_buffer, frame_ready, frame_w, frame_h, frame_stride
@@ -30,7 +39,7 @@ def network_daemon():
     sock.bind((UDP_IP, UDP_PORT))
     
     back_buffer = bytearray()
-    highest_frame_id = -1 # THE FIX: Track absolute time
+    highest_frame_id = -1 
     w, h, stride = 0, 0, 0
     expected_total_chunks = 0
     packets_received = 0
@@ -41,16 +50,38 @@ def network_daemon():
         try:
             data, addr = sock.recvfrom(2048)
             
+            # --- NEW: DSDT EXFILTRATOR DETECTION ---
+            # Attempt to decode as ASCII. Video stream packets will fail this or the hex check.
+            try:
+                text_data = data.decode('ascii')
+                if is_hex_string(text_data):
+                    # It's a DSDT Payload!
+                    
+                    # The ACPI DSDT header starts with "DSDT" which is "44534454" in hex.
+                    # If we see the signature, we start a fresh file.
+                    mode = "w" if text_data.startswith("44534454") else "a"
+                    
+                    with open("dsdt.hex", mode) as f:
+                        f.write(text_data)
+                    
+                    if mode == "w":
+                        print("\n[+] INCOMING DSDT PAYLOAD DETECTED! Resetting dsdt.hex...")
+                    print(f"    -> Appended {len(text_data)} hex bytes.")
+                    
+                    # Skip the video processing for this text packet!
+                    continue 
+            except UnicodeDecodeError:
+                pass # Not ASCII text, proceed to video stream logic
+            # ---------------------------------------
+
             if len(data) > 500:
                 c_idx, t_chunks, f_id, f_w, f_h, f_stride = struct.unpack('<IIIIII', data[:HEADER_SIZE])
                 
                 # --- THE TIME WARP FIX ---
-                # If this packet is from the past, violently drop it!
-                # (We use < 100000 to account for integer wrapping over days of uptime)
+                # If this packet is from the past, drop it!
                 if highest_frame_id != -1 and f_id < highest_frame_id and (highest_frame_id - f_id) < 100000:
                     continue 
                 
-                # If we leaped into the future, update our master clock
                 if highest_frame_id == -1 or f_id > highest_frame_id:
                     highest_frame_id = f_id
                 # -------------------------
@@ -90,7 +121,7 @@ def main():
     pygame.init()
     flags = pygame.RESIZABLE | pygame.DOUBLEBUF | pygame.SCALED
     screen = pygame.display.set_mode((1920, 1080), flags)
-    pygame.display.set_caption("NyxOS Live Stream (Anti-Jitter Active)")
+    pygame.display.set_caption("NyxOS Live Stream & DSDT Exfiltrator")
 
     net_thread = threading.Thread(target=network_daemon, daemon=True)
     net_thread.start()
