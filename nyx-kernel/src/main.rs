@@ -41,6 +41,11 @@ pub mod partitioner;
 pub mod thermal;
 pub mod laptop_fans;
 
+// 🚨 Phase 4 Mounts & Installer 
+pub mod tarfs;
+pub mod installer;
+
+use alloc::boxed::Box;
 pub use gui::{SCREEN_PAINTER, BACK_BUFFER};
 use bootloader_api::{entry_point, BootInfo, config::{BootloaderConfig, Mapping}};
 use x86_64::VirtAddr;
@@ -57,9 +62,8 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
-pub static INIT_FS: &[u8] = include_bytes!("nyx-user.bin");
-pub static HELLO_BIN: &[u8] = include_bytes!("hello.elf");
-pub static RUST_BIN: &[u8] = include_bytes!("rust.elf");
+// The embedded RAM archive used exclusively for installing to the SSD
+pub static INITRD_TAR: &[u8] = include_bytes!("initrd.tar");
 
 lazy_static::lazy_static! {
     static ref TSS: TaskStateSegment = {
@@ -81,12 +85,12 @@ lazy_static::lazy_static! {
         let mut table = [0u64; 9];
         let ext = |d: Descriptor| -> u64 { match d { Descriptor::UserSegment(v) => v, _ => 0 } };
         
-        table[1] = ext(Descriptor::kernel_code_segment());    // 0x08 Kernel Code
-        table[2] = ext(Descriptor::kernel_data_segment());    // 0x10 Kernel Data
-        table[3] = ext(Descriptor::user_data_segment());      // 0x18 User Data 
-        table[4] = ext(Descriptor::user_code_segment());      // 0x20 User Code 32 (STAR BASE)
-        table[5] = ext(Descriptor::user_data_segment());      // 0x28 User Data (SYSRET SS)
-        table[6] = ext(Descriptor::user_code_segment());      // 0x30 User Code 64 (SYSRET CS)
+        table[1] = ext(Descriptor::kernel_code_segment());    
+        table[2] = ext(Descriptor::kernel_data_segment());    
+        table[3] = ext(Descriptor::user_data_segment());      
+        table[4] = ext(Descriptor::user_code_segment());      
+        table[5] = ext(Descriptor::user_data_segment());      
+        table[6] = ext(Descriptor::user_code_segment());      
         
         match Descriptor::tss_segment(&TSS) {
             Descriptor::SystemSegment(low, high) => { table[7] = low; table[8] = high; }
@@ -125,7 +129,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unsafe { crate::memory::PHYS_MEM_OFFSET = phys_mem_offset.as_u64(); }
     
     let mut mapper = unsafe { memory::init(phys_mem_offset, &boot_info.memory_regions) };
-    
     allocator::init_heap(&mut mapper, &mut memory::MEMORY_MANAGER.lock().as_mut().unwrap().frame_allocator).unwrap();
 
     if let Some(fb) = boot_info.framebuffer.as_mut() {
@@ -146,7 +149,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             mouse_state.screen_width = info.width;
             mouse_state.screen_height = info.height;
         }
-
         crate::vga_println!("[BOOT] Framebuffer Mapped: {}x{}", info.width, info.height);
     }
 
@@ -154,7 +156,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_idt();
 
     crate::vga_println!("[BOOT] Initializing PS/2 Legacy Trackpad Emulator...");
-    crate::serial_println!("[BOOT] Initializing PS/2 Legacy Trackpad Emulator...");
     let mut ps2_mouse = crate::mouse::MouseDriver::new();
     ps2_mouse.init();
 
@@ -177,7 +178,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         percpu::init(&apic_ids);
         
         crate::memory::identity_map_low_memory();
-        
         time::init();
         ioapic::init();
         
@@ -195,123 +195,113 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pci::enumerate_pci();
     }
 
+    // Initialize NVMe Hardware Driver
     let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
     if let Some(ref mut driver) = nvme_driver_opt { driver.create_io_queues(); }
-    
     crate::entity::awaken_entity(&mut nvme_driver_opt);
 
-    if let Some(driver) = nvme_driver_opt { crate::fs::FS.lock().init(driver); }
+    // ==========================================
+    // PHYSICAL NVME VFS MOUNT POINT
+    // ==========================================
+    if let Some(driver) = nvme_driver_opt {
+        if let Some(nvme_fs) = crate::fs::NvmeFs::new(driver) {
+            crate::vfs::VFS.mount("/mnt/nvme", Box::new(nvme_fs));
+            crate::vga_println!("[BOOT] Physical NVMe Hardware Mounted to /mnt/nvme");
+        } else {
+            panic!("FATAL: NVMe Drive Found but no FAT partition detected.");
+        }
+    } else {
+        panic!("FATAL: No NVMe Drive Detected! Cannot boot without a system drive.");
+    }
 
     // ==========================================
-    // PID 1 BOOTSTRAPPER (Init Process)
+    // AUTOMATED SYSTEM INSTALLER & UPDATER
     // ==========================================
-    crate::vga_println!("[BOOT] Bootstrapping PID 1 (Init Process)...");
+    // This dynamically unpacks initrd.tar and perfectly overwrites old app bundles!
+    crate::installer::install_apps_to_nvme(INITRD_TAR);
 
+    // ==========================================
+    // SYSTEM BOOTSTRAP
+    // ==========================================
+    crate::vga_println!("[BOOT] Bootstrapping System Daemons...");
     x86_64::instructions::interrupts::disable();
+    let percpu = crate::percpu::current();
 
+    // 1. Thermal Governor
+    let mut thermal_task = crate::process::Process::new().unwrap();
+    thermal_task.name = *b"thermal-governor";
+    unsafe {
+        let iretq_ptr = thermal_task.kernel_stack_top - 40;
+        let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+        iret_slice[0] = crate::thermal::nyx_task_manager_daemon as u64; 
+        iret_slice[1] = 0x08; iret_slice[2] = 0x202;             
+        iret_slice[3] = thermal_task.kernel_stack_top; iret_slice[4] = 0x10;              
+        let regs_ptr = iretq_ptr - 120;
+        core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120); 
+        let fxsave_ptr = (regs_ptr - 512) & !0xF;
+        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512); 
+        *(fxsave_ptr as *mut u32).add(6) = 0x1F80; 
+        let final_rsp = fxsave_ptr - 16;
+        let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+        bottom[0] = regs_ptr; bottom[1] = 0;
+        thermal_task.saved_rsp = final_rsp;
+    }
+
+    // 2. Idle Task
+    let mut idle_task = crate::process::Process::new().unwrap();
+    idle_task.name = *b"kernel-idle\0\0\0\0\0";
+    idle_task.is_idle = true; 
+    unsafe {
+        let iretq_ptr = idle_task.kernel_stack_top - 40;
+        let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+        iret_slice[0] = crate::process::nyx_idle_task as u64; 
+        iret_slice[1] = 0x08; iret_slice[2] = 0x202;             
+        iret_slice[3] = idle_task.kernel_stack_top; iret_slice[4] = 0x10;              
+        let regs_ptr = iretq_ptr - 120;
+        core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
+        let fxsave_ptr = (regs_ptr - 512) & !0xF;
+        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
+        *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+        let final_rsp = fxsave_ptr - 16;
+        let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+        bottom[0] = regs_ptr; bottom[1] = 0;
+        idle_task.saved_rsp = final_rsp;
+    }
+
+    // 3. Init Process (PID 1)
+    crate::vga_println!("[BOOT] Loading Init.nyx into PID 1 directly from NVMe...");
     let mut init_process = crate::process::Process::new().expect("Failed to create init process");
     init_process.state = crate::scheduler::TaskState::Running;
-    init_process.name = *b"nyx-gui-session\0";
+    init_process.name = *b"nyx-init\0\0\0\0\0\0\0\0";
     
     let init_cr3 = init_process.cr3.as_u64();
     let init_kernel_stack = init_process.kernel_stack_top;
     
-    let percpu = crate::percpu::current();
-
-    // ==========================================
-    // SPAWN THE THERMAL GOVERNOR DAEMON
-    // ==========================================
-    crate::vga_println!("[BOOT] Booting Thermal Governor Daemon...");
-    let mut thermal_task = crate::process::Process::new().unwrap();
-    thermal_task.name = *b"thermal-governor";
+    percpu.scheduler.tasks.push(idle_task);    
+    percpu.scheduler.tasks.push(init_process); 
+    percpu.scheduler.tasks.push(thermal_task); 
     
-    unsafe {
-        let iretq_ptr = thermal_task.kernel_stack_top - 40;
-        let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
-        iret_slice[0] = crate::thermal::nyx_task_manager_daemon as u64; // RIP
-        iret_slice[1] = 0x08;              // CS
-        iret_slice[2] = 0x202;             // RFLAGS
-        iret_slice[3] = thermal_task.kernel_stack_top; // RSP
-        iret_slice[4] = 0x10;              // SS
-
-        let regs_ptr = iretq_ptr - 120;
-        core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120); 
-
-        let fxsave_ptr = (regs_ptr - 512) & !0xF;
-        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512); 
-        *(fxsave_ptr as *mut u32).add(6) = 0x1F80; 
-
-        let final_rsp = fxsave_ptr - 16;
-        let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
-        bottom[0] = regs_ptr;
-        bottom[1] = 0;
-        thermal_task.saved_rsp = final_rsp;
-    }
-
-    // ==========================================
-    // SPAWN THE IDLE TASK
-    // ==========================================
-    crate::vga_println!("[BOOT] Booting Kernel Idle Task (C-State Manager)...");
-    let mut idle_task = crate::process::Process::new().unwrap();
-    idle_task.name = *b"kernel-idle\0\0\0\0\0";
-    idle_task.is_idle = true; // Flag it so the scheduler skips it when busy!
+    percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32] = 1;
 
     unsafe {
-        let iretq_ptr = idle_task.kernel_stack_top - 40;
-        let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
-        iret_slice[0] = crate::process::nyx_idle_task as u64; // RIP
-        iret_slice[1] = 0x08;              // CS
-        iret_slice[2] = 0x202;             // RFLAGS
-        iret_slice[3] = idle_task.kernel_stack_top; // RSP
-        iret_slice[4] = 0x10;              // SS
-
-        let regs_ptr = iretq_ptr - 120;
-        core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
-
-        let fxsave_ptr = (regs_ptr - 512) & !0xF;
-        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
-        *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
-
-        let final_rsp = fxsave_ptr - 16;
-        let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
-        bottom[0] = regs_ptr;
-        bottom[1] = 0;
-        idle_task.saved_rsp = final_rsp;
-    }
-
-    // --- PUSH THE TASKS INTO THE SCHEDULER IN ORDER ---
-    percpu.scheduler.tasks.push(thermal_task); // Index 0
-    percpu.scheduler.tasks.push(idle_task);    // Index 1
-    percpu.scheduler.tasks.push(init_process); // Index 2
-    
-    // Tell the scheduler that we are currently executing the Init Process!
-    percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32] = 2;
-
-    unsafe {
-        // Swap to the new isolated address space!
         core::arch::asm!("mov cr3, {}", in(reg) init_cr3);
-        
-        // Point the syscall gateway (gs:[0]) to PID 1's secure kernel stack
         let percpu_base = percpu as *const _ as *mut u64;
         *percpu_base = init_kernel_stack;
     }
 
-    // Now that we are in PID 1's memory space, load the GUI ELF into it
-    crate::vga_println!("[BOOT] Loading GUI into PID 1...");
-    let entry_point = crate::process::load_elf(INIT_FS).expect("ELF Parse Fail");
+    // 🚨 FETCHING PID 1 DIRECTLY FROM NVME SSD 🚨
+    let init_data = crate::vfs::VFS.read_file_alloc("/mnt/nvme/apps/Init.nyx/run.bin")
+        .expect("VFS FATAL: Failed to load /mnt/nvme/apps/Init.nyx/run.bin from SSD!");
+        
+    let entry_point = crate::process::load_elf(&init_data).expect("ELF Parse Fail");
     
     let stack_base = 0x7FFF_0000_0000;
-    
-    // BUMP TO 32 PAGES (128KB) TO PREVENT TLS STACK OVERFLOW
     let stack_pages = 32; 
     crate::memory::allocate_user_pages_at(stack_base, stack_pages).expect("Stack Map Fail");
-    
-    // THE ABI FIX: Subtract 8 bytes so RSP ends in 8 upon entering _start!
     let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8; 
 
     interrupts::init_syscalls();
     unsafe { percpu.user_rsp = stack_top; } 
-
     unsafe {
         let mut cr4 = Cr4::read();
         cr4.remove(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
@@ -319,8 +309,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Cr4::write(cr4);
     }
 
-    crate::vga_println!("[BOOT] Jumping to Ring 3 (Entry: {:#x})...", entry_point);
-    
+    crate::vga_println!("[BOOT] Jumping to Ring 3 Natively (Entry: {:#x})...", entry_point);
     unsafe { process::enter_userspace(entry_point, stack_top); }
 }
 

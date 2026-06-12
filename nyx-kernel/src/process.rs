@@ -1,5 +1,6 @@
 use x86_64::{PhysAddr, VirtAddr};
 use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 use crate::scheduler::{FileDescriptor, TaskState};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,6 +34,14 @@ pub struct Elf64_Phdr {
     pub p_filesz: u64,
     pub p_memsz: u64,
     pub p_align: u64,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IpcMessage {
+    pub sender_pid: u64,
+    pub msg_type: u64,
+    pub data1: u64,
+    pub data2: u64,
 }
 
 pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
@@ -113,6 +122,7 @@ pub struct Process {
     pub is_idle: bool, 
     // --- NEW: WAKE TIMER FOR SYS_SLEEP ---
     pub wake_tsc: u64, 
+    pub mailbox: VecDeque<IpcMessage>,
 }
 
 impl Process {
@@ -135,7 +145,8 @@ impl Process {
             cpu_ticks: 0,
             name: [0; 16],
             is_idle: false, 
-            wake_tsc: 0, // Default to 0 (Not sleeping)
+            wake_tsc: 0,
+            mailbox: VecDeque::new(), // Default to empty mailbox
         })
     }
     
@@ -155,7 +166,8 @@ impl Process {
             cpu_ticks: 0,
             name: [0; 16],
             is_idle: false,
-            wake_tsc: 0, // Default to 0 (Not sleeping)
+            wake_tsc: 0,
+            mailbox: VecDeque::new(), // Default to empty mailbox
         })
     }
 }
@@ -165,7 +177,8 @@ impl Process {
 // ==========================================
 pub extern "C" fn nyx_idle_task() {
     loop {
-        // Halt the physical CPU core. It wakes up instantly when the hardware timer fires!
-        unsafe { x86_64::instructions::hlt(); }
+        // Ensure interrupts are ALWAYS enabled before halting, 
+        // preventing the CPU from becoming permanently bricked.
+        unsafe { x86_64::instructions::interrupts::enable_and_hlt(); }
     }
 }

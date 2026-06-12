@@ -8,6 +8,19 @@ use x86_64::{
 use bootloader_api::info::MemoryRegionKind;
 use spin::Mutex;
 
+use alloc::vec::Vec;
+
+pub struct ShmBlock {
+    pub id: u64,
+    pub frames: Vec<PhysAddr>,
+    pub size: usize,
+}
+
+lazy_static::lazy_static! {
+    pub static ref SHM_REGISTRY: spin::Mutex<Vec<ShmBlock>> = spin::Mutex::new(Vec::new());
+}
+static NEXT_SHM_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 lazy_static::lazy_static! {
     pub static ref MEMORY_MANAGER: Mutex<Option<MemorySystem>> = Mutex::new(None);
 }
@@ -176,8 +189,7 @@ pub fn map_user_framebuffer(phys_addr: u64, size: u64) -> Result<u64, &'static s
     
     let user_start = VirtAddr::new(0x9000_0000); 
 
-    // THE FIX: WRITE_THROUGH enables Write-Combining for PCIe bandwidth!
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITE_THROUGH;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITE_THROUGH | PageTableFlags::BIT_9;
     
     let start_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr));
     let end_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys_addr + size - 1));
@@ -334,15 +346,22 @@ pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
                         let pt_entry = *parent_pt_ptr.add(i1);
                         if pt_entry & 1 == 0 { continue; }
 
-                        if (pt_entry & 0x4) != 0 && (pt_entry & 0x10) == 0 {
-                            let parent_page_phys = pt_entry & phys_mask;
-                            let child_page_frame = system.frame_allocator.allocate_frame().expect("OOM: Page");
+                        // 🚨 COPY-ON-WRITE IMPLEMENTATION
+                        // If it is User Memory (0x4), AND it is NOT MMIO (0x10), AND NOT Shared (0x200)
+                        if (pt_entry & 0x4) != 0 && (pt_entry & 0x10) == 0 && (pt_entry & 0x200) == 0 {
                             
-                            let dst_ptr = (child_page_frame.start_address().as_u64() + offset) as *mut u8;
-                            let src_ptr = (parent_page_phys + offset) as *const u8;
-                            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
-                            *child_pt_ptr.add(i1) = child_page_frame.start_address().as_u64() | (pt_entry & flags_mask);
+                            // 1. Strip the Writable flag (Bit 1), Add the CoW flag (Bit 10 = 0x400)
+                            let cow_entry = (pt_entry & !(1 << 1)) | 0x400;
+                            
+                            // 2. Update Child to point to the SAME frame, but Read-Only (CoW)
+                            *child_pt_ptr.add(i1) = cow_entry;
+                            
+                            // 3. Update the Parent's original table so it traps on write too!
+                            let mut_parent_pt = parent_pt_ptr as *mut u64;
+                            *mut_parent_pt.add(i1) = cow_entry;
+                            
                         } else {
+                            // It is Shared MMIO/Framebuffer! Keep it fully writable for both.
                             *child_pt_ptr.add(i1) = pt_entry;
                         }
                     }
@@ -398,11 +417,16 @@ pub fn clear_user_address_space(cr3_phys: PhysAddr) {
                         if pt_entry & 1 == 0 { continue; }
                         
                         if (pt_entry & 0x4) != 0 {
-                            if (pt_entry & 0x10) == 0 {
+                            // 🚨 THE CoW LEAK FIX 🚨
+                            // Do NOT free MMIO (0x10), Shared Memory (0x200), OR CoW Pages (0x400)!
+                            // If it has the CoW bit, the Parent is still relying on this physical RAM!
+                            if (pt_entry & 0x10) == 0 && (pt_entry & 0x200) == 0 && (pt_entry & 0x400) == 0 {
                                 let page_phys = pt_entry & phys_mask;
                                 use x86_64::structures::paging::PhysFrame;
                                 system.frame_allocator.deallocate_frame(PhysFrame::containing_address(x86_64::PhysAddr::new(page_phys)));
                             }
+                            
+                            // Safely detach this process's pointer to the memory
                             *pt.add(i1) = 0; 
                         } else {
                             pt_empty = false; 
@@ -437,4 +461,50 @@ pub fn clear_user_address_space(cr3_phys: PhysAddr) {
         let active_cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
         core::arch::asm!("mov cr3, {}", in(reg) active_cr3);
     }
+}
+
+pub fn create_shm_block(size: usize) -> Option<u64> {
+    let num_pages = (size + 0xFFF) / 0x1000;
+    let mut frames = Vec::with_capacity(num_pages);
+    
+    let mut sys_lock = MEMORY_MANAGER.lock();
+    let sys = sys_lock.as_mut()?;
+    
+    for _ in 0..num_pages {
+        let frame = sys.frame_allocator.allocate_frame()?;
+        unsafe {
+            let ptr = (frame.start_address().as_u64() + PHYS_MEM_OFFSET) as *mut u8;
+            core::ptr::write_bytes(ptr, 0, 4096);
+        }
+        frames.push(frame.start_address());
+    }
+    
+    let id = NEXT_SHM_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    SHM_REGISTRY.lock().push(ShmBlock { id, frames, size });
+    Some(id)
+}
+
+pub fn map_shm_block(id: u64, target_vaddr: u64) -> Result<u64, &'static str> {
+    let registry = SHM_REGISTRY.lock();
+    let block = registry.iter().find(|b| b.id == id).ok_or("SHM not found")?;
+    
+    let mut system_lock = MEMORY_MANAGER.lock();
+    let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
+    let mut active_mapper = unsafe { active_mapper() };
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::BIT_9;
+
+    for (i, &phys_addr) in block.frames.iter().enumerate() {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(target_vaddr + (i as u64 * 4096)));
+        let frame = PhysFrame::containing_address(phys_addr);
+        
+        unsafe {
+            match active_mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
+                Ok(mapper) => mapper.flush(),
+                Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => continue,
+                Err(_) => return Err("Failed to map SHM page"),
+            }
+        }
+    }
+    Ok(target_vaddr)
 }

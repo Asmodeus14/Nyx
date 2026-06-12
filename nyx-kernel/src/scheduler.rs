@@ -62,14 +62,13 @@ impl Scheduler {
             return current_rsp;
         }
 
-        // --- 1. WAKE UP SLEEPING TASKS ---
-        let mut lo: u32; let mut hi: u32;
-        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-        let current_tsc = ((hi as u64) << 32) | (lo as u64);
+        // --- 1. WAKE UP SLEEPING TASKS (UPTIME CLOCK) ---
+        let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
 
         for task in self.tasks.iter_mut() {
-            if task.state == TaskState::Blocked && task.wake_tsc != 0 {
-                if current_tsc >= task.wake_tsc {
+            if task.state == TaskState::Blocked && task.wake_tsc != 0 && task.wake_tsc != u64::MAX {
+                // Check if the current time has surpassed the target wakeup time
+                if current_ms >= task.wake_tsc {
                     task.state = TaskState::Ready;
                     task.wake_tsc = 0; // Clear the timer
                 }
@@ -87,7 +86,7 @@ impl Scheduler {
             current_process.saved_rsp = current_rsp;
             
             // If it was Running (normal preemption), mark it Ready so it can run again.
-            // If it was Blocked (sys_sleep), we leave it Blocked!
+            // If it was Blocked (sys_sleep or IPC wait), we leave it Blocked!
             if current_process.state == TaskState::Running {
                 current_process.state = TaskState::Ready;
             }

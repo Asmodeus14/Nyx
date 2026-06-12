@@ -66,3 +66,29 @@ pub fn box_blur(buffer: &mut [u32], screen_w: usize, screen_h: usize, rect_x: us
         }
     }
 }
+
+/// Fast ARGB Alpha Blending (0xAARRGGBB)
+#[inline(always)]
+pub fn alpha_blend(fg: u32, bg: u32) -> u32 {
+    let a = (fg >> 24) & 0xFF;
+    
+    // Fast-paths for solid or fully transparent pixels
+    if a == 255 { return fg; }
+    if a == 0 { return bg; }
+
+    let inv_a = 255 - a;
+    
+    let r = (((fg >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * inv_a) / 255;
+    let g = (((fg >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * inv_a) / 255;
+    let b = ((fg & 0xFF) * a + (bg & 0xFF) * inv_a) / 255;
+
+    (0xFF << 24) | (r << 16) | (g << 8) | b
+}
+
+/// Applies a global opacity modifier to an existing ARGB color
+#[inline(always)]
+pub fn apply_opacity(color: u32, opacity: u8) -> u32 {
+    let base_a = (color >> 24) & 0xFF;
+    let new_a = (base_a * (opacity as u32)) / 255;
+    (new_a << 24) | (color & 0x00FFFFFF)
+}

@@ -1,5 +1,5 @@
-use crate::gfx::font;
-use crate::gfx::effects::{blend_color, box_blur};
+use crate::font;
+use crate::effects::{blend_color, box_blur};
 
 /// Draws a simple solid color rectangle
 pub fn draw_rect_simple(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, rw: usize, rh: usize, color: u32) {

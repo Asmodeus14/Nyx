@@ -5,298 +5,263 @@ extern crate alloc;
 use linked_list_allocator::LockedHeap;
 use alloc::vec::Vec;
 use alloc::vec;
-use alloc::format;
 
-mod syscalls;
-mod console;
-mod apps;
-mod gfx;
-
-use syscalls::*;
-use apps::terminal::Terminal;
-use apps::clock::Clock;
-use apps::editor::Editor;
-use apps::explorer::Explorer;
-use apps::monitor::SysMonitor;
-use apps::sysinfo::SysInfoApp;
-use apps::bootlog::BootlogApp;
-use apps::netchat::NetChatApp;
-use apps::browser::BrowserApp;
-use gfx::draw;
-use gfx::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, TASKBAR_H};
+use nyx_api::*;
+use nyx_gui::canvas::{Canvas, Color};
+use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
-const MAX_WINDOWS: usize = 9;
 
-// --- HARDWARE ACCELERATION SYSCALL WRAPPERS ---
-pub fn sys_fill_rect(x: usize, y: usize, w: usize, h: usize, color_idx: usize) {
-    syscall(501, x as u64, y as u64, w as u64, h as u64, color_idx as u64, 0);
+pub struct WindowClient {
+    pub win: Window,
+    pub owner_pid: u64,
+    pub shm_id: u64,
+    pub buffer: *const u32, 
 }
 
-pub fn sys_swap_buffers() {
-    syscall(502, 0, 0, 0, 0, 0, 0);
-}
-
-pub fn sys_gpu_sync() {
-    syscall(503, 0, 0, 0, 0, 0, 0);
-}
-
-pub fn sys_map_gpu_backbuffer() -> u64 {
-    syscall(509, 0, 0, 0, 0, 0, 0)
-}
-
-pub fn sys_wait_vsync() {
-    syscall(513, 0, 0, 0, 0, 0, 0);
-}
-
-pub fn sys_sleep_ms(ms: u64) {
-    syscall(525, ms, 0, 0, 0, 0, 0);
-}
+fn get_str_len(buf: &[u8; 64]) -> usize { buf.iter().position(|&c| c == 0).unwrap_or(64) }
 
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    const HEAP_PAGES: usize = 4096;
+    const HEAP_PAGES: usize = 4096; 
     let heap_start = sys_alloc_pages(HEAP_PAGES);
     if heap_start == 0 { sys_exit(1); }
-    unsafe { ALLOCATOR.lock().init(heap_start as usize, HEAP_PAGES * 4096); }
+    unsafe { ALLOCATOR.lock().init(heap_start as *mut u8, HEAP_PAGES * 4096); }
 
     let (screen_w, screen_h, screen_stride) = sys_get_screen_info();
-    if screen_w == 0 || screen_h == 0 { sys_exit(2); }
-    
     let fb_ptr = sys_map_framebuffer();
-    if fb_ptr == 0 { sys_exit(3); }
-
     let hardware_fb = unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u32, screen_stride * screen_h) };
-    hardware_fb.fill(0xFF1E1E1E);
+    
+    let mut back_buffer: Vec<u32> = vec![Color::WARM_BG; screen_stride * screen_h];
+    let mut clients: Vec<WindowClient> = Vec::new();
+    let mut next_win_id = 0;
 
-    let mut back_buffer: Vec<u32> = vec![0xFF000000; screen_stride * screen_h];
-    
-    let mut windows = [
-        Window { id: 0, x: 50, y: 50, w: 760, h: 480, title: "Nyx Terminal", active: true, exists: true },
-        Window { id: 1, x: 880, y: 50, w: 300, h: 200, title: "Sys Monitor", active: false, exists: true },
-        Window { id: 2, x: 150, y: 150, w: 300, h: 200, title: "Help", active: false, exists: false },
-        Window { id: 3, x: 200, y: 100, w: 600, h: 450, title: "NyxPad", active: false, exists: false },
-        Window { id: 4, x: 150, y: 150, w: 500, h: 400, title: "File Explorer", active: false, exists: false },
-        Window { id: 5, x: 250, y: 150, w: 400, h: 250, title: "Hardware Profile", active: false, exists: false },
-        Window { id: 6, x: 100, y: 100, w: 800, h: 800, title: "Kernel Boot Logs", active: false, exists: true },
-        Window { id: 7, x: 300, y: 150, w: 450, h: 350, title: "NetChat", active: false, exists: false },
-        Window { id: 8, x: 150, y: 100, w: 850, h: 650, title: "NyxBrowser", active: false, exists: false },
-    ];
-    let mut z_order = [0, 1, 2, 3, 4, 5, 6, 7, 8];
-    
-    let mut my_terminal = Terminal::new();
-    my_terminal.write_str("NyxOS Shell v0.6\nType 'ls' to list files.\n> ");
-    let mut my_editor = Editor::new();
-    let mut my_explorer = Explorer::new();
-    let mut my_monitor = SysMonitor::new();
-    let mut my_sysinfo = SysInfoApp::new();
-    let mut my_bootlog = BootlogApp::new();
-    let mut my_netchat = NetChatApp::new();
-    my_netchat.init();
-    let mut my_browser = BrowserApp::new(); 
-
-    let mut show_start_menu = false;
-    let mut is_dragging = false; let mut is_resizing = false;
-    let mut target_idx = 0;
-    let mut drag_off_x = 0; let mut drag_off_y = 0;
-    let mut prev_left = false; 
-    let mut prev_mx = 0; let mut prev_my = 0;
-    
+    let mut msg = IpcMessage { sender_pid: 0, msg_type: 0, data1: 0, data2: 0 };
     let mut last_frame = sys_get_time();
-    let mut last_second = sys_get_time() / 1000;
-    let ms_per_frame = 1000 / 60; // 60 FPS Target
-    
+    let ms_per_frame = 1000 / 60; 
+
+    let mut prev_mx = screen_w / 2; let mut prev_my = screen_h / 2;
     let mut dirty_min_x = 0; let mut dirty_min_y = 0;
     let mut dirty_max_x = screen_stride; let mut dirty_max_y = screen_h;
-    let mut needs_redraw = true;
+    let mut needs_redraw = true; 
+
+    let mut prev_left = false;
+    let mut dragging_win_idx: Option<usize> = None;
+    let mut drag_off_x = 0; let mut drag_off_y = 0;
+
+    // 🚨 NEW: Start Menu State
+    let mut start_menu_open = false;
+
+    sys_print("[COMPOSITOR] Nyx Window Server Online. (Start Menu Active)\n");
 
     loop {
-        let now = sys_get_time();
-        let elapsed = now.wrapping_sub(last_frame);
-        
-        if elapsed < ms_per_frame { 
-            let time_to_sleep = ms_per_frame - elapsed;
-            sys_sleep_ms(time_to_sleep as u64); 
-            continue; 
+        // 1. Process IPC Messages (Unchanged)
+        while sys_ipc_recv(&mut msg, false) {
+            match msg.msg_type {
+                MSG_REQ_WINDOW => {
+                    let shm_id = msg.data1;
+                    let vaddr = sys_map_shm(shm_id) as *mut u8;
+                    let header = unsafe { &*(vaddr as *const WindowHeader) };
+                    if header.magic == WIN_MAGIC {
+                        let w = header.width as usize; let h = header.height as usize;
+                        let x = if header.requested_x == -1 { 100 + (next_win_id as usize * 30) } else { header.requested_x as usize };
+                        let y = if header.requested_y == -1 { 100 + (next_win_id as usize * 30) } else { header.requested_y as usize };
+                        
+                        clients.push(WindowClient {
+                            win: Window { id: next_win_id, x, y, w, h, title: header.title, title_len: get_str_len(&header.title), active: true, exists: true, opacity: 0 },
+                            owner_pid: msg.sender_pid, shm_id, buffer: unsafe { vaddr.add(core::mem::size_of::<WindowHeader>()) } as *const u32,
+                        });
+                        next_win_id += 1;
+                        
+                        // 🚨 THE FIX: Force compositor to redraw the new region instantly!
+                        dirty_min_x = 0; dirty_min_y = 0;
+                        dirty_max_x = screen_w; dirty_max_y = screen_h;
+                        needs_redraw = true;
+
+                        sys_ipc_send(msg.sender_pid, MSG_WINDOW_CREATED, shm_id, 0);
+                    }
+                },
+                MSG_FLUSH_WINDOW => {
+                    if let Some(client) = clients.iter_mut().find(|c| c.owner_pid == msg.sender_pid) {
+                        dirty_min_x = dirty_min_x.min(client.win.x); dirty_min_y = dirty_min_y.min(client.win.y);
+                        dirty_max_x = dirty_max_x.max(client.win.x + client.win.w + 10); dirty_max_y = dirty_max_y.max(client.win.y + client.win.h + 40); 
+                        needs_redraw = true;
+                    }
+                },
+                _ => {}
+            }
         }
-        
-        last_frame = now;
-        
-        // ==========================================
-        // CORRECT MOUSE POLLING: No Loops, Just Absolute State!
-        // ==========================================
-        let (mx_raw, my_raw, left, _right) = sys_get_mouse();
-        
-        let mx = mx_raw.clamp(0, screen_w - 1); 
-        let my = my_raw.clamp(0, screen_h - 1);
-        
-        let mut mark_dirty = |x: usize, y: usize, w: usize, h: usize| {
+
+        // 2. Keyboard Routing (Removed 's' and 't' hotkeys per your request!)
+        if let Some(key) = sys_read_key() {
+            if let Some(top_client) = clients.iter().rev().find(|c| c.win.exists) {
+                sys_ipc_send(top_client.owner_pid, MSG_KEY_EVENT, key as u64, 0);
+            }
+        }
+
+        // 3. Mouse Engine
+        let (mx_raw, my_raw, left_click, _right) = sys_get_mouse();
+        let mx = mx_raw.clamp(0, screen_w - 1); let my = my_raw.clamp(0, screen_h - 1);
+
+        if mx != prev_mx || my != prev_my {
             let pad = 20;
-            let sx = x.saturating_sub(pad); let sy = y.saturating_sub(pad);
-            let ex = (x + w + pad).min(screen_stride); let ey = (y + h + pad).min(screen_h);
-            dirty_min_x = dirty_min_x.min(sx); dirty_min_y = dirty_min_y.min(sy);
-            dirty_max_x = dirty_max_x.max(ex); dirty_max_y = dirty_max_y.max(ey);
-        };
-
-        my_terminal.pump_pipe();
-        if my_browser.pump_pipe() { needs_redraw = true; }
-        
-        if now / 1000 != last_second {
-            last_second = now / 1000;
-            mark_dirty(0, 0, screen_stride, screen_h);
-            my_monitor.update_stats();
-            my_bootlog.refresh();
-            my_netchat.update();
-            needs_redraw = true;
-        }
-        
-        if let Some(c) = sys_read_key() {
-            if windows[0].active && windows[0].exists { my_terminal.handle_key(c); }
-            else if windows[3].active && windows[3].exists { my_editor.handle_key(c); }
-            else if windows[7].active && windows[7].exists { my_netchat.handle_key(c); }
-            else if windows[8].active && windows[8].exists { my_browser.handle_key(c); }
-            mark_dirty(0, 0, screen_stride, screen_h);
-            needs_redraw = true;
-        }
-        
-        if left && !prev_left {
-            mark_dirty(0, 0, screen_stride, screen_h);
-            needs_redraw = true;
-
-            let mut handled = false;
-            if show_start_menu {
-                let menu_w = 150; let menu_h = 9 * 40; let menu_y = screen_h - TASKBAR_H - menu_h;
-                if mx <= menu_w && my >= menu_y {
-                    let item_idx = (my - menu_y) / 40;
-                    match item_idx {
-                        0 => launch_app(&mut windows, &mut z_order, 0),
-                        1 => launch_app(&mut windows, &mut z_order, 4),
-                        2 => launch_app(&mut windows, &mut z_order, 3),
-                        3 => launch_app(&mut windows, &mut z_order, 1),
-                        4 => launch_app(&mut windows, &mut z_order, 2),
-                        5 => launch_app(&mut windows, &mut z_order, 5),
-                        6 => launch_app(&mut windows, &mut z_order, 6),
-                        7 => launch_app(&mut windows, &mut z_order, 7),
-                        8 => launch_app(&mut windows, &mut z_order, 8),
-                        _ => {}
-                    }
-                    handled = true;
-                }
-                show_start_menu = false;
-            }
-            
-            if !handled && my >= screen_h - TASKBAR_H && mx < 100 {
-                show_start_menu = !show_start_menu;
-                handled = true;
-            }
-            
-            if !handled {
-                let mut hit_z_index = None;
-                for i in (0..MAX_WINDOWS).rev() {
-                    let idx = z_order[i];
-                    let w = &windows[idx];
-                    if w.exists && mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h {
-                        hit_z_index = Some(i); break;
-                    }
-                }
-                if let Some(i) = hit_z_index {
-                    let idx = z_order[i];
-                    for j in i..(MAX_WINDOWS-1) { z_order[j] = z_order[j+1]; }
-                    z_order[MAX_WINDOWS-1] = idx;
-                    for win in windows.iter_mut() { win.active = false; }
-                    windows[idx].active = true; target_idx = idx;
-                    
-                    let wx = windows[idx].x; let wy = windows[idx].y;
-                    let ww = windows[idx].w; let wh = windows[idx].h;
-                    
-                    if mx >= wx + ww - 35 && mx <= wx + ww - 5 && my >= wy + 5 && my <= wy + 25 {
-                        windows[idx].exists = false;
-                    } else if mx >= wx + ww - 25 && mx <= wx + ww && my >= wy + wh - 25 && my <= wy + wh {
-                        is_resizing = true; drag_off_x = (wx + ww) as isize - mx as isize; drag_off_y = (wy + wh) as isize - my as isize;
-                    } else if my < wy + 30 {
-                        is_dragging = true; drag_off_x = mx as isize - wx as isize; drag_off_y = my as isize - wy as isize;
-                    } else {
-                        let rx = mx.saturating_sub(wx); let ry = my.saturating_sub(wy);
-                        if windows[idx].id == 3 { my_editor.handle_click(rx, ry, ww); }
-                        if windows[idx].id == 4 { my_explorer.handle_click(rx, ry, ww); }
-                        if windows[idx].id == 6 { my_bootlog.handle_click(mx, my, wx, wy, ww, wh); }
-                        if windows[idx].id == 8 { my_browser.handle_click(rx, ry, ww, wh); }
-                    }
-                }
-            }
-        } else if !left { is_dragging = false; is_resizing = false; }
-        
-        if is_dragging {
-            let win = &mut windows[target_idx];
-            let old_x = win.x; let old_y = win.y; let old_w = win.w; let old_h = win.h;
-            win.x = (mx as isize - drag_off_x).clamp(0, (screen_w.saturating_sub(win.w)) as isize) as usize;
-            win.y = (my as isize - drag_off_y).clamp(0, (screen_h.saturating_sub(TASKBAR_H + win.h)) as isize) as usize;
-            mark_dirty(old_x, old_y, old_w, old_h);
-            mark_dirty(win.x, win.y, win.w, win.h);
-            needs_redraw = true;
-        }
-        if is_resizing {
-            let win = &mut windows[target_idx];
-            let old_x = win.x; let old_y = win.y; let old_w = win.w; let old_h = win.h;
-            let new_right = mx as isize + drag_off_x; let new_bottom = my as isize + drag_off_y;
-            win.w = (new_right - win.x as isize).max(300).min((screen_w.saturating_sub(win.x)) as isize) as usize;
-            win.h = (new_bottom - win.y as isize).max(200).min((screen_h.saturating_sub(TASKBAR_H + win.y)) as isize) as usize;
-            mark_dirty(old_x, old_y, old_w, old_h);
-            mark_dirty(win.x, win.y, win.w, win.h);
-            needs_redraw = true;
-        }
-        
-        if mx != prev_mx || my != prev_my { 
-            mark_dirty(prev_mx, prev_my, 15, 15);
-            mark_dirty(mx, my, 15, 15);
+            dirty_min_x = dirty_min_x.min(prev_mx.saturating_sub(pad)).min(mx.saturating_sub(pad));
+            dirty_min_y = dirty_min_y.min(prev_my.saturating_sub(pad)).min(my.saturating_sub(pad));
+            dirty_max_x = dirty_max_x.max(prev_mx + pad).max(mx + pad).min(screen_stride);
+            dirty_max_y = dirty_max_y.max(prev_my + pad).max(my + pad).min(screen_h);
             needs_redraw = true; 
         }
-        prev_left = left;
-        
+
+        if left_click && !prev_left {
+            let mut clicked_idx: Option<usize> = None;
+
+            // --- TASKBAR DIMENSIONS ---
+            let btn_w = 70; let btn_x = (screen_stride / 2) - (btn_w / 2); let btn_y = screen_h - 36 + 6; 
+            let net_x = screen_stride - 50; let net_w = 30;
+
+            let menu_w = 180; let menu_h = 200;
+            let menu_x = (screen_stride / 2) - (menu_w / 2); let menu_y = screen_h - 36 - menu_h - 10;
+
+            // 3a. Start Menu Item Click
+            if start_menu_open && mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h {
+                let rel_y = my - menu_y;
+                
+                //  THE FIX: Map clicks to the physical NVMe app bundles!
+                if rel_y < 40 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Terminal.nyx/run.bin\0"); sys_exit(1); } }
+                else if rel_y < 80 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Settings.nyx/run.bin\0"); sys_exit(1); } }
+                else if rel_y < 120 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Explorer.nyx/run.bin\0"); sys_exit(1); } }
+                else if rel_y < 160 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Network.nyx/run.bin\0"); sys_exit(1); } }
+                else { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0"); sys_exit(1); } }
+                
+                start_menu_open = false; prev_left = left_click; needs_redraw = true;
+                dirty_min_x = 0; dirty_min_y = 0; dirty_max_x = screen_stride; dirty_max_y = screen_h;
+                continue;
+            }
+
+            // 3b. NYX Button Click (Toggle Menu)
+            if mx >= btn_x && mx <= btn_x + btn_w && my >= btn_y && my <= btn_y + 24 {
+                start_menu_open = !start_menu_open; prev_left = left_click; needs_redraw = true;
+                dirty_min_x = 0; dirty_min_y = 0; dirty_max_x = screen_stride; dirty_max_y = screen_h;
+                continue; 
+            }
+
+            // 3c. Network Icon Click
+            if mx >= net_x && mx <= net_x + net_w && my >= btn_y && my <= btn_y + 24 {
+                if sys_fork() == 0 { sys_execve("/bin/nyx-network\0"); sys_exit(1); }
+                start_menu_open = false; prev_left = left_click; needs_redraw = true;
+                continue; 
+            }
+
+            // 3d. Close menu if clicked anywhere else
+            if start_menu_open {
+                start_menu_open = false; needs_redraw = true;
+                dirty_min_x = 0; dirty_min_y = 0; dirty_max_x = screen_stride; dirty_max_y = screen_h;
+            }
+
+            // 3e. Standard Window Click Routing
+            for (idx, client) in clients.iter_mut().enumerate().rev() {
+                if !client.win.exists { continue; }
+                let win_x = client.win.x; let win_y = client.win.y; let win_w = client.win.w; let win_h = client.win.h + 30;
+                
+                if mx >= win_x + 10 && mx <= win_x + 24 && my >= win_y + 10 && my <= win_y + 22 {
+                    client.win.exists = false; 
+                    sys_ipc_send(client.owner_pid, MSG_WINDOW_CLOSE, 0, 0); 
+                    dirty_min_x = dirty_min_x.min(win_x); dirty_min_y = dirty_min_y.min(win_y);
+                    dirty_max_x = dirty_max_x.max(win_x + win_w + 10); dirty_max_y = dirty_max_y.max(win_y + win_h + 10); 
+                    needs_redraw = true; clicked_idx = Some(idx); break;
+                }
+                if mx >= win_x && mx <= win_x + win_w && my >= win_y && my <= win_y + 30 {
+                    dragging_win_idx = Some(idx); drag_off_x = mx - win_x; drag_off_y = my - win_y; 
+                    clicked_idx = Some(idx); break; 
+                }
+                if mx >= win_x && mx <= win_x + win_w && my > win_y + 30 && my <= win_y + win_h {
+                    sys_ipc_send(client.owner_pid, MSG_MOUSE_EVENT, (mx - win_x) as u64, (my - (win_y + 30)) as u64);
+                    clicked_idx = Some(idx); break; 
+                }
+            }
+
+            if let Some(idx) = clicked_idx {
+                if idx != clients.len() - 1 {
+                    let moved_client = clients.remove(idx);
+                    clients.push(moved_client);
+                    if dragging_win_idx == Some(idx) { dragging_win_idx = Some(clients.len() - 1); }
+                    dirty_min_x = 0; dirty_min_y = 0; dirty_max_x = screen_stride; dirty_max_y = screen_h;
+                    needs_redraw = true;
+                }
+            }
+        } else if left_click && dragging_win_idx.is_some() {
+            let idx = dragging_win_idx.unwrap();
+            let w = clients[idx].win.w + 10; let h = clients[idx].win.h + 40;
+            dirty_min_x = dirty_min_x.min(clients[idx].win.x); dirty_min_y = dirty_min_y.min(clients[idx].win.y);
+            dirty_max_x = dirty_max_x.max(clients[idx].win.x + w); dirty_max_y = dirty_max_y.max(clients[idx].win.y + h);
+            clients[idx].win.x = mx.saturating_sub(drag_off_x); clients[idx].win.y = my.saturating_sub(drag_off_y);
+            dirty_min_x = dirty_min_x.min(clients[idx].win.x); dirty_min_y = dirty_min_y.min(clients[idx].win.y);
+            dirty_max_x = dirty_max_x.max(clients[idx].win.x + w); dirty_max_y = dirty_max_y.max(clients[idx].win.y + h);
+            needs_redraw = true;
+        } else if !left_click { dragging_win_idx = None; }
+        prev_left = left_click;
+
+        for client in clients.iter_mut() {
+            if client.win.exists && client.win.opacity < 255 {
+                client.win.opacity = client.win.opacity.saturating_add(15);
+                dirty_min_x = dirty_min_x.min(client.win.x); dirty_min_y = dirty_min_y.min(client.win.y);
+                dirty_max_x = dirty_max_x.max(client.win.x + client.win.w + 10); dirty_max_y = dirty_max_y.max(client.win.y + client.win.h + 40);
+                needs_redraw = true; 
+            }
+        }
+
+        let now = sys_get_time();
+        if !needs_redraw && now.wrapping_sub(last_frame) < ms_per_frame { sys_sleep_ms(2); continue; }
+        last_frame = now;
+
         if needs_redraw {
-            dirty_min_x = dirty_min_x.clamp(0, screen_stride);
-            dirty_min_y = dirty_min_y.clamp(0, screen_h);
-            dirty_max_x = dirty_max_x.clamp(0, screen_stride);
-            dirty_max_y = dirty_max_y.clamp(0, screen_h);
+            dirty_min_x = dirty_min_x.min(mx.saturating_sub(15)); dirty_min_y = dirty_min_y.min(my.saturating_sub(15));
+            dirty_max_x = dirty_max_x.max(mx + 20).min(screen_stride); dirty_max_y = dirty_max_y.max(my + 20).min(screen_h);
+
+            for y in dirty_min_y..dirty_max_y {
+                for x in dirty_min_x..dirty_max_x { back_buffer[y * screen_stride + x] = Color::WARM_BG; }
+            }
+
+            let mut canvas = Canvas::new(&mut back_buffer, screen_stride, screen_h);
+
+            for client in clients.iter() {
+                if client.win.exists {
+                    draw_window_rounded(canvas.buffer, screen_stride, screen_h, &client.win);
+                    if client.buffer.is_null() || client.buffer as u64 == 0 { continue; }
+                    let client_pixels = unsafe { core::slice::from_raw_parts(client.buffer, client.win.w * client.win.h) };
+                    canvas.composite_buffer(client.win.x, client.win.y + 30, client_pixels, client.win.w, client.win.h, client.win.opacity);
+                }
+            }
+
+            draw_taskbar(canvas.buffer, screen_stride, screen_h);
             
-            let d_w = dirty_max_x.saturating_sub(dirty_min_x);
-            let d_h = dirty_max_y.saturating_sub(dirty_min_y);
+            // 🚨 NEW: Draw the Taskbar Network Icon
+            let net_x = screen_stride - 50; let btn_y = screen_h - 36 + 6;
+            canvas.print_str(net_x, btn_y + 4, "[WIFI]", Color::WHITE, 1);
 
-            if d_w > 0 && d_h > 0 {
-                draw::restore_wallpaper_rect(&mut back_buffer, screen_stride, screen_h, dirty_min_x, dirty_min_y, d_w, d_h);
+            // 🚨 NEW: Draw the Start Menu Over everything else!
+            if start_menu_open {
+                let menu_w = 180; let menu_h = 200;
+                let menu_x = (screen_stride / 2) - (menu_w / 2); let menu_y = screen_h - 36 - menu_h - 10;
                 
-                draw_desktop_icons(&mut back_buffer, screen_stride, screen_h);
-                for &idx in z_order.iter() {
-                    if windows[idx].exists {
-                        draw_window_rounded(&mut back_buffer, screen_stride, screen_h, &windows[idx]);
-                        match windows[idx].id {
-                            0 => my_terminal.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y),
-                            1 => my_monitor.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y),
-                            2 => draw::draw_text(&mut back_buffer, screen_stride, screen_h, windows[idx].x + 20, windows[idx].y + 50, "NyxOS Help", 0xFFFFFFFF),
-                            3 => my_editor.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h),
-                            4 => my_explorer.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h),
-                            5 => my_sysinfo.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y),
-                            6 => my_bootlog.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h),
-                            7 => my_netchat.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h),
-                            8 => my_browser.draw(&mut back_buffer, screen_stride, screen_h, windows[idx].x, windows[idx].y, windows[idx].w, windows[idx].h),
-                            _ => {}
-                        }
-                    }
-                }
+                canvas.fill_rect(menu_x, menu_y, menu_w, menu_h, 0xFF_111111); // Dark Menu BG
+                canvas.fill_rect(menu_x, menu_y, menu_w, 2, Color::NYX_ORANGE); // Top Accent
                 
-                draw_taskbar(&mut back_buffer, screen_stride, screen_h);
-                Clock::draw(&mut back_buffer, screen_stride, screen_h);
-                if show_start_menu { draw_start_menu(&mut back_buffer, screen_stride, screen_h); }
-                draw_cursor(&mut back_buffer, screen_stride, screen_h, mx, my);
+                canvas.print_str(menu_x + 20, menu_y + 12, "> Terminal", Color::WHITE, 1);
+                canvas.print_str(menu_x + 20, menu_y + 52, "> Settings", Color::WHITE, 1);
+                canvas.print_str(menu_x + 20, menu_y + 92, "> Explorer", Color::WHITE, 1);
+                canvas.print_str(menu_x + 20, menu_y + 132, "> Network Suite", Color::WHITE, 1);
+                canvas.print_str(menu_x + 20, menu_y + 172, "> System Monitor", Color::WHITE, 1);
+            }
 
-                let hardware_fb = unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u32, screen_stride * screen_h) };
-                for y in dirty_min_y..dirty_max_y {
-                    let start_idx = y * screen_stride + dirty_min_x;
-                    let end_idx = y * screen_stride + dirty_max_x;
-                    hardware_fb[start_idx..end_idx].copy_from_slice(&back_buffer[start_idx..end_idx]);
-                }
+            draw_cursor(canvas.buffer, screen_stride, screen_h, mx, my);
+
+            for y in dirty_min_y..dirty_max_y {
+                let start_idx = y * screen_stride + dirty_min_x;
+                let end_idx = y * screen_stride + dirty_max_x;
+                hardware_fb[start_idx..end_idx].copy_from_slice(&canvas.buffer[start_idx..end_idx]);
             }
 
             prev_mx = mx; prev_my = my;
@@ -306,54 +271,5 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-fn draw_start_menu(fb: &mut [u32], w: usize, h: usize) {
-    let menu_w = 150;
-    let items = ["Terminal", "File Explorer", "Text Editor", "Sys Monitor", "Help", "Hardware Info", "Boot Logs", "NetChat", "Browser"];
-    let item_h = 40; let menu_h = items.len() * item_h;
-    let x = 10; let y = h - TASKBAR_H - menu_h;
-    
-    draw::draw_rect_simple(fb, w, h, x, y, menu_w, menu_h, 0xFF2D2D30);
-    draw::draw_rect_simple(fb, w, h, x, y, 1, menu_h, 0xFF00AAFF);
-    draw::draw_rect_simple(fb, w, h, x + menu_w - 1, y, 1, menu_h, 0xFF555555);
-    draw::draw_rect_simple(fb, w, h, x, y, menu_w, 1, 0xFF555555);
-    
-    for (i, item) in items.iter().enumerate() {
-        let item_y = y + (i * item_h);
-        if i > 0 { draw::draw_rect_simple(fb, w, h, x + 5, item_y, menu_w - 10, 1, 0xFF3E3E42); }
-        draw::draw_text(fb, w, h, x + 15, item_y + 12, item, 0xFFFFFFFF);
-    }
-}
-
-fn launch_app(windows: &mut [Window], z_order: &mut [usize; MAX_WINDOWS], id_to_launch: usize) {
-    let mut arr_idx = 0;
-    for (i, w) in windows.iter().enumerate() { if w.id == id_to_launch { arr_idx = i; break; } }
-    windows[arr_idx].exists = true;
-    let mut z_pos = 0;
-    for (i, &idx) in z_order.iter().enumerate() { if idx == arr_idx { z_pos = i; break; } }
-    for j in z_pos..(MAX_WINDOWS-1) { z_order[j] = z_order[j+1]; }
-    z_order[MAX_WINDOWS-1] = arr_idx;
-    for w in windows.iter_mut() { w.active = w.id == id_to_launch; }
-}
-
-fn draw_desktop_icons(fb: &mut [u32], w: usize, h: usize) {
-    use crate::syscalls::{sys_fs_count, sys_fs_get_name};
-    let count = sys_fs_count("/");
-    let mut icon_x = 20; let mut icon_y = 20; let grid_h = 100;
-    for i in 0..count {
-        let mut name_buf = [0u8; 32];
-        let len = sys_fs_get_name("/", i, &mut name_buf);
-        if len > 0 {
-            if let Ok(name) = core::str::from_utf8(&name_buf[..len]) {
-                crate::gfx::ui::draw_file_icon(fb, w, h, icon_x, icon_y, name);
-                icon_y += grid_h;
-                if icon_y > h - 100 { icon_y = 20; icon_x += 80; }
-            }
-        }
-    }
-}
-
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys_write(2, b"\n[USERSPACE PANIC] Rust panicked in Ring 3!\n");
-    sys_exit(99);
-}
+fn panic(_info: &core::panic::PanicInfo) -> ! { sys_exit(99); }

@@ -1,0 +1,7 @@
+[package]
+name = "nyx-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# No external dependencies are needed since we talk directly to raw CPU registers!

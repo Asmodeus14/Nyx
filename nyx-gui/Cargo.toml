@@ -1,0 +1,9 @@
+[package]
+name = "nyx-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nyx-api = { path = "../nyx-api" }
+linked_list_allocator = "0.10.5"
+noto-sans-mono-bitmap = "0.2"      

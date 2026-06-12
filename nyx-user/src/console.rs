@@ -1,16 +1,16 @@
-use crate::syscalls;
+use nyx_api::sys_print; // Swapped to use the centralized API
 
 pub struct Console;
 
 impl Console {
     pub fn print(s: &str) {
-        syscalls::sys_print(s);
+        sys_print(s);
     }
 
     pub fn print_char(c: char) {
         let mut b = [0u8; 4];
         let s = c.encode_utf8(&mut b);
-        syscalls::sys_print(s);
+        sys_print(s);
     }
 }
 
@@ -33,7 +33,7 @@ macro_rules! println {
 pub struct StringWriter;
 impl core::fmt::Write for StringWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        syscalls::sys_print(s);
+        sys_print(s);
         Ok(())
     }
 }

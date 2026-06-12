@@ -204,6 +204,23 @@ pub unsafe extern "C" fn AcpiOsRedirectOutput(_handle: *mut c_void) {}
 // ==========================================
 // 10. GLIBC STRING & LOCALE GHOSTS
 // ==========================================
+#[no_mangle]
+pub extern "C" fn toupper(c: i32) -> i32 {
+    if c >= 'a' as i32 && c <= 'z' as i32 {
+        c - ('a' as i32 - 'A' as i32)
+    } else {
+        c
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tolower(c: i32) -> i32 {
+    if c >= 'A' as i32 && c <= 'Z' as i32 {
+        c + ('a' as i32 - 'A' as i32)
+    } else {
+        c
+    }
+}
 
 #[no_mangle] pub unsafe extern "C" fn strcmp(mut s1: *const u8, mut s2: *const u8) -> i32 {
     while *s1 != 0 && *s1 == *s2 { s1 = s1.add(1); s2 = s2.add(1); }

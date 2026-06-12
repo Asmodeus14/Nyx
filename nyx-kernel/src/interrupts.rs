@@ -79,6 +79,7 @@ lazy_static! {
         
         unsafe {
             idt[0x40].set_handler_addr(VirtAddr::new(timer_interrupt_stub as *const () as u64));
+            idt[0x41].set_handler_addr(VirtAddr::new(yield_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Keyboard.as_usize()].set_handler_addr(VirtAddr::new(keyboard_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Mouse.as_usize()].set_handler_addr(VirtAddr::new(mouse_interrupt_stub as *const () as u64));
             idt[0x30].set_handler_addr(VirtAddr::new(ethernet_interrupt_stub as *const () as u64));
@@ -117,18 +118,73 @@ extern "x86-interrupt" fn gpf_handler(stack_frame: InterruptStackFrame, error_co
 extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     let was_user = (stack_frame.code_segment & 3) == 3;
     if was_user { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
-    let cr2 = x86_64::registers::control::Cr2::read();
-    let cr3 = x86_64::registers::control::Cr3::read();
     
+    let cr2 = x86_64::registers::control::Cr2::read().as_u64();
+    let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+    
+    // 🚨 COPY-ON-WRITE (CoW) TRAP HANDLER 🚨
+    if error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) && error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+        unsafe {
+            let offset = crate::memory::PHYS_MEM_OFFSET;
+            let pml4 = (cr3 + offset) as *mut u64;
+            
+            let i4 = (cr2 >> 39) & 0x1FF;
+            let i3 = (cr2 >> 30) & 0x1FF;
+            let i2 = (cr2 >> 21) & 0x1FF;
+            let i1 = (cr2 >> 12) & 0x1FF;
+
+            let pml4_entry = *pml4.add(i4 as usize);
+            if pml4_entry & 1 != 0 {
+                let pml3 = ((pml4_entry & 0x000FFFFF_FFFFF000) + offset) as *mut u64;
+                let pml3_entry = *pml3.add(i3 as usize);
+                if pml3_entry & 1 != 0 {
+                    let pml2 = ((pml3_entry & 0x000FFFFF_FFFFF000) + offset) as *mut u64;
+                    let pml2_entry = *pml2.add(i2 as usize);
+                    if pml2_entry & 1 != 0 && (pml2_entry & (1 << 7)) == 0 {
+                        let pt = ((pml2_entry & 0x000FFFFF_FFFFF000) + offset) as *mut u64;
+                        let pt_entry = *pt.add(i1 as usize);
+                        
+                        // Check if Bit 10 (CoW Flag) is set!
+                        if pt_entry & 0x400 != 0 {
+                            // 1. Allocate a fresh physical frame
+                            if let Some(new_frame) = crate::memory::allocate_frame() {
+                                let old_phys = pt_entry & 0x000FFFFF_FFFFF000;
+                                let new_phys = new_frame.start_address().as_u64();
+                                
+                                // 2. Copy the 4KB data from the old frame to the new frame
+                                core::ptr::copy_nonoverlapping(
+                                    (old_phys + offset) as *const u8,
+                                    (new_phys + offset) as *mut u8,
+                                    4096
+                                );
+                                
+                                // 3. Update the PTE: Point to new frame, clear CoW bit, set Writable bit
+                                let mut new_entry = (pt_entry & !0x000FFFFF_FFFFF000) | new_phys;
+                                new_entry &= !0x400; // Clear CoW
+                                new_entry |= 1 << 1; // Make Writable
+                                *pt.add(i1 as usize) = new_entry;
+                                
+                                // 4. Flush the specific TLB page and instantly resume the app!
+                                core::arch::asm!("invlpg [{}]", in(reg) cr2);
+                                
+                                if was_user { core::arch::asm!("swapgs", options(nostack)); }
+                                return; // 🚨 BYPASS THE CRASH AND RESUME!
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
-        crate::serial_println!("\n[SEGFAULT] User Process Terminated. Invalid Memory Access at: {:?}", cr2);
+        crate::serial_println!("\n[SEGFAULT] User Process Terminated. Invalid Memory Access at: {:#x}", cr2);
         if GsBase::read().as_u64() != 0 {
             let percpu = crate::percpu::current();
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx < percpu.scheduler.tasks.len() {
                 let task = &mut percpu.scheduler.tasks[curr_idx];
                 
-                // 1. Teardown sockets safely via Arc strong count
                 for i in 0..32 { 
                     if let Some(crate::scheduler::FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
                         if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
@@ -148,15 +204,11 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
                     task.fd_table[i] = None; 
                 }
 
-                // 2. Shred ONLY the user memory tables securely. Do NOT swap CR3 to prevent kernel stack dropout.
                 crate::memory::clear_user_address_space(task.cr3);
-                
-                // 3. Mark as Zombie at the very end
                 task.state = crate::scheduler::TaskState::Zombie;
             }
         }
         
-        // THE DEADLOCK FIX: Tell the APIC the interrupt is over so the Timer can fire!
         crate::apic::end_of_interrupt();
         
         unsafe { 
@@ -165,7 +217,7 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
         }
     } else {
         if !was_user && (stack_frame.code_segment & 3) == 3 { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
-        panic!("KERNEL PAGE FAULT\nAddr: {:?}\nError: {:?}\nIP: {:#x}\nCS: {:#x}\nCR3: {:?}", 
+        panic!("KERNEL PAGE FAULT\nAddr: {:#x}\nError: {:?}\nIP: {:#x}\nCS: {:#x}\nCR3: {:#x}", 
              cr2, error_code, stack_frame.instruction_pointer.as_u64(), stack_frame.code_segment, cr3);
     }
 }
@@ -179,22 +231,46 @@ timer_interrupt_stub:
 1:
     push rax; push rbx; push rcx; push rdx; push rbp; push rsi; push rdi
     push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
-    
     mov rax, rsp
     and rsp, -16
     sub rsp, 512
     fxsave [rsp]
-    
     sub rsp, 8
     push rax
     mov rdi, rsp
-    
     call timer_context_switch
-    
     mov rsp, rax
     pop rbx
     add rsp, 8
-    
+    fxrstor [rsp]
+    mov rsp, rbx
+    pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
+    pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+
+.global yield_interrupt_stub
+yield_interrupt_stub:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
+    push rax; push rbx; push rcx; push rdx; push rbp; push rsi; push rdi
+    push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
+    mov rax, rsp
+    and rsp, -16
+    sub rsp, 512
+    fxsave [rsp]
+    sub rsp, 8
+    push rax
+    mov rdi, rsp
+    call yield_context_switch
+    mov rsp, rax
+    pop rbx
+    add rsp, 8
     fxrstor [rsp]
     mov rsp, rbx
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
@@ -215,13 +291,17 @@ keyboard_interrupt_stub:
     push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
     mov rax, rsp
     and rsp, -16
-    
+    sub rsp, 512
+    fxsave [rsp]
     sub rsp, 8
     push rax
-    call keyboard_handler_impl
-    pop rax
-    
+    mov rdi, rsp
+    call keyboard_context_switch
     mov rsp, rax
+    pop rbx
+    add rsp, 8
+    fxrstor [rsp]
+    mov rsp, rbx
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
     pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
     test qword ptr [rsp + 8], 3
@@ -240,13 +320,17 @@ mouse_interrupt_stub:
     push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
     mov rax, rsp
     and rsp, -16
-    
+    sub rsp, 512
+    fxsave [rsp]
     sub rsp, 8
     push rax
-    call mouse_handler_impl
-    pop rax
-    
+    mov rdi, rsp
+    call mouse_context_switch
     mov rsp, rax
+    pop rbx
+    add rsp, 8
+    fxrstor [rsp]
+    mov rsp, rbx
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
     pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
     test qword ptr [rsp + 8], 3
@@ -265,12 +349,10 @@ ethernet_interrupt_stub:
     push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
     mov rax, rsp
     and rsp, -16
-    
     sub rsp, 8
     push rax
     call ethernet_handler_impl
     pop rax
-    
     mov rsp, rax
     pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
     pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
@@ -281,12 +363,15 @@ ethernet_interrupt_stub:
     iretq
 "#);
 
+
+
 extern "C" { 
     fn timer_interrupt_stub(); 
     fn keyboard_interrupt_stub();
     fn mouse_interrupt_stub();
     fn ethernet_interrupt_stub();
     fn syscall_handler_asm();
+    fn yield_interrupt_stub();
 }
 
 #[no_mangle]
@@ -297,11 +382,14 @@ pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
     if x86_64::registers::model_specific::GsBase::read().as_u64() == 0 { 
         return current_rsp; 
     }
+
+    // --- THE TRUE WALL CLOCK ---
+    crate::time::UPTIME_MS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // ---------------------------
     
     let percpu = crate::percpu::current();
     
-    // --- NEW: TASK MANAGER ACCOUNTING ---
-    // Increment the tick counter BEFORE we schedule a new task!
+    // Increment the tick counter BEFORE we schedule a new task
     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
     if curr_idx < percpu.scheduler.tasks.len() {
         percpu.scheduler.tasks[curr_idx].cpu_ticks += 1;
@@ -336,12 +424,77 @@ pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn yield_context_switch(current_rsp: u64) -> u64 {
+    // 🚨 NO EOI IS SENT HERE. This prevents APIC corruption! 🚨
+    if x86_64::registers::model_specific::GsBase::read().as_u64() == 0 { return current_rsp; }
+    
+    let percpu = crate::percpu::current();
+    let new_rsp = percpu.scheduler.schedule(current_rsp);
+    
+    let next_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if next_idx < percpu.scheduler.tasks.len() {
+        let task = &percpu.scheduler.tasks[next_idx];
+        let task_stack = task.kernel_stack_top;
+        unsafe {
+            let current_cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+            if current_cr3 != task.cr3.as_u64() { core::arch::asm!("mov cr3, {}", in(reg) task.cr3.as_u64()); }
+            let percpu_base = percpu as *const _ as *mut u64;
+            *percpu_base = task_stack;
+            let tss_ptr = percpu.gdt_state.tss as *const _ as *mut x86_64::structures::tss::TaskStateSegment;
+            (*tss_ptr).privilege_stack_table[0] = x86_64::VirtAddr::new(task_stack);
+        }
+    }
+    new_rsp
+}
+#[no_mangle]
+pub extern "C" fn keyboard_context_switch(current_rsp: u64) -> u64 {
+    // 1. Let the driver read the keystroke (This naturally drains port 0x60!)
+    keyboard_handler_impl(); 
+    
+    // 2. SAFE EOI (Fired exactly ONCE!)
+    crate::apic::end_of_interrupt(); 
+    
+    // 3. Human Input Override
+    if x86_64::registers::model_specific::GsBase::read().as_u64() != 0 {
+        let percpu = crate::percpu::current();
+        for task in percpu.scheduler.tasks.iter_mut() {
+            if task.state == crate::scheduler::TaskState::Blocked && task.wake_tsc > 0 && task.wake_tsc != u64::MAX {
+                task.state = crate::scheduler::TaskState::Ready;
+                task.wake_tsc = 0;
+            }
+        }
+    }
+    yield_context_switch(current_rsp) 
+}
+
+#[no_mangle]
+pub extern "C" fn mouse_context_switch(current_rsp: u64) -> u64 {
+    // 1. Let the driver read the mouse movement (This naturally drains port 0x60!)
+    mouse_handler_impl(); 
+    
+    // 2. SAFE EOI (Fired exactly ONCE!)
+    crate::apic::end_of_interrupt(); 
+    
+    // 3. Human Input Override
+    if x86_64::registers::model_specific::GsBase::read().as_u64() != 0 {
+        let percpu = crate::percpu::current();
+        for task in percpu.scheduler.tasks.iter_mut() {
+            if task.state == crate::scheduler::TaskState::Blocked && task.wake_tsc > 0 && task.wake_tsc != u64::MAX {
+                task.state = crate::scheduler::TaskState::Ready;
+                task.wake_tsc = 0;
+            }
+        }
+    }
+    yield_context_switch(current_rsp) 
+}
+
+#[no_mangle]
 pub extern "C" fn keyboard_handler_impl() {
     use x86_64::instructions::port::Port;
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     crate::shell::handle_key(scancode);
-    crate::apic::end_of_interrupt();
+    // 🚨 EOI REMOVED FROM HERE!
 }
 
 #[no_mangle]
@@ -350,7 +503,7 @@ pub extern "C" fn mouse_handler_impl() {
     let mut port = Port::new(0x60);
     let packet_byte: u8 = unsafe { port.read() };
     crate::mouse::handle_interrupt(packet_byte);
-    crate::apic::end_of_interrupt();
+    // 🚨 EOI REMOVED FROM HERE!
 }
 
 #[no_mangle]
@@ -401,6 +554,7 @@ pub struct SyscallStackFrame {
     pub r11: u64, pub r10: u64, pub r9:  u64, pub r8:  u64,
     pub rdi: u64, pub rsi: u64, pub rbp: u64, pub rdx: u64,
     pub rcx: u64, pub rbx: u64, pub rax: u64, 
+    pub user_rsp: u64, // <--- ADD THIS AT THE BOTTOM
 }
 
 core::arch::global_asm!(r#"
@@ -410,6 +564,7 @@ syscall_handler_asm:
     mov gs:[8], rsp           
     mov rsp, gs:[0]           
     
+    push qword ptr gs:[8]    // <--- PUSH USER RSP INTO THE FRAME
     push rax
     push rbx
     push rcx
@@ -459,6 +614,7 @@ syscall_handler_asm:
     pop rcx
     pop rbx
     pop rax
+    pop qword ptr gs:[8]    // <--- POP IT SAFELY BACK
 
     mov rsp, gs:[8]
     swapgs
@@ -563,7 +719,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             } else {
                 if fd >= 0 && fd < 32 {
                     if let Some(crate::scheduler::FileDescriptor::File(open_file)) = &task.fd_table[fd as usize] {
-                        match open_file.node.mmap(offset, size) {
+                        match open_file.mmap(offset, size){
                             Ok(phys_addr) => {
                                 if let Ok(virt_addr) = crate::memory::map_user_mmio(phys_addr, size) {
                                     frame.rax = virt_addr;
@@ -588,7 +744,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             
             if arg1 < 32 {
                 if let Some(FileDescriptor::File(open_file)) = &task.fd_table[arg1 as usize] {
-                    match open_file.node.ioctl(arg2 as usize, arg3 as usize) {
+                    match open_file.ioctl(arg2 as usize, arg3 as usize) {
                         Ok(res) => frame.rax = res as u64,
                         Err(e) => frame.rax = e as u64,
                     }
@@ -686,9 +842,20 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             {
                 let parent = &percpu.scheduler.tasks[curr_idx];
                 child.parent_pid = Some(parent.pid);
-                child.mmap_bump = parent.mmap_bump; // <--- THE CRASH FIX
+                child.mmap_bump = parent.mmap_bump; 
+                
+                // 1. Share memory frames (CoW implementation)
                 crate::memory::clone_user_address_space(parent.cr3, child.cr3);
 
+                // 🚨 CoW FIX: Flush the Parent's TLB!
+                // Since we just marked the parent's active pages as Read-Only, we MUST 
+                // force the CPU to forget the old Writable cached pages immediately.
+                unsafe {
+                    let cr3 = x86_64::registers::control::Cr3::read();
+                    x86_64::registers::control::Cr3::write(cr3.0, cr3.1); 
+                }
+
+                // 2. Clone file descriptors (Sockets, files, pipes)
                 for i in 0..32 {
                     if let Some(fd) = &parent.fd_table[i] {
                         child.fd_table[i] = Some(fd.clone());
@@ -696,6 +863,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 }
             }
 
+            // 3. Setup the child's return stack frame
             let stack_top = child.kernel_stack_top;
             let iretq_ptr = stack_top - 40;
 
@@ -704,7 +872,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 iret_slice[0] = frame.rcx;         
                 iret_slice[1] = 0x33;              
                 iret_slice[2] = frame.r11 | 0x200; 
-                iret_slice[3] = percpu.user_rsp;   
+                iret_slice[3] = frame.user_rsp;   
                 iret_slice[4] = 0x2B;              
             }
 
@@ -725,7 +893,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 regs[11] = frame.rdx; 
                 regs[12] = frame.rcx; 
                 regs[13] = frame.rbx; 
-                regs[14] = 0; // The child receives PID 0!
+                regs[14] = 0; // 🚨 The child receives PID 0 as its return value!
             }
 
             let fxsave_ptr = (regs_ptr - 512) & !0xF;
@@ -742,6 +910,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
 
             child.saved_rsp = final_rsp;
+            
+            // 4. The parent process receives the child's actual PID!
             frame.rax = child.pid;
             
             percpu.scheduler.tasks.push(child);
@@ -829,66 +999,69 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             // ----------------------------------
         },
           
-        59 => { // SYS_EXECVE
-            let buf_ptr = arg1 as *const u8;
+       
+        59 => { // sys_execve
+            let ptr = arg1 as *const u8;
             let len = arg2 as usize;
             
-            if !is_valid_user_ptr(buf_ptr, len) { frame.rax = EFAULT as u64; return; }
-            
-            let path_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
-            if let Ok(raw_path) = core::str::from_utf8(path_slice) {
-                
-                let path = raw_path.trim_matches(char::from(0)).trim();
-                
-                let elf_data_opt = if path.contains("hello.elf") {
-                    Some(alloc::vec::Vec::from(crate::HELLO_BIN))
-                } else if path.contains("rust.elf") {
-                    Some(alloc::vec::Vec::from(crate::RUST_BIN))
-                } else {
-                    let mut fs = crate::fs::FS.lock(); 
-                    fs.read_file(path)
-                };
-                
-                if let Some(elf_data) = elf_data_opt {
-                    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-                    let task = &mut percpu.scheduler.tasks[curr_idx];
+            // 1. Copy the path to a safe Kernel String BEFORE shredding user memory!
+            let path_str = if let Ok(s) = core::str::from_utf8(unsafe { core::slice::from_raw_parts(ptr, len) }) {
+                alloc::string::String::from(s.trim_matches(char::from(0)).trim())
+            } else {
+                frame.rax = (-1i64) as u64;
+                return;
+            };
 
-                    crate::memory::clear_user_address_space(task.cr3);
+            // 2. Read the file using the safe Kernel String
+            if let Some(elf_data) = crate::vfs::VFS.read_file_alloc(&path_str) {
+                let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                let task = &mut percpu.scheduler.tasks[curr_idx];
+                
+                // 3. Shred the old memory
+                crate::memory::clear_user_address_space(task.cr3);
+                
+                // 🚨 THE FIX: Reset the bump allocator to a VALID canonical address! 🚨
+                // 0x1000_0000_0000 is safely inside the lower user half.
+                task.mmap_bump = 0x1000_0000_0000;
+                
+                // 4. Flush the CPU TLB
+                unsafe {
+                    let cr3 = x86_64::registers::control::Cr3::read();
+                    x86_64::registers::control::Cr3::write(cr3.0, cr3.1);
+                }
+                
+                // 5. Load the new ELF
+                if let Ok(entry_point) = crate::process::load_elf(&elf_data) {
+                    let stack_base = 0x7FFF_0000_0000;
+                    let stack_pages = 32; 
+                    if crate::memory::allocate_user_pages_at(stack_base, stack_pages).is_ok() {
+                        let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8; 
+                        
+                        // Override the Syscall Return Frame!
+                        frame.rcx = entry_point;    // Jump to the new App's _start
+                        frame.user_rsp = stack_top; // Give it the fresh stack
+                        
+                        // 🚨 SECURITY FIX: Zero out ALL general purpose registers!
+                        // This prevents the new app from inheriting garbage state from the old app.
+                        frame.rdi = 0; frame.rsi = 0; frame.rdx = 0; frame.rbp = 0;
+                        frame.r8 = 0; frame.r9 = 0; frame.r10 = 0; 
+                        frame.r11 = 0x202; // RFLAGS: Ensure hardware interrupts stay enabled!
+                        frame.r12 = 0; frame.r13 = 0; frame.r14 = 0; frame.r15 = 0;
+                        frame.rbx = 0;
 
-                    match crate::process::load_elf(&elf_data) {
-                        Ok(entry_point) => {
-                            let user_stack_base = 0x7FFF_0000_0000;
-                            
-                            // BUMP TO 32 PAGES (128KB)
-                            crate::memory::allocate_user_pages_at(user_stack_base, 32).expect("Failed stack allocation");
-                            let user_stack_top = user_stack_base + (32 * 4096);
-                              
-                            task.mmap_bump = 0x4000_0000_0000;
-
-                            frame.rcx = entry_point;
-                            frame.r11 = 0x202;                              
-                            
-                            // THE ABI FIX: Subtract 40 bytes (32 bytes of args + 8 byte dummy return address)
-                            let initial_rsp = (user_stack_top & !0xF) - 40; 
-                            unsafe {
-                                let stack_ptr = initial_rsp as *mut u64;
-                                *stack_ptr.add(0) = 0; // Dummy Return Address (Forces RSP to end in 8!)
-                                *stack_ptr.add(1) = 0; // argc = 0
-                                *stack_ptr.add(2) = 0; // argv NULL terminator
-                                *stack_ptr.add(3) = 0; // envp NULL terminator
-                                *stack_ptr.add(4) = 0; // auxv AT_NULL terminator
-                                
-                                percpu.user_rsp = initial_rsp; 
-                            } 
-                            return; 
-                          },
-                        Err(e) => {
-                            crate::serial_println!("\n[KERNEL] Execve Failed: {}", e);
-                            frame.rax = EINVAL as u64;
-                        }
+                        // 6. Safely update the task name for the System Monitor
+                        let mut name_arr = [0u8; 16];
+                        let bytes = path_str.as_bytes();
+                        let copy_len = core::cmp::min(16, bytes.len());
+                        name_arr[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                        task.name = name_arr;
+                        
+                        frame.rax = 0; // Success
+                        return;        // Bypass default block exit
                     }
-                } else { frame.rax = EINVAL as u64; } 
-            } else { frame.rax = EINVAL as u64; } 
+                }
+            }
+            frame.rax = (-1i64) as u64; // File Not Found or Parse Error
         },
 
         60 => { // SYS_EXIT
@@ -1050,23 +1223,20 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
              }
         },
 
-        
         504 => { 
-            let mut lo: u32;
-            let mut hi: u32;
-            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-            let tsc = ((hi as u64) << 32) | (lo as u64);
-            frame.rax = tsc / 2_000_000; 
+            // Return true uptime, completely immune to CPU frequency scaling!
+            frame.rax = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed); 
         },
 
         
         505 => { 
-            let m = crate::mouse::MOUSE_STATE.lock();
-            
-            // THE FIX: We are using the Software Cursor now, so we DO NOT call the GPU here.
-            // Just pack the coordinates and click states and return them to userspace!
-            
-            frame.rax = (m.x as u64) << 32 | (m.y as u64) << 16 | (if m.left_click {1} else {0}) << 1 | (if m.right_click {1} else {0});
+            // THE FIX: Shield the spinlock from hardware interrupts!
+            // This prevents IRQ 12 from firing while we are reading the mouse state.
+            let m_val = x86_64::instructions::interrupts::without_interrupts(|| {
+                let m = crate::mouse::MOUSE_STATE.lock();
+                (m.x as u64) << 32 | (m.y as u64) << 16 | (if m.left_click {1} else {0}) << 1 | (if m.right_click {1} else {0})
+            });
+            frame.rax = m_val;
         },
 
         506 => { if let Some(c) = crate::shell::pop_key() { frame.rax = c as u64; } else { frame.rax = 0; } },
@@ -1104,7 +1274,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if !is_valid_user_ptr(buf_ptr, len) { frame.rax = EFAULT as u64; return; }
             let slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
             if let Ok(path) = core::str::from_utf8(slice) {
-                frame.rax = crate::fs::FS.lock().ls(path).len() as u64; 
+                // 🚨 ROUTE TO THE NEW VFS
+                frame.rax = crate::vfs::VFS.list_dir(path).len() as u64; 
             } else { frame.rax = 0; }
         },
 
@@ -1118,8 +1289,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             
             let path_slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
-                let mut fs = crate::fs::FS.lock();
-                let files = fs.ls(path);
+                // 🚨 ROUTE TO THE NEW VFS
+                let files = crate::vfs::VFS.list_dir(path);
                 if idx < files.len() {
                     let name = &files[idx];
                     unsafe {
@@ -1130,7 +1301,6 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = 0; }
             } else { frame.rax = 0; }
         },
-
         513 => { // sys_wait_vsync
             unsafe {
                 if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
@@ -1251,30 +1421,44 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = 0;
         },
         525 => { 
-            // SYSCALL 525: sys_sleep_ms
-            // arg1 (rdi) = milliseconds to sleep
+            // SYSCALL 525: sys_sleep_ms (THE SELF-HEALING FIX)
             let ms = arg1 as u64;
+            let wake_ms = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) + ms; 
             
-            let mut lo: u32; let mut hi: u32;
-            unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-            let start_tsc = ((hi as u64) << 32) | (lo as u64);
-            
-            // Calculate the future timestamp (Assuming a base ~2GHz clock)
-            let wake_tsc = start_tsc + (ms * 2_000_000); 
-
-            // Find the currently running task
-            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-            let task = &mut percpu.scheduler.tasks[curr_idx];
-            
-            // Mark it as Blocked so the scheduler completely ignores it!
-            task.state = crate::scheduler::TaskState::Blocked;
-            task.wake_tsc = wake_tsc;
-            
-            // Force an immediate context switch so the CPU drops into the Idle Task
-            unsafe { core::arch::asm!("int 0x40"); } 
-            
+            unsafe {
+                // 1. We MUST re-enable interrupts so the APIC timer can tick while we sleep!
+                x86_64::instructions::interrupts::enable();
+                
+                loop {
+                    let percpu = crate::percpu::current();
+                    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                    {
+                        let task = &mut percpu.scheduler.tasks[curr_idx];
+                        task.state = crate::scheduler::TaskState::Blocked;
+                        task.wake_tsc = wake_ms; 
+                    }
+                    
+                    // 2. Yield the CPU
+                    core::arch::asm!("int 0x41"); 
+                    
+                    // 3. When we wake up, check WHY we woke up
+                    let percpu = crate::percpu::current();
+                    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                    let task = &mut percpu.scheduler.tasks[curr_idx];
+                    
+                    if task.wake_tsc == 0 { break; } // Human Input Override (Mouse Touched!)
+                    if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) >= wake_ms { break; } // Time passed!
+                    
+                    // 4. If we woke up illegally (scheduler fallback), HALT to save battery!
+                    x86_64::instructions::hlt(); 
+                }
+                
+                // 5. Safely disable interrupts before returning to the syscall dispatcher
+                x86_64::instructions::interrupts::disable();
+            }
             frame.rax = 0;
         },
+
         526 => { 
             let buf_ptr = arg1 as *mut u8;
             let max_len = arg2 as usize;
@@ -1283,10 +1467,122 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = EFAULT as u64; 
                 return; 
             }
-            
             frame.rax = crate::acpi::get_dsdt_data(buf_ptr, max_len) as u64;
         },
 
+        530 => { // SYS_CREATE_SHM
+            let size = arg1 as usize;
+            if let Some(id) = crate::memory::create_shm_block(size) {
+                frame.rax = id;
+            } else { frame.rax = 0; }
+        },
+
+        531 => { // SYS_MAP_SHM
+            let shm_id = arg1;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            
+            // Align the bump allocator to a 2MB boundary to ensure SHM never overlaps with normal heap
+            let target_addr = (task.mmap_bump + 0x1FFFFF) & !0x1FFFFF; 
+            
+            let size = {
+                let reg = crate::memory::SHM_REGISTRY.lock();
+                if let Some(b) = reg.iter().find(|b| b.id == shm_id) { b.size } else { 0 }
+            };
+            
+            if size > 0 {
+                let num_pages = (size + 0xFFF) / 0x1000;
+                task.mmap_bump = target_addr + ((num_pages as u64) * 0x1000); 
+                
+                if let Ok(vaddr) = crate::memory::map_shm_block(shm_id, target_addr) {
+                    frame.rax = vaddr;
+                } else { frame.rax = 0; }
+            } else { frame.rax = 0; }
+        },
+        532 => { // SYS_IPC_SEND
+            let target_pid = arg1;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            let sender_pid = percpu.scheduler.tasks[curr_idx].pid;
+            
+            let msg = crate::process::IpcMessage {
+                sender_pid, msg_type: arg2, data1: arg3, data2: arg4,
+            };
+            
+            let mut found = false;
+            unsafe {
+                let active_cores = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
+                if let Some(cores) = &mut crate::percpu::PER_CPU {
+                    for i in 0..active_cores {
+                        for task in cores[i].scheduler.tasks.iter_mut() {
+                            if task.pid == target_pid {
+                                task.mailbox.push_back(msg);
+                                // If the task was sleeping forever waiting for IPC, wake it up!
+                                if task.state == crate::scheduler::TaskState::Blocked && task.wake_tsc == u64::MAX {
+                                    task.state = crate::scheduler::TaskState::Ready;
+                                    task.wake_tsc = 0;
+                                }
+                                found = true;
+                                break;
+                            }
+                        }
+                        if found { break; }
+                    }
+                }
+            }
+            frame.rax = if found { 1 } else { 0 }; 
+        },
+
+        533 => { 
+            // SYSCALL 533: sys_ipc_recv
+            let msg_ptr = arg1 as *mut crate::process::IpcMessage;
+            let block = arg2 == 1;
+            
+            if !is_valid_user_ptr(msg_ptr as *const u8, core::mem::size_of::<crate::process::IpcMessage>()) {
+                frame.rax = EFAULT as u64; return;
+            }
+            
+            if block {
+                unsafe {
+                    // Re-enable interrupts to prevent timer deadlocks
+                    x86_64::instructions::interrupts::enable();
+                    loop {
+                        let percpu = crate::percpu::current();
+                        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                        let task = &mut percpu.scheduler.tasks[curr_idx];
+                        
+                        if let Some(msg) = task.mailbox.pop_front() {
+                            *msg_ptr = msg;
+                            frame.rax = 1;
+                            break;
+                        }
+                        
+                        task.state = crate::scheduler::TaskState::Blocked;
+                        task.wake_tsc = u64::MAX; 
+                        
+                        core::arch::asm!("int 0x41"); 
+                        
+                        let percpu = crate::percpu::current();
+                        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                        let task = &mut percpu.scheduler.tasks[curr_idx];
+                        
+                        if task.mailbox.is_empty() {
+                            x86_64::instructions::hlt();
+                        }
+                    }
+                    x86_64::instructions::interrupts::disable();
+                }
+            } else {
+                let percpu = crate::percpu::current();
+                let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                let task = &mut percpu.scheduler.tasks[curr_idx];
+                if let Some(msg) = task.mailbox.pop_front() {
+                    unsafe { *msg_ptr = msg; }
+                    frame.rax = 1; 
+                } else {
+                    frame.rax = 0; 
+                }
+            }
+        },
         _ => { frame.rax = EINVAL as u64; }
     }
 }

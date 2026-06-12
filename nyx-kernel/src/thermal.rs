@@ -91,19 +91,31 @@ pub fn scan_smbus(smbus_base: u16) {
 }
 
 fn kernel_sleep_ms(ms: u64) {
-    let mut lo: u32; let mut hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-    let start_tsc = ((hi as u64) << 32) | (lo as u64);
-    let target_tsc = start_tsc + (ms * 2_000_000); 
+    let wake_ms = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) + ms; 
     
-    let percpu = crate::percpu::current();
-    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-    let task = &mut percpu.scheduler.tasks[curr_idx];
-    
-    task.state = crate::scheduler::TaskState::Blocked;
-    task.wake_tsc = target_tsc;
-    unsafe { core::arch::asm!("int 0x40"); } 
+    unsafe {
+        x86_64::instructions::interrupts::enable();
+        loop {
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            {
+                let task = &mut percpu.scheduler.tasks[curr_idx];
+                task.state = crate::scheduler::TaskState::Blocked;
+                task.wake_tsc = wake_ms; 
+            }
+            
+            // Yield the CPU
+            core::arch::asm!("int 0x41"); 
+            
+            // Did the time actually pass? If yes, break!
+            if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) >= wake_ms { break; } 
+            
+            // If we woke up illegally (scheduler fallback), HALT to save battery!
+            x86_64::instructions::hlt(); 
+        }
+    }
 }
+
 
 unsafe fn force_hardware_cooling(throttle: bool) {
     let cpuid_6 = core::arch::x86_64::__cpuid(6);
@@ -137,27 +149,31 @@ pub extern "C" fn nyx_task_manager_daemon() {
 
     loop {
         let temp = get_intel_silicon_temp();
-        if temp >= 95 { // Intel TjMax is usually 100C
-            crate::serial_println!("[Thermal] CRITICAL THERMAL TRIP! Halting system to prevent hardware damage!");
-            
-            // Fire an ACPI poweroff or an immediate hardware halt here
+        if temp >= 95 { 
+            crate::serial_println!("[Thermal] CRITICAL THERMAL TRIP! Halting system!");
             crate::acpi::poweroff(); 
             loop { unsafe { core::arch::asm!("cli; hlt"); } }
         }
         
-
-        if temp >= 76 && !is_throttled { // Threshold adjusted as per your test
-            unsafe { force_hardware_cooling(true); } 
+        // --------------------------------------------------------
+        // THE FIX: Always assert maximum cooling while hot to 
+        // fight the Embedded Controller / BIOS resets!
+        // --------------------------------------------------------
+        if temp >= 76 { 
             crate::laptop_fans::engage_maximum_cooling();
-            is_throttled = true;
-            crate::serial_println!("[Thermal] WARNING: CPU hit {}°C! Throttling active.", temp);
             
+            // Only toggle the MSR hardware throttler once
+            if !is_throttled {
+                unsafe { force_hardware_cooling(true); } 
+                is_throttled = true;
+                crate::serial_println!("[Thermal] WARNING: CPU hit {}°C! Throttling active.", temp);
+            }
         } else if temp <= 60 && is_throttled {
             unsafe { force_hardware_cooling(false); } 
             is_throttled = false;
             crate::serial_println!("[Thermal] CPU cooled to {}°C. Restoring baseline.", temp);
         }
+        
         kernel_sleep_ms(1000); 
-
     }
 }

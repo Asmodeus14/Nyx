@@ -1497,6 +1497,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "linked_list_allocator"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
+dependencies = [
+ "spinning_top",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1693,6 +1702,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
+name = "nyx-api"
+version = "0.1.0"
+
+[[package]]
+name = "nyx-explorer"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "nyx-api",
+ "nyx-gui",
+]
+
+[[package]]
+name = "nyx-gui"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "noto-sans-mono-bitmap",
+ "nyx-api",
+]
+
+[[package]]
+name = "nyx-init"
+version = "0.1.0"
+dependencies = [
+ "nyx-api",
+]
+
+[[package]]
 name = "nyx-kernel"
 version = "0.1.0"
 dependencies = [
@@ -1703,7 +1741,7 @@ dependencies = [
  "fatfs 0.4.0",
  "futures",
  "lazy_static",
- "linked_list_allocator",
+ "linked_list_allocator 0.9.1",
  "log",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
@@ -1717,8 +1755,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-network"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "nyx-api",
+ "nyx-gui",
+]
+
+[[package]]
 name = "nyx-rust-app"
 version = "0.1.0"
+
+[[package]]
+name = "nyx-settings"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "nyx-api",
+ "nyx-gui",
+]
+
+[[package]]
+name = "nyx-sysmon"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "nyx-api",
+ "nyx-gui",
+]
+
+[[package]]
+name = "nyx-terminal"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "nyx-api",
+ "nyx-gui",
+]
 
 [[package]]
 name = "nyx-user"
@@ -1726,8 +1800,10 @@ version = "0.1.0"
 dependencies = [
  "embedded-io",
  "embedded-tls",
- "linked_list_allocator",
+ "linked_list_allocator 0.10.6",
  "noto-sans-mono-bitmap",
+ "nyx-api",
+ "nyx-gui",
  "pc-keyboard",
  "rand_core",
 ]

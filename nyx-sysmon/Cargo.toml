@@ -1,0 +1,9 @@
+[package]
+name = "nyx-sysmon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nyx-api = { path = "../nyx-api" }
+nyx-gui = { path = "../nyx-gui" }
+linked_list_allocator = "0.10.5"

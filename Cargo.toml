@@ -3,10 +3,14 @@ members = [
     "nyx-kernel",
     "compiler",
     "runner",
-    "nyx-user"
-, "nyx-rust-app"]
+    "nyx-user",
+    "nyx-rust-app",
+    "nyx-init",       
+    "nyx-api",        
+    "nyx-terminal"    
+, "nyx-gui", "nyx-settings", "nyx-network", "nyx-sysmon", "nyx-explorer"]
 
-# NEW: Force Cargo to ONLY build the kernel by default
+# Force Cargo to ONLY build the kernel by default
 default-members = ["nyx-kernel"]
 
 resolver = "2"
