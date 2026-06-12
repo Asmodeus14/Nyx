@@ -2,19 +2,18 @@
 
 use core::arch::asm;
 
-//Window creation header struct for NYX-OS. This is passed as a pointer in the MSG_REQ_WINDOW IPC message when requesting a new window from the Compositor.
 #[repr(C)]
 pub struct WindowHeader {
     pub magic: u32,
-    pub requested_x: i32,  // -1 means "Let the Compositor decide"
+    pub requested_x: i32, 
     pub requested_y: i32,
     pub width: u32,
     pub height: u32,
     pub flags: u32,
-    pub title: [u8; 64],   // Dynamic string array for the title
+    pub title: [u8; 64], 
 }
 
-pub const WIN_MAGIC: u32 = 0x4E595857; // "NYXW" in hex
+pub const WIN_MAGIC: u32 = 0x4E595857; 
 pub const WIN_FLAG_NONE: u32 = 0;
 pub const WIN_FLAG_FRAMELESS: u32 = 1;
 pub const WIN_FLAG_TRANSPARENT: u32 = 2;
@@ -28,6 +27,8 @@ pub const MSG_FLUSH_WINDOW: u64 = 3;
 pub const MSG_KEY_EVENT: u64 = 4;
 pub const MSG_MOUSE_EVENT: u64 = 5;
 pub const MSG_WINDOW_CLOSE: u64 = 6;
+pub const MSG_WINDOW_RESIZED: u64 = 7; 
+pub const MSG_WINDOW_UPDATE_SHM: u64 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -58,7 +59,7 @@ pub struct SystemInfo {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// LINUX X86_64 SYSCALL ID CONSTANTS (POSIX COMPATIBLE)
+// LINUX X86_64 SYSCALL ID CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────
 pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -83,9 +84,6 @@ pub const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_PIPE: u64 = 22;
 pub const SYS_DUP2: u64 = 33;
 
-// ─────────────────────────────────────────────────────────────────────────
-// RAW SYSCALL INVOCATION ENGINE
-// ─────────────────────────────────────────────────────────────────────────
 #[inline(always)]
 pub fn syscall(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> u64 {
     let mut ret: u64;
@@ -108,9 +106,6 @@ pub fn syscall(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, ar
     ret
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// POSIX COMPATIBLE STANDARD I/O ABSTRACTION
-// ─────────────────────────────────────────────────────────────────────────
 pub fn sys_read(fd: i64, buf: &mut [u8]) -> i64 {
     syscall(SYS_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0) as i64
 }
@@ -148,9 +143,6 @@ pub fn sys_fork() -> i64 {
     syscall(SYS_FORK, 0, 0, 0, 0, 0, 0) as i64
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// NYX CORE GRAPHICS, IPC & SYSTEM VIRTUAL SYSCALLS
-// ─────────────────────────────────────────────────────────────────────────
 pub fn sys_print(text: &str) {
     sys_write(1, text.as_bytes());
 }
@@ -257,9 +249,6 @@ pub fn sys_ipc_recv(msg_ptr: *mut IpcMessage, block: bool) -> bool {
     syscall(533, msg_ptr as u64, if block { 1 } else { 0 }, 0, 0, 0, 0) == 1
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// NETWORKING & EXTRA SUB-SYSTEM INFRASTRUCTURE
-// ─────────────────────────────────────────────────────────────────────────
 pub fn sys_socket(domain: u64, typ: u64, protocol: u64) -> i64 {
     syscall(SYS_SOCKET, domain, typ, protocol, 0, 0, 0) as i64
 }

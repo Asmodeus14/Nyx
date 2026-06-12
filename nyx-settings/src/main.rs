@@ -1,128 +1,173 @@
 #![no_std]
 #![no_main]
+#![allow(warnings)]
 
 extern crate alloc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::vec;
 use linked_list_allocator::LockedHeap;
 
 use nyx_api::*;
+use nyx_gui::app::NyxApp;
 use nyx_gui::canvas::{Canvas, Color};
-use nyx_gui::ui::{Button, ToggleSwitch, DropdownMenu};
+// Import the new widgets!
+use nyx_gui::ui::{Widget, Button, CheckBox, Menu, TextBox, Label};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-const WIDTH: usize = 420;
-const HEIGHT: usize = 350;
+#[derive(PartialEq, Clone, Copy)]
+enum SettingsTab { Display, Personalization, System, Security }
 
-#[no_mangle]
-#[link_section = ".text.entry"]
+struct SettingsApp {
+    active_tab: SettingsTab,
+    
+    // Sidebar Navigation Widgets
+    btn_display: Button,
+    btn_personalization: Button,
+    btn_system: Button,
+    btn_security: Button,
+
+    // --- Personalization Tab Widgets ---
+    chk_animations: CheckBox,
+    chk_dark_mode: CheckBox,
+
+    // --- Display Tab Widgets ---
+    menu_scale: Menu,
+    txt_resolution: TextBox,
+}
+
+impl SettingsApp {
+    fn new() -> Self {
+        Self {
+            active_tab: SettingsTab::Display,
+            
+            // Sidebar Buttons
+            btn_display: Button { x: 10, y: 65, w: 160, h: 30, text: String::from("Display"), is_hovered: false, is_pressed: false },
+            btn_personalization: Button { x: 10, y: 105, w: 160, h: 30, text: String::from("Personalization"), is_hovered: false, is_pressed: false },
+            btn_system: Button { x: 10, y: 145, w: 160, h: 30, text: String::from("System Info"), is_hovered: false, is_pressed: false },
+            btn_security: Button { x: 10, y: 185, w: 160, h: 30, text: String::from("Security"), is_hovered: false, is_pressed: false },
+
+            // Personalization Widgets
+            chk_animations: CheckBox { x: 210, y: 80, text: String::from("Enable Window Animations"), is_checked: true },
+            chk_dark_mode: CheckBox { x: 210, y: 120, text: String::from("Force Dark Mode UI"), is_checked: false },
+
+            // Display Widgets
+            menu_scale: Menu { x: 210, y: 120, w: 150, items: vec![String::from("100%"), String::from("125%"), String::from("150%")], is_open: false, selected_idx: 0 },
+            txt_resolution: TextBox { x: 210, y: 80, w: 150, h: 25, text: String::from("1920x1080"), is_focused: false },
+        }
+    }
+}
+
+impl NyxApp for SettingsApp {
+    fn title(&self) -> &str { "System Settings" }
+    fn initial_width(&self) -> usize { 680 }
+    fn initial_height(&self) -> usize { 450 }
+
+    fn draw(&mut self, canvas: &mut Canvas) {
+        let width = canvas.width;
+        let height = canvas.height;
+
+        canvas.fill_rect(0, 0, width, height, Color::WARM_BG);
+
+        // Sidebar Background
+        canvas.fill_rect(0, 0, 180, height, Color::WARM_SURFACE);
+        canvas.fill_rect(180, 0, 1, height, Color::WARM_BORDER);
+        canvas.print_str(15, 20, "SETTINGS", Color::TEXT_DARK, 2);
+
+        // 1. Draw Sidebar Widgets
+        self.btn_display.draw(canvas);
+        self.btn_personalization.draw(canvas);
+        self.btn_system.draw(canvas);
+        self.btn_security.draw(canvas);
+
+        // 2. Draw Active Tab Content
+        let cx = 210;
+        match self.active_tab {
+            SettingsTab::Display => {
+                canvas.print_str(cx, 30, "Display Settings", Color::TEXT_DARK, 2);
+                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::WARM_BORDER);
+                
+                canvas.print_str(cx, 160, "Global Scale Factor", Color::TEXT_DARK, 1);
+                
+                // Draw display widgets
+                self.txt_resolution.draw(canvas);
+                self.menu_scale.draw(canvas); // Draw menu last so it overlaps everything else
+            },
+            SettingsTab::Personalization => {
+                canvas.print_str(cx, 30, "Personalization", Color::TEXT_DARK, 2);
+                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::WARM_BORDER);
+
+                // Draw personalization widgets
+                self.chk_animations.draw(canvas);
+                self.chk_dark_mode.draw(canvas);
+            },
+            SettingsTab::System => {
+                canvas.print_str(cx, 30, "System Specifications", Color::TEXT_DARK, 2);
+                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::WARM_BORDER);
+                canvas.print_str(cx, 80, "OS: NyxOS v0.1 (Lethe Build)", Color::TEXT_DARK, 1);
+                canvas.print_str(cx, 110, "Architecture: x86_64", Color::TEXT_DARK, 1);
+                canvas.print_str(cx, 140, "Window Server: Nyx Compositor Phase 3", Color::TEXT_DARK, 1);
+            },
+            _ => {
+                canvas.print_str(cx, 30, "Module Pending", Color::TEXT_DARK, 2);
+            }
+        }
+    }
+
+    fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {
+        let mut needs_redraw = false;
+
+        // 1. Pass events to Sidebar Buttons
+        needs_redraw |= self.btn_display.on_mouse(mx, my, clicked);
+        needs_redraw |= self.btn_personalization.on_mouse(mx, my, clicked);
+        needs_redraw |= self.btn_system.on_mouse(mx, my, clicked);
+        needs_redraw |= self.btn_security.on_mouse(mx, my, clicked);
+
+        // Map button presses to state changes
+        if clicked {
+            if self.btn_display.is_pressed { self.active_tab = SettingsTab::Display; }
+            if self.btn_personalization.is_pressed { self.active_tab = SettingsTab::Personalization; }
+            if self.btn_system.is_pressed { self.active_tab = SettingsTab::System; }
+            if self.btn_security.is_pressed { self.active_tab = SettingsTab::Security; }
+        }
+
+        // 2. Pass events to active tab widgets
+        if self.active_tab == SettingsTab::Personalization {
+            needs_redraw |= self.chk_animations.on_mouse(mx, my, clicked);
+            needs_redraw |= self.chk_dark_mode.on_mouse(mx, my, clicked);
+        } else if self.active_tab == SettingsTab::Display {
+            // Priority: Pass to menu first, because if it's open, it swallows clicks!
+            needs_redraw |= self.menu_scale.on_mouse(mx, my, clicked);
+            if !self.menu_scale.is_open {
+                needs_redraw |= self.txt_resolution.on_mouse(mx, my, clicked);
+            }
+        }
+
+        needs_redraw
+    }
+
+    fn on_key(&mut self, key: char) -> bool {
+        let mut needs_redraw = false;
+        
+        // Pass keyboard events to the focused active tab widgets
+        if self.active_tab == SettingsTab::Display {
+            needs_redraw |= self.txt_resolution.on_key(key);
+        }
+        
+        needs_redraw
+    }
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
     let heap_start = sys_alloc_pages(256);
     if heap_start == 0 { sys_exit(1); }
     unsafe { ALLOCATOR.lock().init(heap_start as *mut u8, 256 * 4096); }
 
-    // 🚨 GUARANTEED COMPOSITOR PID
-    const COMPOSITOR_PID: u64 = 4; 
-
-    let total_size = core::mem::size_of::<WindowHeader>() + (WIDTH * HEIGHT * 4);
-    let shm_id = sys_create_shm(total_size);
-    if shm_id == 0 { sys_exit(1); } // This is where it was crashing before!
-
-    let buffer_ptr = sys_map_shm(shm_id) as *mut u8;
-    let header = unsafe { &mut *(buffer_ptr as *mut WindowHeader) };
-    
-    header.magic = WIN_MAGIC;
-    header.requested_x = -1; 
-    header.requested_y = -1;
-    header.width = WIDTH as u32;
-    header.height = HEIGHT as u32;
-    header.flags = WIN_FLAG_NONE;
-    
-    let title = b"System Settings";
-    header.title.fill(0);
-    header.title[..title.len()].copy_from_slice(title);
-
-    if !sys_ipc_send(COMPOSITOR_PID, MSG_REQ_WINDOW, shm_id, 0) { sys_exit(1); }
-
-    let mut msg = IpcMessage { sender_pid: 0, msg_type: 0, data1: 0, data2: 0 };
-    loop { if sys_ipc_recv(&mut msg, true) && msg.msg_type == MSG_WINDOW_CREATED { break; } }
-
-    let pixels_ptr = unsafe { buffer_ptr.add(core::mem::size_of::<WindowHeader>()) } as *mut u32;
-    let screen = unsafe { core::slice::from_raw_parts_mut(pixels_ptr, WIDTH * HEIGHT) };
-    let mut canvas = Canvas::new(screen, WIDTH, HEIGHT);
-
-    let mut dark_mode = false;
-    let mut animations = true;
-    let resolutions = ["800x600", "1024x768", "1920x1080"];
-    let mut selected_res = 1;
-    let mut dropdown_open = false;
-    let mut needs_redraw = true;
-
-    loop {
-        if needs_redraw {
-            let bg = if dark_mode { 0xFF_1E1E1E } else { Color::WARM_BG };
-            let text_color = if dark_mode { Color::WHITE } else { Color::TEXT_DARK };
-
-            canvas.fill_rect(0, 0, WIDTH, HEIGHT, bg);
-            canvas.print_str(20, 20, "Appearance", text_color, 2); 
-            canvas.print_str(20, 65, "Dark Mode", text_color, 1);
-            
-            let toggle_dark = ToggleSwitch { x: 340, y: 60, is_on: dark_mode };
-            toggle_dark.draw(&mut canvas);
-
-            canvas.print_str(20, 105, "Fluid Animations", text_color, 1);
-            let toggle_anim = ToggleSwitch { x: 340, y: 100, is_on: animations };
-            toggle_anim.draw(&mut canvas);
-
-            canvas.fill_rect(20, 150, WIDTH - 40, 1, Color::WARM_BORDER); 
-            canvas.print_str(20, 170, "Display", text_color, 2);
-            canvas.print_str(20, 215, "Resolution", text_color, 1);
-            
-            let dropdown = DropdownMenu {
-                x: 230, y: 210, w: 150, h: 25,
-                options: &resolutions,
-                selected_idx: selected_res,
-                is_open: dropdown_open,
-                hover_idx: None,
-            };
-            dropdown.draw(&mut canvas);
-
-            let apply_btn = Button {
-                x: WIDTH - 120, y: HEIGHT - 50, w: 100, h: 30,
-                text: "Apply",
-                is_hovered: false, is_pressed: false,
-            };
-            apply_btn.draw(&mut canvas);
-
-            sys_ipc_send(COMPOSITOR_PID, MSG_FLUSH_WINDOW, 0, 0);
-            needs_redraw = false;
-        }
-
-        if sys_ipc_recv(&mut msg, true) {
-            // 🚨 THE FIX: Gracefully die and give memory back to the Kernel
-            if msg.msg_type == MSG_WINDOW_CLOSE {
-                sys_exit(0);
-            }
-            else if msg.msg_type == MSG_MOUSE_EVENT {
-                let mx = msg.data1 as usize; let my = msg.data2 as usize;
-
-                if mx >= 340 && mx <= 380 && my >= 60 && my <= 80 {
-                    dark_mode = !dark_mode; needs_redraw = true;
-                } else if mx >= 340 && mx <= 380 && my >= 100 && my <= 120 {
-                    animations = !animations; needs_redraw = true;
-                } else if dropdown_open {
-                    let drop_y = 235; let drop_h = resolutions.len() * 25;
-                    if mx >= 230 && mx <= 380 && my >= drop_y && my <= drop_y + drop_h {
-                        let clicked_idx = (my - drop_y) / 25;
-                        if clicked_idx < resolutions.len() { selected_res = clicked_idx; }
-                    }
-                    dropdown_open = false; needs_redraw = true;
-                } else if mx >= 230 && mx <= 380 && my >= 210 && my <= 235 {
-                    dropdown_open = true; needs_redraw = true;
-                }
-            }
-        }
-    }
+    nyx_gui::app::run(SettingsApp::new());
 }
 
 #[panic_handler]
