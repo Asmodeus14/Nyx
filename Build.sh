@@ -33,37 +33,46 @@ echo "[6/7] Building Network Suite (nyx-network)..."
 echo "[7/7] Building System Monitor (nyx-sysmon)..."
 (cd nyx-sysmon && $BUILD_CMD)
 
-echo "[8/8] Packaging Initramfs (initrd.tar)..."
-# Create a staging folder
+echo "[8/8] Generating App Tarball..."
 rm -rf build_initrd
-mkdir -p build_initrd
 
-# Copy all compiled binaries into the staging folder
-cp target/x86_64-nyx/release/nyx-* build_initrd/
+# 1. Create the App Folders
+mkdir -p build_initrd/apps/Init.nyx
+mkdir -p build_initrd/apps/WindowServer.nyx
+mkdir -p build_initrd/apps/Terminal.nyx
+mkdir -p build_initrd/apps/Settings.nyx
+mkdir -p build_initrd/apps/Explorer.nyx
+mkdir -p build_initrd/apps/Network.nyx
+mkdir -p build_initrd/apps/SystemMonitor.nyx
 
-# Pack them into a standard Uncompressed TAR archive
+# 2. Copy the compiled binaries into the folders as 'run.bin'
+cp target/x86_64-nyx/release/nyx-init build_initrd/apps/Init.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-user build_initrd/apps/WindowServer.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-terminal build_initrd/apps/Terminal.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-settings build_initrd/apps/Settings.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-explorer build_initrd/apps/Explorer.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-network build_initrd/apps/Network.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-sysmon build_initrd/apps/SystemMonitor.nyx/run.bin
+
+#  NEW: 3. Copy any JSON manifests from the source folders into the App Bundles
+# (The '2>/dev/null || true' prevents the script from crashing if an app doesn't have a JSON file)
+cp nyx-init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true
+cp nyx-user/*.json build_initrd/apps/WindowServer.nyx/ 2>/dev/null || true
+cp nyx-terminal/*.json build_initrd/apps/Terminal.nyx/ 2>/dev/null || true
+cp nyx-settings/*.json build_initrd/apps/Settings.nyx/ 2>/dev/null || true
+cp nyx-explorer/*.json build_initrd/apps/Explorer.nyx/ 2>/dev/null || true
+cp nyx-network/*.json build_initrd/apps/Network.nyx/ 2>/dev/null || true
+cp nyx-sysmon/*.json build_initrd/apps/SystemMonitor.nyx/ 2>/dev/null || true
+
+# 4. Package it into a lightweight tape archive
 cd build_initrd
-tar -cvf ../nyx-kernel/src/initrd.tar *
+tar -cf ../initrd.tar apps
 cd ..
-
-# Cleanup staging folder
-rm -rf build_initrd
-
-# Touch main.rs to force Cargo to rebuild the kernel with the new TAR archive
+cp initrd.tar nyx-kernel/src/initrd.tar
 touch nyx-kernel/src/main.rs
-
-echo "=========================================="
-echo " Build Complete! Ready to compile Kernel. "
-echo "=========================================="
 
 echo "=========================================="
 echo "         Compiling NyxOS Kernel           "
 echo "=========================================="
-# 🚨 CRITICAL: Unset RUSTFLAGS so we don't inject the userspace linker into the Kernel!
-unset RUSTFLAGS 
-
-# Force recompilation of main.rs so it packs the newly copied binaries
-touch nyx-kernel/src/main.rs 
-
-# Run the Kernel via your custom Runner crate!
+unset RUSTFLAGS
 cargo run --package nyx-kernel --release --target x86_64-unknown-none

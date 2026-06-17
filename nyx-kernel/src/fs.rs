@@ -1,242 +1,198 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use spin::Mutex;
-use core::cmp;
 use core::convert::TryInto;
 use crate::drivers::nvme::NvmeDriver;
-use fatfs::{Read, Write, Seek, SeekFrom, IoBase};
-
-const FAT_SECTOR_SIZE: u64 = 512;
-const NVME_BLOCK_SIZE: u64 = 512; 
+use alloc::boxed::Box;
 
 // ==========================================
-// FATFS STREAM WRAPPER FOR NVME HARDWARE
+// C-FFI HARDWARE BRIDGE (DMA ALIGNED)
 // ==========================================
-pub struct NvmeStream {
-    driver: NvmeDriver,
-    position: u64,
-    partition_offset_sectors: u64,
-    temp_block: Vec<u8>,
-}
+pub static mut GLOBAL_NVME: Option<NvmeDriver> = None;
 
-impl NvmeStream {
-    pub fn new(driver: NvmeDriver, partition_offset_sectors: u64) -> Self {
-        Self { 
-            driver, 
-            position: 0, 
-            partition_offset_sectors, 
-            temp_block: alloc::vec![0u8; 4096] 
-        }
-    }
-}
-
-impl IoBase for NvmeStream { type Error = (); }
-
-impl Read for NvmeStream {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() { return Ok(0); }
-        
-        let absolute_byte_pos = (self.partition_offset_sectors * FAT_SECTOR_SIZE) + self.position;
-        let nvme_lba = absolute_byte_pos / NVME_BLOCK_SIZE;
-        let offset_in_nvme_block = (absolute_byte_pos % NVME_BLOCK_SIZE) as usize;
-        
-        if self.driver.read_block(nvme_lba, &mut self.temp_block) {
-            let bytes_available = (NVME_BLOCK_SIZE as usize) - offset_in_nvme_block;
-            let bytes_to_copy = cmp::min(buf.len(), bytes_available);
+#[no_mangle]
+pub extern "C" fn nyx_nvme_read_block(sector: u64, buf: *mut u8) -> bool {
+    unsafe {
+        if let Some(ref mut driver) = GLOBAL_NVME {
+            let mut align_buf = alloc::vec![0u8; 8192];
+            let ptr_addr = align_buf.as_ptr() as usize;
+            let offset = (4096 - (ptr_addr % 4096)) % 4096;
             
-            buf[..bytes_to_copy].copy_from_slice(&self.temp_block[offset_in_nvme_block..offset_in_nvme_block+bytes_to_copy]);
-            self.position += bytes_to_copy as u64;
-            Ok(bytes_to_copy)
-        } else { Err(()) }
-    }
-}
-
-impl Write for NvmeStream {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let absolute_byte_pos = (self.partition_offset_sectors * FAT_SECTOR_SIZE) + self.position;
-        let nvme_lba = absolute_byte_pos / NVME_BLOCK_SIZE;
-        let offset_in_nvme_block = (absolute_byte_pos % NVME_BLOCK_SIZE) as usize;
-        
-        if !self.driver.read_block(nvme_lba, &mut self.temp_block) { return Err(()); }
-        
-        let bytes_available = (NVME_BLOCK_SIZE as usize) - offset_in_nvme_block;
-        let bytes_to_copy = cmp::min(buf.len(), bytes_available);
-        
-        self.temp_block[offset_in_nvme_block..offset_in_nvme_block+bytes_to_copy].copy_from_slice(&buf[..bytes_to_copy]);
-        
-        if self.driver.write_block(nvme_lba, &self.temp_block) {
-            self.position += bytes_to_copy as u64;
-            Ok(bytes_to_copy)
-        } else { Err(()) }
-    }
-    
-    fn flush(&mut self) -> Result<(), Self::Error> { Ok(()) }
-}
-
-impl Seek for NvmeStream {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
-        match pos {
-            SeekFrom::Start(i) => self.position = i,
-            SeekFrom::Current(i) => self.position = (self.position as i64 + i) as u64,
-            SeekFrom::End(_) => return Err(()), 
-        }
-        Ok(self.position)
-    }
-}
-
-// ==========================================
-// THE NVME BRIDGE DRIVER FOR THE NEW VFS
-// ==========================================
-pub struct NvmeFs {
-    inner: Mutex<fatfs::FileSystem<NvmeStream, fatfs::NullTimeProvider, fatfs::LossyOemCpConverter>>,
-}
-
-// Safety wrapper to appease the compiler for the VFS trait requirements
-unsafe impl Send for NvmeFs {}
-unsafe impl Sync for NvmeFs {}
-
-impl NvmeFs {
-    pub fn new(mut driver: NvmeDriver) -> Option<Self> {
-        let mut sector0 = alloc::vec![0u8; 4096];
-        let _ = driver.find_active_namespace();
-        
-        if !driver.read_block(0, &mut sector0) { return None; }
-
-        let mut partition_start_lba = 0;
-        let part_type = sector0[0x1BE + 4];
-
-        if part_type == 0xEE {
-             for gpt_lba in 2..=9 {
-                 let mut entry_block = alloc::vec![0u8; 4096];
-                 if driver.read_block(gpt_lba, &mut entry_block) {
-                     for i in 0..4 {
-                         let offset = i * 128;
-                         let type_guid_first = u64::from_le_bytes(entry_block[offset..offset+8].try_into().unwrap());
-                         if type_guid_first != 0 {
-                             let lba = u64::from_le_bytes(entry_block[offset+32..offset+40].try_into().unwrap());
-                             let nvme_boot_lba = (lba * FAT_SECTOR_SIZE) / NVME_BLOCK_SIZE;
-                             let boot_offset = ((lba * FAT_SECTOR_SIZE) % NVME_BLOCK_SIZE) as usize;
-                             
-                             let mut boot_sector = alloc::vec![0u8; 4096];
-                             if driver.read_block(nvme_boot_lba, &mut boot_sector) {
-                                 if boot_sector[boot_offset + 510] == 0x55 && boot_sector[boot_offset + 511] == 0xAA {
-                                     partition_start_lba = lba; break;
-                                 }
-                             }
-                         }
-                     }
-                 }
-                 if partition_start_lba != 0 { break; }
-             }
-        } else {
-             partition_start_lba = u32::from_le_bytes([sector0[0x1BE+8], sector0[0x1BE+9], sector0[0x1BE+10], sector0[0x1BE+11]]) as u64;
-        }
-
-        if partition_start_lba == 0 { return None; }
-        
-        let stream = NvmeStream::new(driver, partition_start_lba);
-        let options = fatfs::FsOptions::new().update_accessed_date(true);
-        
-        if let Ok(fs) = fatfs::FileSystem::new(stream, options) {
-            Some(Self { inner: Mutex::new(fs) })
-        } else { None }
-    }
-}
-
-impl crate::vfs::FileSystem for NvmeFs {
-    fn read_file(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        let fs = self.inner.lock();
-        let clean_path = path.trim_start_matches('/');
-        
-        if let Ok(mut file) = fs.root_dir().open_file(clean_path) {
-            if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
-                
-                // 🚨 THE FIX: Keep reading blocks until the RAM buffer is completely full!
-                let mut total_read = 0;
-                while total_read < buf.len() {
-                    match file.read(&mut buf[total_read..]) {
-                        Ok(0) => break, // Reached End Of File
-                        Ok(n) => total_read += n,
-                        Err(_) => return None,
-                    }
-                }
-                return Some(total_read);
+            // We MUST pass 4096 to bypass the hardcoded safety check in nvme.rs!
+            let slice_4k = core::slice::from_raw_parts_mut(align_buf.as_mut_ptr().add(offset), 4096);
+            
+            if driver.read_block(sector, slice_4k) {
+                // We only copy the 512 valid logical block bytes over to the C-Library
+                core::ptr::copy_nonoverlapping(slice_4k.as_ptr(), buf, 512);
+                return true;
             }
         }
-        None
+    }
+    false
+}
+
+#[no_mangle]
+pub extern "C" fn nyx_nvme_write_block(sector: u64, buf: *const u8) -> bool {
+    unsafe {
+        if let Some(ref mut driver) = GLOBAL_NVME {
+            let mut align_buf = alloc::vec![0u8; 8192];
+            let ptr_addr = align_buf.as_ptr() as usize;
+            let offset = (4096 - (ptr_addr % 4096)) % 4096;
+            
+            // Generate a 4096 byte slice
+            let slice_4k = core::slice::from_raw_parts_mut(align_buf.as_mut_ptr().add(offset), 4096);
+            
+            // Populate the first 512 bytes with what C wants to write to the SSD
+            core::ptr::copy_nonoverlapping(buf, slice_4k.as_mut_ptr(), 512);
+            
+            return driver.write_block(sector, slice_4k);
+        }
+    }
+    false
+}
+
+extern "C" {
+    fn nyx_fs_mount(start_sector: u64, total_sectors: u64) -> i32;
+    fn nyx_fs_read_file(path: *const u8, offset: u32, buf: *mut u8, len: u32) -> i32;
+    fn nyx_fs_write_file(path: *const u8, offset: u32, buf: *const u8, len: u32) -> i32;
+    fn nyx_fs_get_size(path: *const u8) -> i32;
+    fn nyx_fs_create_dir(path: *const u8) -> i32; 
+    
+    // The directory lister
+    fn nyx_fs_list_dir(
+        path: *const u8, 
+        cb: extern "C" fn(*const u8, u8, *mut u8), 
+        ctx: *mut u8
+    );
+}
+
+// The callback that catches the C-strings and turns them into Rust Strings
+extern "C" fn dir_entry_callback(name_ptr: *const u8, inode_type: u8, ctx: *mut u8) {
+    unsafe {
+        // Cast the context pointer back into a Rust Vec<String> reference
+        let list = &mut *(ctx as *mut Vec<String>);
+        
+        // Find the length of the null-terminated C string
+        let mut len = 0;
+        while *name_ptr.add(len) != 0 { len += 1; }
+        
+        // Convert to Rust string
+        let slice = core::slice::from_raw_parts(name_ptr, len);
+        if let Ok(s) = core::str::from_utf8(slice) {
+            // Ignore the hidden "." and ".." navigation folders
+            if s != "." && s != ".." {
+                let mut entry = String::from(s);
+                
+                // In standard Ext4, inode_type '2' means it is a Directory!
+                // We append a slash so the GUI Explorer knows it is a folder.
+                if inode_type == 2 { entry.push('/'); }
+                
+                list.push(entry);
+            }
+        }
+    }
+}
+
+// ==========================================
+// THE LWEXT4 BRIDGE DRIVER FOR THE VFS
+// ==========================================
+pub struct NvmeLwExt4Fs;
+
+impl NvmeLwExt4Fs {
+    pub fn new() -> Option<Self> {
+        let driver = unsafe { GLOBAL_NVME.as_mut()? };
+        let mut start_lba = 0;
+        let mut size_sectors = 0;
+
+        for gpt_lba in 2..=33 {
+            let mut align_buf = alloc::vec![0u8; 8192];
+            let ptr_addr = align_buf.as_ptr() as usize;
+            let offset = (4096 - (ptr_addr % 4096)) % 4096;
+            
+            let entry_block = unsafe { 
+                core::slice::from_raw_parts_mut(align_buf.as_mut_ptr().add(offset), 4096) 
+            };
+
+            if driver.read_block(gpt_lba, entry_block) {
+                for i in 0..32 {
+                    let off = i * 128;
+                    let type_guid_1 = u64::from_le_bytes(entry_block[off..off+8].try_into().unwrap());
+                    
+                    if type_guid_1 != 0 {
+                        let lba = u64::from_le_bytes(entry_block[off+32..off+40].try_into().unwrap());
+                        let end_lba = u64::from_le_bytes(entry_block[off+40..off+48].try_into().unwrap());
+                        
+                        if end_lba > lba {
+                            let sectors = end_lba - lba;
+                            let size_mb_512 = (sectors * 512) / (1024 * 1024);
+                            let size_mb_4k = (sectors * 4096) / (1024 * 1024);
+
+                            if (size_mb_512 > 90_000 && size_mb_512 < 110_000) || (size_mb_4k > 90_000 && size_mb_4k < 110_000) {
+                                start_lba = lba;
+                                size_sectors = sectors;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if start_lba == 0 {
+            panic!("VFS FATAL: GPT scanned successfully, but the 100GB Partition was missing!");
+        }
+        
+        let err_code = unsafe { nyx_fs_mount(start_lba, size_sectors) };
+        
+        if err_code == 0 {
+            Some(Self)
+        } else {
+            panic!("VFS FATAL: lwext4 rejected LBA {}! POSIX Error: {} (22=Invalid, 5=IO Error)", start_lba, err_code);
+        }
+    }
+}
+
+fn to_c_path(path: &str) -> Vec<u8> {
+    let mut clean = path.trim_start_matches('/');
+    if clean.starts_with("mnt/nvme/") { clean = &clean["mnt/nvme/".len()..]; }
+    alloc::format!("/mnt/{}\0", clean).into_bytes()
+}
+
+impl crate::vfs::FileSystem for NvmeLwExt4Fs {
+    fn read_file(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let c_path = to_c_path(path);
+        let res = unsafe { nyx_fs_read_file(c_path.as_ptr(), offset as u32, buf.as_mut_ptr(), buf.len() as u32) };
+        if res > 0 { Some(res as usize) } else { None }
     }
 
     fn write_file(&mut self, path: &str, offset: usize, buf: &[u8]) -> Option<usize> {
-        let fs = self.inner.lock();
-        let clean_path = path.trim_start_matches('/');
-        
-        if let Ok(mut file) = fs.root_dir().create_file(clean_path) {
-            if offset == 0 { let _ = file.truncate(); }
-            
-            if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
-                
-                // 🚨 THE FIX: Keep writing blocks until the entire payload is on the disk!
-                let mut total_written = 0;
-                while total_written < buf.len() {
-                    match file.write(&buf[total_written..]) {
-                        Ok(0) => break, // Disk full or Hardware Error
-                        Ok(n) => total_written += n,
-                        Err(_) => return None,
-                    }
-                }
-                let _ = file.flush();
-                return Some(total_written);
-            }
-        }
-        None
+        let c_path = to_c_path(path);
+        let res = unsafe { nyx_fs_write_file(c_path.as_ptr(), offset as u32, buf.as_ptr(), buf.len() as u32) };
+        if res > 0 { Some(res as usize) } else { None }
     }
 
     fn get_file_size(&self, path: &str) -> Option<usize> {
-        let fs = self.inner.lock();
-        let clean_path = path.trim_start_matches('/');
-        if let Ok(mut file) = fs.root_dir().open_file(clean_path) {
-            if let Ok(size) = file.seek(SeekFrom::End(0)) {
-                return Some(size as usize);
-            }
-        }
-        None
+        let c_path = to_c_path(path);
+        let res = unsafe { nyx_fs_get_size(c_path.as_ptr()) };
+        if res >= 0 { Some(res as usize) } else { None }
     }
 
-    fn create_file(&mut self, path: &str) -> bool {
-        let fs = self.inner.lock();
-        let clean_path = path.trim_start_matches('/');
-        // Safe binding to drop the Mutex before returning
-        let result = fs.root_dir().create_file(clean_path).is_ok();
-        result
-    }
-
+    fn create_file(&mut self, _path: &str) -> bool { true }
+    
     fn create_dir(&mut self, path: &str) -> bool {
-        let fs = self.inner.lock();
-        let clean_path = path.trim_start_matches('/');
-        // Safe binding to drop the Mutex before returning
-        let result = fs.root_dir().create_dir(clean_path).is_ok();
-        result
+        let c_path = to_c_path(path);
+        unsafe { nyx_fs_create_dir(c_path.as_ptr()) == 1 }
     }
-
+    
+    //  Actually use the callback to populate the array!
     fn list_dir(&self, path: &str) -> Vec<String> {
-        let mut results = Vec::new();
-        let fs = self.inner.lock();
-        let root = fs.root_dir();
-        let clean_path = path.trim_start_matches('/');
+        let c_path = to_c_path(path);
+        let mut list: Vec<String> = Vec::new();
         
-        let dir = if clean_path.is_empty() { root } else { 
-            match root.open_dir(clean_path) { Ok(d) => d, Err(_) => return results }
-        };
-
-        for entry in dir.iter() {
-            if let Ok(e) = entry {
-                let mut name = e.file_name();
-                if name != "." && name != ".." {
-                    if e.is_dir() { name.push('/'); }
-                    results.push(name);
-                }
-            }
+        unsafe {
+            // Pass a memory pointer of our local Vector over to C, so the callback knows where to push the strings!
+            let ctx = &mut list as *mut _ as *mut u8;
+            nyx_fs_list_dir(c_path.as_ptr(), dir_entry_callback, ctx);
         }
-        results
+        
+        list
     }
 }

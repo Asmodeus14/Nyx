@@ -6,9 +6,11 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=acpica-core");
     println!("cargo:rerun-if-changed=acpica-includes");
+    println!("cargo:rerun-if-changed=ext4_wrapper.c");
+    println!("cargo:rerun-if-changed=lwext4");
 
     // ==========================================
-    // 1. COMPILE THE C CODE (libacpica.a)
+    // 1. COMPILE THE ACPICA C CODE (libacpica.a)
     // ==========================================
     let mut build = cc::Build::new();
 
@@ -54,7 +56,61 @@ fn main() {
     build.compile("acpica");
 
     // ==========================================
-    // 2. GENERATE THE RUST BINDINGS
+    // 1.5 COMPILE THE EXT4 C-LIBRARY (libnyx_ext4.a)
+    // ==========================================
+    // Dynamically generate the missing CMake config file required by lwext4
+    let ext4_gen_dir = PathBuf::from("lwext4/include/generated");
+    if !ext4_gen_dir.exists() {
+        fs::create_dir_all(&ext4_gen_dir).unwrap();
+    }
+    fs::write(
+        ext4_gen_dir.join("ext4_config.h"),
+        "
+#ifndef EXT4_CONFIG_GENERATED_H_
+#define EXT4_CONFIG_GENERATED_H_
+
+#define CONFIG_DIR_INDEX_ENABLE 1
+#define CONFIG_EXTENT_ENABLE 1
+#define CONFIG_JOURNAL_ENABLE 1
+#define CONFIG_BLOCK_DEV_CACHE_SIZE 16
+#define CONFIG_HAVE_OWN_OFLAGS 1
+#define CONFIG_HAVE_OWN_ASSERT 0
+
+#endif
+        ",
+    ).expect("Failed to write lwext4 config file!");
+
+    // We use a fresh cc::Build block to prevent macro conflicts with ACPICA
+    let mut ext4_build = cc::Build::new();
+    ext4_build.warnings(false)
+        .flag_if_supported("-w")
+        .flag("-ffreestanding")
+        .flag("-nostdlib")
+        .flag("-fno-builtin")
+        .flag("-mno-red-zone")
+        // STRIP UBUNTU'S LINUX SECURITY WRAPPERS
+        .flag("-fno-stack-protector") 
+        .flag("-U_FORTIFY_SOURCE")    
+        .include("lwext4/include")
+        .define("CONFIG_HAVE_OWN_OFLAGS", "1");
+
+    // Include our Rust-to-C wrapper
+    ext4_build.file("ext4_wrapper.c");
+
+    // Dynamically include ALL lwext4 source files to prevent Linker errors
+    if let Ok(entries) = fs::read_dir("lwext4/src") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("c") {
+                ext4_build.file(path);
+            }
+        }
+    }
+
+    ext4_build.compile("nyx_ext4");
+
+    // ==========================================
+    // 2. GENERATE THE RUST BINDINGS (ACPICA)
     // ==========================================
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")

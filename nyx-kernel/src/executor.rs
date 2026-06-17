@@ -112,3 +112,26 @@ pub async fn yield_now() {
     }
     YieldNow { yielded: false }.await;
 }
+
+// ==========================================
+// BARE-METAL HARDWARE ASYNC RUNTIME
+// ==========================================
+/// Runs an async Future to completion, blocking the current thread.
+/// Used to bridge asynchronous hardware traits (like ext4plus) into synchronous VFS calls.
+pub fn block_on<T>(mut future: impl core::future::Future<Output = T>) -> T {
+    let waker = dummy_waker();
+    let mut context = core::task::Context::from_waker(&waker);
+    
+    // Pin the future to the stack so it can safely be polled by the CPU
+    let mut future = unsafe { core::pin::Pin::new_unchecked(&mut future) };
+    
+    loop {
+        match future.as_mut().poll(&mut context) {
+            core::task::Poll::Ready(value) => return value, // The NVMe I/O finished!
+            core::task::Poll::Pending => {
+                // Yield CPU time while waiting for the hardware interrupt
+                core::hint::spin_loop();
+            }
+        }
+    }
+}

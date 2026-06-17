@@ -310,3 +310,92 @@ static CTYPE_TOLOWER_PTR: SyncPtr<i32> = SyncPtr(CTYPE_TOLOWER.as_ptr().wrapping
 #[no_mangle] pub unsafe extern "C" fn AcpiDbSingleStep(_walk_state: *mut c_void, _op: *mut c_void, _op_class: u32) -> u32 { 0 }
 #[no_mangle] pub unsafe extern "C" fn AcpiDbSignalBreakPoint(_walk_state: *mut c_void) {}
 #[no_mangle] pub unsafe extern "C" fn AcpiDmDisassemble(_walk_state: *mut c_void, _origin: *mut c_void, _num_opcodes: u32) {}
+
+use core::alloc::Layout;
+use alloc::alloc::{alloc, dealloc};
+
+// ==========================================
+// C-LIBRARY MEMORY ALLOCATOR (MALLOC/FREE)
+// ==========================================
+// We allocate 8 extra bytes to store the size of the allocation, 
+// so `free()` knows exactly how much memory to deallocate!
+
+#[no_mangle]
+pub extern "C" fn malloc(size: usize) -> *mut u8 {
+    if size == 0 { return core::ptr::null_mut(); }
+    let layout = Layout::from_size_align(size + 8, 8).unwrap();
+    unsafe {
+        let ptr = alloc(layout);
+        if ptr.is_null() { return core::ptr::null_mut(); }
+        *(ptr as *mut usize) = size; // Store the size at the very beginning
+        ptr.add(8) // Return the pointer just after our hidden size tag
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn free(ptr: *mut u8) {
+    if ptr.is_null() { return; }
+    unsafe {
+        let actual_ptr = ptr.sub(8); // Step back to read our hidden size tag
+        let size = *(actual_ptr as *const usize);
+        let layout = Layout::from_size_align(size + 8, 8).unwrap();
+        dealloc(actual_ptr, layout);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn calloc(num: usize, size: usize) -> *mut u8 {
+    let total = num * size;
+    let ptr = malloc(total);
+    if !ptr.is_null() {
+        unsafe { core::ptr::write_bytes(ptr, 0, total); } // Zero out the memory
+    }
+    ptr
+}
+
+// ==========================================
+// C-LIBRARY STUBS (PRINTING & ASSERTIONS)
+// ==========================================
+
+#[no_mangle]
+pub static mut stdout: *mut u8 = core::ptr::null_mut();
+
+#[no_mangle]
+pub extern "C" fn fflush(_stream: *mut u8) -> i32 { 0 }
+
+#[no_mangle]
+pub unsafe extern "C" fn printf(_format: *const u8, _args: ...) -> i32 { 0 } // Silently drop C prints
+
+#[no_mangle]
+pub extern "C" fn __assert_fail(_assertion: *const u8, _file: *const u8, _line: u32, _function: *const u8) -> ! {
+    panic!("FATAL: lwext4 C-library internal assertion failed!");
+}
+
+// ==========================================
+// C-LIBRARY ALGORITHMS (QSORT)
+// ==========================================
+// lwext4 needs to sort directory indexes. Here is a bare-metal bubble sort for C.
+#[no_mangle]
+pub extern "C" fn qsort(
+    base: *mut u8,
+    num: usize,
+    size: usize,
+    compar: extern "C" fn(*const u8, *const u8) -> i32,
+) {
+    if num < 2 || size == 0 { return; }
+    let mut temp = alloc::vec![0u8; size];
+    
+    for i in 0..num {
+        for j in i + 1..num {
+            unsafe {
+                let a = base.add(i * size);
+                let b = base.add(j * size);
+                if compar(a, b) > 0 {
+                    core::ptr::copy_nonoverlapping(a, temp.as_mut_ptr(), size);
+                    core::ptr::copy_nonoverlapping(b, a, size);
+                    core::ptr::copy_nonoverlapping(temp.as_ptr(), b, size);
+                }
+            }
+        }
+    }
+}

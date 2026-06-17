@@ -1267,40 +1267,55 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 } else { frame.rax = 0; }
             }
         },
-
-        510 => { 
-            let buf_ptr = arg1 as *const u8;
-            let len = arg2 as usize;
-            if !is_valid_user_ptr(buf_ptr, len) { frame.rax = EFAULT as u64; return; }
-            let slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
-            if let Ok(path) = core::str::from_utf8(slice) {
-                // 🚨 ROUTE TO THE NEW VFS
-                frame.rax = crate::vfs::VFS.list_dir(path).len() as u64; 
-            } else { frame.rax = 0; }
-        },
-
-        511 => { 
-            let idx = arg1 as usize;
+        // -----------------------------------------------------
+        // VFS DIRECTORY LISTING SYSCALLS
+        // -----------------------------------------------------
+        
+        // Syscall 510: Get Directory Item Count
+        510 => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            
+            // 🔥 FIX: Wrap raw slice creation in an unsafe block
+            let path_slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+            
+            if let Ok(path) = core::str::from_utf8(path_slice) {
+                let list = crate::vfs::VFS.list_dir(path);
+                frame.rax = list.len() as u64;
+            } else {
+                frame.rax = 0;
+            }
+        }
+        
+        // Syscall 511: Get Directory Item String by Index
+        511 => {
+            let index = arg1 as usize;
             let buf_ptr = arg2 as *mut u8;
             let path_ptr = arg3 as *const u8;
             let path_len = arg4 as usize;
             
-            if !is_valid_user_ptr(path_ptr, path_len) || !is_valid_user_ptr(buf_ptr, 256) { frame.rax = EFAULT as u64; return; }
-            
+            // 🔥 FIX: Wrap raw slice creation in an unsafe block
             let path_slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+            
             if let Ok(path) = core::str::from_utf8(path_slice) {
-                // 🚨 ROUTE TO THE NEW VFS
-                let files = crate::vfs::VFS.list_dir(path);
-                if idx < files.len() {
-                    let name = &files[idx];
+                let list = crate::vfs::VFS.list_dir(path);
+                
+                if let Some(entry) = list.get(index) {
+                    let bytes = entry.as_bytes();
+                    
+                    // 🔥 FIX: Wrap the memory copy in an unsafe block
                     unsafe {
-                        let len = name.len();
-                        for (i, b) in name.bytes().enumerate() { *buf_ptr.add(i) = b; }
-                        frame.rax = len as u64;
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, bytes.len());
                     }
-                } else { frame.rax = 0; }
-            } else { frame.rax = 0; }
-        },
+                    
+                    frame.rax = bytes.len() as u64;
+                } else {
+                    frame.rax = 0;
+                }
+            } else {
+                frame.rax = 0;
+            }
+        }
         513 => { // sys_wait_vsync
             unsafe {
                 if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {

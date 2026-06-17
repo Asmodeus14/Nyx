@@ -40,9 +40,6 @@ pub mod usb;
 pub mod partitioner;
 pub mod thermal;
 pub mod laptop_fans;
-
-// 🚨 Phase 4 Mounts & Installer 
-pub mod tarfs;
 pub mod installer;
 
 use alloc::boxed::Box;
@@ -55,15 +52,17 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::structures::DescriptorTablePointer;
 use x86_64::PrivilegeLevel;
 
+// ==========================================
+// BAKED-IN TINY APP TARBALL
+// ==========================================
+pub static INITRD_TAR: &[u8] = include_bytes!("initrd.tar");
+
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
     config.mappings.framebuffer = Mapping::Dynamic;
     config
 };
-
-// The embedded RAM archive used exclusively for installing to the SSD
-pub static INITRD_TAR: &[u8] = include_bytes!("initrd.tar");
 
 lazy_static::lazy_static! {
     static ref TSS: TaskStateSegment = {
@@ -195,30 +194,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pci::enumerate_pci();
     }
 
-    // Initialize NVMe Hardware Driver
-    let mut nvme_driver_opt = crate::drivers::nvme::NvmeDriver::init();
-    if let Some(ref mut driver) = nvme_driver_opt { driver.create_io_queues(); }
-    crate::entity::awaken_entity(&mut nvme_driver_opt);
+    // ==========================================
+    // NVME HARDWARE DRIVER INITIALIZATION
+    // ==========================================
+    //  FIX: We MUST move the driver into its final static memory location BEFORE 
+    // initializing the IO queues. This locks the physical DMA pointers safely in place!
+    unsafe { crate::fs::GLOBAL_NVME = crate::drivers::nvme::NvmeDriver::init(); }
+    
+    unsafe {
+        if let Some(ref mut driver) = crate::fs::GLOBAL_NVME { 
+            driver.create_io_queues(); 
+        }
+        crate::entity::awaken_entity(&mut crate::fs::GLOBAL_NVME);
+    }
 
     // ==========================================
     // PHYSICAL NVME VFS MOUNT POINT
     // ==========================================
-    if let Some(driver) = nvme_driver_opt {
-        if let Some(nvme_fs) = crate::fs::NvmeFs::new(driver) {
-            crate::vfs::VFS.mount("/mnt/nvme", Box::new(nvme_fs));
-            crate::vga_println!("[BOOT] Physical NVMe Hardware Mounted to /mnt/nvme");
+    unsafe {
+        if crate::fs::GLOBAL_NVME.is_some() {
+            // 🔥 FIX: new() no longer takes ownership of the driver!
+            if let Some(ext4_fs) = crate::fs::NvmeLwExt4Fs::new() {
+                crate::vfs::VFS.mount("/mnt/nvme", Box::new(ext4_fs));
+                crate::vga_println!("[BOOT] Physical NVMe Hardware (lwext4 R/W) Mounted to /mnt/nvme");
+                
+                crate::installer::extract_tar_to_ext4(INITRD_TAR);
+                
+            } else {
+                panic!("FATAL: NVMe Drive Found but no ext4 partition detected.");
+            }
         } else {
-            panic!("FATAL: NVMe Drive Found but no FAT partition detected.");
+            panic!("FATAL: No NVMe Drive Detected! Cannot boot without a system drive.");
         }
-    } else {
-        panic!("FATAL: No NVMe Drive Detected! Cannot boot without a system drive.");
     }
-
-    // ==========================================
-    // AUTOMATED SYSTEM INSTALLER & UPDATER
-    // ==========================================
-    // This dynamically unpacks initrd.tar and perfectly overwrites old app bundles!
-    crate::installer::install_apps_to_nvme(INITRD_TAR);
 
     // ==========================================
     // SYSTEM BOOTSTRAP
@@ -289,7 +297,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         *percpu_base = init_kernel_stack;
     }
 
-    // 🚨 FETCHING PID 1 DIRECTLY FROM NVME SSD 🚨
+    // 🚨 FETCHING PID 1 DIRECTLY FROM THE NATIVE C-FFI EXT4 MOUNT 🚨
     let init_data = crate::vfs::VFS.read_file_alloc("/mnt/nvme/apps/Init.nyx/run.bin")
         .expect("VFS FATAL: Failed to load /mnt/nvme/apps/Init.nyx/run.bin from SSD!");
         

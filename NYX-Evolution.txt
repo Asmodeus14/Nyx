@@ -1,0 +1,94 @@
+
+Phase 2: Bare-Metal Intel Wi-Fi Hardware Bootstrap
+With the filesystem upgraded, we open up nyx-kernel/src/drivers/net/iwlwifi.rs to awaken the wireless network controller card via standard PCI MMIO maps and load its isolated firmware code.
+
+Milestone 2.1: PCI Configuration Space Alignment
+
+Instruct pci::enumerate_pci() to probe for the Intel Network Controller family (Vendor ID 0x8086, looking for Device IDs matching your PC2 target wireless hardware).
+
+Read BAR0 to locate the device's physical memory-mapped I/O base. Map this region in memory.rs into the virtual memory management space with PageTableFlags::NO_CACHE | PageTableFlags::WRITABLE.
+
+Milestone 2.2: DMA Ring Setup
+
+Allocate physically contiguous chunks of system frames via your MEMORY_MANAGER allocator framework to define the hardware Circular Transmit (Tx) and Receive (Rx) buffer command rings used by the device.
+
+Milestone 2.3: Zero-Copy Firmware Injection
+
+Use your newly deployed ext2 file methods to fetch iwlwifi.ucode from storage.
+
+Copy the raw firmware machine segments into a dedicated contiguous DMA frame memory allocation. Write this exact physical destination frame index into the card's boot-up registers via MMIO.
+
+Milestone 2.4: Triggering Card Initialization
+
+Signal the device hardware microcontroller reset bit (CSR_RESET). Write a polling timeout loop inside the driver block to watch the register states until the card flags a successful context execution initialization.
+
+Phase 3: Wireless 802.11 State Machine & Crypto Processing
+Intel cards manage frames at the 802.11 layer, requiring the driver to actively coordinate with home access routers and perform encryption sequences on independent incoming or outgoing frames.
+
+Milestone 3.1: 802.11 Management Frame Structures
+
+Define raw C-compatible layout structs (#[repr(C)]) in iwlwifi.rs representing wireless frame layouts including Beacons, Probe Requests, Probe Responses, Authentication, and Association packets.
+
+Milestone 3.2: Passive Scanning Engine
+
+Set the wireless device Rx hardware command register filter flags to capture wide management packets. Track and extract broadcasted Beacon frames to map out local network access points (SSIDs) and their associated broadcast radio channels.
+
+Milestone 3.3: Connection Exchange Loop
+
+Build out a state routine inside the driver workspace:
+
+Construct and transmit an 802.11 Authentication Frame to the destination router MAC address -> Await reply.
+
+Construct and transmit an 802.11 Association Request Frame outlining local client capabilities -> Await incoming Association Response.
+
+Lock driver operational properties into an Associated state.
+
+Milestone 3.4: WPA2-PSK Cryptographic Acceleration
+
+Implement an Extensible Authentication Protocol over LAN (EAPOL) packet intercept parsing filter.
+
+Upon intercepting the router's 4-way handshake frames, utilize a kernel-level SHA-1/HMAC cryptographical module to compute network Pairwise Transient Keys (PTK) using your stored Wi-Fi passphrase and SSID configuration context.
+
+Push the completed cryptographic session keys directly into the Intel card's on-chip MMIO hardware cryptographic slots. This lets the card automatically execute high-speed hardware-accelerated AES-CCMP decryption/encryption on inbound and outbound frames, handing raw decrypted Ethernet packets straight to your smoltcp networking loop.
+
+Phase 4: Network System Call Layers & Sockets API
+With network connectivity routing seamlessly at the Ring 0 layer, we must bridge the networking features down to Ring 3 so userspace software binaries can negotiate web-facing network connections safely.
+
+Milestone 4.1: Extended Syscall Implementation
+
+Add new system call entries inside interrupts.rs to expose standard networking primitives down to processes:
+
+sys_socket_connect(ip_ptr: *const u8, len: usize, port: u16) -> u32
+
+sys_socket_write(handle: u32, buf_ptr: *const u8, len: usize) -> usize
+
+sys_socket_read(handle: u32, buf_ptr: *mut u8, len: usize) -> usize
+
+Milestone 4.2: Linking to Kernel Network Instances
+
+Map these Ring 3 system calls directly into the active smoltcp stack interface structures configured inside the kernel core loop.
+
+Milestone 4.3: Nyx-API Socket Integration
+
+Update nyx-api/src/lib.rs to introduce safe, native Rust TcpStream wrappers. These wrappers will invoke your newly assigned networking software interrupt vectors natively from Ring 3 space.
+
+Phase 5: Userspace Playstore Application & Git Micro-Agent
+The final layer is userspace implementation, bringing a visual point-and-click app manager to the window manager environment and adding network download capabilities to the shell suite.
+
+Milestone 5.1: The nyx-store App Core
+
+Create a new visual program called nyx-store using your existing UI layout modules.
+
+Upon launching, the app opens a TcpStream through nyx-api to query a web application manifest catalog file.
+
+Milestone 5.2: Chunked Stream Installation Engine
+
+When an application download command is clicked, nyx-store leverages nyx-api to issue file creation commands on the SSD path (e.g., /mnt/nvme/apps/Explorer.nyx/run.bin).
+
+Stream incoming HTTP binary packet blocks into a compact 4KB buffer chunk loop, calling File::write sequentially to persist data directly onto the ext2 physical NVMe blocks without causing RAM inflation.
+
+Milestone 5.3: Terminal Git Micro-Agent
+
+Open nyx-terminal/src/main.rs and implement a custom command parser for git fetch-firmware <device>.
+
+This agent will call out via an HTTP network request directly to GitHub's raw asset servers, read updated firmware blocks over raw TCP streams, and write them dynamically onto your NVMe platform workspace paths.
