@@ -63,6 +63,8 @@ fn main() {
     if !ext4_gen_dir.exists() {
         fs::create_dir_all(&ext4_gen_dir).unwrap();
     }
+    
+    // 🔥 FIX: Increased CONFIG_BLOCK_DEV_CACHE_SIZE from 16 to 256 (Milestone 1.4)
     fs::write(
         ext4_gen_dir.join("ext4_config.h"),
         "
@@ -72,7 +74,7 @@ fn main() {
 #define CONFIG_DIR_INDEX_ENABLE 1
 #define CONFIG_EXTENT_ENABLE 1
 #define CONFIG_JOURNAL_ENABLE 1
-#define CONFIG_BLOCK_DEV_CACHE_SIZE 16
+#define CONFIG_BLOCK_DEV_CACHE_SIZE 256
 #define CONFIG_HAVE_OWN_OFLAGS 1
 #define CONFIG_HAVE_OWN_ASSERT 0
 

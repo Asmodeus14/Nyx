@@ -1,6 +1,5 @@
 # Rust build outputs
 /target/
 # NyxOS Build Artifacts
-*.img
 *.tar
 build_initrd/

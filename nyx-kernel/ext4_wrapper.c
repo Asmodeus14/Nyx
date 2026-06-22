@@ -1,5 +1,5 @@
-#include "lwext4/include/ext4.h"
-#include "lwext4/include/ext4_mbr.h"
+#include "ext4.h"
+#include "ext4_mbr.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -50,13 +50,20 @@ static struct ext4_blockdev nyx_bdev = {
 // ==========================================
 
 //  FIX: Now returns 'int' instead of 'bool'
+// Add a tracker variable
+static bool is_dev_registered = false;
+
 int nyx_fs_mount(uint64_t partition_start_sector, uint64_t total_sectors) {
     nyx_bdev.part_offset = partition_start_sector * 512;
     nyx_bdev.part_size = total_sectors * 512;
     nyx_bdif.ph_bcnt = total_sectors;
-    
-    ext4_device_register(&nyx_bdev, "nx");
-    
+
+    // Only register the device the very first time
+    if (!is_dev_registered) {
+        ext4_device_register(&nyx_bdev, "nx");
+        is_dev_registered = true;
+    }
+
     // Return the exact POSIX error code directly to Rust! (0 = Success)
     return ext4_mount("nx", "/mnt/", false);
 }
@@ -124,4 +131,29 @@ void nyx_fs_list_dir(const char* path, void (*cb)(const char*, unsigned char, vo
     }
     
     ext4_dir_close(&dir);
+}
+
+int nyx_fs_create_file(const char* path) {
+    ext4_file f;
+    // "w+" creates an empty file for reading and writing.
+    if (ext4_fopen(&f, path, "w+") != EOK) return 0;
+    
+    // Close it immediately since we just want to create it
+    ext4_fclose(&f);
+    return 1;
+}
+
+// Deletes a file (or an empty directory) from the Ext4 partition
+int nyx_fs_delete_file(const char* path) {
+    if (ext4_fremove(path) == EOK) {
+        return 1; // Success
+    }
+    return 0; // Failed (e.g., file doesn't exist, or folder not empty)
+}
+// Forces the block cache to flush its journal to the physical NVMe drive
+int nyx_fs_sync(const char* path) {
+    if (ext4_cache_flush(path) == EOK) {
+        return 1;
+    }
+    return 0;
 }

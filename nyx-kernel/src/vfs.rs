@@ -11,29 +11,41 @@ lazy_static::lazy_static! {
 // ==========================================
 // 1. THE HARDWARE DRIVER ABSTRACTION
 // ==========================================
+
+// 🔥 MILESTONE 1.5: FsError Enum Added for POSIX-style OS Error Codes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsError {
+    NotFound,
+    IoError,
+    InvalidPath,
+    OutOfSpace,
+    Unsupported,
+    PermissionDenied,
+}
+
 /// Any storage driver (NVMe, AHCI, TAR RAMFS) must implement this trait.
 pub trait FileSystem: Send + Sync {
     /// Reads up to buf.len() bytes from the file at the given offset.
-    fn read_file(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize>;
+    fn read_file(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError>;
     
     /// Writes buf.len() bytes to the file at the given offset.
-    fn write_file(&mut self, path: &str, offset: usize, buf: &[u8]) -> Option<usize>;
+    fn write_file(&mut self, path: &str, offset: usize, buf: &[u8]) -> Result<usize, FsError>;
     
     /// Gets the total size of the file in bytes.
-    fn get_file_size(&self, path: &str) -> Option<usize>;
+    fn get_file_size(&self, path: &str) -> Result<usize, FsError>;
     
-    /// Creates a new empty file. Returns true if successful.
-    fn create_file(&mut self, path: &str) -> bool;
+    // Default implementations gracefully fail for read-only systems (like TarFs)
+    fn create_file(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
+    fn create_dir(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
+    fn list_dir(&self, _path: &str) -> Result<Vec<String>, FsError> { Err(FsError::Unsupported) }
     
-    /// Creates a new directory. Returns true if successful.
-    fn create_dir(&mut self, path: &str) -> bool;
+    // 🔥 MILESTONE 1.3: Delete File Added
+    fn delete_file(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
     
-    /// Lists all files and folders inside a directory.
-    fn list_dir(&self, path: &str) -> Vec<String>;
+    // 🔥 MILESTONE 1.7: Sync/Flush to commit Journal to physical disk
+    fn sync(&mut self) -> Result<(), FsError> { Ok(()) }
     
     // --- WAL (Write-Ahead Logging) Hooks ---
-    // Default implementations do nothing, allowing read-only filesystems 
-    // (like our initial TAR Initramfs) to ignore them safely.
     fn begin_transaction(&mut self) -> u64 { 0 }
     fn commit_transaction(&mut self, _tx_id: u64) -> bool { true }
     fn rollback_transaction(&mut self, _tx_id: u64) {}
@@ -82,58 +94,44 @@ impl VirtualFileSystem {
         }
     }
 
-    /// Mounts a hardware driver to a specific path in the OS
     pub fn mount(&self, path: &str, fs: Box<dyn FileSystem>) -> bool {
         let mut mounts = self.mounts.lock();
-        
-        // Ensure path starts with '/' and strip trailing slashes for consistency
         let clean_path = if path.ends_with('/') && path.len() > 1 {
             &path[..path.len() - 1]
         } else {
             path
         };
-
-        if mounts.contains_key(clean_path) { return false; } // Already mounted
+        if mounts.contains_key(clean_path) { return false; } 
         mounts.insert(String::from(clean_path), fs);
         true
     }
+    
     pub fn unmount(&self, path: &str) -> bool {
         let mut mounts = self.mounts.lock();
-        
         let clean_path = if path.ends_with('/') && path.len() > 1 {
             &path[..path.len() - 1]
         } else {
             path
         };
-
-        // Remove the driver from the BTreeMap and drop it from memory
         mounts.remove(clean_path).is_some()
     }
 
-    /// Finds which hardware driver owns a specific file path
     fn resolve_mount<'a>(&'a self, path: &str) -> Option<(String, String)> {
         let mounts = self.mounts.lock();
-        
-        // Ensure the path is absolute
         let search_path = if !path.starts_with('/') {
             alloc::format!("/{}", path)
         } else {
             String::from(path)
         };
 
-        // We use `.rev()` to match the deepest mount paths first.
-        // e.g., "/mnt/usb" matches before "/mnt"
         for (mount_path, _fs) in mounts.iter().rev() {
             if search_path.starts_with(mount_path) {
-                // Extract the remainder of the path to pass to the driver
-                // If mount is "/bin" and search is "/bin/nyx-user", relative is "/nyx-user"
                 let relative_path = if mount_path == "/" {
                     search_path.clone()
                 } else {
                     String::from(&search_path[mount_path.len()..])
                 };
                 
-                // Ensure relative path always starts with '/' for the driver
                 let safe_relative = if relative_path.is_empty() {
                     String::from("/")
                 } else if !relative_path.starts_with('/') {
@@ -157,30 +155,26 @@ impl VirtualFileSystem {
         let mounts = self.mounts.lock();
         let driver = mounts.get(&mount_point)?;
 
-        // Find file size so we can allocate the exact right amount of RAM
-        let size = driver.get_file_size(&relative_path)?;
+        let size = driver.get_file_size(&relative_path).ok()?;
         let mut buf = alloc::vec![0u8; size];
         
-        let bytes_read = driver.read_file(&relative_path, 0, &mut buf)?;
+        let bytes_read = driver.read_file(&relative_path, 0, &mut buf).ok()?;
         if bytes_read == size {
             Some(buf)
         } else {
             None
         }
     }
+    
     pub fn list_dir(&self, path: &str) -> Vec<String> {
         let mut results = Vec::new();
         
-        // 1. Check if the path itself is a virtual mount point root
         let mounts = self.mounts.lock();
         let search_path = if !path.starts_with('/') { alloc::format!("/{}", path) } else { String::from(path) };
         
         for mount_path in mounts.keys() {
             if mount_path != "/" && mount_path.starts_with(&search_path) {
                 let remainder = mount_path[search_path.len()..].trim_start_matches('/');
-                
-                // 🚨 THE FIX: Extract just the next folder level!
-                // This correctly pulls "mnt" out of "/mnt/nvme" so the Explorer can see it.
                 let folder_name = remainder.split('/').next().unwrap_or("");
                 
                 if !folder_name.is_empty() {
@@ -190,33 +184,33 @@ impl VirtualFileSystem {
         }
         drop(mounts);
 
-        // 2. Ask the hardware driver for its internal files
         if let Some((mount_point, relative_path)) = self.resolve_mount(path) {
             let mounts = self.mounts.lock();
             if let Some(driver) = mounts.get(&mount_point) {
-                let driver_files = driver.list_dir(&relative_path);
-                results.extend(driver_files);
+                if let Ok(driver_files) = driver.list_dir(&relative_path) {
+                    results.extend(driver_files);
+                }
             }
         }
 
-        // Deduplicate in case multiple drives are mounted in the same virtual folder
         results.sort();
         results.dedup();
         results
     }
+    
     pub fn open_path(&self, path: &str) -> Option<String> {
-        // Verify it exists in the VFS, then return the path for the FD table
         if self.resolve_mount(path).is_some() {
             Some(String::from(path))
         } else {
             None
         }
     }
+    
     pub fn create_dir(&self, path: &str) -> bool {
         if let Some((mount_point, rel_path)) = self.resolve_mount(path) {
             let mut mounts = self.mounts.lock();
             if let Some(driver) = mounts.get_mut(&mount_point) {
-                return driver.create_dir(&rel_path);
+                return driver.create_dir(&rel_path).is_ok();
             }
         }
         false
@@ -226,7 +220,7 @@ impl VirtualFileSystem {
         if let Some((mount_point, rel_path)) = self.resolve_mount(path) {
             let mut mounts = self.mounts.lock();
             if let Some(driver) = mounts.get_mut(&mount_point) {
-                return driver.create_file(&rel_path);
+                return driver.create_file(&rel_path).is_ok();
             }
         }
         false
@@ -236,12 +230,23 @@ impl VirtualFileSystem {
         if let Some((mount_point, rel_path)) = self.resolve_mount(path) {
             let mut mounts = self.mounts.lock();
             if let Some(driver) = mounts.get_mut(&mount_point) {
-                return driver.write_file(&rel_path, 0, buf).is_some();
+                return driver.write_file(&rel_path, 0, buf).is_ok();
+            }
+        }
+        false
+    }
+    
+    pub fn delete_file(&self, path: &str) -> bool {
+        if let Some((mount_point, rel_path)) = self.resolve_mount(path) {
+            let mut mounts = self.mounts.lock();
+            if let Some(driver) = mounts.get_mut(&mount_point) {
+                return driver.delete_file(&rel_path).is_ok();
             }
         }
         false
     }
 }
+
 // ==========================================
 // 4. LEGACY FILE DESCRIPTOR BRIDGES
 // ==========================================
@@ -258,12 +263,10 @@ impl OpenFile {
     pub fn read(&self, buf: &mut [u8]) -> usize {
         let mut off = self.offset.lock();
         
-        // 1. Ask the VFS which driver owns this file
         if let Some((mount_point, rel_path)) = VFS.resolve_mount(&self.path) {
             let mounts = VFS.mounts.lock();
             if let Some(driver) = mounts.get(&mount_point) {
-                // 2. Ask the driver to read the bytes directly!
-                if let Some(bytes_read) = driver.read_file(&rel_path, *off, buf) {
+                if let Ok(bytes_read) = driver.read_file(&rel_path, *off, buf) {
                     *off += bytes_read;
                     return bytes_read;
                 }
@@ -272,11 +275,7 @@ impl OpenFile {
         0 // EOF or Error
     }
 
-    pub fn write(&self, buf: &[u8]) -> usize {
-        // Our TarFS Initramfs is Read-Only! 
-        // When you write your NvmeFs driver later, you will map this to driver.write_file()
-        0 
-    }
+    pub fn write(&self, _buf: &[u8]) -> usize { 0 }
 
     pub fn mmap(&self, _offset: usize, _size: usize) -> Result<u64, i64> {
         Err(-12) // ENOMEM

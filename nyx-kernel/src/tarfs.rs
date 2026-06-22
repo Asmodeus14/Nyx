@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::vfs::FileSystem;
+use crate::vfs::{FileSystem, FsError};
 
 pub struct TarFs {
     data: &'static [u8],
@@ -51,25 +51,23 @@ impl TarFs {
 }
 
 impl FileSystem for TarFs {
-    fn read_file(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        let (file_offset, file_size) = self.find_file(path)?;
-        if offset >= file_size { return Some(0); }
+    fn read_file(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        let (file_offset, file_size) = self.find_file(path).ok_or(FsError::NotFound)?;
+        if offset >= file_size { return Ok(0); }
         
         let read_size = core::cmp::min(buf.len(), file_size - offset);
         buf[..read_size].copy_from_slice(&self.data[file_offset + offset .. file_offset + offset + read_size]);
-        Some(read_size)
+        Ok(read_size)
     }
 
-    fn get_file_size(&self, path: &str) -> Option<usize> {
-        self.find_file(path).map(|(_, size)| size)
+    fn get_file_size(&self, path: &str) -> Result<usize, FsError> {
+        self.find_file(path).map(|(_, size)| size).ok_or(FsError::NotFound)
     }
 
-    // TAR Initramfs is Read-Only!
-    fn write_file(&mut self, _path: &str, _offset: usize, _buf: &[u8]) -> Option<usize> { None }
-    fn create_file(&mut self, _path: &str) -> bool { false }
-    fn create_dir(&mut self, _path: &str) -> bool { false }
-
-    fn list_dir(&self, path: &str) -> Vec<String> {
+    // TAR Initramfs is Read-Only! We do not need to implement write/delete/sync, 
+    // as they correctly fall back to returning FsError::Unsupported from the default trait.
+    
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
         let mut results = Vec::new();
         let mut offset = 0;
         let target_dir = path.trim_start_matches('/');
@@ -91,6 +89,6 @@ impl FileSystem for TarFs {
             }
             offset += 512 + ((size + 511) / 512) * 512;
         }
-        results
+        Ok(results)
     }
 }
