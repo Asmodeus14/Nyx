@@ -454,6 +454,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "compositor"
+version = "0.1.0"
+dependencies = [
+ "embedded-io",
+ "embedded-tls",
+ "linked_list_allocator 0.10.6",
+ "noto-sans-mono-bitmap",
+ "nyx-api",
+ "nyx-gui",
+ "pc-keyboard",
+ "rand_core",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1830,10 +1844,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nyx-rust-app"
-version = "0.1.0"
-
-[[package]]
 name = "nyx-settings"
 version = "0.1.0"
 dependencies = [
@@ -1858,20 +1868,6 @@ dependencies = [
  "linked_list_allocator 0.10.6",
  "nyx-api",
  "nyx-gui",
-]
-
-[[package]]
-name = "nyx-user"
-version = "0.1.0"
-dependencies = [
- "embedded-io",
- "embedded-tls",
- "linked_list_allocator 0.10.6",
- "noto-sans-mono-bitmap",
- "nyx-api",
- "nyx-gui",
- "pc-keyboard",
- "rand_core",
 ]
 
 [[package]]

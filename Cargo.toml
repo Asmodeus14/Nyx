@@ -1,14 +1,25 @@
 [workspace]
 members = [
     "nyx-kernel",
-    "compiler",
-    "runner",
-    "nyx-user",
-    "nyx-rust-app",
-    "nyx-init",       
-    "nyx-api",        
-    "nyx-terminal"    
-, "nyx-gui", "nyx-settings", "nyx-network", "nyx-sysmon", "nyx-explorer"]
+    
+    # Tools
+    "tools/compiler",
+    "tools/runner",
+    
+    # Libraries
+    "libs/api",
+    "libs/gui",
+    
+    # Applications
+    "apps/init",
+    "apps/compositor",
+    "apps/terminal",
+    "apps/settings",
+    "apps/explorer",
+    "apps/network",
+    "apps/sysmon",
+    
+]
 
 # Force Cargo to ONLY build the kernel by default
 default-members = ["nyx-kernel"]

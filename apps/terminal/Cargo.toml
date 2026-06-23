@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Link directly to your local OS API!
-nyx-api = { path = "../nyx-api" }
+
 linked_list_allocator = "0.10.5"
-nyx-gui = { path = "../nyx-gui" }
+nyx-api = { path = "../../libs/api" }
+nyx-gui = { path = "../../libs/gui" }
 
 [profile.release]
 panic = "abort"

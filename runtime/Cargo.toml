@@ -1,7 +1,0 @@
-[package]
-name = "qclang-runtime"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-qclang-compiler = { path = "../compiler" }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nyx-api = { path = "../nyx-api" } # <--- Link the Standard Library
+nyx-api = { path = "../../libs/api" }
 
 [profile.release]
 panic = "abort"
