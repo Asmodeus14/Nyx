@@ -27,14 +27,12 @@ pub struct RtkDescriptor {
     pub buf_addr_high: u32,
 }
 
-// STRICT 256-BYTE ALIGNMENT FOR HARDWARE DMA RINGS
 #[repr(C, align(256))]
 #[derive(Clone)]
 pub struct DmaRing {
     pub descs: [RtkDescriptor; 16],
 }
 
-// STRICT 256-BYTE ALIGNMENT FOR PAYLOAD BUFFERS
 #[repr(C, align(256))]
 pub struct DmaBuffer {
     pub data: [u8; BUFFER_SIZE],
@@ -59,6 +57,15 @@ impl Rtl8168Driver {
         let mmio_virt = crate::memory::phys_to_virt(mmio_phys).unwrap();
         let empty_desc = RtkDescriptor { command_status: 0, vlan: 0, buf_addr_low: 0, buf_addr_high: 0 };
         
+        // 🔥 MILESTONE 2.4: Pre-fill the global memory pool with 16 buffers to avoid heap fragmentation!
+        let mut pool = crate::drivers::net::RX_BUFFER_POOL.lock();
+        if pool.is_empty() {
+            for _ in 0..16 {
+                pool.push(Box::new([0; 2048]));
+            }
+        }
+        drop(pool);
+
         let mut tx_bufs = Vec::new();
         let mut rx_bufs = Vec::new();
         for _ in 0..NUM_TX_DESC { tx_bufs.push(Box::new(DmaBuffer { data: [0; BUFFER_SIZE] })); }
@@ -88,7 +95,7 @@ impl Rtl8168Driver {
     pub fn write32(&mut self, offset: usize, val: u32) { unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u32, val) } }
 
     pub fn ack_interrupt(&mut self) {
-        self.write16(0x3E, 0xFFFF); // ISR clear
+        self.write16(0x3E, 0xFFFF);
     }
 
     pub fn initialize(&mut self) {
@@ -144,7 +151,6 @@ impl Rtl8168Driver {
         self.write32(REG_TCR, 0x03000700); 
         self.write8(REG_CR, 0x0C); 
 
-        // 🚨 WAKE UP FIX: Keep the card fully awake so the DMA engine never halts.
         self.write16(0x3C, 0x803F);
 
         let phy_status = self.read8(0x6C);
@@ -167,10 +173,8 @@ impl Device for Rtl8168Driver {
     type TxToken<'a> = RtkTxToken<'a> where Self: 'a;
 
     fn receive<'a>(&'a mut self, _timestamp: Instant) -> Option<(Self::RxToken<'a>, Self::TxToken<'a>)> {
-        // 🚨 POLLING ACK FIX: Manually clear the ISR every time we poll. 
-        self.write16(0x3E, 0xFFFF);
+        // 🔥 MILESTONE 2.2: Interrupt Ack removed from here, now handled centrally in poll_network!
 
-        // 1. ACQUIRE FENCE
         fence(Ordering::Acquire);
 
         let cmd_ptr = core::ptr::addr_of!(self.rx_ring.descs[self.rx_index].command_status);
@@ -179,38 +183,32 @@ impl Device for Rtl8168Driver {
         if (status & (1 << 31)) == 0 {
             let length = ((status & 0x3FFF) as usize).saturating_sub(4); 
             
-            let mut packet = alloc::vec![0; length];
-            packet.copy_from_slice(&self.rx_buffers[self.rx_index].data[..length]);
+            // 🔥 MILESTONE 2.4: Instantly pop a pre-allocated buffer! 
+            // If the pool runs dry during a massive burst/DDoS, dynamically allocate a new box to survive.
+            let mut pool_buf = crate::drivers::net::RX_BUFFER_POOL.lock().pop().unwrap_or_else(|| Box::new([0; 2048]));
+            
+            pool_buf[..length].copy_from_slice(&self.rx_buffers[self.rx_index].data[..length]);
 
-            // 🚨 NON-ALLOCATING RAW SNIFFER: Fast enough to not drop serial logs
+            #[cfg(feature = "net_trace")]
             if length >= 14 {
-                let eth_type = (packet[12] as u16) << 8 | (packet[13] as u16);
-                
-                // Only print ARP (0x0806) and IPv4 (0x0800) to avoid background noise spam
+                let eth_type = (pool_buf[12] as u16) << 8 | (pool_buf[13] as u16);
                 if eth_type == 0x0806 || eth_type == 0x0800 {
                     crate::serial_println!("[NIC RAW] Rx {} bytes | Type: {:#06X}", length, eth_type);
                 }
             }
 
-            // 🚨 THE FULL RESET
             let cmd_mut_ptr = core::ptr::addr_of_mut!(self.rx_ring.descs[self.rx_index].command_status);
-            
             let mut reset_cmd = (BUFFER_SIZE as u32) | (1 << 31); 
-            if self.rx_index == NUM_RX_DESC - 1 { 
-                reset_cmd |= 1 << 30; // EOR bit
-            }
-            
+            if self.rx_index == NUM_RX_DESC - 1 { reset_cmd |= 1 << 30; }
             unsafe { core::ptr::write_volatile(cmd_mut_ptr, reset_cmd) };
 
-            // 2. RELEASE FENCE
             fence(Ordering::Release);
 
-            // 🚨 THE KICK: Nudge the MAC state machine
             self.write8(0x37, 0x0C); 
-
             self.rx_index = (self.rx_index + 1) % NUM_RX_DESC;
 
-            Some((RtkRxToken(packet), RtkTxToken(self)))
+            // Pass the Box into the Token wrapper
+            Some((RtkRxToken { buf: Some(pool_buf), len: length }, RtkTxToken(self)))
         } else {
             None 
         }
@@ -219,11 +217,7 @@ impl Device for Rtl8168Driver {
     fn transmit<'a>(&'a mut self, _timestamp: Instant) -> Option<Self::TxToken<'a>> {
         let cmd_ptr = core::ptr::addr_of!(self.tx_ring.descs[self.tx_index].command_status);
         let status = unsafe { core::ptr::read_volatile(cmd_ptr) };
-        
-        if (status & (1 << 31)) != 0 {
-            return None; 
-        }
-        
+        if (status & (1 << 31)) != 0 { return None; }
         Some(RtkTxToken(self))
     }
 
@@ -236,39 +230,55 @@ impl Device for Rtl8168Driver {
     }
 }
 
-pub struct RtkRxToken(Vec<u8>);
+// 🔥 MILESTONE 2.4: A Zero-Allocation Auto-Recycling Token
+pub struct RtkRxToken {
+    buf: Option<Box<[u8; 2048]>>,
+    len: usize,
+}
+
 impl smoltcp::phy::RxToken for RtkRxToken {
     fn consume<R, F>(mut self, f: F) -> R where F: FnOnce(&mut [u8]) -> R {
-        if self.0.len() >= 14 {
-            let eth_type = (self.0[12] as u16) << 8 | (self.0[13] as u16);
-            if eth_type == 0x0806 { // ARP
-                crate::serial_println!("[smoltcp] 🚨 Received ARP Request! Passing to internal stack...");
-            }
+        let mut buffer = self.buf.take().unwrap();
+        
+        #[cfg(feature = "net_trace")]
+        if self.len >= 14 {
+            let eth_type = (buffer[12] as u16) << 8 | (buffer[13] as u16);
+            if eth_type == 0x0806 { crate::serial_println!("[smoltcp] 🚨 Received ARP Request!"); }
         }
-        f(&mut self.0)
+        
+        // Let the OS process the packet
+        let result = f(&mut buffer[..self.len]);
+        
+        // Immediately recycle the memory back into the global pool!
+        crate::drivers::net::RX_BUFFER_POOL.lock().push(buffer);
+        result
+    }
+}
+
+// In case the token is dropped BEFORE it is consumed, recycle it anyway!
+impl Drop for RtkRxToken {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buf.take() {
+            crate::drivers::net::RX_BUFFER_POOL.lock().push(buffer);
+        }
     }
 }
 
 pub struct RtkTxToken<'a>(&'a mut Rtl8168Driver);
 impl<'a> smoltcp::phy::TxToken for RtkTxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R where F: FnOnce(&mut [u8]) -> R {
-        // Only print this if you want to trace TX packets
+        #[cfg(feature = "net_trace")]
         crate::serial_println!("[NIC TX] smoltcp generating {} byte packet!", len);
 
         let mut buffer = alloc::vec![0; len];
         let result = f(&mut buffer);
 
         let idx = self.0.tx_index;
-        
-        // 🚨 HARDWARE PADDING FIX (60 bytes minimum)
         let actual_len = core::cmp::max(len, 60);
 
         self.0.tx_buffers[idx].data[..len].copy_from_slice(&buffer);
-        
         if actual_len > len {
-            for i in len..actual_len {
-                self.0.tx_buffers[idx].data[i] = 0;
-            }
+            for i in len..actual_len { self.0.tx_buffers[idx].data[i] = 0; }
         }
 
         fence(Ordering::Release);
@@ -279,10 +289,7 @@ impl<'a> smoltcp::phy::TxToken for RtkTxToken<'a> {
         unsafe { core::ptr::write_volatile(cmd_mut_ptr, cmd) };
         
         fence(Ordering::SeqCst);
-        
         self.0.tx_index = (idx + 1) % NUM_TX_DESC;
-
-        // 🚨 MMIO DOORBELL
         self.0.write8(0x38, 0x40); 
         fence(Ordering::SeqCst);
 

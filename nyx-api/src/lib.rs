@@ -305,3 +305,17 @@ pub fn sys_yield() {
 pub fn sys_spawn_thread(entry_point: extern "C" fn(), stack_top: *mut u8) -> u64 {
     syscall(58, entry_point as u64, stack_top as u64, 0, 0, 0, 0)
 }
+
+pub fn sys_dns_resolve(hostname: &str) -> Option<[u8; 4]> {
+    let res = syscall(534, hostname.as_ptr() as u64, hostname.len() as u64, 0, 0, 0, 0);
+    if res == 0 {
+        None // NXDOMAIN or Timeout
+    } else {
+        Some([
+            (res & 0xFF) as u8,
+            ((res >> 8) & 0xFF) as u8,
+            ((res >> 16) & 0xFF) as u8,
+            ((res >> 24) & 0xFF) as u8,
+        ])
+    }
+}

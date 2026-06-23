@@ -177,6 +177,8 @@ impl Process {
 // ==========================================
 pub extern "C" fn nyx_idle_task() {
     loop {
+        // This allows smoltcp to send the DHCP Discover and handle incoming ARP/TCP packets.
+        crate::drivers::net::poll_network();
         // Ensure interrupts are ALWAYS enabled before halting, 
         // preventing the CPU from becoming permanently bricked.
         unsafe { x86_64::instructions::interrupts::enable_and_hlt(); }

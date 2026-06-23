@@ -26,6 +26,7 @@ pub struct KernelSocket {
     pub kind: SocketKind,
     pub local_port: u16,
     pub remote: Option<smoltcp::wire::IpEndpoint>,
+    pub non_blocking: bool,
 }
 
 #[derive(Clone)]

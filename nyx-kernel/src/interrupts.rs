@@ -82,8 +82,13 @@ lazy_static! {
             idt[0x41].set_handler_addr(VirtAddr::new(yield_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Keyboard.as_usize()].set_handler_addr(VirtAddr::new(keyboard_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Mouse.as_usize()].set_handler_addr(VirtAddr::new(mouse_interrupt_stub as *const () as u64));
-            idt[0x30].set_handler_addr(VirtAddr::new(ethernet_interrupt_stub as *const () as u64));
+            
+            // REMOVE the old ethernet_interrupt_stub line from inside the unsafe block
         }
+        
+        // new x86-interrupt handler directly to slot 0x30 (48) outside the unsafe block
+        idt[0x30].set_handler_fn(rtl8168_interrupt_handler);
+        
         idt
     };
 }
@@ -1598,6 +1603,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 }
             }
         },
+        534 => { 
+            frame.rax = sys_dns_resolve(arg1 as usize, arg2 as usize); 
+        },
         _ => { frame.rax = EINVAL as u64; }
     }
 }
@@ -1638,14 +1646,35 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                             }
                         },
                         SocketKind::Tcp(handle) => {
-                            let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                            if socket.can_recv() {
-                                let user_slice = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
-                                if let Ok(received) = socket.recv_slice(user_slice) {
-                                    if received > 0 { return received as isize; }
+                            let is_non_blocking = sock.non_blocking;
+                            drop(sock); // Drop lock during the yield cycle
+
+                            loop {
+                                crate::drivers::net::poll_network();
+                                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+                                if let Some(sockets) = sockets_lock.as_mut() {
+                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                    if socket.can_recv() {
+                                        let user_slice = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                                        if let Ok(received) = socket.recv_slice(user_slice) {
+                                            if received > 0 { return received as isize; }
+                                        }
+                                    } else if !socket.may_recv() {
+                                        return 0; // Connection closed gracefully (EOF)
+                                    }
                                 }
-                            } else if !socket.may_recv() {
-                                return 0; 
+                                drop(sockets_lock);
+
+                                if is_non_blocking {
+                                    return EAGAIN as isize; // Async bypass
+                                }
+
+                                // Yield thread safely while waiting for new hardware frames
+                                unsafe {
+                                    x86_64::instructions::interrupts::enable();
+                                    core::arch::asm!("int 0x41");
+                                    x86_64::instructions::interrupts::disable();
+                                }
                             }
                         }
                     }
@@ -1712,10 +1741,30 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
                             }
                         },
                         SocketKind::Tcp(handle) => {
-                            let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                            if socket.can_send() {
-                                if let Ok(sent) = socket.send_slice(buf_slice) {
-                                    return sent as isize;
+                            let is_non_blocking = sock.non_blocking;
+                            drop(sock);
+
+                            loop {
+                                crate::drivers::net::poll_network();
+                                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+                                if let Some(sockets) = sockets_lock.as_mut() {
+                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                    if socket.can_send() {
+                                        if let Ok(sent) = socket.send_slice(buf_slice) {
+                                            return sent as isize;
+                                        }
+                                    }
+                                }
+                                drop(sockets_lock);
+
+                                if is_non_blocking {
+                                    return EAGAIN as isize;
+                                }
+
+                                unsafe {
+                                    x86_64::instructions::interrupts::enable();
+                                    core::arch::asm!("int 0x41");
+                                    x86_64::instructions::interrupts::disable();
                                 }
                             }
                         }
@@ -1741,14 +1790,24 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
     EBADF as isize
 }
 
+// Add these POSIX error code constants at the top of interrupts.rs if they aren't there:
+const EINPROGRESS: i64 = -115;
+const ECONNREFUSED: i64 = -111;
+const ETIMEDOUT: i64 = -110;
+
+#[no_mangle]
 pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
     let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
     if sockets_lock.is_none() { *sockets_lock = Some(smoltcp::iface::SocketSet::new(alloc::vec![])); }
     
     if let Some(sockets) = sockets_lock.as_mut() {
+        // 🔥 MILESTONE 3.1: Linux checks if SOCK_NONBLOCK (2048 / 0x800) is set in the type parameter
+        let is_non_blocking = (_typ & 2048) != 0;
+        let clean_type = _typ & !2048; // Strip the flag out to get the raw type (1 = TCP, 2 = UDP)
+
         let local_port = NEXT_LOCAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         
-        let handle = if _typ == 1 {
+        let handle = if clean_type == 1 {
             let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
             let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
             let socket = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
@@ -1761,13 +1820,11 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
             sockets.add(socket)
         };
 
-        let kind = if _typ == 1 { SocketKind::Tcp(handle) } else { SocketKind::Udp(handle) };
-        let ks = KernelSocket { kind, local_port, remote: None };
+        let kind = if clean_type == 1 { SocketKind::Tcp(handle) } else { SocketKind::Udp(handle) };
+        let ks = KernelSocket { kind, local_port, remote: None, non_blocking: is_non_blocking };
         
         if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return EBADF; }
         let percpu = crate::percpu::current();
-        let p_addr = percpu as *const _ as u64;
-        if unsafe { core::ptr::read_volatile(&p_addr) } == 0 { return EBADF; }
         
         let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
         if curr_idx >= percpu.scheduler.tasks.len() { return EBADF; }
@@ -1783,14 +1840,12 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
     -24 // EMFILE
 }
 
+#[no_mangle]
 pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -> i64 {
     if addr_len < 16 || !is_valid_user_ptr(addr_ptr, addr_len) { return EFAULT; }
-    
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return EBADF; }
-    let percpu = crate::percpu::current();
-    let p_addr = percpu as *const _ as u64;
-    if unsafe { core::ptr::read_volatile(&p_addr) } == 0 { return EBADF; }
     
+    let percpu = crate::percpu::current();
     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
     if curr_idx >= percpu.scheduler.tasks.len() { return EBADF; }
     
@@ -1799,32 +1854,162 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
 
     let port = u16::from_be(sockaddr.sin_port);
     let ip = sockaddr.sin_addr;
-
     let task = &mut percpu.scheduler.tasks[curr_idx];
     
-    if fd < 32 {
-        if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
-            let mut sock = sock_mtx.lock();
-            let addr = IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
-            sock.remote = Some(IpEndpoint::new(addr, port));
+    if fd >= 32 { return EBADF; }
+    
+    if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
+        let mut sock = sock_mtx.lock();
+        let addr = IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]));
+        sock.remote = Some(IpEndpoint::new(addr, port));
+        
+        if let SocketKind::Tcp(handle) = sock.kind {
+            let local_port = sock.local_port;
+            let is_non_blocking = sock.non_blocking;
             
-            if let SocketKind::Tcp(handle) = sock.kind {
+            {
                 let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
                 let mut iface_lock = crate::drivers::net::NET_IFACE.lock();
-                
                 if let (Some(sockets), Some(iface)) = (sockets_lock.as_mut(), iface_lock.as_mut()) {
                     let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                    let local_port = sock.local_port;
-                    
                     if socket.connect(iface.context(), IpEndpoint::new(addr, port), local_port).is_err() {
-                        return -11; // EAGAIN
+                        return ECONNREFUSED;
+                    }
+                } else { return EBADF; }
+            }
+
+            // Drop lock while we poll/sleep to avoid cross-thread deadlocks
+            drop(sock);
+
+            // 🔥 MILESTONE 3.1 & 3.3: Handling Blocking vs Non-Blocking states + State Transitions
+            if is_non_blocking {
+                return EINPROGRESS; // Return instantly for async GUI apps
+            }
+
+            // Blocking Loop: Put thread to sleep until TCP handshakes finish or fail
+            let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+            loop {
+                crate::drivers::net::poll_network();
+                
+                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+                if let Some(sockets) = sockets_lock.as_mut() {
+                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                    
+                    if socket.state() == smoltcp::socket::tcp::State::Established {
+                        return 0; // Connected!
+                    }
+                    if socket.state() == smoltcp::socket::tcp::State::Closed {
+                        return ECONNREFUSED; // Connection rejected
                     }
                 }
+                drop(sockets_lock);
+
+                // Timeout check (safely timeout after 10 seconds)
+                let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                if current_ms.saturating_sub(start_ms) > 10000 {
+                    return ETIMEDOUT;
+                }
+
+                // Yield the CPU core to other threads while waiting for the network card interrupt
+                unsafe {
+                    x86_64::instructions::interrupts::enable();
+                    core::arch::asm!("int 0x41");
+                    x86_64::instructions::interrupts::disable();
+                }
             }
-            
-            crate::drivers::net::poll_network();
-            return 0; 
         }
+        return 0;
     }
     EBADF
+}
+
+pub extern "x86-interrupt" fn rtl8168_interrupt_handler(_stack_frame: x86_64::structures::idt::InterruptStackFrame) {
+   
+    crate::serial_println!("[ISR] Hardware Interrupt Fired! NIC Woke up the CPU!");
+    
+    crate::drivers::net::NETWORK_PENDING.store(true, core::sync::atomic::Ordering::Release);
+    crate::apic::end_of_interrupt();
+}
+
+// Domain Name Resolution (DNS)
+#[no_mangle]
+pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u64 {
+    if hostname_len == 0 { return 0; }
+    if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return 0; }
+    
+    let hostname_slice = unsafe { core::slice::from_raw_parts(hostname_ptr as *const u8, hostname_len) };
+    let hostname_str = match core::str::from_utf8(hostname_slice) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    crate::serial_println!("[DNS] Resolving: {}", hostname_str);
+
+    // 1. Fire the DNS Query
+    let query_handle = {
+        let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+        let mut iface_lock = crate::drivers::net::NET_IFACE.lock();
+        let dns_lock = crate::drivers::net::DNS_HANDLE.lock();
+        
+        if let (Some(sockets), Some(iface), Some(dns_handle)) = (sockets_lock.as_mut(), iface_lock.as_mut(), *dns_lock) {
+            let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
+            match dns_socket.start_query(iface.context(), hostname_str, smoltcp::wire::DnsQueryType::A) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    crate::serial_println!("[DNS] Failed to start query: {:?}", e);
+                    return 0;
+                }
+            }
+        } else {
+            return 0;
+        }
+    };
+
+    let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+    
+    // 2. Safely Block until the DNS Server Replies
+    loop {
+        crate::drivers::net::poll_network();
+        
+        let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
+        if let Some(sockets) = sockets_lock.as_mut() {
+            let dns_handle = crate::drivers::net::DNS_HANDLE.lock().unwrap();
+            let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
+            
+            match dns_socket.get_query_result(query_handle) {
+                Ok(addrs) => {
+                    for addr in addrs.iter() {
+                        if let smoltcp::wire::IpAddress::Ipv4(ipv4) = addr {
+                            crate::serial_println!("[DNS] Resolved {} -> {}", hostname_str, ipv4);
+                            let octets = ipv4.0;
+                            // Pack the 4 bytes into a single u64 to return across the Syscall boundary
+                            return (octets[0] as u64) | ((octets[1] as u64) << 8) | ((octets[2] as u64) << 16) | ((octets[3] as u64) << 24);
+                        }
+                    }
+                    return 0; // No IPv4 found
+                },
+                Err(smoltcp::socket::dns::GetQueryResultError::Pending) => {
+                    // Still waiting...
+                },
+                Err(_) => {
+                    crate::serial_println!("[DNS] Query Failed/NXDOMAIN.");
+                    return 0; 
+                }
+            }
+        }
+        drop(sockets_lock);
+
+        let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+        if current_ms.saturating_sub(start_ms) > 5000 {
+            crate::serial_println!("[DNS] Timeout.");
+            return 0;
+        }
+
+        // Sleep the thread via the Scheduler Gateway
+        unsafe {
+            x86_64::instructions::interrupts::enable();
+            core::arch::asm!("int 0x41");
+            x86_64::instructions::interrupts::disable();
+        }
+    }
 }

@@ -171,18 +171,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         acpi::init_intel_acpica();
         acpi::scan_for_modern_inputs();
         apic::init();
-        crate::apic::init_timer(0x40);
         
         let apic_ids = crate::apic::get_cpu_apic_ids();
         percpu::init(&apic_ids);
         
         crate::memory::identity_map_low_memory();
         time::init();
+        crate::time::calibrate_tsc();
         ioapic::init();
         
         let bsp_apic_id = apic_ids[0] as u8;
         crate::ioapic::route_irq(1, bsp_apic_id, crate::interrupts::InterruptIndex::Keyboard as u8);
         crate::ioapic::route_irq(12, bsp_apic_id, crate::interrupts::InterruptIndex::Mouse as u8);
+        
+        // 🔥 THE FIX: Route the RTL8168 MSI Vector (0x30 = 48) directly to the CPU!
+        crate::ioapic::route_irq(11, bsp_apic_id, 48); 
         
         smp::init_aps(&apic_ids);
         pci::enumerate_pci();
@@ -191,14 +194,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let apic_ids = [0];
         percpu::init(&apic_ids);
         time::init();
+        crate::time::calibrate_tsc();
         pci::enumerate_pci();
     }
 
     // ==========================================
     // NVME HARDWARE DRIVER INITIALIZATION
     // ==========================================
-    //  FIX: We MUST move the driver into its final static memory location BEFORE 
-    // initializing the IO queues. This locks the physical DMA pointers safely in place!
     unsafe { crate::fs::GLOBAL_NVME = crate::drivers::nvme::NvmeDriver::init(); }
     
     unsafe {
@@ -213,7 +215,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // ==========================================
     unsafe {
         if crate::fs::GLOBAL_NVME.is_some() {
-            // 🔥 FIX: new() no longer takes ownership of the driver!
             if let Some(ext4_fs) = crate::fs::NvmeLwExt4Fs::new() {
                 crate::vfs::VFS.mount("/mnt/nvme", Box::new(ext4_fs));
                 crate::vga_println!("[BOOT] Physical NVMe Hardware (lwext4 R/W) Mounted to /mnt/nvme");
@@ -297,7 +298,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         *percpu_base = init_kernel_stack;
     }
 
-    // 🚨 FETCHING PID 1 DIRECTLY FROM THE NATIVE C-FFI EXT4 MOUNT 🚨
     let init_data = crate::vfs::VFS.read_file_alloc("/mnt/nvme/apps/Init.nyx/run.bin")
         .expect("VFS FATAL: Failed to load /mnt/nvme/apps/Init.nyx/run.bin from SSD!");
         
@@ -316,6 +316,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cr4.remove(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION);
         Cr4::write(cr4);
     }
+
+    // 🔥 ADDED HERE: Safe Hardware Timer Initialization
+    crate::apic::init_timer(0x40);
 
     crate::vga_println!("[BOOT] Jumping to Ring 3 Natively (Entry: {:#x})...", entry_point);
     unsafe { process::enter_userspace(entry_point, stack_top); }

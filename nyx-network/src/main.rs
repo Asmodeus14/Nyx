@@ -158,8 +158,11 @@ impl NyxApp for NetworkSuite {
         }
     }
 
-    fn on_mouse(&mut self, mx: usize, my: usize, _clicked: bool) -> bool {
-        if mx < 150 {
+    fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {
+        let mut requested_redraw = false;
+
+        // 1. Check for Sidebar Tab Clicks
+        if mx < 150 && clicked {
             let old_state = self.state;
             if my >= 75 && my <= 105 { self.state = NetState::Dns; }
             else if my >= 115 && my <= 145 { self.state = NetState::Fetch; }
@@ -172,7 +175,33 @@ impl NyxApp for NetworkSuite {
                 return true; 
             }
         }
-        false 
+
+        // 2. Check for "EXEC" Button Clicks
+        let width = 700; // initial width
+        let cx = 170; 
+        let cw = width - (cx + 20);
+        let btn_x = cx + cw - 70;
+        
+        if clicked && mx >= btn_x && mx <= btn_x + 70 && my >= 50 && my <= 80 {
+            if self.async_status == AsyncState::Idle {
+                if self.state == NetState::Dns {
+                    // 🔥 CALL THE NEW SYSCALL!
+                    self.log_buffer = alloc::format!("Querying DNS for: {} ...", self.input_buffer);
+                    
+                    if let Some(ip) = nyx_api::sys_dns_resolve(&self.input_buffer) {
+                        self.log_buffer = alloc::format!(
+                            "SUCCESS!\nHost: {}\nIP Address: {}.{}.{}.{}", 
+                            self.input_buffer, ip[0], ip[1], ip[2], ip[3]
+                        );
+                    } else {
+                        self.log_buffer = alloc::format!("FAILED to resolve '{}'.\nCheck connection.", self.input_buffer);
+                    }
+                    requested_redraw = true;
+                }
+            }
+        }
+        
+        requested_redraw 
     }
 
     fn on_key(&mut self, key: char) -> bool {

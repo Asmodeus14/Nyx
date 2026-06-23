@@ -3,6 +3,10 @@ name = "nyx-kernel"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+net_trace = [] #  Milestone 2.3: Enables packet sniffing logs when needed
+
 [dependencies]
 # Bootloader
 bootloader_api = "0.11.15"
@@ -35,20 +39,20 @@ sha3 = { version = "0.10", default-features = false }
 
 aml = "0.16.4"
 
-smoltcp = { version = "0.9.1", default-features = false, features = ["alloc", "log", "medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp"] }
+#  Milestone 2.1: Added proto-dhcpv4 and socket-dhcpv4 features!
+smoltcp = { version = "0.9.1", default-features = false, features = ["alloc", "log", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns"] }
 
 # File systems
-
 ext4plus = "0.1.0-beta.3"
 
 [build-dependencies]
 bindgen = "0.69.1"
 cc = "1.0"
 
-
 [package.metadata.bootloader]
 map-physical-memory = true
 run-args = ["-display", "none", "-serial", "stdio"]
+
 [profile.dev]
 panic = "abort"
 
