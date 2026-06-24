@@ -63,7 +63,22 @@ pub fn init_intel_acpica() {
         } else {
             crate::serial_println!("[ACPI] WARNING: MADT not found! Status: {}", get_status);
         }
+        let mut mcfg_header: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mcfg_status = AcpiGetTable(
+            b"MCFG\0".as_ptr() as *mut i8, 
+            1, 
+            &mut mcfg_header as *mut _ as *mut *mut _
+        );
 
+        if mcfg_status == 0 && !mcfg_header.is_null() {
+            let mcfg_virt = mcfg_header as u64;
+            let mcfg_phys = crate::memory::virt_to_phys(mcfg_virt).unwrap_or(mcfg_virt);
+            
+            ACPI_INFO.mcfg_addr = Some(mcfg_phys);
+            crate::serial_println!("[ACPI] MCFG stored dynamically @ {:#x}", mcfg_phys);
+        } else {
+            crate::serial_println!("[ACPI] WARNING: MCFG not found! PCIe will fallback to Legacy Port I/O.");
+        }
         // 3. Build the Hardware Namespace Tree
         crate::serial_println!("[ACPI] Loading Hardware Namespace...");
         status = AcpiLoadTables();

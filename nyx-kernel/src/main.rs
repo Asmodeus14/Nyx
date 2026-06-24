@@ -35,7 +35,6 @@ pub mod mouse;
 pub mod shell;
 pub mod entity;
 pub mod c_stubs;
-pub mod drm;
 pub mod usb;
 pub mod partitioner;
 pub mod thermal;

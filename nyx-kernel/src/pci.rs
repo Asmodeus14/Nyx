@@ -103,6 +103,7 @@ pub fn enumerate_pci() {
     let num_allocations = allocations_size / core::mem::size_of::<McfgAllocation>();
     let alloc_ptr = (mcfg_virt + core::mem::size_of::<McfgHeader>() as u64) as *const McfgAllocation;
 
+    crate::serial_println!("[PCI] MCFG Table Initialized. Mapping {} PCIe allocations...", num_allocations);
     for i in 0..num_allocations {
         let alloc = unsafe { &*alloc_ptr.add(i) };
         scan_bus_range(alloc.base_address, alloc.start_bus_number, alloc.end_bus_number);
@@ -127,7 +128,6 @@ fn enumerate_pci_legacy() {
                     crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
                 }
                 
-                // 🔥 MILESTONE 2.5: Widen the Realtek ID Matcher!
                 if dev.vendor_id == 0x10ec && matches!(dev.device_id, 0x8168 | 0x8125 | 0x8169 | 0x8136 | 0x8167) {
                     crate::serial_println!("[PCI] Binding Realtek Ethernet Driver...");
                     
@@ -207,17 +207,24 @@ fn enumerate_pci_legacy() {
             0x03 => {
                 crate::serial_println!("[PCI] *** FOUND GPU: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id);
                 if dev.vendor_id == 0x8086 {
-                    crate::serial_println!("[PCI] Intel GPU Detected! Initiating Phase 1 (Legacy)...");
-                    let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
-                    cmd |= 0x06; 
-                    let cmd_addr = 0x80000000 | ((dev.bus as u32) << 16) | ((dev.device as u32) << 11) | ((dev.func as u32) << 8) | 0x04;
-                    unsafe { Port::<u32>::new(0xCF8).write(cmd_addr); Port::<u32>::new(0xCFC).write(cmd); }
-                    let mmio_phys = driver.get_bar_address(&dev, 0).unwrap_or(0);
-                    if mmio_phys != 0 {
-                        if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
-                            let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, dev.device_id);
-                            gpu.initialize();
-                            *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
+                    let gen = crate::drivers::gpu::intel::IntelGpuDriver::probe(dev.device_id);
+                    
+                    if gen == crate::drivers::gpu::intel::GpuGeneration::Unsupported {
+                        crate::serial_println!("[PCI] Unsupported Intel GPU Generation (Device ID: {:#06x})", dev.device_id);
+                    } else {
+                        crate::serial_println!("[PCI] Intel GPU Detected ({:?})! Initiating Phase 1 (Legacy)...", gen);
+                        let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
+                        cmd |= 0x06; 
+                        let cmd_addr = 0x80000000 | ((dev.bus as u32) << 16) | ((dev.device as u32) << 11) | ((dev.func as u32) << 8) | 0x04;
+                        unsafe { Port::<u32>::new(0xCF8).write(cmd_addr); Port::<u32>::new(0xCFC).write(cmd); }
+                        
+                        let mmio_phys = driver.get_bar_address(&dev, 0).unwrap_or(0);
+                        if mmio_phys != 0 {
+                            if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
+                                let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, dev.device_id);
+                                gpu.initialize();
+                                *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
+                            }
                         }
                     }
                 }
@@ -285,7 +292,6 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                     crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
                                 }
                                 
-                                // 🔥 MILESTONE 2.5: Widen the Realtek ID Matcher!
                                 if vendor_id == 0x10ec && matches!(device_id, 0x8168 | 0x8125 | 0x8169 | 0x8136 | 0x8167) {
                                     crate::serial_println!("[PCI] Binding Realtek Ethernet Driver...");
                                     
@@ -377,25 +383,32 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                             0x01 => crate::serial_println!("[PCI] Found Mass Storage: Vendor {:#06x}, Device {:#06x}", vendor_id, device_id),
                             0x03 => {
                                 if vendor_id == 0x8086 {
-                                    let command_ptr = (device_virt + 0x04) as *mut u16;
-                                    let mut command = unsafe { core::ptr::read_volatile(command_ptr) };
-                                    command |= 0x06; 
-                                    unsafe { core::ptr::write_volatile(command_ptr, command) };
+                                    let gen = crate::drivers::gpu::intel::IntelGpuDriver::probe(device_id);
+                                    
+                                    if gen == crate::drivers::gpu::intel::GpuGeneration::Unsupported {
+                                        crate::serial_println!("[PCI] Unsupported Intel GPU Generation (Device ID: {:#06x})", device_id);
+                                    } else {
+                                        crate::serial_println!("[PCI] Intel GPU Detected ({:?})! Initiating Phase 1 (MCFG)...", gen);
+                                        let command_ptr = (device_virt + 0x04) as *mut u16;
+                                        let mut command = unsafe { core::ptr::read_volatile(command_ptr) };
+                                        command |= 0x06; 
+                                        unsafe { core::ptr::write_volatile(command_ptr, command) };
 
-                                    let bar0 = unsafe { core::ptr::read_volatile((device_virt + 0x10) as *const u32) };
-                                    let is_64bit = (bar0 & 0b100) != 0;
-                                    let mut mmio_phys = (bar0 & 0xFFFFFFF0) as u64;
+                                        let bar0 = unsafe { core::ptr::read_volatile((device_virt + 0x10) as *const u32) };
+                                        let is_64bit = (bar0 & 0b100) != 0;
+                                        let mut mmio_phys = (bar0 & 0xFFFFFFF0) as u64;
 
-                                    if is_64bit {
-                                        let bar1 = unsafe { core::ptr::read_volatile((device_virt + 0x14) as *const u32) };
-                                        mmio_phys |= (bar1 as u64) << 32;
-                                    }
+                                        if is_64bit {
+                                            let bar1 = unsafe { core::ptr::read_volatile((device_virt + 0x14) as *const u32) };
+                                            mmio_phys |= (bar1 as u64) << 32;
+                                        }
 
-                                    if mmio_phys != 0 {
-                                        if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
-                                            let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, device_id);
-                                            gpu.initialize();
-                                            *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
+                                        if mmio_phys != 0 {
+                                            if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
+                                                let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, device_id);
+                                                gpu.initialize();
+                                                *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
+                                            }
                                         }
                                     }
                                 }
