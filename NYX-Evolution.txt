@@ -1,126 +1,454 @@
-Complete Revised Plan (Phases 1-5)
-Phase 1: Ext4 Subsystem Hardening
-This is now a "fix and polish" phase rather than a rebuild. The core stack is sound; the gaps are integration correctness.
+Nyx OS - Intel Comet Lake iGPU Support Implementation Plan
+==========================================================
 
-Milestone 1.1: Fix create_file Stub ✅ Priority
+Phase 0: Current State Assessment (Week 1)
+------------------------------------------
+Objective: Audit existing GPU code and understand current capabilities
 
-Problem: fs.rs line 147: fn create_file(&mut self, _path: &str) -> bool { true } returns success without touching the disk. Any code path relying on explicit file creation (like the Phase 5 installer pre-allocating a placeholder) will silently fail.
-Action:
-In ext4_wrapper.c, add:
-c
+Tasks:
+1. Audit existing intel.rs file in nyx-kernel/src/
+   - Document current implementation status
+   - Identify existing device detection logic
+   - Check for any GOP (Graphics Output Protocol) support
 
-int nyx_fs_create_file(const char* path) {
-    ext4_file f;
-    if (ext4_fopen(&f, path, "w+") != EOK) return 0;
-    ext4_fclose(&f);
-    return 1;
-}
-In fs.rs, declare fn nyx_fs_create_file(path: *const u8) -> i32; in the extern block and implement:
-rust
+2. Review pci.rs implementation
+   - Understand current PCI device enumeration
+   - Verify Intel GPU detection capabilities
+   - Document how to extract device ID and revision ID
 
-fn create_file(&mut self, path: &str) -> bool {
-    let c_path = to_c_path(path);
-    unsafe { nyx_fs_create_file(c_path.as_ptr()) == 1 }
-}
-Result: Explicit file creation works correctly and returns actual success/failure.
-Milestone 1.2: GPT Partition Selection by Type GUID ✅ Priority
+3. Hardware Identification (using existing pci.rs)
+   - Use your PCI detection code to identify the iGPU
+   - Extract Device ID and Revision ID from PCI config space
+   - Determine if it's a Comet Lake GT1F or GT2 configuration
 
-Problem: fs.rs line 106 uses a hardcoded 90-110 GB size window: (size_mb_512 > 90_000 && size_mb_512 < 110_000) || (size_mb_4k > 90_000 && size_mb_4k < 110_000). This is testing-specific and will break when you move to full disk or a different partition size.
-Action: Replace the size check with a type GUID match. The standard Linux filesystem GPT type GUID is 0FC63DAF-8483-4772-8E79-3D69D8477DE4 (stored little-endian on disk). In the GPT entry parsing loop:
-rust
+Deliverables:
+- Audit report of intel.rs current capabilities
+- Exact device ID and revision ID from your hardware
+- List of implemented vs missing features
+- Baseline performance metrics for CPU rendering
 
-// Read the full 16-byte type GUID (bytes 0-15 of entry)
-let mut type_guid = [0u8; 16];
-type_guid.copy_from_slice(&entry_block[off..off+16]);
 
-// Linux filesystem data partition GUID (little-endian on disk)
-const LINUX_FS_GUID: [u8; 16] = [
-    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
-    0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4
-];
+Phase 1: Comet Lake iGPU Identification & Documentation Study (Weeks 2-3)
+------------------------------------------------------------------------
+Objective: Implement proper device identification and study Comet Lake architecture
 
-if type_guid == LINUX_FS_GUID {
-    start_lba = lba;
-    size_sectors = end_lba - lba;
-    break; // Take the first Linux partition
-}
-Result: Nyx mounts any Linux-formatted GPT partition regardless of size. The 100 GB test partition still works; full-disk installs will work too.
-Milestone 1.3: Add delete_file to the VFS Trait (Suggestion)
+1.1 Device ID Database Implementation
+Create nyx-kernel/src/intel/gpu_ids.rs with:
 
-Problem: The FileSystem trait in vfs.rs has no delete_file method. The Phase 5 git micro-agent will need to delete stale firmware caches, and the app store will need to uninstall apps.
-Action: Add fn delete_file(&mut self, path: &str) -> bool { false } as a default method (returning false means "unsupported"). Implement it in NvmeLwExt4Fs by adding nyx_fs_remove in ext4_wrapper.c calling ext4_fremove.
-Result: File deletion is available to userspace when needed.
-Milestone 1.4: Increase Block Cache Size (Suggestion)
+Comet Lake Device IDs from Intel documentation:
+- 0x9B41 (rev 0x2) - Mobile U42/U2f2 (GT2, WHL V0)
+- 0x9B21 (rev 0x2) - Mobile U2f1f (GT1F, WHL V0)
+- 0x9BCA (rev 0x4) - Mobile U62/U4f2/U2f2 (GT2, CML A0)
+- 0x9BAA (rev 0x4) - Mobile U2f1f (GT1F, CML A0)
+- 0x9BCC (rev 0x5) - Mobile U62/U4f2/U2f2 (GT2, CML K0)
+- 0x9BAC (rev 0x5) - Mobile U2f1f (GT1F, CML K0)
+- 0x9BC5 (rev 0x5) - Desktop S10+2/S8f2/S6f2 (GT2, CML P0)
+- 0x9BC8 (rev 0x4) - Desktop S62/S4f2/S2f2 (GT2, CML G0)
+- 0x9BA8 (rev 0x4) - Desktop S2f1f (GT1F, CML G0)
+- 0x9BC4 (rev 0x5) - Mobile H82/H6f2/H4f2 (GT2, R2)
+- 0x9BA4 (rev 0x5) - Mobile H81/H6f1f (GT1F, R2)
+- 0x9BF6 (rev 0x5) - Mobile Xeon H82 (GT2, R2)
+- 0x9BC6 (rev 0x5) - Workstation S10+2 (GT2, CML P0)
+- 0x9BE6 (rev 0x4) - Workstation S62 (GT2, CML G0)
 
-Problem: build.rs line 65 sets CONFIG_BLOCK_DEV_CACHE_SIZE 16. lwext4 caches 16 blocks (8 KB at 512-byte sectors) in RAM. For sequential reads (like loading an app binary), this causes excessive NVMe round-trips because the cache thrashes constantly.
-Action: Increase to 128 or 256 (64-128 KB cache). This costs negligible RAM (a few hundred KB) but dramatically reduces NVMe command overhead.
-Result: Faster file reads, especially for the initrd tarball extraction and app loading.
-Milestone 1.5: Distinguish Error Types in Return Values (Suggestion)
+1.2 Configuration Structure
+Implement nyx-kernel/src/intel/cml_config.rs with:
 
-Problem: read_file returns Option<usize> — None could mean "file not found" or "disk I/O error." Userspace (and the kernel itself) can't distinguish recoverable from fatal errors.
-Action: Change Option<usize> to Result<usize, FsError> where FsError is an enum (NotFound, IoError, InvalidPath, OutOfSpace). This is a breaking change to the trait but worth doing now before more callers exist.
-Result: Proper error reporting to userspace via errno-style syscalls.
-Milestone 1.6: Verify 4K Native NVMe Sector Handling (Suggestion)
+GT1F Configuration:
+- 1 Slice, 2 Subslices, 12 EUs (84 threads)
+- 384KB L3 Cache, 192KB URB, 128KB SLM
+- 2 Data Ports, 2 Samplers
 
-Problem: fs.rs allocates an 8192-byte buffer, manually aligns it to 4096, then calls driver.read_block(sector, slice_4k) and copies only 512 bytes out. The comment says "We MUST pass 4096 to bypass the hardcoded safety check in nvme.rs!". This suggests the NVMe driver expects 4K buffers but lwext4 works in 512-byte logical sectors. If the underlying NVMe device is 4K-native (no 512-byte emulation), this works. But if it's 512-byte emulation, you're doing 8x more I/O than necessary.
-Action: Verify your NVMe driver's logical block size. If it's 512, simplify the bridge to pass 512-byte buffers directly. If it's 4K-native, keep the current approach but document why. The block size mismatch is a common source of silent data corruption.
-Result: Correct and efficient block I/O.
-Milestone 1.7: Add sync/flush Operation (Suggestion)
+GT2 Configuration:
+- 1 Slice, 3 Subslices, 24 EUs (168 threads, 1 reserved)
+- 768KB L3 Cache, 384KB URB, 192KB SLM
+- 3 Data Ports, 3 Samplers
 
-Problem: lwext4 has ext4_cache_flush() and ext4_fs_sync() to force journal commits. The FileSystem trait has no sync method. In a power-loss scenario, unflushed journal data could corrupt the filesystem.
-Action: Add fn sync(&mut self) -> bool { true } as a default method. Implement it in NvmeLwExt4Fs by calling ext4_cache_flush and ext4_fs_sync in the C wrapper.
-Result: Clean shutdown and power-loss safety.
-Phase 2: Ethernet Stack Hardening (Primary Focus)
-This is where you spend the next 4-6 weeks. The goal is to transform the RTL8168 driver from a Windows-ICS testbench prototype into a robust, interrupt-driven, DHCP-capable stack that survives real network traffic.
+1.3 Documentation Study
+Key areas from Intel CML PRM:
+- Top Level Block Diagrams (Section 2)
+- Device Attributes (Section 5)
+- Stepping and Device IDs (Section 9)
+- Register definitions for:
+  * GFX_MODE (0x915C)
+  * Display pipes (0x70008, 0x6001C)
+  * GTT registers (0x0188, 0x0180)
+  * Command streamer (0x0200, 0x020C)
 
-Milestone 2.1: Dynamic IP via DHCP ✅ Priority
+Deliverables:
+- Complete device ID database for Comet Lake
+- GPU identification function using existing pci.rs
+- Configuration structure with GT1F/GT2 differentiation
+- Documentation summary of key architectural features
 
-Problem: pci.rs hardcodes 192.168.137.99/24 with gateway 192.168.137.1.
-Action: Enable smoltcp's dhcp feature. Replace the static IpCidr assignment with a Dhcpv4Client instance stored alongside NET_IFACE. In poll_network(), call dhcp_client.poll() before iface.poll().
-Result: Nyx auto-configures on any Ethernet network.
-Milestone 2.2: Interrupt-Driven RX ✅ Priority
 
-Problem: pci.rs configures MSI vector 0x30 but no handler exists. poll_network() spins on every tick.
-Action: Register an ISR for vector 0x30 that sets NETWORK_PENDING.store(true, Relaxed) and issues an EOI. Rewrite poll_network() to idle (HLT) until NETWORK_PENDING is set, then poll. Remove the write16(0x3E, 0xFFFF) from receive().
-Result: CPU usage drops to ~0% when idle; no dropped packets under burst traffic.
-Milestone 2.3: Hot-Path Debug Gating ✅ Priority
+Phase 2: Ring 0 Engine Verification - Bare Metal (Weeks 4-6)
+------------------------------------------------------------
+Objective: Initialize and verify Intel GPU engine on bare metal
 
-Problem: serial_println! on every RX/TX packet will stall the kernel under real traffic.
-Action: Add a net_trace feature in nyx-kernel/Cargo.toml. Gate all packet-level serial prints behind #[cfg(feature = "net_trace")].
-Result: Zero serial overhead in production builds.
-Milestone 2.4: RX Buffer Pool ✅ Priority
+2.1 GPU Initialization with Comet Lake Specifics
 
-Problem: receive() does alloc::vec![0; length] on every packet, fragmenting the heap.
-Action: Pre-allocate a pool of 16 Box<[u8; 2048]> in Rtl8168Driver::new(). receive() checks out a buffer from the pool, copies the frame, and returns ownership. RtkRxToken returns the buffer to the pool on Drop.
-Result: Zero per-packet heap allocation after boot.
-Milestone 2.5: PCI ID Coverage & TSC Calibration
+Create nyx-kernel/src/intel/gpu_init.rs:
 
-Problem: Only 0x10ec:0x8168 binds. TSC assumed 2 GHz.
-Action: Widen the match to matches!(device_id, 0x8168 | 0x8125 | 0x8169 | 0x8136 | 0x8167). Read the actual TSC frequency from ACPI or calibrate against the HPET/local APIC timer.
-Result: Driver binds to full RTL81xx family; TCP timers run correctly on any CPU.
-Phase 3: Network Syscalls Refinement
-Your nyx-api/src/lib.rs already has sys_socket, sys_connect, sys_sendto, sys_recvfrom. These need refinement.
+Initialization Sequence:
+1. Detect Intel GPU via existing pci.rs
+   - Extract device ID and revision ID
+   - Identify specific Comet Lake SKU
 
-Milestone 3.1: Non-blocking Socket Support
+2. Enable MMIO
+   - Map GPU MMIO registers
+   - Configure memory aperture
 
-Add fcntl-style flags to sys_socket or a new sys_ioctl to support O_NONBLOCK. Required for Phase 4 GUI apps to stay responsive during network operations.
-Milestone 3.2: sys_gethostbyname
+3. Reset GPU Engine
+   - Assert reset via GFX_MODE register (0x915C)
+   - Wait for reset completion
 
-Add a syscall that wraps smoltcp's DNS client so userspace doesn't reinvent DNS parsing (currently done manually in nyx-network/main.rs).
-Signature: sys_dns_resolve(hostname: &str) -> Option<[u8; 4]>.
-Milestone 3.3: Socket Error Reporting
+4. Initialize Display Engine
+   - Configure 3 display pipes
+   - Setup 2 DDI ports + 1 eDP
+   - Initialize display planes (3 per pipe)
 
-Ensure socket syscalls return proper errno-style codes (-ECONNREFUSED, -ETIMEDOUT, etc.) instead of generic -1. This lets GUI apps show meaningful errors.
-Milestone 3.4: sys_getifaddrs (Suggestion)
+5. Configure Memory Aperture
+   - Allocate GTT (512KB)
+   - Program GTT base address (0x0188)
+   - Enable GTT (0x0180)
 
-Add a syscall that returns the current interface IP, MAC, and link status. This lets the Settings app display network status like a conventional OS.
-Phase 4: Userspace Apps (nyx-store & git agent)
-Milestone 4.1: nyx-store
+6. Initialize Render Engine
+   - Configure slice common
+   - Initialize subslices (2 for GT1F, 3 for GT2)
+   - Setup EU array (12 for GT1F, 24 for GT2)
 
-Uses sys_socket + sys_dns_resolve to fetch a JSON catalog over HTTP.
-The 4KB streaming installer loop from your original plan works perfectly — it's just sys_read into a 4KB stack buffer followed by sys_write to a file on the ext4 NVMe partition.
-Uses create_file (fixed in Phase 1) to pre-allocate install targets.
-Milestone 4.2: Terminal Git Micro-Agent
+7. Setup Command Streamer
+   - Allocate command buffer
+   - Program RCS base address (0x0200)
+   - Enable command streamer (0x020C)
 
-git fetch-firmware over TCP to GitHub raw endpoints. No full Git protocol — just HTTP GET via sockets.
-Downloads raw driver updates and caches them on the ext4 SSD using create_file + write_file.
+2.2 Bare Metal Testing Framework
+
+Create nyx-kernel/src/intel/test_harness.rs:
+
+Test Cases:
+1. Basic Initialization Test
+   - Verify GPU detection
+   - Test MMIO mapping
+   - Verify engine reset
+
+2. Display Engine Test
+   - Test display pipe initialization
+   - Test DDI port configuration
+   - Verify display output
+
+3. Render Engine Test
+   - Test EU initialization
+   - Test subslice configuration
+   - Verify slice common setup
+
+4. Memory Management Test
+   - Test GTT initialization
+   - Test memory allocation
+   - Verify aperture configuration
+
+5. Command Execution Test
+   - Test command streamer
+   - Test basic rendering (clear screen)
+   - Test synchronization
+
+6. Stability Test
+   - Run continuous rendering for 1 hour
+   - Monitor for hangs/crashes
+   - Check for memory leaks
+
+Testing Strategy:
+- Use serial port for debug output
+- Use motherboard LEDs/GPIO for status
+- Verify GPU memory doesn't corrupt system memory
+- Monitor GPU temperature
+
+Deliverables:
+- Working GPU initialization on bare metal
+- Test harness for all GPU components
+- Verified display output
+- Performance baseline measurements
+
+
+Phase 3: Ring 3 Integration & UI Offloading (Weeks 7-10)
+---------------------------------------------------------
+Objective: Create user-space API and integrate with GUI subsystem
+
+3.1 User-Space GPU API
+
+Create nyx-api/src/gpu.rs:
+
+API Functions:
+- create_context() -> GpuContextId
+- destroy_context(ctx: GpuContextId)
+- execute_command_list(ctx, commands: &[GpuCommand])
+- allocate_memory(size, mem_type) -> GpuMemoryInfo
+- free_memory(handle: GpuMemoryHandle)
+- sync(ctx: GpuContextId)
+
+Memory Types:
+- Local (GPU local memory)
+- Shared (CPU-GPU shared memory)
+- Aperture (Aperture memory)
+
+Command Types:
+- Clear
+- DrawRect
+- DrawText
+- CopyBuffer
+- FillBuffer
+- Sync
+
+3.2 Kernel-User Space Interface
+
+Create nyx-kernel/src/syscalls/gpu.rs:
+
+System Calls:
+- sys_gpu_create_context()
+- sys_gpu_destroy_context(ctx_id)
+- sys_gpu_execute_commands(ctx_id, commands_ptr, count)
+- sys_gpu_allocate_memory(size, mem_type)
+- sys_gpu_free_memory(handle)
+- sys_gpu_sync(ctx_id)
+
+Security:
+- Validate all pointers
+- Check context ownership
+- Limit memory allocations
+- Implement resource quotas
+
+3.3 GUI Subsystem Adaptation
+
+Modify nyx-gui/src/renderer/:
+
+Create gpu_renderer.rs:
+- Replace CPU rendering with GPU commands
+- Implement texture uploads to GPU memory
+- Add basic shader support
+- Implement double buffering
+
+Update terminal.rs:
+- GPU-accelerated text rendering
+- Hardware cursor support
+- Scroll buffer in GPU memory
+
+Optimization:
+- Command batching (reduce syscall overhead)
+- Memory pooling for textures
+- Lazy texture uploads
+- Partial updates for damaged regions
+
+Deliverables:
+- Working GPU API in user space
+- GUI rendering offloaded to GPU
+- Terminal with GPU acceleration
+- Performance optimization implemented
+
+
+Phase 4: Testing & Validation (Weeks 11-12)
+-------------------------------------------
+Objective: Ensure stability and measure performance improvements
+
+4.1 Comprehensive Testing
+
+Unit Tests:
+- Test each GPU command type
+- Test memory allocation/deallocation
+- Test context switching
+- Test error conditions
+
+Integration Tests:
+- Test GUI rendering with GPU
+- Test terminal rendering with GPU
+- Test multi-window scenarios
+- Test display hotplugging
+
+Stress Tests:
+- Continuous rendering for 24 hours
+- Memory leak detection
+- Thermal stability
+- Power consumption monitoring
+
+4.2 Performance Benchmarking
+
+Metrics to Measure:
+- CPU usage reduction (>50% target)
+- Frame rate (>30 FPS target)
+- Memory usage (<10% increase)
+- Boot time impact (<2s increase)
+- Power consumption
+
+Benchmark Scenarios:
+- Clear screen (1000 iterations)
+- Draw rectangles (1000 iterations)
+- Text rendering (1000 lines)
+- Window compositing
+- Terminal scrolling
+
+4.3 Bug Fixing and Stabilization
+
+- Address all critical bugs
+- Optimize critical paths
+- Add error recovery mechanisms
+- Implement graceful degradation
+
+Deliverables:
+- All tests passing with >95% stability
+- Performance targets met
+- Bug-free operation for 24+ hours
+- Comprehensive test report
+
+
+Phase 5: Documentation & Future Planning (Ongoing)
+--------------------------------------------------
+Objective: Ensure long-term maintainability and future development
+
+5.1 Documentation Updates
+
+Update README.md:
+- Add Intel GPU support section
+- Document supported hardware
+- Add build instructions for GPU support
+
+Create GPU_SUPPORT.md:
+- Detailed architecture documentation
+- API reference for GPU context
+- Debugging guide for GPU issues
+- Performance tuning guide
+
+Update CONTRIBUTING.md:
+- Guidelines for GPU-related contributions
+- Testing requirements for GPU changes
+- Code review checklist for GPU code
+
+5.2 Future Enhancements
+
+Video Decode Support:
+- VDBox (Video Decode Box) implementation
+- Hardware-accelerated video playback
+- Multiple codec support
+
+3D Rendering:
+- OpenGL/Vulkan implementation
+- Shader compiler
+- 3D pipeline support
+
+Power Management:
+- Dynamic frequency scaling
+- RC6 power states
+- Display panel power management
+
+Multi-Monitor Support:
+- Multiple display pipes
+- Different resolutions per display
+- Display hotplugging
+
+Deliverables:
+- Complete documentation
+- Contribution guidelines updated
+- Future roadmap documented
+- Maintenance plan established
+
+
+Implementation Notes:
+====================
+
+1. Use existing pci.rs for all hardware detection - no external tools needed
+
+2. All testing is on bare metal - no QEMU emulation
+
+3. Reference Intel CML PRM (Doc Ref # IHD-OS-CML-Vol 1-4.20) for:
+   - Register definitions
+   - Initialization sequences
+   - Device attributes
+   - Stepping and Device IDs
+
+4. Key Comet Lake architectural details:
+   - GT1F: 1x2x6 (1 Slice, 2 Subslices, 6 EUs per subslice = 12 EUs)
+   - GT2: 1x3x8 (1 Slice, 3 Subslices, 8 EUs per subslice = 24 EUs)
+   - 48-bit virtual address range
+   - 39-bit physical address range
+   - 3 display pipes, 3 planes per pipe
+   - 2 DDI ports + 1 eDP port
+
+5. Critical registers to implement:
+   - GFX_MODE (0x915C) - Graphics mode control
+   - PIPE_CONF (0x70008) - Pipe configuration
+   - PIPE_SRC (0x6001C) - Pipe source size
+   - GTT_BASE (0x0188) - GTT base address
+   - GTT_CTRL (0x0180) - GTT control
+   - RCS_BASE (0x0200) - Render command streamer base
+   - RCS_CTRL (0x020C) - Render command streamer control
+
+6. Testing approach for bare metal:
+   - Serial port for debug output
+   - Motherboard LEDs/GPIO for status
+   - Memory validation routines
+   - Thermal monitoring
+   - Fallback to CPU rendering if needed
+
+7. Performance optimization priorities:
+   - Command batching to reduce syscall overhead
+   - Memory pooling for frequently used resources
+   - Double buffering for smooth animation
+   - Partial updates for damaged regions
+   - Hardware cursor for pointer rendering
+
+Success Criteria:
+================
+
+Phase 0:
+- Complete audit of intel.rs
+- Hardware identified using pci.rs
+- Baseline metrics established
+
+Phase 1:
+- Device ID database complete
+- GPU identification working
+- Configuration structures implemented
+
+Phase 2:
+- GPU initializes on bare metal
+- Display output working
+- Stable for 24+ hours
+- Performance baseline measured
+
+Phase 3:
+- GUI rendering offloaded to GPU
+- CPU usage reduced by >50%
+- No visual artifacts
+- Responsive UI under load
+
+Phase 4:
+- All tests passing
+- Performance targets met
+- Stable operation verified
+
+Phase 5:
+- Documentation complete
+- Contribution guidelines updated
+- Future roadmap defined
+
+Risk Mitigation:
+===============
+
+1. Hardware Compatibility:
+   - Test on actual Comet Lake hardware
+   - Have fallback to CPU rendering
+   - Document supported configurations
+
+2. Stability Issues:
+   - Comprehensive testing in Phase 2
+   - Gradual rollout in Phase 3
+   - Easy fallback mechanisms
+
+3. Performance:
+   - Profile early and often
+   - Optimize critical paths
+   - Consider partial offloading
+
+4. Documentation:
+   - Start documentation early
+   - Maintain throughout development
+   - Review regularly
