@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 Phase 1: PCI Initialization & Memory Mapping (The Foundation)
 Before you can draw anything, the kernel must find the GPU and map its memory into your virtual address space.
 
@@ -79,3 +80,459 @@ Initialize the RCS: Setup a ring buffer for the Render Command Streamer, just li
 Pipeline State: The Gen9.5 3D pipeline requires setting up dozens of states (Vertex Fetch, Geometry Shader, Rasterizer, Pixel Shader). You will send 3DSTATE_* commands to configure the Unified Return Buffer (URB) and pipeline geometry.
 
 Shaders: You will eventually need to write or compile GEN assembly instructions (EU ISA) to tell the Execution Units (EUs) how to shade pixels.
+=======
+Nyx OS - Intel Comet Lake iGPU Support Implementation Plan
+==========================================================
+
+Phase 0: Current State Assessment (Week 1)
+------------------------------------------
+Objective: Audit existing GPU code and understand current capabilities
+
+Tasks:
+1. Audit existing intel.rs file in nyx-kernel/src/
+   - Document current implementation status
+   - Identify existing device detection logic
+   - Check for any GOP (Graphics Output Protocol) support
+
+2. Review pci.rs implementation
+   - Understand current PCI device enumeration
+   - Verify Intel GPU detection capabilities
+   - Document how to extract device ID and revision ID
+
+3. Hardware Identification (using existing pci.rs)
+   - Use your PCI detection code to identify the iGPU
+   - Extract Device ID and Revision ID from PCI config space
+   - Determine if it's a Comet Lake GT1F or GT2 configuration
+
+Deliverables:
+- Audit report of intel.rs current capabilities
+- Exact device ID and revision ID from your hardware
+- List of implemented vs missing features
+- Baseline performance metrics for CPU rendering
+
+
+Phase 1: Comet Lake iGPU Identification & Documentation Study (Weeks 2-3)
+------------------------------------------------------------------------
+Objective: Implement proper device identification and study Comet Lake architecture
+
+1.1 Device ID Database Implementation
+Create nyx-kernel/src/intel/gpu_ids.rs with:
+
+Comet Lake Device IDs from Intel documentation:
+- 0x9B41 (rev 0x2) - Mobile U42/U2f2 (GT2, WHL V0)
+- 0x9B21 (rev 0x2) - Mobile U2f1f (GT1F, WHL V0)
+- 0x9BCA (rev 0x4) - Mobile U62/U4f2/U2f2 (GT2, CML A0)
+- 0x9BAA (rev 0x4) - Mobile U2f1f (GT1F, CML A0)
+- 0x9BCC (rev 0x5) - Mobile U62/U4f2/U2f2 (GT2, CML K0)
+- 0x9BAC (rev 0x5) - Mobile U2f1f (GT1F, CML K0)
+- 0x9BC5 (rev 0x5) - Desktop S10+2/S8f2/S6f2 (GT2, CML P0)
+- 0x9BC8 (rev 0x4) - Desktop S62/S4f2/S2f2 (GT2, CML G0)
+- 0x9BA8 (rev 0x4) - Desktop S2f1f (GT1F, CML G0)
+- 0x9BC4 (rev 0x5) - Mobile H82/H6f2/H4f2 (GT2, R2)
+- 0x9BA4 (rev 0x5) - Mobile H81/H6f1f (GT1F, R2)
+- 0x9BF6 (rev 0x5) - Mobile Xeon H82 (GT2, R2)
+- 0x9BC6 (rev 0x5) - Workstation S10+2 (GT2, CML P0)
+- 0x9BE6 (rev 0x4) - Workstation S62 (GT2, CML G0)
+
+1.2 Configuration Structure
+Implement nyx-kernel/src/intel/cml_config.rs with:
+
+GT1F Configuration:
+- 1 Slice, 2 Subslices, 12 EUs (84 threads)
+- 384KB L3 Cache, 192KB URB, 128KB SLM
+- 2 Data Ports, 2 Samplers
+
+GT2 Configuration:
+- 1 Slice, 3 Subslices, 24 EUs (168 threads, 1 reserved)
+- 768KB L3 Cache, 384KB URB, 192KB SLM
+- 3 Data Ports, 3 Samplers
+
+1.3 Documentation Study
+Key areas from Intel CML PRM:
+- Top Level Block Diagrams (Section 2)
+- Device Attributes (Section 5)
+- Stepping and Device IDs (Section 9)
+- Register definitions for:
+  * GFX_MODE (0x915C)
+  * Display pipes (0x70008, 0x6001C)
+  * GTT registers (0x0188, 0x0180)
+  * Command streamer (0x0200, 0x020C)
+
+Deliverables:
+- Complete device ID database for Comet Lake
+- GPU identification function using existing pci.rs
+- Configuration structure with GT1F/GT2 differentiation
+- Documentation summary of key architectural features
+
+
+Phase 2: Ring 0 Engine Verification - Bare Metal (Weeks 4-6)
+------------------------------------------------------------
+Objective: Initialize and verify Intel GPU engine on bare metal
+
+2.1 GPU Initialization with Comet Lake Specifics
+
+Create nyx-kernel/src/intel/gpu_init.rs:
+
+Initialization Sequence:
+1. Detect Intel GPU via existing pci.rs
+   - Extract device ID and revision ID
+   - Identify specific Comet Lake SKU
+
+2. Enable MMIO
+   - Map GPU MMIO registers
+   - Configure memory aperture
+
+3. Reset GPU Engine
+   - Assert reset via GFX_MODE register (0x915C)
+   - Wait for reset completion
+
+4. Initialize Display Engine
+   - Configure 3 display pipes
+   - Setup 2 DDI ports + 1 eDP
+   - Initialize display planes (3 per pipe)
+
+5. Configure Memory Aperture
+   - Allocate GTT (512KB)
+   - Program GTT base address (0x0188)
+   - Enable GTT (0x0180)
+
+6. Initialize Render Engine
+   - Configure slice common
+   - Initialize subslices (2 for GT1F, 3 for GT2)
+   - Setup EU array (12 for GT1F, 24 for GT2)
+
+7. Setup Command Streamer
+   - Allocate command buffer
+   - Program RCS base address (0x0200)
+   - Enable command streamer (0x020C)
+
+2.2 Bare Metal Testing Framework
+
+Create nyx-kernel/src/intel/test_harness.rs:
+
+Test Cases:
+1. Basic Initialization Test
+   - Verify GPU detection
+   - Test MMIO mapping
+   - Verify engine reset
+
+2. Display Engine Test
+   - Test display pipe initialization
+   - Test DDI port configuration
+   - Verify display output
+
+3. Render Engine Test
+   - Test EU initialization
+   - Test subslice configuration
+   - Verify slice common setup
+
+4. Memory Management Test
+   - Test GTT initialization
+   - Test memory allocation
+   - Verify aperture configuration
+
+5. Command Execution Test
+   - Test command streamer
+   - Test basic rendering (clear screen)
+   - Test synchronization
+
+6. Stability Test
+   - Run continuous rendering for 1 hour
+   - Monitor for hangs/crashes
+   - Check for memory leaks
+
+Testing Strategy:
+- Use serial port for debug output
+- Use motherboard LEDs/GPIO for status
+- Verify GPU memory doesn't corrupt system memory
+- Monitor GPU temperature
+
+Deliverables:
+- Working GPU initialization on bare metal
+- Test harness for all GPU components
+- Verified display output
+- Performance baseline measurements
+
+
+Phase 3: Ring 3 Integration & UI Offloading (Weeks 7-10)
+---------------------------------------------------------
+Objective: Create user-space API and integrate with GUI subsystem
+
+3.1 User-Space GPU API
+
+Create nyx-api/src/gpu.rs:
+
+API Functions:
+- create_context() -> GpuContextId
+- destroy_context(ctx: GpuContextId)
+- execute_command_list(ctx, commands: &[GpuCommand])
+- allocate_memory(size, mem_type) -> GpuMemoryInfo
+- free_memory(handle: GpuMemoryHandle)
+- sync(ctx: GpuContextId)
+
+Memory Types:
+- Local (GPU local memory)
+- Shared (CPU-GPU shared memory)
+- Aperture (Aperture memory)
+
+Command Types:
+- Clear
+- DrawRect
+- DrawText
+- CopyBuffer
+- FillBuffer
+- Sync
+
+3.2 Kernel-User Space Interface
+
+Create nyx-kernel/src/syscalls/gpu.rs:
+
+System Calls:
+- sys_gpu_create_context()
+- sys_gpu_destroy_context(ctx_id)
+- sys_gpu_execute_commands(ctx_id, commands_ptr, count)
+- sys_gpu_allocate_memory(size, mem_type)
+- sys_gpu_free_memory(handle)
+- sys_gpu_sync(ctx_id)
+
+Security:
+- Validate all pointers
+- Check context ownership
+- Limit memory allocations
+- Implement resource quotas
+
+3.3 GUI Subsystem Adaptation
+
+Modify nyx-gui/src/renderer/:
+
+Create gpu_renderer.rs:
+- Replace CPU rendering with GPU commands
+- Implement texture uploads to GPU memory
+- Add basic shader support
+- Implement double buffering
+
+Update terminal.rs:
+- GPU-accelerated text rendering
+- Hardware cursor support
+- Scroll buffer in GPU memory
+
+Optimization:
+- Command batching (reduce syscall overhead)
+- Memory pooling for textures
+- Lazy texture uploads
+- Partial updates for damaged regions
+
+Deliverables:
+- Working GPU API in user space
+- GUI rendering offloaded to GPU
+- Terminal with GPU acceleration
+- Performance optimization implemented
+
+
+Phase 4: Testing & Validation (Weeks 11-12)
+-------------------------------------------
+Objective: Ensure stability and measure performance improvements
+
+4.1 Comprehensive Testing
+
+Unit Tests:
+- Test each GPU command type
+- Test memory allocation/deallocation
+- Test context switching
+- Test error conditions
+
+Integration Tests:
+- Test GUI rendering with GPU
+- Test terminal rendering with GPU
+- Test multi-window scenarios
+- Test display hotplugging
+
+Stress Tests:
+- Continuous rendering for 24 hours
+- Memory leak detection
+- Thermal stability
+- Power consumption monitoring
+
+4.2 Performance Benchmarking
+
+Metrics to Measure:
+- CPU usage reduction (>50% target)
+- Frame rate (>30 FPS target)
+- Memory usage (<10% increase)
+- Boot time impact (<2s increase)
+- Power consumption
+
+Benchmark Scenarios:
+- Clear screen (1000 iterations)
+- Draw rectangles (1000 iterations)
+- Text rendering (1000 lines)
+- Window compositing
+- Terminal scrolling
+
+4.3 Bug Fixing and Stabilization
+
+- Address all critical bugs
+- Optimize critical paths
+- Add error recovery mechanisms
+- Implement graceful degradation
+
+Deliverables:
+- All tests passing with >95% stability
+- Performance targets met
+- Bug-free operation for 24+ hours
+- Comprehensive test report
+
+
+Phase 5: Documentation & Future Planning (Ongoing)
+--------------------------------------------------
+Objective: Ensure long-term maintainability and future development
+
+5.1 Documentation Updates
+
+Update README.md:
+- Add Intel GPU support section
+- Document supported hardware
+- Add build instructions for GPU support
+
+Create GPU_SUPPORT.md:
+- Detailed architecture documentation
+- API reference for GPU context
+- Debugging guide for GPU issues
+- Performance tuning guide
+
+Update CONTRIBUTING.md:
+- Guidelines for GPU-related contributions
+- Testing requirements for GPU changes
+- Code review checklist for GPU code
+
+5.2 Future Enhancements
+
+Video Decode Support:
+- VDBox (Video Decode Box) implementation
+- Hardware-accelerated video playback
+- Multiple codec support
+
+3D Rendering:
+- OpenGL/Vulkan implementation
+- Shader compiler
+- 3D pipeline support
+
+Power Management:
+- Dynamic frequency scaling
+- RC6 power states
+- Display panel power management
+
+Multi-Monitor Support:
+- Multiple display pipes
+- Different resolutions per display
+- Display hotplugging
+
+Deliverables:
+- Complete documentation
+- Contribution guidelines updated
+- Future roadmap documented
+- Maintenance plan established
+
+
+Implementation Notes:
+====================
+
+1. Use existing pci.rs for all hardware detection - no external tools needed
+
+2. All testing is on bare metal - no QEMU emulation
+
+3. Reference Intel CML PRM (Doc Ref # IHD-OS-CML-Vol 1-4.20) for:
+   - Register definitions
+   - Initialization sequences
+   - Device attributes
+   - Stepping and Device IDs
+
+4. Key Comet Lake architectural details:
+   - GT1F: 1x2x6 (1 Slice, 2 Subslices, 6 EUs per subslice = 12 EUs)
+   - GT2: 1x3x8 (1 Slice, 3 Subslices, 8 EUs per subslice = 24 EUs)
+   - 48-bit virtual address range
+   - 39-bit physical address range
+   - 3 display pipes, 3 planes per pipe
+   - 2 DDI ports + 1 eDP port
+
+5. Critical registers to implement:
+   - GFX_MODE (0x915C) - Graphics mode control
+   - PIPE_CONF (0x70008) - Pipe configuration
+   - PIPE_SRC (0x6001C) - Pipe source size
+   - GTT_BASE (0x0188) - GTT base address
+   - GTT_CTRL (0x0180) - GTT control
+   - RCS_BASE (0x0200) - Render command streamer base
+   - RCS_CTRL (0x020C) - Render command streamer control
+
+6. Testing approach for bare metal:
+   - Serial port for debug output
+   - Motherboard LEDs/GPIO for status
+   - Memory validation routines
+   - Thermal monitoring
+   - Fallback to CPU rendering if needed
+
+7. Performance optimization priorities:
+   - Command batching to reduce syscall overhead
+   - Memory pooling for frequently used resources
+   - Double buffering for smooth animation
+   - Partial updates for damaged regions
+   - Hardware cursor for pointer rendering
+
+Success Criteria:
+================
+
+Phase 0:
+- Complete audit of intel.rs
+- Hardware identified using pci.rs
+- Baseline metrics established
+
+Phase 1:
+- Device ID database complete
+- GPU identification working
+- Configuration structures implemented
+
+Phase 2:
+- GPU initializes on bare metal
+- Display output working
+- Stable for 24+ hours
+- Performance baseline measured
+
+Phase 3:
+- GUI rendering offloaded to GPU
+- CPU usage reduced by >50%
+- No visual artifacts
+- Responsive UI under load
+
+Phase 4:
+- All tests passing
+- Performance targets met
+- Stable operation verified
+
+Phase 5:
+- Documentation complete
+- Contribution guidelines updated
+- Future roadmap defined
+
+Risk Mitigation:
+===============
+
+1. Hardware Compatibility:
+   - Test on actual Comet Lake hardware
+   - Have fallback to CPU rendering
+   - Document supported configurations
+
+2. Stability Issues:
+   - Comprehensive testing in Phase 2
+   - Gradual rollout in Phase 3
+   - Easy fallback mechanisms
+
+3. Performance:
+   - Profile early and often
+   - Optimize critical paths
+   - Consider partial offloading
+
+4. Documentation:
+   - Start documentation early
+   - Maintain throughout development
+   - Review regularly
+>>>>>>> fdefd5fce554a2245969b28aedc8cf6d7a09bd68
