@@ -85,6 +85,46 @@ impl BootInfoFrameAllocator {
         unsafe { *ptr = next_ptr; }
         self.recycled_frames = Some(frame);
     }
+
+    pub fn allocate_contiguous_frames(&mut self, num_frames: usize, alignment: u64, below_4gb: bool) -> Option<PhysFrame> {
+        let size = (num_frames as u64) * 4096;
+        
+        // Save state in case we need to search and fail
+        let orig_region = self.current_region;
+        let orig_offset = self.current_offset;
+
+        while self.current_region < self.memory_map.len() {
+            let region = &self.memory_map[self.current_region];
+            if region.kind == MemoryRegionKind::Usable {
+                let mut target_addr = region.start + self.current_offset;
+                
+                // Align the target address
+                let remainder = target_addr % alignment;
+                if remainder != 0 {
+                    target_addr += alignment - remainder;
+                }
+
+                if target_addr + size <= region.end {
+                    if below_4gb && (target_addr + size) > 0x1_0000_0000 {
+                        self.current_region += 1;
+                        self.current_offset = 0;
+                        continue;
+                    }
+
+                    // Found a suitable block
+                    self.current_offset = (target_addr - region.start) + size;
+                    return Some(PhysFrame::containing_address(PhysAddr::new(target_addr)));
+                }
+            }
+            self.current_region += 1;
+            self.current_offset = 0;
+        }
+        
+        // Restore state if failed
+        self.current_region = orig_region;
+        self.current_offset = orig_offset;
+        None
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
@@ -283,6 +323,11 @@ pub fn identity_map_low_memory() {
 pub fn allocate_frame() -> Option<PhysFrame> {
     let mut lock = MEMORY_MANAGER.lock();
     lock.as_mut().and_then(|sys| sys.frame_allocator.allocate_frame())
+}
+
+pub fn allocate_contiguous(num_frames: usize, alignment: u64, below_4gb: bool) -> Option<PhysFrame> {
+    let mut lock = MEMORY_MANAGER.lock();
+    lock.as_mut().and_then(|sys| sys.frame_allocator.allocate_contiguous_frames(num_frames, alignment, below_4gb))
 }
 
 pub fn clone_kernel_page_table(new_pml4_phys: PhysAddr) {

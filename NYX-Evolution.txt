@@ -1,126 +1,81 @@
-Complete Revised Plan (Phases 1-5)
-Phase 1: Ext4 Subsystem Hardening
-This is now a "fix and polish" phase rather than a rebuild. The core stack is sound; the gaps are integration correctness.
+Phase 1: PCI Initialization & Memory Mapping (The Foundation)
+Before you can draw anything, the kernel must find the GPU and map its memory into your virtual address space.
 
-Milestone 1.1: Fix create_file Stub ✅ Priority
+Reference: vol13-mmio.pdf
 
-Problem: fs.rs line 147: fn create_file(&mut self, _path: &str) -> bool { true } returns success without touching the disk. Any code path relying on explicit file creation (like the Phase 5 installer pre-allocating a placeholder) will silently fail.
-Action:
-In ext4_wrapper.c, add:
-c
+Actionable Steps:
 
-int nyx_fs_create_file(const char* path) {
-    ext4_file f;
-    if (ext4_fopen(&f, path, "w+") != EOK) return 0;
-    ext4_fclose(&f);
-    return 1;
-}
-In fs.rs, declare fn nyx_fs_create_file(path: *const u8) -> i32; in the extern block and implement:
-rust
+PCI Enumeration: Scan the PCI bus for Vendor ID 0x8086. Match the Device ID against known Kaby Lake / Comet Lake IDs (e.g., 0x5916, 0x9BC5, etc.).
 
-fn create_file(&mut self, path: &str) -> bool {
-    let c_path = to_c_path(path);
-    unsafe { nyx_fs_create_file(c_path.as_ptr()) == 1 }
-}
-Result: Explicit file creation works correctly and returns actual success/failure.
-Milestone 1.2: GPT Partition Selection by Type GUID ✅ Priority
+Map BAR0 (GTTMMADR): This is the most critical step. BAR0 contains the Graphics Translation Table (GTT) and all the Memory Mapped I/O (MMIO) registers. Read this physical address from the PCI configuration space and map it into your kernel's virtual memory as Uncacheable (UC) to prevent the CPU from caching register writes.
 
-Problem: fs.rs line 106 uses a hardcoded 90-110 GB size window: (size_mb_512 > 90_000 && size_mb_512 < 110_000) || (size_mb_4k > 90_000 && size_mb_4k < 110_000). This is testing-specific and will break when you move to full disk or a different partition size.
-Action: Replace the size check with a type GUID match. The standard Linux filesystem GPT type GUID is 0FC63DAF-8483-4772-8E79-3D69D8477DE4 (stored little-endian on disk). In the GPT entry parsing loop:
-rust
+Map BAR2 (Aperture): Map the aperture base. This is a CPU-visible window into the GPU's memory.
 
-// Read the full 16-byte type GUID (bytes 0-15 of entry)
-let mut type_guid = [0u8; 16];
-type_guid.copy_from_slice(&entry_block[off..off+16]);
+Wake the Device: Ensure the device is powered up by checking the PCI Power Management registers and writing to the appropriate MMIO power control registers to wake the graphics engines.
 
-// Linux filesystem data partition GUID (little-endian on disk)
-const LINUX_FS_GUID: [u8; 16] = [
-    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
-    0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4
-];
+Phase 2: The Global Graphics Translation Table (GGTT)
+The GPU does not understand your CPU's page tables; it has its own memory management unit (IOMMU/GART).
 
-if type_guid == LINUX_FS_GUID {
-    start_lba = lba;
-    size_sectors = end_lba - lba;
-    break; // Take the first Linux partition
-}
-Result: Nyx mounts any Linux-formatted GPT partition regardless of size. The 100 GB test partition still works; full-disk installs will work too.
-Milestone 1.3: Add delete_file to the VFS Trait (Suggestion)
+Reference: vol06-command_stream_programming.pdf (Memory Interface section) & vol13-mmio.pdf.
 
-Problem: The FileSystem trait in vfs.rs has no delete_file method. The Phase 5 git micro-agent will need to delete stale firmware caches, and the app store will need to uninstall apps.
-Action: Add fn delete_file(&mut self, path: &str) -> bool { false } as a default method (returning false means "unsupported"). Implement it in NvmeLwExt4Fs by adding nyx_fs_remove in ext4_wrapper.c calling ext4_fremove.
-Result: File deletion is available to userspace when needed.
-Milestone 1.4: Increase Block Cache Size (Suggestion)
+Actionable Steps:
 
-Problem: build.rs line 65 sets CONFIG_BLOCK_DEV_CACHE_SIZE 16. lwext4 caches 16 blocks (8 KB at 512-byte sectors) in RAM. For sequential reads (like loading an app binary), this causes excessive NVMe round-trips because the cache thrashes constantly.
-Action: Increase to 128 or 256 (64-128 KB cache). This costs negligible RAM (a few hundred KB) but dramatically reduces NVMe command overhead.
-Result: Faster file reads, especially for the initrd tarball extraction and app loading.
-Milestone 1.5: Distinguish Error Types in Return Values (Suggestion)
+Understand the GGTT: The GGTT maps GPU virtual addresses to physical memory addresses. The PTEs (Page Table Entries) for the GGTT are located exactly at GTTMMADR + 2MB.
 
-Problem: read_file returns Option<usize> — None could mean "file not found" or "disk I/O error." Userspace (and the kernel itself) can't distinguish recoverable from fatal errors.
-Action: Change Option<usize> to Result<usize, FsError> where FsError is an enum (NotFound, IoError, InvalidPath, OutOfSpace). This is a breaking change to the trait but worth doing now before more callers exist.
-Result: Proper error reporting to userspace via errno-style syscalls.
-Milestone 1.6: Verify 4K Native NVMe Sector Handling (Suggestion)
+Allocate Backing Pages: Using nyx-kernel/src/allocator.rs, allocate physical pages in system RAM to serve as your framebuffers and command buffers.
 
-Problem: fs.rs allocates an 8192-byte buffer, manually aligns it to 4096, then calls driver.read_block(sector, slice_4k) and copies only 512 bytes out. The comment says "We MUST pass 4096 to bypass the hardcoded safety check in nvme.rs!". This suggests the NVMe driver expects 4K buffers but lwext4 works in 512-byte logical sectors. If the underlying NVMe device is 4K-native (no 512-byte emulation), this works. But if it's 512-byte emulation, you're doing 8x more I/O than necessary.
-Action: Verify your NVMe driver's logical block size. If it's 512, simplify the bridge to pass 512-byte buffers directly. If it's 4K-native, keep the current approach but document why. The block size mismatch is a common source of silent data corruption.
-Result: Correct and efficient block I/O.
-Milestone 1.7: Add sync/flush Operation (Suggestion)
+Write PTEs: Write the physical addresses of these allocated pages into the GGTT. Now, when the GPU tries to access a specific graphics virtual address, it will fetch from your allocated physical system RAM.
 
-Problem: lwext4 has ext4_cache_flush() and ext4_fs_sync() to force journal commits. The FileSystem trait has no sync method. In a power-loss scenario, unflushed journal data could corrupt the filesystem.
-Action: Add fn sync(&mut self) -> bool { true } as a default method. Implement it in NvmeLwExt4Fs by calling ext4_cache_flush and ext4_fs_sync in the C wrapper.
-Result: Clean shutdown and power-loss safety.
-Phase 2: Ethernet Stack Hardening (Primary Focus)
-This is where you spend the next 4-6 weeks. The goal is to transform the RTL8168 driver from a Windows-ICS testbench prototype into a robust, interrupt-driven, DHCP-capable stack that survives real network traffic.
+Phase 3: Ring Buffers and Command Streamers (Talking to the GPU)
+You don't control the GPU by constantly poking registers. You write commands to a circular queue in memory (a Ring Buffer), and the GPU's Command Streamer reads and executes them asynchronously.
 
-Milestone 2.1: Dynamic IP via DHCP ✅ Priority
+Reference: vol06-command_stream_programming.pdf & vol02a-commandreference-instructions.pdf.
 
-Problem: pci.rs hardcodes 192.168.137.99/24 with gateway 192.168.137.1.
-Action: Enable smoltcp's dhcp feature. Replace the static IpCidr assignment with a Dhcpv4Client instance stored alongside NET_IFACE. In poll_network(), call dhcp_client.poll() before iface.poll().
-Result: Nyx auto-configures on any Ethernet network.
-Milestone 2.2: Interrupt-Driven RX ✅ Priority
+Actionable Steps:
 
-Problem: pci.rs configures MSI vector 0x30 but no handler exists. poll_network() spins on every tick.
-Action: Register an ISR for vector 0x30 that sets NETWORK_PENDING.store(true, Relaxed) and issues an EOI. Rewrite poll_network() to idle (HLT) until NETWORK_PENDING is set, then poll. Remove the write16(0x3E, 0xFFFF) from receive().
-Result: CPU usage drops to ~0% when idle; no dropped packets under burst traffic.
-Milestone 2.3: Hot-Path Debug Gating ✅ Priority
+Setup the BCS (Blitter Command Streamer): For UI offloading, the Blitter engine is your best friend. Allocate a page for the Blitter Ring Buffer. Map it via the GGTT.
 
-Problem: serial_println! on every RX/TX packet will stall the kernel under real traffic.
-Action: Add a net_trace feature in nyx-kernel/Cargo.toml. Gate all packet-level serial prints behind #[cfg(feature = "net_trace")].
-Result: Zero serial overhead in production builds.
-Milestone 2.4: RX Buffer Pool ✅ Priority
+Initialize Ring Registers: Write the starting address, length, and enable bit to the Ring Buffer MMIO registers (BLT_RING_BASE, BLT_RING_CTL).
 
-Problem: receive() does alloc::vec![0; length] on every packet, fragmenting the heap.
-Action: Pre-allocate a pool of 16 Box<[u8; 2048]> in Rtl8168Driver::new(). receive() checks out a buffer from the pool, copies the frame, and returns ownership. RtkRxToken returns the buffer to the pool on Drop.
-Result: Zero per-packet heap allocation after boot.
-Milestone 2.5: PCI ID Coverage & TSC Calibration
+Write the first Command: Write a MI_NOOP (No Operation) to the ring buffer.
 
-Problem: Only 0x10ec:0x8168 binds. TSC assumed 2 GHz.
-Action: Widen the match to matches!(device_id, 0x8168 | 0x8125 | 0x8169 | 0x8136 | 0x8167). Read the actual TSC frequency from ACPI or calibrate against the HPET/local APIC timer.
-Result: Driver binds to full RTL81xx family; TCP timers run correctly on any CPU.
-Phase 3: Network Syscalls Refinement
-Your nyx-api/src/lib.rs already has sys_socket, sys_connect, sys_sendto, sys_recvfrom. These need refinement.
+Ring the Doorbell: Update the Ring Buffer Tail pointer register. The GPU will see the tail has moved, fetch the MI_NOOP, execute it, and update the Head pointer.
 
-Milestone 3.1: Non-blocking Socket Support
+Phase 4: Hardware-Accelerated 2D UI (The Blitter Engine)
+This is where your software loops in libs/gui/src/draw.rs get replaced by hardware commands. We will use the GPU to composite windows and fill rectangles.
 
-Add fcntl-style flags to sys_socket or a new sys_ioctl to support O_NONBLOCK. Required for Phase 4 GUI apps to stay responsive during network operations.
-Milestone 3.2: sys_gethostbyname
+Reference: vol11-blitter.pdf & vol02a-commandreference-instructions.pdf.
 
-Add a syscall that wraps smoltcp's DNS client so userspace doesn't reinvent DNS parsing (currently done manually in nyx-network/main.rs).
-Signature: sys_dns_resolve(hostname: &str) -> Option<[u8; 4]>.
-Milestone 3.3: Socket Error Reporting
+Actionable Steps:
 
-Ensure socket syscalls return proper errno-style codes (-ECONNREFUSED, -ETIMEDOUT, etc.) instead of generic -1. This lets GUI apps show meaningful errors.
-Milestone 3.4: sys_getifaddrs (Suggestion)
+XY_COLOR_BLT (Rectangle Fill): Instead of looping over pixels to draw a window background, construct an XY_COLOR_BLT command packet. You specify the X/Y coordinates, width, height, destination memory pitch, and color. Push this to the Blitter Ring Buffer and advance the tail.
 
-Add a syscall that returns the current interface IP, MAC, and link status. This lets the Settings app display network status like a conventional OS.
-Phase 4: Userspace Apps (nyx-store & git agent)
-Milestone 4.1: nyx-store
+XY_SRC_COPY_BLT (Bitmask / Window Compositing): When your compositor needs to move a window's backing buffer to the main screen, use this command. It copies pixel blocks from a source address to a destination address asynchronously at massive speeds.
 
-Uses sys_socket + sys_dns_resolve to fetch a JSON catalog over HTTP.
-The 4KB streaming installer loop from your original plan works perfectly — it's just sys_read into a 4KB stack buffer followed by sys_write to a file on the ext4 NVMe partition.
-Uses create_file (fixed in Phase 1) to pre-allocate install targets.
-Milestone 4.2: Terminal Git Micro-Agent
+Syncing: Implement a way to wait for the GPU to finish. You can use MI_STORE_DATA_IMM to write a sequence number to a specific memory address when a batch of commands finishes, and have the CPU spinloop (or sleep/interrupt) waiting for that value to change.
 
-git fetch-firmware over TCP to GitHub raw endpoints. No full Git protocol — just HTTP GET via sockets.
-Downloads raw driver updates and caches them on the ext4 SSD using create_file + write_file.
+Phase 5: Display Engine and Modesetting (Native Resolution)
+Currently, you likely inherit a framebuffer from your bootloader (EFI GOP). Taking native control allows you to change resolutions, setup double-buffering, and use hardware cursors.
+
+Reference: vol12-display.pdf.
+
+Actionable Steps:
+
+The Display Pipeline: Understand the flow: Planes (memory buffers) -> Pipes (blenders/color formatters) -> Transcoders (timing generators) -> Ports/DDI (physical connectors like HDMI/eDP).
+
+Configure a Plane: Point a primary display plane to your GGTT-mapped framebuffer.
+
+Hardware Cursor: Intel GPUs have dedicated registers for a hardware mouse cursor plane. This means moving the mouse requires zero redrawing of the UI underneath it. Hook this up to nyx-kernel/src/mouse.rs.
+
+Phase 6: The 3D Render Command Streamer (RCS)
+Once the 2D Blitter is handling your UI compositing, you can tackle the beast: the 3D pipeline.
+
+Reference: vol07-3d_media_gpgpu.pdf.
+
+Actionable Steps:
+
+Initialize the RCS: Setup a ring buffer for the Render Command Streamer, just like you did for the Blitter.
+
+Pipeline State: The Gen9.5 3D pipeline requires setting up dozens of states (Vertex Fetch, Geometry Shader, Rasterizer, Pixel Shader). You will send 3DSTATE_* commands to configure the Unified Return Buffer (URB) and pipeline geometry.
+
+Shaders: You will eventually need to write or compile GEN assembly instructions (EU ISA) to tell the Execution Units (EUs) how to shade pixels.

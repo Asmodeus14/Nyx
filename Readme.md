@@ -256,14 +256,16 @@ These syscalls are unique to Nyx OS and provide access to the kernel's quantum, 
 
 | Number | Name | Arguments | Returns | Description |
 |--------|------|-----------|---------|-------------|
-| `501` | `sys_draw_rect` | `x, y, w, h, color_idx` | — | Draw a filled rectangle. If Intel GPU is available, uses the BLT hardware engine. Falls back to CPU-side pixel fill. Color index maps: 0=Black, 1=Blue, 2=Green, 3=Cyan, 4=Red, 14=Yellow, default=White. |
-| `502` | `sys_swap_buffers` | — | — | Blit the GPU back buffer (GGTT offset `0x900000`) to the visible framebuffer (GGTT offset `0x100000`) via the Intel BLT engine. |
-| `503` | `sys_gpu_sync` | — | — | Block until the Intel GPU command ring is idle (`wait_for_idle()`). |
+| `501` | `sys_gpu_fill_rect` | `x, y, w, h, color` | — | Draw a filled rectangle with a 32-bit ARGB hex color. Uses the Intel blitter hardware engine (BCS) when available, falling back to CPU SIMD copy. |
+| `502` | `sys_swap_buffers` | — | — | Blit the GPU back buffer (GGTT offset `0x900000` / GVA `0x1400_0000`) to the visible framebuffer (GGTT offset `0x100000`) via the Intel BLT engine. |
+| `503` | `sys_gpu_sync` | — | — | Submit a fence and block until the Intel GPU command ring is idle. Used to synchronize GPU fills and blits before CPU drawing. |
 | `504` | `sys_get_uptime_ms` | — | `u64` | Return current system uptime in milliseconds derived from TSC. Immune to CPU frequency scaling. |
 | `505` | `sys_get_mouse_state` | — | Packed `u64` | Returns mouse state packed as: `[x:16][y:16][lclick:1][rclick:1]` in bits 63–0. Read is interrupt-safe (disables IRQs around spinlock). |
 | `506` | `sys_get_key` | — | `u64` | Pop one keypress from the kernel key queue. Returns 0 if the queue is empty. |
 | `507` | `sys_get_screen_info` | `width*, height*, stride*` | `1` on success | Write screen width, height, and stride (in pixels) into caller-supplied pointers. |
 | `508` | `sys_map_framebuffer` | — | `u64` | Map the physical framebuffer into the calling process's virtual address space. Returns the user-space virtual address, or 0 on failure. |
+| `509` | `sys_gpu_map_shm` | `shm_id, gva` | `u64` | Map a shared memory segment's physical frames into the GPU GTT at the specified GVA. Returns 1 on success, 0 on failure. |
+| `512` | `sys_gpu_copy_rect` | `src_gva, dst_gva, w, h, dst_x, dst_y` | — | Submits an asynchronous `XY_SRC_COPY_BLT` command to the GPU blitter to copy a rectangle from a source GVA to a destination GVA. |
 | `513` | `sys_wait_vsync` | — | `0` | Block until the Intel GPU signals vertical sync. Provides tear-free rendering synchronization. |
 
 #### VFS and Filesystem

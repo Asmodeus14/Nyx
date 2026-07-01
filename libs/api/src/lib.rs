@@ -151,6 +151,14 @@ pub fn sys_gpu_sync() {
     syscall(503, 0, 0, 0, 0, 0, 0);
 }
 
+pub fn sys_swap_buffers() {
+    syscall(502, 0, 0, 0, 0, 0, 0);
+}
+
+pub fn sys_gpu_fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
+    syscall(501, x as u64, y as u64, w as u64, h as u64, color as u64, 0);
+}
+
 pub fn sys_get_time() -> usize {
     syscall(504, 0, 0, 0, 0, 0, 0) as usize
 }
@@ -208,6 +216,16 @@ pub fn sys_get_screen_info() -> (usize, usize, usize) {
 pub fn sys_map_framebuffer() -> u64 {
     syscall(508, 0, 0, 0, 0, 0, 0)
 }
+
+pub fn sys_gpu_map_shm(shm_id: u64, gva: u32) -> u64 {
+    syscall(509, shm_id, gva as u64, 0, 0, 0, 0)
+}
+
+pub fn sys_gpu_copy_rect(src_gva: u32, dst_gva: u32, w: usize, h: usize, dst_x: usize, dst_y: usize) {
+    syscall(512, src_gva as u64, dst_gva as u64, w as u64, h as u64, dst_x as u64, dst_y as u64);
+}
+
+
 
 pub fn sys_fs_count(path: &str) -> usize {
     syscall(510, path.as_ptr() as u64, path.len() as u64, 0, 0, 0, 0) as usize

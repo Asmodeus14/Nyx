@@ -101,8 +101,9 @@ pub fn handle_interrupt(packet_byte: u8) {
                 let rel_y = if (flags & 0x20) != 0 { (driver.packet[2] as i16) - 256 } else { driver.packet[2] as i16 };
 
                 let mut state = MOUSE_STATE.lock();
-                let new_x = state.x as i32 + rel_x as i32;
-                let new_y = state.y as i32 - rel_y as i32; 
+                let multiplier = 2; // Increase mouse sensitivity!
+                let new_x = state.x as i32 + (rel_x as i32 * multiplier);
+                let new_y = state.y as i32 - (rel_y as i32 * multiplier); 
 
                 state.x = new_x.clamp(0, state.screen_width as i32 - 1) as usize;
                 state.y = new_y.clamp(0, state.screen_height as i32 - 1) as usize;

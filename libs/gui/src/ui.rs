@@ -132,7 +132,6 @@ pub fn draw_window_rounded(buffer: &mut [u32], stride: usize, screen_h: usize, w
     let surface = apply_opacity(Color::WARM_SURFACE, win.opacity);
     let border = apply_opacity(Color::WARM_BORDER, win.opacity);
     let total_h = if win.is_minimized { 30 } else { win.h + 30 };
-
     canvas.fill_rect(win.x, win.y, win.w, total_h, surface);
     canvas.fill_rect(win.x, win.y, win.w, 1, border); 
     canvas.fill_rect(win.x, win.y + total_h, win.w, 1, border); 

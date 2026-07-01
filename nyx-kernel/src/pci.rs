@@ -220,8 +220,9 @@ fn enumerate_pci_legacy() {
                         
                         let mmio_phys = driver.get_bar_address(&dev, 0).unwrap_or(0);
                         if mmio_phys != 0 {
-                            if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
-                                let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, dev.device_id);
+                            // FIXED: Mapped full 16MB for BAR0
+                            if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x1000000) } {
+                                let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, dev.device_id, dev.bus, dev.device, dev.func);
                                 gpu.initialize();
                                 *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
                             }
@@ -404,10 +405,11 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                         }
 
                                         if mmio_phys != 0 {
-                                            if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x400000) } {
-                                                let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, device_id);
-                                                gpu.initialize();
-                                                *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
+                                            // FIXED: Mapped full 16MB for BAR0
+                                            if let Ok(mmio_virt) = unsafe { crate::memory::map_mmio(mmio_phys, 0x1000000) } {
+                                                 let mut gpu = crate::drivers::gpu::intel::IntelGpuDriver::new(mmio_virt, device_id, bus, device, func);
+                                                 gpu.initialize();
+                                                 *crate::drivers::gpu::intel::INTEL_GPU.lock() = Some(gpu);
                                             }
                                         }
                                     }

@@ -20,6 +20,7 @@ pub struct WindowClient {
     pub buffer: *const u32, 
     pub buf_w: usize,
     pub buf_h: usize,
+    pub gpu_gva: u32,
 }
 
 fn get_str_len(buf: &[u8; 64]) -> usize { buf.iter().position(|&c| c == 0).unwrap_or(64) }
@@ -88,6 +89,9 @@ impl CompositorState {
                         let x = if header.requested_x == -1 { 100 + (self.next_win_id * 30) } else { header.requested_x as usize };
                         let y = if header.requested_y == -1 { 100 + (self.next_win_id * 30) } else { header.requested_y as usize };
                         
+                        let gpu_gva = 0x2000_0000 + (self.next_win_id * 0x0100_0000) as u32;
+                        sys_gpu_map_shm(shm_id, gpu_gva);
+
                         self.clients.push(WindowClient {
                             win: Window { 
                                 id: self.next_win_id, x, y, w, h, 
@@ -98,6 +102,7 @@ impl CompositorState {
                             },
                             owner_pid: msg.sender_pid, shm_id, buffer: unsafe { vaddr.add(core::mem::size_of::<WindowHeader>()) } as *const u32,
                             buf_w: w, buf_h: h,
+                            gpu_gva,
                         });
                         self.next_win_id += 1;
                         self.mark_full_redraw();
@@ -113,6 +118,9 @@ impl CompositorState {
                         client.buffer = unsafe { vaddr.add(core::mem::size_of::<WindowHeader>()) } as *const u32;
                         client.buf_w = header.width as usize;
                         client.buf_h = header.height as usize;
+                        
+                        // Re-map the new SHM pages to the SAME GVA!
+                        sys_gpu_map_shm(new_shm_id, client.gpu_gva);
                         self.mark_full_redraw();
                     }
                 },
@@ -303,7 +311,6 @@ pub extern "C" fn _start() -> ! {
     let fb_ptr = sys_map_framebuffer();
     let hardware_fb = unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u32, screen_stride * screen_h) };
     
-    let mut back_buffer: Vec<u32> = vec![Color::WARM_BG; screen_stride * screen_h];
     let mut state = CompositorState::new(screen_w, screen_h, screen_stride);
 
     let mut last_frame = sys_get_time();
@@ -326,44 +333,49 @@ pub extern "C" fn _start() -> ! {
         if state.needs_redraw {
             state.mark_dirty(state.mx.saturating_sub(15), state.my.saturating_sub(15), 35, 35);
 
-            for y in state.dirty_min_y..state.dirty_max_y {
-                for x in state.dirty_min_x..state.dirty_max_x { 
-                    back_buffer[y * screen_stride + x] = Color::WARM_BG; 
-                }
-            }
+            // 1. Submit GPU background fill for the ENTIRE screen (Asynchronous)
+            sys_gpu_fill_rect(0, 0, screen_stride, screen_h, Color::WARM_BG);
 
-            let mut canvas = Canvas::new(&mut back_buffer, screen_stride, screen_h);
+            // 2. Synchronize! Wait for GPU wallpaper clear to finish before CPU starts drawing
+            sys_gpu_sync();
 
+            // 3. Perform CPU drawing (Text, Window Borders, Windows, Taskbar, Cursor)
+            let mut canvas = Canvas::new(hardware_fb, screen_stride, screen_h);
+
+            // Draw window decorations and CPU client compositing sequentially in Z-order
             for client in state.clients.iter() {
                 if client.win.exists {
-                    let win_w = client.win.w + 15; 
-                    let win_h = if client.win.is_minimized { 30 } else { client.win.h + 45 };
-
-                    let overlap = !(client.win.x + win_w <= state.dirty_min_x || 
-                                    state.dirty_max_x <= client.win.x || 
-                                    client.win.y + win_h <= state.dirty_min_y || 
-                                    state.dirty_max_y <= client.win.y);
-
-                    if overlap {
-                        draw_window_rounded(canvas.buffer, screen_stride, screen_h, &client.win);
+                    // Draw window border, white background, and title bar
+                    draw_window_rounded(canvas.buffer, screen_stride, screen_h, &client.win);
+                    
+                    if !client.win.is_minimized {
+                        if client.buffer.is_null() || client.buffer as u64 == 0 { continue; }
                         
-                        if !client.win.is_minimized {
-                            if client.buffer.is_null() || client.buffer as u64 == 0 { continue; }
-                            
-                            let expected_size = client.buf_w * client.buf_h;
-                            let client_pixels = unsafe { core::slice::from_raw_parts(client.buffer, expected_size) };
-                            
-                            canvas.composite_buffer(client.win.x, client.win.y + 30, client_pixels, client.buf_w, client.buf_h, client.win.opacity);
-                        }
+                        let expected_size = client.buf_w * client.buf_h;
+                        let client_pixels = unsafe { core::slice::from_raw_parts(client.buffer, expected_size) };
+                        canvas.composite_buffer(client.win.x, client.win.y + 30, client_pixels, client.buf_w, client.buf_h, client.win.opacity);
                     }
                 }
             }
 
-            draw_taskbar(canvas.buffer, screen_stride, screen_h);
+            // 5. Draw Taskbar on top of windows (CPU-based fills and text)
+            let bar_h = 36;
+            let start_y = screen_h - bar_h;
+            canvas.fill_rect(0, start_y, screen_stride, bar_h, 0xFF_FFFFFF); // Opaque white taskbar
+            canvas.fill_rect(0, start_y, screen_stride, 1, 0xFF_D1D1D1);     // Border
+            
+            // Draw Start Button
+            let btn_x = (screen_stride / 2) - 35;
+            canvas.fill_rect(btn_x, start_y + 6, 70, 24, Color::ACCENT_PRIMARY);
+
+            // Draw taskbar text
+            canvas.print_str(20, start_y + 14, "10:20 AM", Color::TEXT_DARK, 1);
+            canvas.print_str(btn_x + 15, start_y + 8, "NYX", Color::WHITE, 1);
             
             let net_x = screen_stride - 50; let btn_y = screen_h - 36 + 6;
             canvas.print_str(net_x, btn_y + 4, "[WIFI]", Color::WHITE, 1);
 
+            // Draw Start Menu on top of windows
             if state.start_menu_open {
                 let menu_w = 180; let menu_h = 200;
                 let menu_x = (screen_stride / 2) - (menu_w / 2); let menu_y = screen_h - 36 - menu_h - 10;
@@ -380,11 +392,8 @@ pub extern "C" fn _start() -> ! {
 
             draw_cursor(canvas.buffer, screen_stride, screen_h, state.mx, state.my, CursorType::Arrow);
 
-            for y in state.dirty_min_y..state.dirty_max_y {
-                let start_idx = y * screen_stride + state.dirty_min_x;
-                let end_idx = y * screen_stride + state.dirty_max_x;
-                hardware_fb[start_idx..end_idx].copy_from_slice(&canvas.buffer[start_idx..end_idx]);
-            }
+            sys_swap_buffers();
+            sys_gpu_sync();
 
             state.prev_mx = state.mx; 
             state.prev_my = state.my;

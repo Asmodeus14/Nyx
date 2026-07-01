@@ -227,6 +227,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             panic!("FATAL: No NVMe Drive Detected! Cannot boot without a system drive.");
         }
     }
+    // GPU TEST
+    if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_ref() {
+    // 0x22034 is HEAD, 0x22030 is TAIL
+    let head = unsafe { gpu.read_reg(0x22034) };
+    let tail = unsafe { gpu.read_reg(0x22030) };
+    crate::serial_println!("[DEBUG] Before Test: HEAD={:#x}, TAIL={:#x}", head, tail);
+}
+
 
     // ==========================================
     // SYSTEM BOOTSTRAP

@@ -96,9 +96,21 @@ impl NyxApp for TerminalApp {
             self.output_history.push('\n');
 
             if cmd == "help" {
-                self.output_history.push_str("Commands: help, clear, echo <text>\n");
+                self.output_history.push_str("Commands: help, clear, echo <text>, settings, explorer, sysmon, network\n");
             } else if cmd == "clear" {
                 self.output_history.clear();
+            } else if cmd == "settings" {
+                self.output_history.push_str("Launching Settings...\n");
+                if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Settings.nyx/run.bin\0"); sys_exit(1); }
+            } else if cmd == "explorer" {
+                self.output_history.push_str("Launching Explorer...\n");
+                if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Explorer.nyx/run.bin\0"); sys_exit(1); }
+            } else if cmd == "sysmon" {
+                self.output_history.push_str("Launching System Monitor...\n");
+                if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0"); sys_exit(1); }
+            } else if cmd == "network" {
+                self.output_history.push_str("Launching Network Suite...\n");
+                if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Network.nyx/run.bin\0"); sys_exit(1); }
             } else if cmd.starts_with("echo ") {
                 self.output_history.push_str(&cmd[5..]);
                 self.output_history.push('\n');
