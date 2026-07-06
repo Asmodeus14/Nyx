@@ -1403,7 +1403,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if !is_valid_user_ptr(buf_ptr, buf_len) { frame.rax = EFAULT as u64; return; }
             
             unsafe {
-                let log_len = core::cmp::min(crate::serial::BOOT_LOG_IDX, 8192);
+                // Copy as much of the boot log as the caller's buffer holds. (Was
+                // capped at 8192, which truncated the GPU pipeline decode mid-stream
+                // in the sysmon viewer.) BOOT_LOG_IDX is always <= BOOT_LOG_SIZE.
+                let log_len = crate::serial::BOOT_LOG_IDX;
                 let copy_len = core::cmp::min(buf_len, log_len);
                 for i in 0..copy_len { *buf_ptr.add(i) = crate::serial::BOOT_LOG[i]; }
                 frame.rax = copy_len as u64;

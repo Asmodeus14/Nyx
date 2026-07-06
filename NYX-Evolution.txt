@@ -1,538 +1,255 @@
-<<<<<<< HEAD
-Phase 1: PCI Initialization & Memory Mapping (The Foundation)
-Before you can draw anything, the kernel must find the GPU and map its memory into your virtual address space.
+================================================================================
+Nyx OS — GPU / 3D Engine Evolution
+Intel Gen9.5 (Comet Lake, device 0x9BC4, GT2) — RENDER Command Streamer (RCS)
+================================================================================
 
-Reference: vol13-mmio.pdf
+This document tracks the bring-up of a full 3D rendering engine on the Intel
+integrated GPU, driving the RENDER command streamer (RCS) and the Gen9 3D
+pipeline in legacy ring-buffer mode (no execlists / GuC), culminating in a
+mini-GL API exposed to userspace over syscalls.
+
+Target: Intel Comet Lake iGPU, PCI device 0x9BC4 (GT2), mapped to
+GpuGeneration::Gen9. Tested on bare metal only (QEMU cannot emulate the render
+engine); every 3D milestone is verified over serial + on-panel photo.
+
+--------------------------------------------------------------------------------
+STATUS SUMMARY
+--------------------------------------------------------------------------------
+[DONE] Phase 0  Scaffolding, device IDs, spec sourcing
+[DONE] Phase 1  RCS ring bring-up (legacy mode) + engine reset/recovery
+[DONE] Phase 2  Batch buffers + PIPE_CONTROL post-sync fences
+[DONE] Phase 3  EU shader kernels (pass-through VS + constant-color PS)
+[DONE] Phase 4  STATE_BASE_ADDRESS + surface/state objects
+[DONE] Phase 5  FIRST TRIANGLE — the go/no-go gate  <<< CLEARED
+
+[TODO] Phase 6  Primitives, CPU/GPU transforms, depth  -> spinning cube
+[TODO] Phase 7  Textures & samplers                    -> textured cube
+[TODO] Phase 8  Engine API layer (Device/Buffer/Mesh/Camera)
+[TODO] Phase 9  Mini-GL + syscalls + userspace 3D demo
+
+Milestone reached: a fully GPU-rendered red triangle (real VS + PS EU kernels,
+full Gen9 3D pipeline) drawn into the backbuffer at GVA 0x1400_0000, verified by
+CPU pixel readback (PS_inv=665088, center=0xffff0000) AND presented to the panel.
+This is NOT a CPU blit — it is the execution units shading real rasterizer
+coverage.
+
+--------------------------------------------------------------------------------
+GVA (GGTT) MEMORY MAP owned by the 3D engine
+--------------------------------------------------------------------------------
+Chosen to avoid the BLT driver's existing allocations (ring 0x1000_0000,
+backbuffer 0x1400_0000, fence 0x1500_0000, windows 0x2000_0000+).
+
+  0x1600_0000  RCS ring buffer
+  0x1700_0000  Batch buffer(s)
+  0x1800_0000  Instruction base (shader kernels)
+  0x1900_0000  Dynamic state (viewport / CC / blend / sampler)
+  0x1A00_0000  Surface state + binding tables
+  0x1B00_0000  Vertex / index buffers
+  0x1C00_0000  Depth buffer
+  0x1D00_0000  Textures
+  0x1E00_0000  RCS fence / scratch
+
+--------------------------------------------------------------------------------
+HARD-WON LESSONS (first-triangle bring-up) — avoid this whole bug class
+--------------------------------------------------------------------------------
+The first triangle took THREE distinct root-cause bugs, all the same shape: a
+Gen9 field whose innocent-looking or "more complete" value is the trap. When a
+field is left 0 or set to the seemingly-safe option, cross-check Mesa's Gen9
+lowering (ELK, not brw — brw is Xe/Gen12+) and the local genxml before trusting
+it.
+
+  Bug #1  EU hardware opcodes. mov=1 / send=49 (pre-Xe). We had mov=2 (=sel!) and
+          send=51 (=sends, split-send) — silently mis-encoded every instruction.
+          Symptom: VS_inv>0 but CL_inv=0, deadlock.
+
+  Bug #2  3DSTATE_RASTER Cull Mode. Value 0 = CULLMODE_BOTH (cull EVERY triangle),
+          NOT "none". CULLMODE_NONE = 1. An all-zero DW1 culls everything.
+          Symptom: CL_prims=1 but PS_inv=0, black screen.
+
+  Bug #3  PS Render-Target write must be HEADERLESS on Gen9. Setting header-present
+          and forwarding raw R0/R1 as the message header fed the render cache
+          garbage (PS payload is NOT in RT-write-header format) -> per-thread
+          garbage destination addresses -> wild, per-boot-varying GGTT page faults
+          while PS_inv>0. Mesa builds a header only for dual-source / multi-RT /
+          kill, and even then it is a constructed g0-derived header, never a raw
+          forward. The render cache derives each pixel's destination from the
+          fixed-function dispatch; the EOT pixel mask comes from the exec mask.
+
+Debug infrastructure that made this tractable:
+  - On-device command-stream decoder (render/decode.rs) prints the whole batch
+    as readable lines, so one screen photo captures the pipeline.
+  - Staged PIPE_CONTROL "progress" fences: the fence page holds the last stage
+    reached, so a hang is localized without a GPU debugger.
+  - Fault-address readback: GEN8_FAULT_TLB_DATA0/1 (0x4b10/0x4b14) decode the
+    exact faulting GPU virtual address; RING_FAULT_REG = 0x4094.
+  - Gen9 pipeline-statistics MMIO counters pinpoint where a draw dies:
+    IA_VERTICES 0x2310, VS_INVOCATION 0x2320, CL_INVOCATION 0x2338,
+    CL_PRIMITIVES 0x2340, PS_INVOCATION 0x2348. (IA_VERTICES needs a separate
+    3DSTATE_VF_STATISTICS enable to count — IA_verts=0 is a red herring.)
+  - MOCS table MUST be programmed on Gen9 (all entries LLC write-back) or render-
+    cache writes have undefined caching and never reach memory.
+
+
+================================================================================
+REMAINING PHASES
+================================================================================
+
+--------------------------------------------------------------------------------
+Phase 6: 3D Primitives, Transforms, and Depth  ->  spinning depth-tested cube
+--------------------------------------------------------------------------------
+Objective: go from one hardcoded NDC triangle to real indexed geometry with a
+model-view-projection transform and a working depth buffer.
+
+Reference: PRM vol07-3d_media_gpgpu.pdf; genxml 3DSTATE_INDEX_BUFFER,
+3DSTATE_DEPTH_BUFFER, 3DSTATE_WM_DEPTH_STENCIL, 3DSTATE_CLEAR_PARAMS.
 
 Actionable Steps:
 
-PCI Enumeration: Scan the PCI bus for Vendor ID 0x8086. Match the Device ID against known Kaby Lake / Comet Lake IDs (e.g., 0x5916, 0x9BC5, etc.).
+1. Index buffers.
+   - Implement 3DSTATE_INDEX_BUFFER (index format UINT16/UINT32, GGTT address at
+     0x1B00_0000 region) and switch 3DPRIMITIVE to RANDOM (indexed) access.
+   - Add a vertex-format abstraction so a mesh declares its attributes
+     (position, color, later normal/uv) and the code emits matching
+     3DSTATE_VERTEX_ELEMENTS / VERTEX_BUFFERS automatically.
 
-Map BAR0 (GTTMMADR): This is the most critical step. BAR0 contains the Graphics Translation Table (GTT) and all the Memory Mapped I/O (MMIO) registers. Read this physical address from the PCI configuration space and map it into your kernel's virtual memory as Uncacheable (UC) to prevent the CPU from caching register writes.
+2. CPU-side math (new engine/math.rs).
+   - mat4 (multiply, identity), perspective (fovy/aspect/near/far), lookAt,
+     translate/rotate/scale, vec3/vec4.
+   - START by transforming vertices on the CPU: feed already-projected clip-space
+     verts to the existing pass-through VS. This isolates the math from the VS
+     kernel and reuses the proven Phase-5 pipeline unchanged.
 
-Map BAR2 (Aperture): Map the aperture base. This is a CPU-visible window into the GPU's memory.
+3. Move the transform into the VS (push constants).
+   - Upload the MVP matrix via 3DSTATE_CONSTANT_VS (push-constant region already
+     reserved by PUSH_CONSTANT_ALLOC_VS) into the VS payload GRFs.
+   - Extend the VS kernel with multiply-add (mul/mad) ops to transform position
+     by the MVP. Validate the new EU encoding by byte-diff vs Mesa ELK as in
+     Phase 3. Keep the CPU-transform path as a fallback for A/B debugging.
 
-Wake the Device: Ensure the device is powered up by checking the PCI Power Management registers and writing to the appropriate MMIO power control registers to wake the graphics engines.
+4. Real depth buffer.
+   - Allocate + GGTT-map a depth surface at 0x1C00_0000 (D32_FLOAT or D24_UNORM),
+     replace the SURFTYPE_NULL 3DSTATE_DEPTH_BUFFER with a real one, program
+     3DSTATE_CLEAR_PARAMS, and clear it each frame.
+   - Enable depth test LESS + depth write in 3DSTATE_WM_DEPTH_STENCIL. HiZ can
+     stay off initially.
 
-Phase 2: The Global Graphics Translation Table (GGTT)
-The GPU does not understand your CPU's page tables; it has its own memory management unit (IOMMU/GART).
+5. Animation loop.
+   - Drive rotation from a frame counter / TSC; re-emit the MVP push constant per
+     frame; re-run the pipeline; present.
 
-Reference: vol06-command_stream_programming.pdf (Memory Interface section) & vol13-mmio.pdf.
+Milestone: a spinning, depth-tested, per-vertex-colored cube on the monitor.
+Watch for: back-face occlusion correct (depth working), no z-fighting, cull mode
+now meaningfully BACK (test that CULLMODE_BACK culls the correct faces).
 
-Actionable Steps:
 
-Understand the GGTT: The GGTT maps GPU virtual addresses to physical memory addresses. The PTEs (Page Table Entries) for the GGTT are located exactly at GTTMMADR + 2MB.
+--------------------------------------------------------------------------------
+Phase 7: Textures & Samplers  ->  textured cube
+--------------------------------------------------------------------------------
+Objective: sample a 2D texture in the pixel shader.
 
-Allocate Backing Pages: Using nyx-kernel/src/allocator.rs, allocate physical pages in system RAM to serve as your framebuffers and command buffers.
-
-Write PTEs: Write the physical addresses of these allocated pages into the GGTT. Now, when the GPU tries to access a specific graphics virtual address, it will fetch from your allocated physical system RAM.
-
-Phase 3: Ring Buffers and Command Streamers (Talking to the GPU)
-You don't control the GPU by constantly poking registers. You write commands to a circular queue in memory (a Ring Buffer), and the GPU's Command Streamer reads and executes them asynchronously.
-
-Reference: vol06-command_stream_programming.pdf & vol02a-commandreference-instructions.pdf.
-
-Actionable Steps:
-
-Setup the BCS (Blitter Command Streamer): For UI offloading, the Blitter engine is your best friend. Allocate a page for the Blitter Ring Buffer. Map it via the GGTT.
-
-Initialize Ring Registers: Write the starting address, length, and enable bit to the Ring Buffer MMIO registers (BLT_RING_BASE, BLT_RING_CTL).
-
-Write the first Command: Write a MI_NOOP (No Operation) to the ring buffer.
-
-Ring the Doorbell: Update the Ring Buffer Tail pointer register. The GPU will see the tail has moved, fetch the MI_NOOP, execute it, and update the Head pointer.
-
-Phase 4: Hardware-Accelerated 2D UI (The Blitter Engine)
-This is where your software loops in libs/gui/src/draw.rs get replaced by hardware commands. We will use the GPU to composite windows and fill rectangles.
-
-Reference: vol11-blitter.pdf & vol02a-commandreference-instructions.pdf.
-
-Actionable Steps:
-
-XY_COLOR_BLT (Rectangle Fill): Instead of looping over pixels to draw a window background, construct an XY_COLOR_BLT command packet. You specify the X/Y coordinates, width, height, destination memory pitch, and color. Push this to the Blitter Ring Buffer and advance the tail.
-
-XY_SRC_COPY_BLT (Bitmask / Window Compositing): When your compositor needs to move a window's backing buffer to the main screen, use this command. It copies pixel blocks from a source address to a destination address asynchronously at massive speeds.
-
-Syncing: Implement a way to wait for the GPU to finish. You can use MI_STORE_DATA_IMM to write a sequence number to a specific memory address when a batch of commands finishes, and have the CPU spinloop (or sleep/interrupt) waiting for that value to change.
-
-Phase 5: Display Engine and Modesetting (Native Resolution)
-Currently, you likely inherit a framebuffer from your bootloader (EFI GOP). Taking native control allows you to change resolutions, setup double-buffering, and use hardware cursors.
-
-Reference: vol12-display.pdf.
+Reference: PRM vol02b (SURFACE_FORMAT), vol07 (sampler messages); genxml
+RENDER_SURFACE_STATE, SAMPLER_STATE, 3DSTATE_SAMPLER_STATE_POINTERS_PS.
 
 Actionable Steps:
 
-The Display Pipeline: Understand the flow: Planes (memory buffers) -> Pipes (blenders/color formatters) -> Transcoders (timing generators) -> Ports/DDI (physical connectors like HDMI/eDP).
+1. Texture upload.
+   - Allocate + GGTT-map texture storage at 0x1D00_0000; upload pixels; clflush.
+   - Start LINEAR (no tiling) to reuse the Phase-4/5 surface path; add Y-tiling
+     later for performance.
 
-Configure a Plane: Point a primary display plane to your GGTT-mapped framebuffer.
+2. Texture surface state.
+   - Build a second RENDER_SURFACE_STATE (sampled image, e.g. R8G8B8A8_UNORM),
+     place it as binding-table entry [1] (RT stays entry [0]).
 
-Hardware Cursor: Intel GPUs have dedicated registers for a hardware mouse cursor plane. This means moving the mouse requires zero redrawing of the UI underneath it. Hook this up to nyx-kernel/src/mouse.rs.
+3. Sampler state.
+   - Build SAMPLER_STATE (min/mag filter, wrap modes), place in dynamic state,
+     point 3DSTATE_SAMPLER_STATE_POINTERS_PS at it.
 
-Phase 6: The 3D Render Command Streamer (RCS)
-Once the 2D Blitter is handling your UI compositing, you can tackle the beast: the 3D pipeline.
+4. Textured PS kernel.
+   - Add UV as a second vertex attribute; the SF interpolates it into the PS
+     payload (extend 3DSTATE_SBE attribute count + read offset).
+   - New PS variant: issue a sampler `send` (SFID sampler) with the UVs, receive
+     the RGBA result, then the headerless RT write. Byte-diff the new send vs
+     Mesa ELK sampler lowering.
 
-Reference: vol07-3d_media_gpgpu.pdf.
+Milestone: a textured, spinning cube.
+
+
+--------------------------------------------------------------------------------
+Phase 8: Engine API Layer
+--------------------------------------------------------------------------------
+Objective: wrap the raw command emission behind a small, reusable engine so
+scenes are described in data, not hand-rolled batches.
 
 Actionable Steps:
 
-Initialize the RCS: Setup a ring buffer for the Render Command Streamer, just like you did for the Blitter.
-
-Pipeline State: The Gen9.5 3D pipeline requires setting up dozens of states (Vertex Fetch, Geometry Shader, Rasterizer, Pixel Shader). You will send 3DSTATE_* commands to configure the Unified Return Buffer (URB) and pipeline geometry.
-
-Shaders: You will eventually need to write or compile GEN assembly instructions (EU ISA) to tell the Execution Units (EUs) how to shade pixels.
-=======
-Nyx OS - Intel Comet Lake iGPU Support Implementation Plan
-==========================================================
-
-Phase 0: Current State Assessment (Week 1)
-------------------------------------------
-Objective: Audit existing GPU code and understand current capabilities
-
-Tasks:
-1. Audit existing intel.rs file in nyx-kernel/src/
-   - Document current implementation status
-   - Identify existing device detection logic
-   - Check for any GOP (Graphics Output Protocol) support
-
-2. Review pci.rs implementation
-   - Understand current PCI device enumeration
-   - Verify Intel GPU detection capabilities
-   - Document how to extract device ID and revision ID
-
-3. Hardware Identification (using existing pci.rs)
-   - Use your PCI detection code to identify the iGPU
-   - Extract Device ID and Revision ID from PCI config space
-   - Determine if it's a Comet Lake GT1F or GT2 configuration
-
-Deliverables:
-- Audit report of intel.rs current capabilities
-- Exact device ID and revision ID from your hardware
-- List of implemented vs missing features
-- Baseline performance metrics for CPU rendering
-
-
-Phase 1: Comet Lake iGPU Identification & Documentation Study (Weeks 2-3)
-------------------------------------------------------------------------
-Objective: Implement proper device identification and study Comet Lake architecture
-
-1.1 Device ID Database Implementation
-Create nyx-kernel/src/intel/gpu_ids.rs with:
-
-Comet Lake Device IDs from Intel documentation:
-- 0x9B41 (rev 0x2) - Mobile U42/U2f2 (GT2, WHL V0)
-- 0x9B21 (rev 0x2) - Mobile U2f1f (GT1F, WHL V0)
-- 0x9BCA (rev 0x4) - Mobile U62/U4f2/U2f2 (GT2, CML A0)
-- 0x9BAA (rev 0x4) - Mobile U2f1f (GT1F, CML A0)
-- 0x9BCC (rev 0x5) - Mobile U62/U4f2/U2f2 (GT2, CML K0)
-- 0x9BAC (rev 0x5) - Mobile U2f1f (GT1F, CML K0)
-- 0x9BC5 (rev 0x5) - Desktop S10+2/S8f2/S6f2 (GT2, CML P0)
-- 0x9BC8 (rev 0x4) - Desktop S62/S4f2/S2f2 (GT2, CML G0)
-- 0x9BA8 (rev 0x4) - Desktop S2f1f (GT1F, CML G0)
-- 0x9BC4 (rev 0x5) - Mobile H82/H6f2/H4f2 (GT2, R2)
-- 0x9BA4 (rev 0x5) - Mobile H81/H6f1f (GT1F, R2)
-- 0x9BF6 (rev 0x5) - Mobile Xeon H82 (GT2, R2)
-- 0x9BC6 (rev 0x5) - Workstation S10+2 (GT2, CML P0)
-- 0x9BE6 (rev 0x4) - Workstation S62 (GT2, CML G0)
-
-1.2 Configuration Structure
-Implement nyx-kernel/src/intel/cml_config.rs with:
-
-GT1F Configuration:
-- 1 Slice, 2 Subslices, 12 EUs (84 threads)
-- 384KB L3 Cache, 192KB URB, 128KB SLM
-- 2 Data Ports, 2 Samplers
-
-GT2 Configuration:
-- 1 Slice, 3 Subslices, 24 EUs (168 threads, 1 reserved)
-- 768KB L3 Cache, 384KB URB, 192KB SLM
-- 3 Data Ports, 3 Samplers
-
-1.3 Documentation Study
-Key areas from Intel CML PRM:
-- Top Level Block Diagrams (Section 2)
-- Device Attributes (Section 5)
-- Stepping and Device IDs (Section 9)
-- Register definitions for:
-  * GFX_MODE (0x915C)
-  * Display pipes (0x70008, 0x6001C)
-  * GTT registers (0x0188, 0x0180)
-  * Command streamer (0x0200, 0x020C)
-
-Deliverables:
-- Complete device ID database for Comet Lake
-- GPU identification function using existing pci.rs
-- Configuration structure with GT1F/GT2 differentiation
-- Documentation summary of key architectural features
-
-
-Phase 2: Ring 0 Engine Verification - Bare Metal (Weeks 4-6)
-------------------------------------------------------------
-Objective: Initialize and verify Intel GPU engine on bare metal
-
-2.1 GPU Initialization with Comet Lake Specifics
-
-Create nyx-kernel/src/intel/gpu_init.rs:
-
-Initialization Sequence:
-1. Detect Intel GPU via existing pci.rs
-   - Extract device ID and revision ID
-   - Identify specific Comet Lake SKU
-
-2. Enable MMIO
-   - Map GPU MMIO registers
-   - Configure memory aperture
-
-3. Reset GPU Engine
-   - Assert reset via GFX_MODE register (0x915C)
-   - Wait for reset completion
-
-4. Initialize Display Engine
-   - Configure 3 display pipes
-   - Setup 2 DDI ports + 1 eDP
-   - Initialize display planes (3 per pipe)
-
-5. Configure Memory Aperture
-   - Allocate GTT (512KB)
-   - Program GTT base address (0x0188)
-   - Enable GTT (0x0180)
-
-6. Initialize Render Engine
-   - Configure slice common
-   - Initialize subslices (2 for GT1F, 3 for GT2)
-   - Setup EU array (12 for GT1F, 24 for GT2)
-
-7. Setup Command Streamer
-   - Allocate command buffer
-   - Program RCS base address (0x0200)
-   - Enable command streamer (0x020C)
-
-2.2 Bare Metal Testing Framework
-
-Create nyx-kernel/src/intel/test_harness.rs:
-
-Test Cases:
-1. Basic Initialization Test
-   - Verify GPU detection
-   - Test MMIO mapping
-   - Verify engine reset
-
-2. Display Engine Test
-   - Test display pipe initialization
-   - Test DDI port configuration
-   - Verify display output
-
-3. Render Engine Test
-   - Test EU initialization
-   - Test subslice configuration
-   - Verify slice common setup
-
-4. Memory Management Test
-   - Test GTT initialization
-   - Test memory allocation
-   - Verify aperture configuration
-
-5. Command Execution Test
-   - Test command streamer
-   - Test basic rendering (clear screen)
-   - Test synchronization
-
-6. Stability Test
-   - Run continuous rendering for 1 hour
-   - Monitor for hangs/crashes
-   - Check for memory leaks
-
-Testing Strategy:
-- Use serial port for debug output
-- Use motherboard LEDs/GPIO for status
-- Verify GPU memory doesn't corrupt system memory
-- Monitor GPU temperature
-
-Deliverables:
-- Working GPU initialization on bare metal
-- Test harness for all GPU components
-- Verified display output
-- Performance baseline measurements
-
-
-Phase 3: Ring 3 Integration & UI Offloading (Weeks 7-10)
----------------------------------------------------------
-Objective: Create user-space API and integrate with GUI subsystem
-
-3.1 User-Space GPU API
-
-Create nyx-api/src/gpu.rs:
-
-API Functions:
-- create_context() -> GpuContextId
-- destroy_context(ctx: GpuContextId)
-- execute_command_list(ctx, commands: &[GpuCommand])
-- allocate_memory(size, mem_type) -> GpuMemoryInfo
-- free_memory(handle: GpuMemoryHandle)
-- sync(ctx: GpuContextId)
-
-Memory Types:
-- Local (GPU local memory)
-- Shared (CPU-GPU shared memory)
-- Aperture (Aperture memory)
-
-Command Types:
-- Clear
-- DrawRect
-- DrawText
-- CopyBuffer
-- FillBuffer
-- Sync
-
-3.2 Kernel-User Space Interface
-
-Create nyx-kernel/src/syscalls/gpu.rs:
-
-System Calls:
-- sys_gpu_create_context()
-- sys_gpu_destroy_context(ctx_id)
-- sys_gpu_execute_commands(ctx_id, commands_ptr, count)
-- sys_gpu_allocate_memory(size, mem_type)
-- sys_gpu_free_memory(handle)
-- sys_gpu_sync(ctx_id)
-
-Security:
-- Validate all pointers
-- Check context ownership
-- Limit memory allocations
-- Implement resource quotas
-
-3.3 GUI Subsystem Adaptation
-
-Modify nyx-gui/src/renderer/:
-
-Create gpu_renderer.rs:
-- Replace CPU rendering with GPU commands
-- Implement texture uploads to GPU memory
-- Add basic shader support
-- Implement double buffering
-
-Update terminal.rs:
-- GPU-accelerated text rendering
-- Hardware cursor support
-- Scroll buffer in GPU memory
-
-Optimization:
-- Command batching (reduce syscall overhead)
-- Memory pooling for textures
-- Lazy texture uploads
-- Partial updates for damaged regions
-
-Deliverables:
-- Working GPU API in user space
-- GUI rendering offloaded to GPU
-- Terminal with GPU acceleration
-- Performance optimization implemented
-
-
-Phase 4: Testing & Validation (Weeks 11-12)
--------------------------------------------
-Objective: Ensure stability and measure performance improvements
-
-4.1 Comprehensive Testing
-
-Unit Tests:
-- Test each GPU command type
-- Test memory allocation/deallocation
-- Test context switching
-- Test error conditions
-
-Integration Tests:
-- Test GUI rendering with GPU
-- Test terminal rendering with GPU
-- Test multi-window scenarios
-- Test display hotplugging
-
-Stress Tests:
-- Continuous rendering for 24 hours
-- Memory leak detection
-- Thermal stability
-- Power consumption monitoring
-
-4.2 Performance Benchmarking
-
-Metrics to Measure:
-- CPU usage reduction (>50% target)
-- Frame rate (>30 FPS target)
-- Memory usage (<10% increase)
-- Boot time impact (<2s increase)
-- Power consumption
-
-Benchmark Scenarios:
-- Clear screen (1000 iterations)
-- Draw rectangles (1000 iterations)
-- Text rendering (1000 lines)
-- Window compositing
-- Terminal scrolling
-
-4.3 Bug Fixing and Stabilization
-
-- Address all critical bugs
-- Optimize critical paths
-- Add error recovery mechanisms
-- Implement graceful degradation
-
-Deliverables:
-- All tests passing with >95% stability
-- Performance targets met
-- Bug-free operation for 24+ hours
-- Comprehensive test report
-
-
-Phase 5: Documentation & Future Planning (Ongoing)
---------------------------------------------------
-Objective: Ensure long-term maintainability and future development
-
-5.1 Documentation Updates
-
-Update README.md:
-- Add Intel GPU support section
-- Document supported hardware
-- Add build instructions for GPU support
-
-Create GPU_SUPPORT.md:
-- Detailed architecture documentation
-- API reference for GPU context
-- Debugging guide for GPU issues
-- Performance tuning guide
-
-Update CONTRIBUTING.md:
-- Guidelines for GPU-related contributions
-- Testing requirements for GPU changes
-- Code review checklist for GPU code
-
-5.2 Future Enhancements
-
-Video Decode Support:
-- VDBox (Video Decode Box) implementation
-- Hardware-accelerated video playback
-- Multiple codec support
-
-3D Rendering:
-- OpenGL/Vulkan implementation
-- Shader compiler
-- 3D pipeline support
-
-Power Management:
-- Dynamic frequency scaling
-- RC6 power states
-- Display panel power management
-
-Multi-Monitor Support:
-- Multiple display pipes
-- Different resolutions per display
-- Display hotplugging
-
-Deliverables:
-- Complete documentation
-- Contribution guidelines updated
-- Future roadmap documented
-- Maintenance plan established
-
-
-Implementation Notes:
-====================
-
-1. Use existing pci.rs for all hardware detection - no external tools needed
-
-2. All testing is on bare metal - no QEMU emulation
-
-3. Reference Intel CML PRM (Doc Ref # IHD-OS-CML-Vol 1-4.20) for:
-   - Register definitions
-   - Initialization sequences
-   - Device attributes
-   - Stepping and Device IDs
-
-4. Key Comet Lake architectural details:
-   - GT1F: 1x2x6 (1 Slice, 2 Subslices, 6 EUs per subslice = 12 EUs)
-   - GT2: 1x3x8 (1 Slice, 3 Subslices, 8 EUs per subslice = 24 EUs)
-   - 48-bit virtual address range
-   - 39-bit physical address range
-   - 3 display pipes, 3 planes per pipe
-   - 2 DDI ports + 1 eDP port
-
-5. Critical registers to implement:
-   - GFX_MODE (0x915C) - Graphics mode control
-   - PIPE_CONF (0x70008) - Pipe configuration
-   - PIPE_SRC (0x6001C) - Pipe source size
-   - GTT_BASE (0x0188) - GTT base address
-   - GTT_CTRL (0x0180) - GTT control
-   - RCS_BASE (0x0200) - Render command streamer base
-   - RCS_CTRL (0x020C) - Render command streamer control
-
-6. Testing approach for bare metal:
-   - Serial port for debug output
-   - Motherboard LEDs/GPIO for status
-   - Memory validation routines
-   - Thermal monitoring
-   - Fallback to CPU rendering if needed
-
-7. Performance optimization priorities:
-   - Command batching to reduce syscall overhead
-   - Memory pooling for frequently used resources
-   - Double buffering for smooth animation
-   - Partial updates for damaged regions
-   - Hardware cursor for pointer rendering
-
-Success Criteria:
-================
-
-Phase 0:
-- Complete audit of intel.rs
-- Hardware identified using pci.rs
-- Baseline metrics established
-
-Phase 1:
-- Device ID database complete
-- GPU identification working
-- Configuration structures implemented
-
-Phase 2:
-- GPU initializes on bare metal
-- Display output working
-- Stable for 24+ hours
-- Performance baseline measured
-
-Phase 3:
-- GUI rendering offloaded to GPU
-- CPU usage reduced by >50%
-- No visual artifacts
-- Responsive UI under load
-
-Phase 4:
-- All tests passing
-- Performance targets met
-- Stable operation verified
-
-Phase 5:
-- Documentation complete
-- Contribution guidelines updated
-- Future roadmap defined
-
-Risk Mitigation:
-===============
-
-1. Hardware Compatibility:
-   - Test on actual Comet Lake hardware
-   - Have fallback to CPU rendering
-   - Document supported configurations
-
-2. Stability Issues:
-   - Comprehensive testing in Phase 2
-   - Gradual rollout in Phase 3
-   - Easy fallback mechanisms
-
-3. Performance:
-   - Profile early and often
-   - Optimize critical paths
-   - Consider partial offloading
-
-4. Documentation:
-   - Start documentation early
-   - Maintain throughout development
-   - Review regularly
->>>>>>> fdefd5fce554a2245969b28aedc8cf6d7a09bd68
+1. engine/ module.
+   - Device (owns the RenderEngine + state allocators), Buffer, Texture,
+     Shader (selects a compiled kernel), Pipeline / render-state, CommandList.
+   - draw_indexed(mesh, material, mvp); present().
+
+2. Scene helpers.
+   - Mesh (vertex/index buffers + format), Camera (view/proj), Transform,
+     Material (shader + textures + render state).
+
+3. Present path.
+   - Currently proof-of-life copies the backbuffer to scanout then holds. Replace
+     with a proper present: either the existing BLT-to-scanout swap, or a true
+     display flip via PLANE_SURF register writes (the driver currently only reads
+     those regs — add the write path) for tear-free double buffering.
+   - Resolve backbuffer ownership vs the compositor: the engine should render into
+     its own surface and composite, not fight the window server for 0x1400_0000.
+
+Milestone: a scene (multiple meshes, a camera) rendered from data through the
+engine API, presented without the Phase-5 "present + 5s hold" hack.
+
+
+--------------------------------------------------------------------------------
+Phase 9: Mini-GL + Syscalls + Userspace Demo  (stated end goal)
+--------------------------------------------------------------------------------
+Objective: expose the engine to userspace as a small OpenGL-like API over
+syscalls, and prove it with a userspace 3D app.
+
+Reference: existing GPU syscall model in nyx-kernel/src/interrupts.rs
+(syscalls 501-513; sys_swap_buffers = 502). Add new syscalls at 514+.
+
+Actionable Steps:
+
+1. Syscall surface.
+   - Define syscalls: create/destroy buffer, create/destroy texture, create
+     shader/program, bind, set uniform (MVP etc.), draw(_indexed), clear, present.
+   - Marshal handles (not raw kernel pointers) across the boundary; validate all
+     userspace-supplied sizes/offsets in the kernel (no GGTT address escapes).
+
+2. Mini-GL library (userspace).
+   - Thin libGL-like wrapper over the syscalls: glGenBuffers/glBufferData,
+     glGenTextures/glTexImage2D, glUseProgram, glUniformMatrix4fv, glDrawElements,
+     glClear, glSwapBuffers.
+
+3. Userspace demo app.
+   - Patterned on apps/compositor: open the device, upload a cube, spin it,
+     present each frame — entirely from userspace through the mini-GL API.
+
+Milestone: a userspace process rendering an animated 3D scene through mini-GL
+syscalls.
+
+Stretch (only if multi-app 3D is required):
+   - Per-process GPU contexts need PPGTT (only GGTT exists today) and most likely
+     execlists. A single-context mini-GL runs fine on GGTT; scope PPGTT/execlists
+     only when two apps must render concurrently.
+
+
+================================================================================
+BUILD / TEST NOTES
+================================================================================
+- No Rust toolchain on the Windows host. Build in WSL Ubuntu:
+    wsl.exe -- bash -lc 'cd /mnt/c/CODE/Nyx && cargo build --package nyx-kernel \
+      --release --target x86_64-unknown-none -Z build-std=core,alloc \
+      -Z build-std-features=compiler-builtins-mem'
+  Full image: ./Build.sh
+- The Git Bash tool has /tmp and git but NO /mnt/c; only WSL sees /mnt/c.
+- Mesa Gen9 encoding reference is ELK (src/intel/compiler/elk/), not brw.
+  genxml (command/state field offsets) is local at
+  C:\CODE\Nyx-Firmwares\Intel_Docs\mesa-gen9.xml.
+- No serial capture on the test laptop: read kernel logs in the userspace sysmon
+  boot-log viewer, and photograph the panel for visual milestones.

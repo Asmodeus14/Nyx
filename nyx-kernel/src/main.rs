@@ -228,12 +228,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
     // GPU TEST
-    if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_ref() {
-    // 0x22034 is HEAD, 0x22030 is TAIL
-    let head = unsafe { gpu.read_reg(0x22034) };
-    let tail = unsafe { gpu.read_reg(0x22030) };
-    crate::serial_println!("[DEBUG] Before Test: HEAD={:#x}, TAIL={:#x}", head, tail);
-}
+    let gpu_mmio_base = {
+        let guard = crate::drivers::gpu::intel::INTEL_GPU.lock();
+        if let Some(gpu) = guard.as_ref() {
+            // 0x22034 is HEAD, 0x22030 is TAIL (blitter ring)
+            let head = unsafe { gpu.read_reg(0x22034) };
+            let tail = unsafe { gpu.read_reg(0x22030) };
+            crate::serial_println!("[DEBUG] Before Test: HEAD={:#x}, TAIL={:#x}", head, tail);
+            Some(gpu.mmio_base)
+        } else {
+            None
+        }
+    }; // release INTEL_GPU lock before touching the render engine
+
+    // Phase 1: bring up the RENDER command streamer (RCS) and run its self-test.
+    // Real-hardware only (QEMU does not emulate the render engine).
+    if let Some(mmio_base) = gpu_mmio_base {
+        let ok = crate::drivers::gpu::intel::render::init_render_engine(mmio_base);
+        crate::serial_println!("[BOOT] RCS render engine self-test: {}", if ok { "PASS" } else { "FAIL" });
+    }
 
 
     // ==========================================

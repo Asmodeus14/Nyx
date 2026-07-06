@@ -37,7 +37,7 @@ impl SysMonApp {
             entity_stats: [0.0; 4],
             active_cores: 0,
             sys_info: unsafe { core::mem::zeroed() },
-            bootlog_buf: alloc::vec![0u8; 16384],
+            bootlog_buf: alloc::vec![0u8; 131072], // 128 KB: hold the full boot log + GPU pipeline decode
             bootlog_lines: Vec::new(),
             bootlog_last_len: 0,
             bootlog_scroll: 0,

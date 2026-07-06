@@ -4,6 +4,11 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
+// 3D RENDER engine (RCS) + Gen9 3D pipeline. See plan: agile-churning-parrot.md.
+// The existing driver above drives only the BLT engine (base 0x22000); `render`
+// brings up the RENDER command streamer (base 0x2000) and the 3D pipeline.
+pub mod render;
+
 pub static INTEL_GPU: Mutex<Option<IntelGpuDriver>> = Mutex::new(None);
 pub static BACKBUFFER_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 
@@ -60,7 +65,12 @@ unsafe impl Sync for IntelGpuDriver {}
 impl IntelGpuDriver {
     pub fn probe(device_id: u16) -> GpuGeneration {
         match device_id {
-            0x3185 | 0x3E9B | 0x5917 | 0x5916 | 0x9BC4 => GpuGeneration::Gen9, 
+            // Gen9 / Gen9.5 (Skylake, Kaby Lake, Coffee Lake, Comet Lake — all share the Gen9 render arch)
+            0x3185 | 0x3E9B | 0x5917 | 0x5916 => GpuGeneration::Gen9,
+            // Comet Lake (Gen9.5) — mobile + desktop SKUs (see NYX-Evolution.txt device table)
+            0x9B41 | 0x9B21 | 0x9BCA | 0x9BAA | 0x9BCC | 0x9BAC
+            | 0x9BC5 | 0x9BC8 | 0x9BA8 | 0x9BC4 | 0x9BA4 | 0x9BF6
+            | 0x9BC6 | 0x9BE6 => GpuGeneration::Gen9,
             0x8A56 => GpuGeneration::Gen11,
             0x9A49 => GpuGeneration::Gen12,
             _ => GpuGeneration::Unsupported,

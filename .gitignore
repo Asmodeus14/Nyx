@@ -3,3 +3,4 @@
 # NyxOS Build Artifacts
 *.tar
 build_initrd/
+.claude

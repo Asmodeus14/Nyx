@@ -69,7 +69,11 @@ lazy_static! {
 }
 
 // --- NEW: KERNEL BOOT LOG BUFFER ---
-pub const BOOT_LOG_SIZE: usize = 16384; // 16 KB of text
+// 128 KB: the GPU pipeline decode (~60 lines) lands late in boot, and at 16 KB the
+// buffer filled mid-decode (stopped at ~line 48) so the userspace sysmon viewer
+// never saw the tail. This is a non-wrapping buffer — once full it drops the rest —
+// so size it to comfortably hold a full boot plus the decode.
+pub const BOOT_LOG_SIZE: usize = 131072; // 128 KB of text
 pub static mut BOOT_LOG: [u8; BOOT_LOG_SIZE] = [0; BOOT_LOG_SIZE];
 pub static mut BOOT_LOG_IDX: usize = 0;
 
