@@ -42,6 +42,9 @@ pub struct KernelStore {
     /// Kernel Start Pointer offsets (from instruction base) for the placed kernels.
     pub vs_off: u32,
     pub ps_off: u32,
+    /// Six constant-color PS kernels, one per cube face (Phase 6 Step 4 per-face color).
+    /// `ps_off` aliases `ps_offs[0]` for the single-color callers.
+    pub ps_offs: [u32; 6],
 }
 
 impl KernelStore {
@@ -71,6 +74,7 @@ impl KernelStore {
             capacity: pages * 4096,
             vs_off: 0,
             ps_off: 0,
+            ps_offs: [0; 6],
         })
     }
 
@@ -325,12 +329,16 @@ pub fn build_vs() -> Vec<u8> {
     emit(&mut k, mov_imm_f(EXEC_SIMD8, 8, 0.0)); // dw1
     emit(&mut k, mov_imm_f(EXEC_SIMD8, 9, 0.0)); // dw2
     emit(&mut k, mov_imm_f(EXEC_SIMD8, 10, 0.0)); // dw3
-    // 2D triangle: read x,y from the fetched vertex (g2,g3); hardcode z=0, w=1 so the
-    // result never depends on z/w loading correctly (a common vertex-fetch pitfall).
+    // Full vec4 pass-through: the VF deinterleaves the R32G32B32A32 position into
+    // g2=x g3=y g4=z g5=w (scalar SIMD8 = 4 GRFs per attribute slot, urb_read_length=1
+    // covers all four — verified vs Mesa ELK elk_fs.cpp:1575 / elk_vec4.cpp:2608). We
+    // now forward z and w too, so a CPU-computed clip-space vertex (w = -z_eye) survives
+    // the clipper's perspective divide. Backward compatible with the Phase-5 triangle,
+    // whose verts are already [x,y,0,1] -> forwarding g4=0,g5=1 reproduces it exactly.
     emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 11, 2)); // pos x <- input g2
     emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 12, 3)); // pos y <- input g3
-    emit(&mut k, mov_imm_f(EXEC_SIMD8, 13, 0.0)); // pos z = 0
-    emit(&mut k, mov_imm_f(EXEC_SIMD8, 14, 1.0)); // pos w = 1
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 13, 4)); // pos z <- input g4
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 14, 5)); // pos w <- input g5
     // URB write: base = g6, mlen = 1 handle-header + 8 data (VUE header + position) = 9, EOT.
     emit(&mut k, send_eot(EXEC_SIMD8, SFID_URB, 6, urb_write_desc(9)));
     k
@@ -389,14 +397,28 @@ pub unsafe fn build_and_dump_kernels(mmio_base: u64) -> Result<KernelStore, Rend
     store.vs_off = vs_off;
     store.dump("VS pass-through", vs_off, vs.len());
 
-    let ps = build_ps([1.0, 0.0, 0.0, 1.0]); // opaque red
-    let ps_off = store.place(&ps)?;
-    store.ps_off = ps_off;
-    store.dump("PS constant-red", ps_off, ps.len());
+    // Six constant-color PS kernels, one per cube face. Distinct, bright colors so the
+    // three visible faces of the back-face-culled cube read as clearly different planes.
+    // Order matches cube_geometry()'s face grouping: front,back,left,right,top,bottom.
+    const FACE_COLORS: [[f32; 4]; 6] = [
+        [1.0, 0.2, 0.2, 1.0], // front (+z) red
+        [0.2, 1.0, 0.2, 1.0], // back  (-z) green
+        [0.3, 0.5, 1.0, 1.0], // left  (-x) blue
+        [1.0, 0.9, 0.2, 1.0], // right (+x) yellow
+        [0.3, 1.0, 1.0, 1.0], // top   (+y) cyan
+        [1.0, 0.4, 1.0, 1.0], // bottom(-y) magenta
+    ];
+    for (i, color) in FACE_COLORS.iter().enumerate() {
+        let ps = build_ps(*color);
+        let off = store.place(&ps)?;
+        store.ps_offs[i] = off;
+    }
+    store.ps_off = store.ps_offs[0]; // back-compat alias for single-color callers
+    store.dump("PS face[0] red", store.ps_offs[0], build_ps(FACE_COLORS[0]).len());
 
     crate::serial_println!(
-        "[EU] kernels placed: VS kernel-ptr={:#x}, PS kernel-ptr={:#x} (offsets from instruction base)",
-        vs_off, ps_off
+        "[EU] kernels placed: VS={:#x}, PS faces={:#x?} (offsets from instruction base)",
+        vs_off, store.ps_offs
     );
     Ok(store)
 }

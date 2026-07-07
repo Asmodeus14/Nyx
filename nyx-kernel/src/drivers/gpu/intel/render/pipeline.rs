@@ -47,6 +47,7 @@ mod so {
     pub const URB_GS: u32 = 51;
     pub const VERTEX_BUFFERS: u32 = 8;
     pub const VERTEX_ELEMENTS: u32 = 9;
+    pub const INDEX_BUFFER: u32 = 10;
     pub const BINDING_TABLE_POINTERS_PS: u32 = 42;
     pub const SAMPLER_STATE_POINTERS_PS: u32 = 47;
     pub const VIEWPORT_SF_CLIP: u32 = 33;
@@ -430,6 +431,375 @@ impl RenderEngine {
         Ok(())
     }
 
+    /// Set up the persistent GPU resources for the cube ONCE (surface/dynamic/vertex state
+    /// buffers, render state, a reserved vertex block, and the static index buffer). These
+    /// are reused across frames by [`draw_cube_frame`], so an animation loop does not leak a
+    /// GGTT mapping / contiguous frame per frame. The vertex block is left uninitialised —
+    /// each frame rewrites it with fresh clip-space positions.
+    unsafe fn setup_cube_gpu(
+        &mut self,
+        rt_gva: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+    ) -> Result<CubeGpu, RenderError> {
+        let (vs_off, ps_off, ps_offs) = match &self.kernels {
+            Some(k) => (k.vs_off, k.ps_off, k.ps_offs),
+            None => return Err(RenderError::NotInitialized),
+        };
+        let mmio = self.mmio_base;
+        let mut surf_buf = StateBuffer::new(mmio, GVA_SURFACE_STATE, 1)?;
+        let mut dyn_buf = StateBuffer::new(mmio, GVA_DYNAMIC_STATE, 1)?;
+        let mut vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 1)?;
+        let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch)?;
+
+        let (corners, indices) = cube_geometry();
+        // Reserve the vertex block (8 verts * vec4 = 32 dwords) at a stable GVA; it is
+        // rewritten every frame. Indices are static, so write them once, after the block.
+        let (vbo_cpu, vbo_gva) = vbo_buf.alloc(32, 64)?;
+        let idx_gva = vbo_buf.write(&indices, 64)?;
+
+        Ok(CubeGpu {
+            surf_buf,
+            dyn_buf,
+            vbo_buf,
+            rs,
+            corners,
+            vbo_cpu,
+            vbo_gva,
+            vbo_dwords: 32,
+            idx_gva,
+            idx_count: indices.len(),
+            vs_off,
+            ps_off,
+            ps_offs,
+        })
+    }
+
+    /// Render ONE frame of the cube at rotation `angle` into `rt_gva`, using the pre-built
+    /// `g`. Rewrites only the vertex block, then re-emits the full known-good Phase-5
+    /// pipeline (index buffer + indexed 3DPRIMITIVE, back-face culled). `present` copies the
+    /// result to scanout; `verbose` logs the decoded stream + pipeline stats + pixel
+    /// readback (first frame only during animation, to avoid flooding serial).
+    unsafe fn draw_cube_frame(
+        &mut self,
+        g: &mut CubeGpu,
+        rt_gva: u32,
+        bb_cpu: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        angle: f32,
+        present: bool,
+        verbose: bool,
+    ) -> Result<(), RenderError> {
+        use super::math::{self, Mat4, Vec3, Vec4};
+
+        let vs_off = g.vs_off;
+        let ps_offs = g.ps_offs;
+        let vbo_gva = g.vbo_gva;
+        let idx_gva = g.idx_gva;
+        let idx_count = g.idx_count;
+        let vbo_dwords = g.vbo_dwords;
+
+        // Clear the RT to black (so the cube reads clearly on an empty background).
+        let bytes = (pitch * height) as usize;
+        core::ptr::write_bytes(bb_cpu as *mut u8, 0x00, bytes);
+        let mut off = 0usize;
+        while off < bytes {
+            self.flush_line(bb_cpu as usize + off);
+            off += 64;
+        }
+
+        // --- CPU transform: MVP * cube corners -> clip space, into the persistent VBO ---
+        let aspect = width as f32 / height as f32;
+        let proj = Mat4::perspective(math::radians(60.0), aspect, 0.1, 100.0);
+        let view = Mat4::look_at(
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let model = Mat4::rotate_y(angle).mul(&Mat4::rotate_x(angle * 0.6));
+        let mvp = proj.mul(&view).mul(&model);
+
+        for (i, c) in g.corners.iter().enumerate() {
+            let clip = mvp.mul_vec4(Vec4::from_point(*c));
+            let b = clip.to_bits();
+            let base = i * 4;
+            g.vbo_cpu.add(base).write_volatile(b[0]);
+            g.vbo_cpu.add(base + 1).write_volatile(b[1]);
+            g.vbo_cpu.add(base + 2).write_volatile(b[2]);
+            g.vbo_cpu.add(base + 3).write_volatile(b[3]);
+        }
+        g.vbo_buf.flush_range(vbo_gva, vbo_dwords * 4);
+        let rs = &g.rs;
+
+        // --- Assemble the pipeline (identical to draw_triangle except geometry/draw) ---
+        let mut cs = CmdStream::new();
+        // The progress() PIPE_CONTROL below is a CS-stall + post-sync write; it also serves
+        // as the mandatory preceding stall for WaPipeControlBeforeVFCacheInvalidationEnable
+        // (Gen9: a VF-cache-invalidate PIPE_CONTROL must follow a CS-stall/post-sync one).
+        self.progress(&mut cs, 0x10);
+        cmd::pipe_control(
+            &mut cs,
+            cmd::pc::CS_STALL
+                // VF_CACHE_INVALIDATE is the load-bearing fix for animation: the VBO lives at
+                // a FIXED GVA and we rewrite its contents every frame. Without invalidating the
+                // vertex-fetch cache the GPU keeps re-fetching frame 0's vertices, so the cube
+                // renders frozen (looked static / "no rotation") despite the CPU-side rewrite.
+                | cmd::pc::VF_CACHE_INVALIDATE
+                | cmd::pc::STATE_CACHE_INVALIDATE
+                | cmd::pc::CONSTANT_CACHE_INVALIDATE
+                | cmd::pc::INSTRUCTION_CACHE_INVALIDATE,
+            0,
+            0,
+        );
+        cs.push(cmd::pipeline_select(cmd::PIPELINE_SELECT_3D));
+        self.progress(&mut cs, 1);
+        self.emit_state_base_address(&mut cs);
+        self.progress(&mut cs, 2);
+        cs.push(h1(so::PUSH_CONSTANT_ALLOC_VS, 2)).push(2);
+        cs.push(h1(so::PUSH_CONSTANT_ALLOC_PS, 2)).push((2 << 16) | 2);
+        let vs_entries = 64u32;
+        let vs_alloc = 0u32;
+        let vs_start = 4u32;
+        let vs_bytes = vs_entries * (vs_alloc + 1) * 64;
+        let empty_start = vs_start + (vs_bytes + 8191) / 8192;
+        cs.push(h(so::URB_VS, 2)).push(vs_entries | (vs_alloc << 16) | (vs_start << 25));
+        cs.push(h(so::URB_HS, 2)).push(empty_start << 25);
+        cs.push(h(so::URB_DS, 2)).push(empty_start << 25);
+        cs.push(h(so::URB_GS, 2)).push(empty_start << 25);
+        self.progress(&mut cs, 3);
+        // Vertex input: 8 verts, pitch 16 B (one vec4), size = whole VBO.
+        self.emit_vertex_buffers(&mut cs, vbo_gva, 16, (vbo_dwords * 4) as u32);
+        self.emit_vertex_elements(&mut cs);
+        cs.push(h(so::VF, 2)).push(0);
+        cs.push(h(so::VF_INSTANCING, 3)).push(0).push(0);
+        cs.push(h(so::VF_TOPOLOGY, 2)).push(4); // TRILIST
+        // Index buffer: DWORD (u32) format = 2 at bits [41:40] (DW1 [9:8]); addr; size B.
+        cs.push(h(so::INDEX_BUFFER, 5))
+            .push(2 << 8)
+            .push(idx_gva)
+            .push(0)
+            .push((idx_count * 4) as u32);
+        // Shader stages: VS enabled, rest disabled (same as triangle).
+        self.emit_vs(&mut cs, vs_off);
+        cs.push(h(so::HS, 9));
+        for _ in 0..8 { cs.push(0); }
+        cs.push(h(so::DS, 11));
+        for _ in 0..10 { cs.push(0); }
+        cs.push(h(so::GS, 10));
+        for _ in 0..9 { cs.push(0); }
+        cs.push(h(so::TE, 4));
+        for _ in 0..3 { cs.push(0); }
+        cs.push(h(so::STREAMOUT, 5));
+        for _ in 0..4 { cs.push(0); }
+        self.progress(&mut cs, 4);
+        cs.push(h(so::CLIP, 4)).push(1 << 10).push((1 << 31) | (1 << 28) | (1 << 26)).push(0);
+        cs.push(h(so::SF, 4)).push((1 << 1) | (1 << 10)).push(0).push(0);
+        // Step 2 — back-face culling. Cull Mode[49:48] -> DW1[17:16]: BACK=3 (was NONE=1).
+        // Front Winding[53] -> DW1[21]: Clockwise=0. Our cube's outward faces are CCW in
+        // MODEL space, but sf_clip_viewport flips Y (m11=-h/2) so they become CW in SCREEN
+        // space, and Gen9 classifies front/back from post-viewport screen-space area. Hence
+        // Front Winding=CW(0) marks the outward faces as front; Cull BACK removes the 6
+        // faces pointing away. Expected: CL_prims 12 -> 6. If the cube shows HOLES instead
+        // (outward faces culled), flip to Front Winding=CCW: .push((3<<16)|(1<<21)).
+        cs.push(h(so::RASTER, 5)).push(3 << 16).push(0).push(0).push(0); // cull BACK, front=CW
+        cs.push(h(so::SBE, 6)).push((1 << 5) | (1 << 11) | (1 << 28) | (1 << 29));
+        for _ in 0..4 { cs.push(0); }
+        cs.push(h(so::WM, 2)).push(1 << 31);
+        cs.push(h(so::VIEWPORT_SF_CLIP, 2)).push(rs.sf_clip_viewport_off);
+        cs.push(h(so::VIEWPORT_CC, 2)).push(rs.cc_viewport_off);
+        cs.push(h1(so::DRAWING_RECTANGLE, 4)).push(0).push(((height - 1) << 16) | (width - 1)).push(0);
+        // PS-adjacent state that does NOT vary per face (emitted once). Only the PS kernel
+        // pointer (3DSTATE_PS) changes between faces, re-emitted inside the loop below.
+        cs.push(h(so::PS_EXTRA, 2)).push(1u32 << 31);
+        cs.push(h(so::PS_BLEND, 2)).push(1u32 << 30);
+        cs.push(h(so::CC_STATE_POINTERS, 2)).push(rs.cc_off | 1);
+        cs.push(h(so::BLEND_STATE_POINTERS, 2)).push(rs.blend_off | 1);
+        cs.push(h(so::WM_DEPTH_STENCIL, 4)).push(0).push(0).push(0); // depth off (convex + cull)
+        cs.push(h(so::MULTISAMPLE, 2)).push(0);
+        cs.push(h(so::SAMPLE_MASK, 2)).push(1);
+        cs.push(h(so::DEPTH_BUFFER, 8)).push(7u32 << 29);
+        for _ in 0..6 { cs.push(0); } // SURFTYPE_NULL
+        cs.push(h(so::BINDING_TABLE_POINTERS_PS, 2)).push(rs.binding_table_off);
+        cs.push(h(so::SAMPLER_STATE_POINTERS_PS, 2)).push(0);
+        self.progress(&mut cs, 5);
+        // Step 4 — per-face color. cube_geometry() lays the 36 indices out as 6 contiguous
+        // 6-index faces. Draw each face separately with its own constant-color PS kernel:
+        // re-emit 3DSTATE_PS (kernel ptr) then an indexed 3DPRIMITIVE with Start Index
+        // Location = face*6, count 6. 3DSTATE_PS is pipelined state, legal to change between
+        // draws in one stream. Back-face culling drops the 3 hidden faces automatically, so
+        // only the visible faces paint — no depth buffer needed for a convex cube.
+        let faces = idx_count / 6;
+        for face in 0..faces {
+            self.emit_ps(&mut cs, ps_offs[face]);
+            cs.push(super::cmd::gfxpipe_header(PIPELINE_3D, 3, 0, 7 - 2));
+            cs.push(4 | (1 << 8)); // TRILIST topology + Vertex Access Type = RANDOM
+            cs.push(6); // Vertex Count Per Instance (one face = 2 tris = 6 indices)
+            cs.push((face * 6) as u32); // Start Index Location
+            cs.push(1); // Instance Count
+            cs.push(0); // Start Instance
+            cs.push(0); // Base Vertex
+        }
+        self.progress(&mut cs, 6);
+        cmd::pipe_control(
+            &mut cs,
+            cmd::pc::CS_STALL | cmd::pc::RENDER_TARGET_CACHE_FLUSH | cmd::pc::DC_FLUSH_ENABLE,
+            0,
+            0,
+        );
+        self.progress(&mut cs, 7);
+        const DONE: u32 = 0x00D0_5EED;
+        cmd::pipe_control(
+            &mut cs,
+            cmd::pc::CS_STALL | cmd::pc::POST_SYNC_WRITE_IMM | cmd::pc::DEST_ADDRESS_GTT,
+            GVA_RCS_FENCE,
+            DONE as u64,
+        );
+        for _ in 0..16 { cs.push(cmd::MI_NOOP); }
+
+        if verbose {
+            crate::serial_println!("[CUBE] submitting {} dwords (angle={}.{:02})",
+                cs.len(), angle as i32, ((angle - angle as i32 as f32) * 100.0) as i32);
+            super::decode::decode_and_print(cs.as_slice());
+        }
+        self.fence_virt.write_volatile(0);
+        self.flush_line(self.fence_virt as usize);
+        self.rcs_submit(cs.as_slice())?;
+
+        // Wait for completion / detect hang (reuses the triangle's fault-dump logic).
+        let mut t = 0u32;
+        let mut last = 0u32;
+        let mut hung = false;
+        loop {
+            self.flush_line(self.fence_virt as usize);
+            let v = self.fence_virt.read_volatile();
+            if v != last { last = v; }
+            if v == DONE { break; }
+            core::hint::spin_loop();
+            t += 1;
+            if t > 30_000_000 {
+                let fault = self.read_reg(super::RENDER_FAULT_REG);
+                crate::serial_println!(
+                    "[CUBE] HUNG. last_progress={:#x} FAULT={:#010x} HEAD={:#x}",
+                    last, fault, self.read_reg(super::RENDER_RING_HEAD)
+                );
+                if fault & 1 != 0 {
+                    let d0 = self.read_reg(0x4b10);
+                    let d1 = self.read_reg(0x4b14);
+                    let va = ((d0 as u64) << 12) | (((d1 & 0xF) as u64) << 44);
+                    crate::serial_println!("[CUBE]  FAULT_VA={:#x} (D0={:#010x} D1={:#010x})", va, d0, d1);
+                }
+                hung = true;
+                break;
+            }
+        }
+
+        if verbose {
+            let ia = self.read_reg(0x2310);
+            let vs = self.read_reg(0x2320);
+            let cl = self.read_reg(0x2338);
+            let clp = self.read_reg(0x2340);
+            let ps = self.read_reg(0x2348);
+            crate::serial_println!(
+                "[CUBE] STATS: IA_verts={} VS_inv={} CL_inv={} CL_prims={} PS_inv={}",
+                ia, vs, cl, clp, ps
+            );
+            // Step 2 gate: back-face cull is applied in SF/setup, AFTER the clipper, so
+            // CL_PRIMITIVES(0x2340) stays 12 (clipper sees all tris). The counter that
+            // reflects culling is PS_inv: culled tris never reach the PS. Baseline (cull
+            // off) was 329108; with CULLMODE_BACK the 6 back faces drop it to ~half.
+            // ~half => cull OK; ~full(329k) => cull not applied; 0 => winding inverted.
+            crate::serial_println!(
+                "[CUBE] cull check: PS_inv={} (expect ~half of 329108; full=cull off, 0=winding inverted)",
+                ps
+            );
+            // Pixel readback: count non-black samples (the cube should cover a chunk).
+            let px = (pitch / 4) as usize;
+            let mut o = 0usize;
+            while o < bytes { self.flush_line(bb_cpu as usize + o); o += 64; }
+            let mut nonblack = 0u32;
+            let mut yy = 0u32;
+            while yy < height {
+                let mut xx = 0u32;
+                while xx < width {
+                    if (bb_cpu as *const u32).add(yy as usize * px + xx as usize).read_volatile() != 0 {
+                        nonblack += 1;
+                    }
+                    xx += 13;
+                }
+                yy += 13;
+            }
+            crate::serial_println!("[CUBE] readback: {} non-black grid samples ({} => cube visible)",
+                nonblack, if nonblack > 0 { "OK" } else { "NONE" });
+        }
+
+        if present {
+            self.present_to_scanout(bb_cpu, bytes);
+        }
+        if hung { return Err(RenderError::EngineHang); }
+        Ok(())
+    }
+
+    /// One-shot cube draw (Steps 1-2 entry point): allocate resources and render a single
+    /// static frame at `angle`. Kept as a thin wrapper over the reusable frame path.
+    pub unsafe fn draw_mesh(
+        &mut self,
+        rt_gva: u32,
+        bb_cpu: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        angle: f32,
+        present: bool,
+        verbose: bool,
+    ) -> Result<(), RenderError> {
+        let mut g = self.setup_cube_gpu(rt_gva, width, height, pitch)?;
+        self.draw_cube_frame(&mut g, rt_gva, bb_cpu, width, height, pitch, angle, present, verbose)
+    }
+
+    /// Phase 6, Step 3: spin the cube. Allocate GPU resources ONCE, then render `frames`
+    /// frames at increasing rotation and present each to the scanout. Only the first frame
+    /// logs stats / decodes the stream, so serial isn't flooded. Reusing the buffers every
+    /// frame is what makes an animation loop viable (no per-frame GGTT-mapping leak).
+    pub unsafe fn spin_cube(
+        &mut self,
+        rt_gva: u32,
+        bb_cpu: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        frames: u32,
+    ) -> Result<(), RenderError> {
+        let mut g = self.setup_cube_gpu(rt_gva, width, height, pitch)?;
+        for f in 0..frames {
+            let angle = f as f32 * 0.03; // ~0.03 rad/frame -> a smooth, steady tumble
+            let verbose = f == 0; // stats/decode on the first frame only
+            self.draw_cube_frame(&mut g, rt_gva, bb_cpu, width, height, pitch, angle, true, verbose)?;
+            // Heartbeat: prove the loop advances the angle (and at what cadence) in the boot
+            // log, independent of what the panel shows. With the VF-cache invalidate in place
+            // each logged angle should correspond to a visibly different cube pose.
+            if f % 60 == 0 {
+                crate::serial_println!("[CUBE] frame {}/{} angle={}.{:02} rad",
+                    f, frames, angle as i32, ((angle - angle as i32 as f32) * 100.0) as i32);
+            }
+            crate::time::sleep_ms(12); // pace the spin so it reads as motion, not a blur
+        }
+        crate::serial_println!("[CUBE] spin complete: {} frames rendered + presented", frames);
+        Ok(())
+    }
+
+    /// Copy the rendered backbuffer straight onto the live scanout framebuffer (same
+    /// BGRA/stride layout). Shared by the Phase-5 proof-of-life present and the cube.
+    unsafe fn present_to_scanout(&self, bb_cpu: u64, bytes: usize) {
+        let sp = core::ptr::addr_of_mut!(crate::gui::SCREEN_PAINTER);
+        if let Some(painter) = (*sp).as_mut() {
+            let n = bytes.min(painter.buffer.len());
+            crate::gui::turbo_copy(painter.buffer.as_mut_ptr(), bb_cpu as *const u8, n);
+        }
+    }
+
     /// Emit a PIPE_CONTROL that writes `val` to the fence page (CS-stall, no cache flush).
     /// Used as a progress checkpoint; the last value written survives a hang.
     unsafe fn progress(&self, cs: &mut CmdStream, val: u32) {
@@ -503,4 +873,50 @@ impl RenderEngine {
         cs.push(0).push(0); // Kernel Start Pointer 1
         cs.push(0).push(0); // Kernel Start Pointer 2
     }
+}
+
+/// Persistent GPU resources for an animated mesh: the state buffers + render state are
+/// allocated ONCE and reused every frame (avoids leaking a GGTT mapping + contiguous frame
+/// per frame). Only the vertex block is rewritten per frame; the index buffer and every
+/// state object (surface/binding/blend/viewport) are static across the animation.
+struct CubeGpu {
+    surf_buf: StateBuffer,
+    dyn_buf: StateBuffer,
+    vbo_buf: StateBuffer,
+    rs: state::RenderState,
+    corners: [super::math::Vec3; 8],
+    vbo_cpu: *mut u32, // CPU ptr to the reserved vertex block (points into vbo_buf)
+    vbo_gva: u32,      // GVA of the vertex block (stable across frames)
+    vbo_dwords: usize, // size of the vertex block in dwords (32 = 8 verts * vec4)
+    idx_gva: u32,
+    idx_count: usize,
+    vs_off: u32,
+    ps_off: u32,
+    ps_offs: [u32; 6], // per-face constant-color PS kernels
+}
+
+/// Unit cube centered at the origin (side 1.0): 8 corners + 36 indices (12 triangles).
+/// Winding is CCW-front-facing for later back-face culling (Step 2); with cull NONE it
+/// is irrelevant. Index order groups the 6 faces (front/back/left/right/top/bottom).
+fn cube_geometry() -> ([super::math::Vec3; 8], [u32; 36]) {
+    use super::math::Vec3;
+    let v = [
+        Vec3::new(-0.5, -0.5, -0.5), // 0
+        Vec3::new(0.5, -0.5, -0.5),  // 1
+        Vec3::new(0.5, 0.5, -0.5),   // 2
+        Vec3::new(-0.5, 0.5, -0.5),  // 3
+        Vec3::new(-0.5, -0.5, 0.5),  // 4
+        Vec3::new(0.5, -0.5, 0.5),   // 5
+        Vec3::new(0.5, 0.5, 0.5),    // 6
+        Vec3::new(-0.5, 0.5, 0.5),   // 7
+    ];
+    let idx = [
+        4, 5, 6, 4, 6, 7, // front  (+z)
+        1, 0, 3, 1, 3, 2, // back   (-z)
+        0, 4, 7, 0, 7, 3, // left   (-x)
+        5, 1, 2, 5, 2, 6, // right  (+x)
+        3, 7, 6, 3, 6, 2, // top    (+y)
+        0, 1, 5, 0, 5, 4, // bottom (-y)
+    ];
+    (v, idx)
 }

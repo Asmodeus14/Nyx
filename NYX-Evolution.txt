@@ -15,12 +15,7 @@ engine); every 3D milestone is verified over serial + on-panel photo.
 --------------------------------------------------------------------------------
 STATUS SUMMARY
 --------------------------------------------------------------------------------
-[DONE] Phase 0  Scaffolding, device IDs, spec sourcing
-[DONE] Phase 1  RCS ring bring-up (legacy mode) + engine reset/recovery
-[DONE] Phase 2  Batch buffers + PIPE_CONTROL post-sync fences
-[DONE] Phase 3  EU shader kernels (pass-through VS + constant-color PS)
-[DONE] Phase 4  STATE_BASE_ADDRESS + surface/state objects
-[DONE] Phase 5  FIRST TRIANGLE — the go/no-go gate  <<< CLEARED
+
 
 [TODO] Phase 6  Primitives, CPU/GPU transforms, depth  -> spinning cube
 [TODO] Phase 7  Textures & samplers                    -> textured cube

@@ -28,6 +28,7 @@ pub mod state;
 pub mod urb;
 pub mod pipeline;
 pub mod decode;
+pub mod math;
 
 // ---------------------------------------------------------------------------
 // RCS MMIO register map (offsets from BAR0 / mmio_base). PRM Vol 6 RINGBUF.
@@ -517,6 +518,10 @@ pub fn init_render_engine(mmio_base: u64) -> bool {
             Err(e) => crate::serial_println!("[EU] kernel build failed: {:?}", e),
         }
 
+        // Phase 6: CPU-side math self-check (pure software, no GPU). Validates the
+        // column-major mat4 storage + trig approximations before they feed the pipeline.
+        math::self_test();
+
         // Phase 5: draw a triangle into the backbuffer (GVA 0x1400_0000) and verify via
         // CPU pixel readback. Only if the fence path (Phase 2b) and kernels are ready.
         if pc_ok && eng.kernels.is_some() {
@@ -536,31 +541,16 @@ pub fn init_render_engine(mmio_base: u64) -> bool {
                 (1920, 1080, 1920, 4)
             };
             if bb_cpu != 0 {
-                match eng.draw_triangle(0x1400_0000, bb_cpu, w, h, stride * bpp) {
+                // Phase 6, Step 3: spin the back-face-culled cube. spin_cube allocates GPU
+                // resources once and renders/presents N frames at increasing rotation
+                // (buffers reused per frame, no leak). ~300 frames * 12ms ≈ 3.6 s of motion.
+                let pitch = stride * bpp;
+                match eng.spin_cube(0x1400_0000, bb_cpu, w, h, pitch, 300) {
                     Ok(()) => {
-                        // PROOF-OF-LIFE PRESENT: the GPU rendered the triangle into the
-                        // backbuffer (GVA 0x1400_0000) but nothing presents it, and the
-                        // window server is about to clear+repaint that same buffer. Copy
-                        // the rendered backbuffer straight onto the live scanout
-                        // framebuffer (same BGRA/stride layout) and hold a few seconds so
-                        // the red triangle is actually visible before boot continues.
-                        let bb_len = (stride * bpp * h) as usize;
-                        let sp = core::ptr::addr_of_mut!(crate::gui::SCREEN_PAINTER);
-                        if let Some(painter) = (*sp).as_mut() {
-                            let n = bb_len.min(painter.buffer.len());
-                            crate::gui::turbo_copy(
-                                painter.buffer.as_mut_ptr(),
-                                bb_cpu as *const u8,
-                                n,
-                            );
-                            crate::serial_println!(
-                                "[TRI] presented GPU backbuffer to scanout ({} bytes); holding 5s so it's visible.",
-                                n
-                            );
-                        }
-                        crate::time::sleep_ms(5000);
+                        crate::serial_println!("[CUBE] spin done; holding final frame 2s.");
+                        crate::time::sleep_ms(2000);
                     }
-                    Err(e) => crate::serial_println!("[TRI] draw_triangle failed: {:?}", e),
+                    Err(e) => crate::serial_println!("[CUBE] spin_cube failed: {:?}", e),
                 }
             }
         }
