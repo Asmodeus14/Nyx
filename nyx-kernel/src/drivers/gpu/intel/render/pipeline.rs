@@ -640,7 +640,7 @@ impl RenderEngine {
         // (1<<28|1<<29). Barycentric stays OFF (flat, a0 only) so PS setup lands at g2/g3.
         cs.push(h(so::SBE, 6)).push((1 << 5) | (1 << 11) | (1 << 21) | (1 << 22) | (1 << 28) | (1 << 29));
         cs.push(0);            // DW2 = Point Sprite Texture Coordinate Enable (none)
-        cs.push(1);            // DW3 = Constant Interpolation Enable (attribute 0 -> flat)
+        cs.push(0);            // DW3 = Constant Interpolation Enable OFF (Boot B: smooth/pln)
         // DW4 = "Attribute Active Component Format" group (genxml: 32 attrs x 2 bits, starting
         // at bit 128). Attribute 0 = DW4[1:0]. LOAD-BEARING: this MUST be XYZW(3), not the
         // DISABLED(0) default. Number-of-SF-Output-Attributes=1 told the SF to emit one
@@ -675,7 +675,9 @@ impl RenderEngine {
         // inserts the R3-R4 perspective-pixel phase into the PS payload, which SHIFTS the
         // attribute setup a0/a1/a2 to a higher GRF -> when the real attribute read is restored,
         // its source register must move down from g2/g3 accordingly (that's Boot B's job).
-        cs.push(h(so::WM, 2)).push(1 << 31); // BISECTION #7: barycentric OFF (no attrs)
+        // Boot B: enable BIM_PERSPECTIVE_PIXEL barycentric (genxml Barycentric Interpolation Mode
+        // [48:43]=1 -> DW1 bit 11) so the SF delivers per-pixel b1/b2 at PS payload g2/g3 for pln.
+        cs.push(h(so::WM, 2)).push((1 << 31) | (1 << 11));
         cs.push(h(so::VIEWPORT_SF_CLIP, 2)).push(rs.sf_clip_viewport_off);
         cs.push(h(so::VIEWPORT_CC, 2)).push(rs.cc_viewport_off);
         cs.push(h1(so::DRAWING_RECTANGLE, 4)).push(0).push(((height - 1) << 16) | (width - 1)).push(0);
@@ -952,8 +954,10 @@ impl RenderEngine {
         cs.push(0).push(0); // scratch base
         // DW6: 8 Pixel Dispatch Enable(bit0) | Max threads per PSD 63 (<<23).
         cs.push(1 | (63 << 23));
-        // DW7: Dispatch GRF Start For Constant/Setup Data 0 = 2 (<<16).
-        cs.push(2 << 16);
+        // DW7: Dispatch GRF Start For Constant/Setup Data 0. Boot B = 4: with BIM_PERSPECTIVE_PIXEL
+        // enabled the payload is g0/g1 header + g2/g3 barycentric, so attribute setup starts at g4.
+        // (Boot A flat path used 2 = setup right after header with no barycentric.)
+        cs.push(4 << 16);
         cs.push(0).push(0); // Kernel Start Pointer 1
         cs.push(0).push(0); // Kernel Start Pointer 2
     }
@@ -1032,14 +1036,24 @@ fn cube_geometry_colored() -> ([super::math::Vec3; 24], [[f32; 4]; 24], [u32; 36
         ([3, 7, 6, 2], [0.3, 1.0, 1.0, 1.0]), // top   (+y) cyan
         ([0, 1, 5, 4], [1.0, 0.4, 1.0, 1.0]), // bottom(-y) magenta
     ];
+    // Boot B (perspective interpolation): give the 4 corners of every face DISTINCT colors so
+    // pln produces a visible smooth gradient across each face (flat per-face color would look
+    // identical to Boot A and prove nothing). Corner ramp: red, green, blue, white. The base
+    // per-face color is ignored for Boot B; kept in `faces` for the Boot-A/flat reference.
+    let corner_ramp: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 1.0], // corner 0 red
+        [0.0, 1.0, 0.0, 1.0], // corner 1 green
+        [0.0, 0.0, 1.0, 1.0], // corner 2 blue
+        [1.0, 1.0, 1.0, 1.0], // corner 3 white
+    ];
     let mut pos = [Vec3::new(0.0, 0.0, 0.0); 24];
     let mut col = [[0.0f32; 4]; 24];
     let mut idx = [0u32; 36];
-    for (f, (corner_ids, color)) in faces.iter().enumerate() {
+    for (f, (corner_ids, _color)) in faces.iter().enumerate() {
         let base = (f * 4) as u32;
         for (j, &cid) in corner_ids.iter().enumerate() {
             pos[f * 4 + j] = c[cid];
-            col[f * 4 + j] = *color;
+            col[f * 4 + j] = corner_ramp[j];
         }
         // Quad (base+0,1,2,3) -> two triangles preserving the original winding.
         let t = [base, base + 1, base + 2, base, base + 2, base + 3];

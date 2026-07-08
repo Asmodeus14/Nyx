@@ -180,6 +180,7 @@ mod enc {
     // -> 3DPRIMITIVE deadlock (VS_inv>0, CL_inv=0). See gen9-eu-opcode-bug memory.
     pub const OP_MOV: u32 = 1;
     pub const OP_SEND: u32 = 49; // legacy single-descriptor send (matches our encoding)
+    pub const OP_PLN: u32 = 90;  // plane: dst = p*u + q*v + r (2-source, perspective interp)
     pub const OP_NOP: u32 = 126;
 
     // SFIDs
@@ -215,6 +216,33 @@ fn set_src0_grf(i: &mut [u32; 4], ty: u32, regnum: u32, subreg: u32, vs: u32, w:
     set(i, 81, 80, hs);
     set(i, 84, 82, w);
     set(i, 88, 85, vs);
+}
+
+/// Program src1 as a GRF region <vstride;width,hstride>. Field bits mirror src0 shifted +32
+/// into DW2-top/DW3 (PRM Vol2a: Src1.RegFile [90:89], Src1.SrcType [94:91]; region [120:96]).
+fn set_src1_grf(i: &mut [u32; 4], ty: u32, regnum: u32, subreg: u32, vs: u32, w: u32, hs: u32) {
+    set(i, 90, 89, RF_GRF);
+    set(i, 94, 91, ty);
+    set(i, 100, 96, subreg);
+    set(i, 108, 101, regnum);
+    set(i, 113, 112, hs);
+    set(i, 116, 114, w);
+    set(i, 120, 117, vs);
+}
+
+/// `pln(exec) gDst<1>:F  gSetup.<sub><0;1,0>:F  gBary<8;8,1>:F` — perspective-correct plane
+/// interpolation of ONE attribute channel. Computes dst = p*u + q*v + r where src0 (setup) is a
+/// replicated scalar whose 4-tuple holds p (a1) at sub .0, q (a2) at .1, r (a0) at .3, and src1
+/// (barycentric) supplies u = gBary (b1) and v = gBary+1 (b2, implied by HW). `setup_subreg` is
+/// a BYTE offset and MUST be 0 or 16 (PRM restriction: src0 sub-register .0 or .4).
+fn pln(exec: u32, dst: u32, setup_reg: u32, setup_subreg: u32, bary_reg: u32) -> [u32; 4] {
+    let mut i = base(OP_PLN, exec);
+    set_dst(&mut i, RF_GRF, TY_F, dst, 0, HS_1);
+    // src0 = setup: replicated scalar region <0;1,0> (VertStride 0, Width 1(enc 0), HorzStride 0).
+    set_src0_grf(&mut i, TY_F, setup_reg, setup_subreg, 0, 0, 0);
+    // src1 = barycentric u vector <8;8,1>; HW auto-reads bary_reg+1 as v.
+    set_src1_grf(&mut i, TY_F, bary_reg, 0, VS_8, W_8, HS_1);
+    i
 }
 
 /// Program src0 as a 32-bit immediate (value lands in DW3 / bits [127:96]).
@@ -420,20 +448,30 @@ pub fn build_ps(color: [f32; 4]) -> Vec<u8> {
 ///   R = g2.3, G = g2.7, B = g3.3, A = g3.7   (Vol2a "pln" + Mesa interp_reg agree).
 /// Broadcast each scalar to all 8 lanes into the RT-write color payload g4..g7 (kept clear
 /// of the g2/g3 setup registers), then a headerless RT write with EOT.
-pub fn build_ps_attr() -> Vec<u8> {
+/// Boot A flat-attribute PS (kept for reference). Reads the constant term a0 directly.
+pub fn build_ps_attr_flat() -> Vec<u8> {
     let mut k = Vec::new();
-    // BOOT #13: hang fixed + 2-slot VUE proven (orange cube). Restore the REAL flat-attribute
-    // read. With barycentric OFF and Dispatch GRF Start for Setup = 2, the PS payload is g0/g1
-    // header then attribute-0 setup at g2/g3 (one vec4 = 2 GRFs, 2 channels/GRF). For a flat
-    // (constant-interp) attribute a1=a2=0, so the value is a0 = Mesa suboffset(interp,3):
-    //   R = g2.3, G = g2.7, B = g3.3, A = g3.7 (byte 12/28 within g2/g3).
-    // If faces show shifted/wrong colors, the setup GRF is off-by-one (header may be 3 GRFs) ->
-    // try g3/g4 and Dispatch GRF Start 3. Non-fatal: geometry is unaffected either way.
     emit(&mut k, mov_scalar_f(EXEC_SIMD8, 4, 2, 12)); // R <- g2.3
     emit(&mut k, mov_scalar_f(EXEC_SIMD8, 5, 2, 28)); // G <- g2.7
     emit(&mut k, mov_scalar_f(EXEC_SIMD8, 6, 3, 12)); // B <- g3.3
     emit(&mut k, mov_scalar_f(EXEC_SIMD8, 7, 3, 28)); // A <- g3.7
     emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 4, rt_write_desc(4, 0)));
+    k
+}
+
+/// Boot B: PERSPECTIVE-CORRECT interpolation via `pln`. With 3DSTATE_WM Barycentric
+/// Interpolation Mode = BIM_PERSPECTIVE_PIXEL the PS payload is: g0/g1 = header, g2 = bary b1,
+/// g3 = bary b2, then attribute-0 setup at g4/g5 (Dispatch GRF Start for Setup = 4). Each color
+/// channel is pln'd: dst = a1*b1 + a2*b2 + a0. Per-channel setup 4-tuple lives at:
+///   R = g4 sub .0, G = g4 sub .4 (byte 16), B = g5 sub .0, A = g5 sub .4.
+/// A is set to a constant 1.0 (cube colors are opaque; avoids a 4th pln). RT payload g10-g13.
+pub fn build_ps_attr() -> Vec<u8> {
+    let mut k = Vec::new();
+    emit(&mut k, pln(EXEC_SIMD8, 10, 4, 0, 2));   // R = pln(setup ch0 @g4.0, bary @g2)
+    emit(&mut k, pln(EXEC_SIMD8, 11, 4, 16, 2));  // G = pln(setup ch1 @g4.4, bary @g2)
+    emit(&mut k, pln(EXEC_SIMD8, 12, 5, 0, 2));   // B = pln(setup ch2 @g5.0, bary @g2)
+    emit(&mut k, mov_imm_f(EXEC_SIMD8, 13, 1.0)); // A = 1.0
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 10, rt_write_desc(4, 0)));
     k
 }
 
