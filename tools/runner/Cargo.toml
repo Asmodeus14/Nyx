@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]  
 # Enable both so the runner has access to UefiBoot and BiosBoot classes
-bootloader = { version = "0.11", features = ["uefi", "bios"] }
+bootloader = { version = "0.11", features = ["uefi"] }
 ovmf-prebuilt = "0.2"
