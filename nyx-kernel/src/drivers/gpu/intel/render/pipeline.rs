@@ -30,6 +30,7 @@ mod so {
     pub const PS_EXTRA: u32 = 79;
     pub const PS_BLEND: u32 = 77;
     pub const SBE: u32 = 31;
+    pub const SBE_SWIZ: u32 = 81; // 3DSTATE_SBE_SWIZ (per-attribute source/swizzle table)
     pub const SF: u32 = 19;
     pub const RASTER: u32 = 80;
     pub const WM: u32 = 20;
@@ -443,8 +444,8 @@ impl RenderEngine {
         height: u32,
         pitch: u32,
     ) -> Result<CubeGpu, RenderError> {
-        let (vs_off, ps_off, ps_offs) = match &self.kernels {
-            Some(k) => (k.vs_off, k.ps_off, k.ps_offs),
+        let (vs_off, ps_off) = match &self.kernels {
+            Some(k) => (k.vs_off, k.ps_off),
             None => return Err(RenderError::NotInitialized),
         };
         let mmio = self.mmio_base;
@@ -453,10 +454,11 @@ impl RenderEngine {
         let mut vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 1)?;
         let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch)?;
 
-        let (corners, indices) = cube_geometry();
-        // Reserve the vertex block (8 verts * vec4 = 32 dwords) at a stable GVA; it is
-        // rewritten every frame. Indices are static, so write them once, after the block.
-        let (vbo_cpu, vbo_gva) = vbo_buf.alloc(32, 64)?;
+        let (verts, colors, indices) = cube_geometry_colored();
+        // Reserve the vertex block (24 verts * (pos vec4 + color vec4) = 192 dwords) at a
+        // stable GVA; positions are rewritten every frame, colors are static. Indices are
+        // static, so write them once after the block.
+        let (vbo_cpu, vbo_gva) = vbo_buf.alloc(192, 64)?;
         let idx_gva = vbo_buf.write(&indices, 64)?;
 
         Ok(CubeGpu {
@@ -464,15 +466,15 @@ impl RenderEngine {
             dyn_buf,
             vbo_buf,
             rs,
-            corners,
+            verts,
+            colors,
             vbo_cpu,
             vbo_gva,
-            vbo_dwords: 32,
+            vbo_dwords: 192,
             idx_gva,
             idx_count: indices.len(),
             vs_off,
             ps_off,
-            ps_offs,
         })
     }
 
@@ -496,15 +498,25 @@ impl RenderEngine {
         use super::math::{self, Mat4, Vec3, Vec4};
 
         let vs_off = g.vs_off;
-        let ps_offs = g.ps_offs;
+        let ps_off = g.ps_off;
         let vbo_gva = g.vbo_gva;
         let idx_gva = g.idx_gva;
         let idx_count = g.idx_count;
         let vbo_dwords = g.vbo_dwords;
 
-        // Clear the RT to black (so the cube reads clearly on an empty background).
+        // Clear the RT to DARK GRAY (0x30 in every byte -> 0x30303030 BGRA, ~RGB(48,48,48))
+        // instead of black. DIAGNOSTIC (Boot A bring-up): the panel was "totally black, no
+        // shape ever," which is ambiguous — a cube drawn with RGB=0 is invisible on a black
+        // background, and so is a cube that never drew at all. A non-black clear disambiguates:
+        //   * dark/black cube silhouette on gray -> geometry+present OK, bug is only the PS
+        //     color read (attribute value from setup GRFs g2/g3);
+        //   * colored cube on gray -> the whole attribute path works (we were fooled by
+        //     black-on-black);
+        //   * uniform gray, no shape -> geometry/present is broken (the 497-sample readback
+        //     was stale/misleading), a different fix entirely.
+        const CLEAR_BYTE: u8 = 0x30;
         let bytes = (pitch * height) as usize;
-        core::ptr::write_bytes(bb_cpu as *mut u8, 0x00, bytes);
+        core::ptr::write_bytes(bb_cpu as *mut u8, CLEAR_BYTE, bytes);
         let mut off = 0usize;
         while off < bytes {
             self.flush_line(bb_cpu as usize + off);
@@ -522,14 +534,22 @@ impl RenderEngine {
         let model = Mat4::rotate_y(angle).mul(&Mat4::rotate_x(angle * 0.6));
         let mvp = proj.mul(&view).mul(&model);
 
-        for (i, c) in g.corners.iter().enumerate() {
-            let clip = mvp.mul_vec4(Vec4::from_point(*c));
-            let b = clip.to_bits();
-            let base = i * 4;
-            g.vbo_cpu.add(base).write_volatile(b[0]);
-            g.vbo_cpu.add(base + 1).write_volatile(b[1]);
-            g.vbo_cpu.add(base + 2).write_volatile(b[2]);
-            g.vbo_cpu.add(base + 3).write_volatile(b[3]);
+        // Interleaved layout per vertex: [pos.x pos.y pos.z pos.w  col.r col.g col.b col.a]
+        // = 8 dwords (pitch 32B). Positions are MVP-transformed to clip space each frame;
+        // colors are static (element 1, read by the VS as the color varying).
+        for i in 0..g.verts.len() {
+            let clip = mvp.mul_vec4(Vec4::from_point(g.verts[i]));
+            let p = clip.to_bits();
+            let c = g.colors[i];
+            let base = i * 8;
+            g.vbo_cpu.add(base).write_volatile(p[0]);
+            g.vbo_cpu.add(base + 1).write_volatile(p[1]);
+            g.vbo_cpu.add(base + 2).write_volatile(p[2]);
+            g.vbo_cpu.add(base + 3).write_volatile(p[3]);
+            g.vbo_cpu.add(base + 4).write_volatile(c[0].to_bits());
+            g.vbo_cpu.add(base + 5).write_volatile(c[1].to_bits());
+            g.vbo_cpu.add(base + 6).write_volatile(c[2].to_bits());
+            g.vbo_cpu.add(base + 7).write_volatile(c[3].to_bits());
         }
         g.vbo_buf.flush_range(vbo_gva, vbo_dwords * 4);
         let rs = &g.rs;
@@ -561,6 +581,8 @@ impl RenderEngine {
         cs.push(h1(so::PUSH_CONSTANT_ALLOC_VS, 2)).push(2);
         cs.push(h1(so::PUSH_CONSTANT_ALLOC_PS, 2)).push((2 << 16) | 2);
         let vs_entries = 64u32;
+        // BISECTION #9: URB_VS alloc reverted 1 -> 0 (Phase-6 512-bit entry) to pair with the
+        // 1-slot VUE (VS output length 1, position-only build_vs). Tests the 2-slot-VUE hang.
         let vs_alloc = 0u32;
         let vs_start = 4u32;
         let vs_bytes = vs_entries * (vs_alloc + 1) * 64;
@@ -570,8 +592,8 @@ impl RenderEngine {
         cs.push(h(so::URB_DS, 2)).push(empty_start << 25);
         cs.push(h(so::URB_GS, 2)).push(empty_start << 25);
         self.progress(&mut cs, 3);
-        // Vertex input: 8 verts, pitch 16 B (one vec4), size = whole VBO.
-        self.emit_vertex_buffers(&mut cs, vbo_gva, 16, (vbo_dwords * 4) as u32);
+        // Vertex input: 24 verts, pitch 32 B (pos vec4 + color vec4), size = whole VBO.
+        self.emit_vertex_buffers(&mut cs, vbo_gva, 32, (vbo_dwords * 4) as u32);
         self.emit_vertex_elements(&mut cs);
         cs.push(h(so::VF, 2)).push(0);
         cs.push(h(so::VF_INSTANCING, 3)).push(0).push(0);
@@ -605,15 +627,62 @@ impl RenderEngine {
         // faces pointing away. Expected: CL_prims 12 -> 6. If the cube shows HOLES instead
         // (outward faces culled), flip to Front Winding=CCW: .push((3<<16)|(1<<21)).
         cs.push(h(so::RASTER, 5)).push(3 << 16).push(0).push(0).push(0); // cull BACK, front=CW
-        cs.push(h(so::SBE, 6)).push((1 << 5) | (1 << 11) | (1 << 28) | (1 << 29));
-        for _ in 0..4 { cs.push(0); }
-        cs.push(h(so::WM, 2)).push(1 << 31);
+        // SBE (Boot A): route ONE SF output attribute (the color varying). DW1 bits:
+        //   [10:5]=Read Offset 1 (skip the 256-bit VUE header+position -> attr at VUE DW8),
+        //   [15:11]=Read Length 1, [27:22]=Number of SF Output Attributes = 1 (1<<22),
+        //   [28]/[29]=Force Read Length/Offset. DW3 (bits[127:96]) = Constant Interpolation
+        //   Enable, attr-0 bit set (flat: a0=provoking-vertex value, a1=a2=0 -> no PLN).
+        //   [53]=Attribute Swizzle Enable (DW1 bit 21) -> must be ON so the paired
+        //   3DSTATE_SBE_SWIZ table below actually routes SF output attr 0 <- URB source attr 0.
+        // BOOT #13: hang is fully fixed (split 2-slot URB write). Re-enable the FLAT attribute
+        // path. DW1: Read Offset 1 (1<<5) + Read Length 1 (1<<11) + Attribute Swizzle Enable
+        // (1<<21) + Number of SF Output Attributes = 1 (1<<22) + Force Read Length/Offset
+        // (1<<28|1<<29). Barycentric stays OFF (flat, a0 only) so PS setup lands at g2/g3.
+        cs.push(h(so::SBE, 6)).push((1 << 5) | (1 << 11) | (1 << 21) | (1 << 22) | (1 << 28) | (1 << 29));
+        cs.push(0);            // DW2 = Point Sprite Texture Coordinate Enable (none)
+        cs.push(1);            // DW3 = Constant Interpolation Enable (attribute 0 -> flat)
+        // DW4 = "Attribute Active Component Format" group (genxml: 32 attrs x 2 bits, starting
+        // at bit 128). Attribute 0 = DW4[1:0]. LOAD-BEARING: this MUST be XYZW(3), not the
+        // DISABLED(0) default. Number-of-SF-Output-Attributes=1 told the SF to emit one
+        // attribute, but leaving its Active Component Format = DISABLED contradicts that: the
+        // SF then materializes ZERO components, so (a) the PS setup GRFs g2/g3 are never
+        // populated -> build_ps_attr reads per-subspan garbage (the "strided noise"), and
+        // (b) the inconsistent SF state wedges the pipeline on the following draw (the
+        // no-fault 3DPRIMITIVE hang at progress=0x5). Mesa/iris genX(upload_sbe) always sets
+        // ACTIVE_COMPONENT_XYZW for every enabled attribute. Phases 5-6 used num_attr=0 so
+        // this group was don't-care -> the gap only surfaced now (Boot A's first nonzero attr).
+        cs.push(3).push(0);   // DW4 = attr0 Active Component Format XYZW(3); DW5 attrs16-31 off
+        // 3DSTATE_SBE_SWIZ (11 dw): the per-attribute source/swizzle table Mesa ALWAYS emits
+        // next to 3DSTATE_SBE but we never had. genxml: DW1..DW8 = 16 x SF_OUTPUT_ATTRIBUTE_DETAIL
+        // (16 bits each, 2/dword); DW9..DW10 = 16 x 4-bit Attribute Wrap. Attribute 0 detail = 0
+        // means Source Attribute 0, Swizzle Select INPUTATTR, no Constant Source, no Component
+        // Override -> SF output attr 0 passes through URB source attr 0 (our color at Read
+        // Offset 1 = VUE DW8) with all 4 components. This is the prime suspect for BOTH the
+        // "a0 reads zero regardless of VUE contents" AND the persistent no-fault 3DPRIMITIVE
+        // hang: with num_attr=1 but the swizzle table never programmed, the SF's source routing
+        // for output attr 0 is undefined -> it materializes zero AND wedges the pipeline.
+        // BISECTION #7: SBE_SWIZ still emitted (all-zero table is harmless with num_attr=0).
+        cs.push(h(so::SBE_SWIZ, 11));
+        for _ in 0..10 { cs.push(0); }
+        // 3DSTATE_WM DW1: enable BIM_PERSPECTIVE_PIXEL barycentric (genxml Barycentric
+        // Interpolation Mode [48:43], value 1 -> DW1 bit 11) IN ADDITION to bit 31.
+        // LOAD-BEARING for the HANG: PS_EXTRA Attribute Enable tells the PSD the pixel shader
+        // consumes interpolated attributes, but with Barycentric Interpolation Mode = 0 the SF
+        // delivers no barycentric setup -> the PS-dispatch handshake never completes and the
+        // post-draw CS-stall never drains (hang at progress 5->6, FAULT=0). Mesa never enables
+        // attribute input without >=1 barycentric mode. Tested with the PS hardcoded to orange
+        // so this isolates the hang (color is unaffected). NOTE: enabling a barycentric mode
+        // inserts the R3-R4 perspective-pixel phase into the PS payload, which SHIFTS the
+        // attribute setup a0/a1/a2 to a higher GRF -> when the real attribute read is restored,
+        // its source register must move down from g2/g3 accordingly (that's Boot B's job).
+        cs.push(h(so::WM, 2)).push(1 << 31); // BISECTION #7: barycentric OFF (no attrs)
         cs.push(h(so::VIEWPORT_SF_CLIP, 2)).push(rs.sf_clip_viewport_off);
         cs.push(h(so::VIEWPORT_CC, 2)).push(rs.cc_viewport_off);
         cs.push(h1(so::DRAWING_RECTANGLE, 4)).push(0).push(((height - 1) << 16) | (width - 1)).push(0);
-        // PS-adjacent state that does NOT vary per face (emitted once). Only the PS kernel
-        // pointer (3DSTATE_PS) changes between faces, re-emitted inside the loop below.
-        cs.push(h(so::PS_EXTRA, 2)).push(1u32 << 31);
+        // PS-adjacent state. Boot A: set PS_EXTRA Attribute Enable (bit 40 -> DW1 bit 8) in
+        // addition to Pixel Shader Valid (bit 63 -> DW1 bit 31), so the PS is told it consumes
+        // per-vertex attributes (the color varying delivered as plane setup at g2/g3).
+        cs.push(h(so::PS_EXTRA, 2)).push((1u32 << 31) | (1 << 8)); // PS Valid + Attribute Enable
         cs.push(h(so::PS_BLEND, 2)).push(1u32 << 30);
         cs.push(h(so::CC_STATE_POINTERS, 2)).push(rs.cc_off | 1);
         cs.push(h(so::BLEND_STATE_POINTERS, 2)).push(rs.blend_off | 1);
@@ -625,23 +694,17 @@ impl RenderEngine {
         cs.push(h(so::BINDING_TABLE_POINTERS_PS, 2)).push(rs.binding_table_off);
         cs.push(h(so::SAMPLER_STATE_POINTERS_PS, 2)).push(0);
         self.progress(&mut cs, 5);
-        // Step 4 — per-face color. cube_geometry() lays the 36 indices out as 6 contiguous
-        // 6-index faces. Draw each face separately with its own constant-color PS kernel:
-        // re-emit 3DSTATE_PS (kernel ptr) then an indexed 3DPRIMITIVE with Start Index
-        // Location = face*6, count 6. 3DSTATE_PS is pipelined state, legal to change between
-        // draws in one stream. Back-face culling drops the 3 hidden faces automatically, so
-        // only the visible faces paint — no depth buffer needed for a convex cube.
-        let faces = idx_count / 6;
-        for face in 0..faces {
-            self.emit_ps(&mut cs, ps_offs[face]);
-            cs.push(super::cmd::gfxpipe_header(PIPELINE_3D, 3, 0, 7 - 2));
-            cs.push(4 | (1 << 8)); // TRILIST topology + Vertex Access Type = RANDOM
-            cs.push(6); // Vertex Count Per Instance (one face = 2 tris = 6 indices)
-            cs.push((face * 6) as u32); // Start Index Location
-            cs.push(1); // Instance Count
-            cs.push(0); // Start Instance
-            cs.push(0); // Base Vertex
-        }
+        // Boot #8 showed 6 draws STILL hang -> draw count is not the cause. Back to ONE indexed
+        // 36-draw (clean geometry). Boot #9 tests the LAST Set-B suspect: the 2-slot VUE, by
+        // reverting the VUE to Phase-6 1-slot (position-only VS, output length 1, URB alloc 0).
+        self.emit_ps(&mut cs, ps_off);
+        cs.push(super::cmd::gfxpipe_header(PIPELINE_3D, 3, 0, 7 - 2));
+        cs.push(4 | (1 << 8)); // TRILIST topology + Vertex Access Type = RANDOM
+        cs.push(idx_count as u32); // Vertex Count Per Instance (all 36 indices)
+        cs.push(0); // Start Index Location
+        cs.push(1); // Instance Count
+        cs.push(0); // Start Instance
+        cs.push(0); // Base Vertex
         self.progress(&mut cs, 6);
         cmd::pipe_control(
             &mut cs,
@@ -715,24 +778,38 @@ impl RenderEngine {
                 "[CUBE] cull check: PS_inv={} (expect ~half of 329108; full=cull off, 0=winding inverted)",
                 ps
             );
-            // Pixel readback: count non-black samples (the cube should cover a chunk).
+            // Pixel readback: with the gray (0x30303030) diagnostic clear, "cube pixels" are
+            // the ones that DIFFER from the background. Count those, and also (a) count how many
+            // of them are pure-black-RGB (0x??000000 -> the "drawn but RGB=0" signature) and
+            // (b) capture up to 4 distinct non-background pixel values so the boot log itself
+            // shows whether the PS wrote real colors (e.g. 0xFFFF0000 red) or black.
+            const CLEAR_U32: u32 = 0x3030_3030;
             let px = (pitch / 4) as usize;
             let mut o = 0usize;
             while o < bytes { self.flush_line(bb_cpu as usize + o); o += 64; }
-            let mut nonblack = 0u32;
+            let mut non_bg = 0u32;
+            let mut rgb_black = 0u32;
+            let mut samples = [0u32; 4];
+            let mut nsamp = 0usize;
             let mut yy = 0u32;
             while yy < height {
                 let mut xx = 0u32;
                 while xx < width {
-                    if (bb_cpu as *const u32).add(yy as usize * px + xx as usize).read_volatile() != 0 {
-                        nonblack += 1;
+                    let v = (bb_cpu as *const u32).add(yy as usize * px + xx as usize).read_volatile();
+                    if v != CLEAR_U32 {
+                        non_bg += 1;
+                        if (v & 0x00FF_FFFF) == 0 { rgb_black += 1; } // RGB=0 (alpha-only)
+                        if nsamp < 4 && !samples[..nsamp].contains(&v) {
+                            samples[nsamp] = v; nsamp += 1;
+                        }
                     }
                     xx += 13;
                 }
                 yy += 13;
             }
-            crate::serial_println!("[CUBE] readback: {} non-black grid samples ({} => cube visible)",
-                nonblack, if nonblack > 0 { "OK" } else { "NONE" });
+            crate::serial_println!(
+                "[CUBE] readback: {} non-bg samples ({} of them RGB=0/black); distinct vals: {:#010x} {:#010x} {:#010x} {:#010x}",
+                non_bg, rgb_black, samples[0], samples[1], samples[2], samples[3]);
         }
 
         if present {
@@ -839,10 +916,13 @@ impl RenderEngine {
     }
 
     unsafe fn emit_vertex_elements(&self, cs: &mut CmdStream) {
-        cs.push(h(so::VERTEX_ELEMENTS, 3)); // header + 1 VERTEX_ELEMENT_STATE (2 dw)
-        // DW0: format R32G32B32A32_FLOAT (0), Valid (bit25), VB index 0, offset 0.
+        cs.push(h(so::VERTEX_ELEMENTS, 5)); // header + 2 VERTEX_ELEMENT_STATE (2 dw each)
+        // Element 0 = position: R32G32B32A32_FLOAT (0), Valid (bit25), VB 0, Source Offset 0.
         cs.push(1 << 25);
         // DW1: components 0..3 = STORE_SRC (1) at [30:28],[26:24],[22:20],[18:16].
+        cs.push((1 << 28) | (1 << 24) | (1 << 20) | (1 << 16));
+        // Element 1 = color: same format, Valid, VB 0, Source Element Offset = 16 bytes [11:0].
+        cs.push((1 << 25) | 16);
         cs.push((1 << 28) | (1 << 24) | (1 << 20) | (1 << 16));
     }
 
@@ -851,14 +931,18 @@ impl RenderEngine {
         cs.push(kernel_off).push(0); // Kernel Start Pointer (64B granular at bit 6; off is 64B aligned)
         cs.push(0); // scratch
         cs.push(0).push(0); // scratch base
-        // DW6: URB read offset 0, read length 1 (<<11), dispatch GRF start 2 (<<20).
-        cs.push((1 << 11) | (2 << 20));
+        // DW6: URB read offset 0, read length 2 (<<11), dispatch GRF start 2 (<<20).
+        // Boot A: read length 2 so the VF delivers BOTH input attributes (position g2-g5 and
+        // color g6-g9). 2 covers both under either read-length unit convention (per-attribute
+        // or per-pair); any over-read lands in unused GRFs, so it is safe.
+        cs.push((2 << 11) | (2 << 20));
         // DW7: Enable(bit0) | SIMD8 Dispatch(bit2) | StatisticsEnable(bit10) | Max threads 63 (<<23).
         cs.push(1 | (1 << 2) | (1 << 10) | (63 << 23));
-        // DW8: Vertex URB Entry Output Length = 1 (<<16). My VUE is exactly the 256-bit
-        // header (position in DW4-7), so 1 unit of output. Output length 2 exceeded the
-        // URB_VS allocation (size 1) -> VUE write overflowed -> no primitives to clip.
-        cs.push(1 << 16);
+        // DW8: Vertex URB Entry Output Length = 2 (Boot #10). 2-slot VUE = header(DW0-3) +
+        // position(DW4-7) + color(DW8-11) = 48B -> rounds to 2 x 256-bit units (64B). Pairs with
+        // build_vs writing the color slot. URB_VS alloc STAYS 0 (a 64B VUE fits a 64B entry) --
+        // the earlier alloc=1 bump is what overflowed the URB and hung the drain (Boot #9).
+        cs.push(2 << 16);
     }
 
     unsafe fn emit_ps(&self, cs: &mut CmdStream, kernel_off: u32) {
@@ -884,15 +968,15 @@ struct CubeGpu {
     dyn_buf: StateBuffer,
     vbo_buf: StateBuffer,
     rs: state::RenderState,
-    corners: [super::math::Vec3; 8],
+    verts: [super::math::Vec3; 24],  // 24 face-vertices (model space), transformed per frame
+    colors: [[f32; 4]; 24],          // per-vertex color (static), interleaved into the VBO
     vbo_cpu: *mut u32, // CPU ptr to the reserved vertex block (points into vbo_buf)
     vbo_gva: u32,      // GVA of the vertex block (stable across frames)
-    vbo_dwords: usize, // size of the vertex block in dwords (32 = 8 verts * vec4)
+    vbo_dwords: usize, // size of the vertex block in dwords (192 = 24 verts * (pos4 + color4))
     idx_gva: u32,
     idx_count: usize,
     vs_off: u32,
-    ps_off: u32,
-    ps_offs: [u32; 6], // per-face constant-color PS kernels
+    ps_off: u32,       // single per-vertex-color PS kernel (Phase 7 Boot A)
 }
 
 /// Unit cube centered at the origin (side 1.0): 8 corners + 36 indices (12 triangles).
@@ -919,4 +1003,47 @@ fn cube_geometry() -> ([super::math::Vec3; 8], [u32; 36]) {
         0, 1, 5, 0, 5, 4, // bottom (-y)
     ];
     (v, idx)
+}
+
+/// Phase 7 Boot A: a per-vertex COLORED cube. Unlike `cube_geometry` (8 shared corners),
+/// this lays out 24 vertices = 6 faces x 4 unique corners, so each face's corners can carry
+/// that face's color as a per-vertex attribute. Winding matches `cube_geometry`'s (the same
+/// corner order per face), so back-face culling still removes the 3 hidden faces. Returns
+/// (positions[24], colors[24], indices[36] as 6 quads: base+{0,1,2, 0,2,3}).
+fn cube_geometry_colored() -> ([super::math::Vec3; 24], [[f32; 4]; 24], [u32; 36]) {
+    use super::math::Vec3;
+    // The 8 canonical corners (same coordinates as cube_geometry).
+    let c = [
+        Vec3::new(-0.5, -0.5, -0.5), // 0
+        Vec3::new(0.5, -0.5, -0.5),  // 1
+        Vec3::new(0.5, 0.5, -0.5),   // 2
+        Vec3::new(-0.5, 0.5, -0.5),  // 3
+        Vec3::new(-0.5, -0.5, 0.5),  // 4
+        Vec3::new(0.5, -0.5, 0.5),   // 5
+        Vec3::new(0.5, 0.5, 0.5),    // 6
+        Vec3::new(-0.5, 0.5, 0.5),   // 7
+    ];
+    // Each face: its 4 corners in the winding order cube_geometry() referenced, + a color.
+    let faces: [([usize; 4], [f32; 4]); 6] = [
+        ([4, 5, 6, 7], [1.0, 0.2, 0.2, 1.0]), // front (+z) red
+        ([1, 0, 3, 2], [0.2, 1.0, 0.2, 1.0]), // back  (-z) green
+        ([0, 4, 7, 3], [0.3, 0.5, 1.0, 1.0]), // left  (-x) blue
+        ([5, 1, 2, 6], [1.0, 0.9, 0.2, 1.0]), // right (+x) yellow
+        ([3, 7, 6, 2], [0.3, 1.0, 1.0, 1.0]), // top   (+y) cyan
+        ([0, 1, 5, 4], [1.0, 0.4, 1.0, 1.0]), // bottom(-y) magenta
+    ];
+    let mut pos = [Vec3::new(0.0, 0.0, 0.0); 24];
+    let mut col = [[0.0f32; 4]; 24];
+    let mut idx = [0u32; 36];
+    for (f, (corner_ids, color)) in faces.iter().enumerate() {
+        let base = (f * 4) as u32;
+        for (j, &cid) in corner_ids.iter().enumerate() {
+            pos[f * 4 + j] = c[cid];
+            col[f * 4 + j] = *color;
+        }
+        // Quad (base+0,1,2,3) -> two triangles preserving the original winding.
+        let t = [base, base + 1, base + 2, base, base + 2, base + 3];
+        idx[f * 6..f * 6 + 6].copy_from_slice(&t);
+    }
+    (pos, col, idx)
 }

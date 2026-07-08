@@ -240,6 +240,25 @@ fn mov_imm_f(exec: u32, dst: u32, imm: f32) -> [u32; 4] {
     i
 }
 
+/// `mov(exec) gDst<1>:F  gSrc.<subreg_bytes><0;1,0>:F` — broadcast ONE scalar float from a
+/// source sub-register to all `exec` lanes. Used to pull a flat (constant-interpolated) PS
+/// attribute out of its plane-setup GRF: the attribute's a0/constant term lives at the `r`
+/// sub-register of the PLN setup tuple (Vol2a "pln": r = 4th component, sub-reg .3 within a
+/// .0-based tuple or .7 within a .4-based tuple). `src_subreg` is a BYTE offset in [0,31].
+fn mov_scalar_f(exec: u32, dst: u32, src: u32, src_subreg: u32) -> [u32; 4] {
+    let mut i = base(OP_MOV, exec);
+    set_dst(&mut i, RF_GRF, TY_F, dst, 0, HS_1);
+    // src0 = replicated scalar g{src}.{subreg}<0;1,0>:F (VertStride=0, Width=1, HorzStride=0).
+    set(&mut i, 42, 41, RF_GRF);
+    set(&mut i, 46, 43, TY_F);
+    set(&mut i, 68, 64, src_subreg); // sub-register number (bytes)
+    set(&mut i, 76, 69, src);        // register number
+    set(&mut i, 81, 80, 0);          // HorzStride = 0
+    set(&mut i, 84, 82, 0);          // Width = 1 element (encoded 0)
+    set(&mut i, 88, 85, 0);          // VertStride = 0
+    i
+}
+
 /// `send(exec) null  gBase<8;8,1>:UD  desc` with SFID and an immediate 32-bit message
 /// descriptor (carries header-present, rlen, mlen and EOT in DW3). SFID goes in [27:24].
 fn send_eot(exec: u32, sfid: u32, base_grf: u32, desc: u32) -> [u32; 4] {
@@ -266,13 +285,19 @@ fn emit(buf: &mut Vec<u8>, inst: [u32; 4]) {
 // Message descriptors (from the Gen9 encoding reference).
 // ---------------------------------------------------------------------------
 
-/// URB SIMD8 write: opcode 7, global offset 0, header present, rlen 0.
-/// `mlen` = 1 (header) + number of data GRFs.
-fn urb_write_desc(mlen: u32) -> u32 {
+/// URB SIMD8 write: opcode 7, header present, rlen 0.
+/// `mlen` = 1 (header) + number of data GRFs. The data payload is limited to 1..8 message
+/// phases (PRM Vol7 p288: "The write data payload can be between 1 and 8 message phases long")
+/// -> a VUE larger than 8 dwords MUST be split across multiple writes. `offset` = Global Offset
+/// [14:4]. For URB_SIMD8_WRITE this is in 128-bit (4-dword) units from the VUE start (PRM Vol7
+/// line ~32047 -- NOT 256-bit like the HWORD messages). `eot` sets End-Of-Thread (desc bit 31);
+/// only the LAST write of a thread is EOT.
+fn urb_write_desc(mlen: u32, offset: u32, eot: bool) -> u32 {
     let opcode = 7u32; // GEN8_URB_OPCODE_SIMD8_WRITE, desc[3:0]
-    (1 << 31)            // EOT
-        | (mlen << 25)   // message length [28:25]
-        | (1 << 19)      // header present
+    (if eot { 1 << 31 } else { 0 })  // End Of Thread
+        | (mlen << 25)               // message length [28:25]
+        | (1 << 19)                  // header present (mandatory for URB messages)
+        | (offset << 4)              // Global Offset [14:4], 256-bit units
         | opcode
 }
 
@@ -318,29 +343,47 @@ fn rt_write_desc(mlen: u32, bti: u32) -> u32 {
 /// data phases, and emit a URB write with EOT.
 pub fn build_vs() -> Vec<u8> {
     let mut k = Vec::new();
-    // The output VUE is [DW0..3 = VUE header][DW4..7 = clip-space position]; the SF/CLIP
-    // read position from DW4..7. Input position (from the VF) is preloaded at g2..g5
-    // (Dispatch GRF Start = 2), one component per GRF across the 8 SIMD lanes.
+    // Phase 7 Boot A: pass through position AND a per-vertex color varying.
     //
-    // Message layout: g6 = URB handles header; g7..g10 = VUE header (zeros);
-    //                 g11..g14 = position x,y,z,w.
-    emit(&mut k, mov_grf(EXEC_SIMD8, TY_UD, 6, 1)); // handles from R1
-    emit(&mut k, mov_imm_f(EXEC_SIMD8, 7, 0.0)); // VUE header dw0
-    emit(&mut k, mov_imm_f(EXEC_SIMD8, 8, 0.0)); // dw1
-    emit(&mut k, mov_imm_f(EXEC_SIMD8, 9, 0.0)); // dw2
-    emit(&mut k, mov_imm_f(EXEC_SIMD8, 10, 0.0)); // dw3
-    // Full vec4 pass-through: the VF deinterleaves the R32G32B32A32 position into
-    // g2=x g3=y g4=z g5=w (scalar SIMD8 = 4 GRFs per attribute slot, urb_read_length=1
-    // covers all four — verified vs Mesa ELK elk_fs.cpp:1575 / elk_vec4.cpp:2608). We
-    // now forward z and w too, so a CPU-computed clip-space vertex (w = -z_eye) survives
-    // the clipper's perspective divide. Backward compatible with the Phase-5 triangle,
-    // whose verts are already [x,y,0,1] -> forwarding g4=0,g5=1 reproduces it exactly.
-    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 11, 2)); // pos x <- input g2
-    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 12, 3)); // pos y <- input g3
-    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 13, 4)); // pos z <- input g4
-    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 14, 5)); // pos w <- input g5
-    // URB write: base = g6, mlen = 1 handle-header + 8 data (VUE header + position) = 9, EOT.
-    emit(&mut k, send_eot(EXEC_SIMD8, SFID_URB, 6, urb_write_desc(9)));
+    // Output VUE layout (256-bit units; SBE reads attributes at Read Offset 1 = DW8):
+    //   DW0..3  = VUE header (zeros)
+    //   DW4..7  = clip-space position   (SF/CLIP read position here)
+    //   DW8..11 = color varying          (SBE routes this to SF output attribute 0)
+    //
+    // Input payload (VF, Dispatch GRF Start = 2, deinterleaved SIMD8 = 4 GRFs/vec4):
+    //   g1      = URB return handles (R1)
+    //   g2..g5  = position x,y,z,w   (vertex element 0)
+    //   g6..g9  = color r,g,b,a      (vertex element 1)
+    //
+    // ROOT CAUSE of the whole 2-slot-VUE hang saga (Boot #10, PRM Vol7 p288): a single URB
+    // write payload is limited to 1..8 message phases. Our 2-slot VUE is 12 data dwords (header
+    // 4 + pos 4 + color 4); writing all 12 in ONE URB write (mlen 13) exceeds the 8-phase limit
+    // and silently WEDGES the URB unit -> no-fault drain hang. Boot #9 worked only because it
+    // wrote exactly 8 phases (position-only). FIX: split into TWO URB writes, each <= 8 phases.
+    //
+    // Write 1 (NOT EOT): VUE DW0-7 = header + position, Global Offset 0, 8 data phases.
+    //   g10 = handles, g11-14 = VUE header (zeros), g15-18 = position.
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_UD, 10, 1)); // handles from R1
+    emit(&mut k, mov_imm_f(EXEC_SIMD8, 11, 0.0)); // VUE header dw0
+    emit(&mut k, mov_imm_f(EXEC_SIMD8, 12, 0.0)); // dw1
+    emit(&mut k, mov_imm_f(EXEC_SIMD8, 13, 0.0)); // dw2
+    emit(&mut k, mov_imm_f(EXEC_SIMD8, 14, 0.0)); // dw3
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 15, 2)); // pos x <- g2
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 16, 3)); // pos y <- g3
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 17, 4)); // pos z <- g4
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 18, 5)); // pos w <- g5
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_URB, 10, urb_write_desc(9, 0, false)));
+    // Write 2 (EOT): VUE DW8-11 = color. Global Offset is in 128-bit (4-dword) units for
+    // URB_SIMD8_WRITE, so DW8 = unit 2 (unit0=header DW0-3, unit1=position DW4-7, unit2=color
+    // DW8-11). Boot #11 used offset 1 -> wrote color onto DW4-7 = POSITION -> degenerate tris,
+    // PS_inv=0. Correct offset is 2. 4 data phases.
+    //   g19 = handles (again), g20-23 = color. Message must be contiguous so re-copy handles.
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_UD, 19, 1)); // handles from R1 (2nd message header)
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 20, 6)); // color r <- g6
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 21, 7)); // color g <- g7
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 22, 8)); // color b <- g8
+    emit(&mut k, mov_grf(EXEC_SIMD8, TY_F, 23, 9)); // color a <- g9
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_URB, 19, urb_write_desc(5, 2, true)));
     k
 }
 
@@ -362,6 +405,35 @@ pub fn build_ps(color: [f32; 4]) -> Vec<u8> {
     emit(&mut k, mov_imm_f(EXEC_SIMD8, 5, color[3])); // A
     // RT write: base = g2, mlen = 4 color GRFs (no header), BTI 0, Last RT, EOT.
     emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 2, rt_write_desc(4, 0)));
+    k
+}
+
+/// Phase 7 Boot A pixel shader: output the FLAT (constant-interpolated) per-vertex color
+/// attribute delivered by the SF. Validates the whole VUE->SBE->PS attribute path with a
+/// single kernel + single draw (replacing the 6-kernel constant-color hack).
+///
+/// PS payload with all optional phases (barycentric/depth/W/coverage) DISABLED and Dispatch
+/// GRF Start for Setup Data = 2: g0/g1 = R0/R1 header, then attribute-0 plane setup at g2/g3
+/// (one vec4 attribute = 2 GRFs, two channels per GRF). For a constant-interpolated
+/// attribute a0 = provoking-vertex value and a1=a2=0, so the value is the PLN `r` term:
+///   channel .0-based tuple -> r at sub-reg 3 (byte 12); .4-based tuple -> r at sub-reg 7 (byte 28).
+///   R = g2.3, G = g2.7, B = g3.3, A = g3.7   (Vol2a "pln" + Mesa interp_reg agree).
+/// Broadcast each scalar to all 8 lanes into the RT-write color payload g4..g7 (kept clear
+/// of the g2/g3 setup registers), then a headerless RT write with EOT.
+pub fn build_ps_attr() -> Vec<u8> {
+    let mut k = Vec::new();
+    // BOOT #13: hang fixed + 2-slot VUE proven (orange cube). Restore the REAL flat-attribute
+    // read. With barycentric OFF and Dispatch GRF Start for Setup = 2, the PS payload is g0/g1
+    // header then attribute-0 setup at g2/g3 (one vec4 = 2 GRFs, 2 channels/GRF). For a flat
+    // (constant-interp) attribute a1=a2=0, so the value is a0 = Mesa suboffset(interp,3):
+    //   R = g2.3, G = g2.7, B = g3.3, A = g3.7 (byte 12/28 within g2/g3).
+    // If faces show shifted/wrong colors, the setup GRF is off-by-one (header may be 3 GRFs) ->
+    // try g3/g4 and Dispatch GRF Start 3. Non-fatal: geometry is unaffected either way.
+    emit(&mut k, mov_scalar_f(EXEC_SIMD8, 4, 2, 12)); // R <- g2.3
+    emit(&mut k, mov_scalar_f(EXEC_SIMD8, 5, 2, 28)); // G <- g2.7
+    emit(&mut k, mov_scalar_f(EXEC_SIMD8, 6, 3, 12)); // B <- g3.3
+    emit(&mut k, mov_scalar_f(EXEC_SIMD8, 7, 3, 28)); // A <- g3.7
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 4, rt_write_desc(4, 0)));
     k
 }
 
@@ -397,28 +469,17 @@ pub unsafe fn build_and_dump_kernels(mmio_base: u64) -> Result<KernelStore, Rend
     store.vs_off = vs_off;
     store.dump("VS pass-through", vs_off, vs.len());
 
-    // Six constant-color PS kernels, one per cube face. Distinct, bright colors so the
-    // three visible faces of the back-face-culled cube read as clearly different planes.
-    // Order matches cube_geometry()'s face grouping: front,back,left,right,top,bottom.
-    const FACE_COLORS: [[f32; 4]; 6] = [
-        [1.0, 0.2, 0.2, 1.0], // front (+z) red
-        [0.2, 1.0, 0.2, 1.0], // back  (-z) green
-        [0.3, 0.5, 1.0, 1.0], // left  (-x) blue
-        [1.0, 0.9, 0.2, 1.0], // right (+x) yellow
-        [0.3, 1.0, 1.0, 1.0], // top   (+y) cyan
-        [1.0, 0.4, 1.0, 1.0], // bottom(-y) magenta
-    ];
-    for (i, color) in FACE_COLORS.iter().enumerate() {
-        let ps = build_ps(*color);
-        let off = store.place(&ps)?;
-        store.ps_offs[i] = off;
-    }
-    store.ps_off = store.ps_offs[0]; // back-compat alias for single-color callers
-    store.dump("PS face[0] red", store.ps_offs[0], build_ps(FACE_COLORS[0]).len());
+    // Phase 7 Boot A: a SINGLE pixel shader that outputs the per-vertex color varying
+    // interpolated (flat) through the SF, replacing the six constant-color face kernels.
+    let ps = build_ps_attr();
+    let ps_off = store.place(&ps)?;
+    store.ps_off = ps_off;
+    store.ps_offs = [ps_off; 6]; // all faces share the one attribute PS (back-compat)
+    store.dump("PS per-vertex color (flat)", ps_off, ps.len());
 
     crate::serial_println!(
-        "[EU] kernels placed: VS={:#x}, PS faces={:#x?} (offsets from instruction base)",
-        vs_off, store.ps_offs
+        "[EU] kernels placed: VS={:#x}, PS(attr)={:#x} (offsets from instruction base)",
+        vs_off, ps_off
     );
     Ok(store)
 }
