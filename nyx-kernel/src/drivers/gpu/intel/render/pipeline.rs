@@ -15,7 +15,7 @@ use super::cmd::{self, gfxpipe_header, CmdStream, PIPELINE_3D};
 use super::state::{self, StateBuffer};
 use super::{
     RenderEngine, RenderError, GVA_DYNAMIC_STATE, GVA_RCS_FENCE, GVA_SURFACE_STATE,
-    GVA_VERTEX_BUFFERS,
+    GVA_TEXTURES, GVA_VERTEX_BUFFERS,
 };
 
 // --- 3D command sub-opcodes (verified against gen9.xml) ---
@@ -452,7 +452,36 @@ impl RenderEngine {
         let mut surf_buf = StateBuffer::new(mmio, GVA_SURFACE_STATE, 1)?;
         let mut dyn_buf = StateBuffer::new(mmio, GVA_DYNAMIC_STATE, 1)?;
         let mut vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 1)?;
-        let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch)?;
+        let mut rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch)?;
+
+        // --- Boot C: procedural checkerboard texture + sampler + 2-entry binding table ---
+        // Upload a 64x64 B8G8R8A8 checkerboard (8-texel cells) to GVA_TEXTURES. 64*64*4 = 16KB
+        // = 4 pages; pitch 256B is a 64B multiple (linear-surface requirement, PRM Vol2a).
+        const TEX_W: u32 = 64;
+        const TEX_H: u32 = 64;
+        const TEX_PITCH: u32 = TEX_W * 4; // 256 B
+        let mut tex_buf = StateBuffer::new(mmio, GVA_TEXTURES, 4)?;
+        let (tex_cpu, tex_gva) = tex_buf.alloc((TEX_W * TEX_H) as usize, 4096)?;
+        state::fill_checkerboard(tex_cpu as *mut u8, TEX_W, TEX_H, TEX_PITCH, 8);
+        tex_buf.flush_range(tex_gva, (TEX_H * TEX_PITCH) as usize);
+        // Texture RENDER_SURFACE_STATE (LINEAR 2D, same builder as the RT — a linear sampled
+        // surface is allowed on Gen9; if the sampler rejects it we fall back to X-tiling).
+        let ts = state::render_surface_state_2d(
+            state::SURFACE_FORMAT_B8G8R8A8_UNORM, TEX_W, TEX_H, TEX_PITCH, tex_gva);
+        let tex_surf_gva = surf_buf.write(&ts, 64)?;
+        let tex_surf_off = tex_surf_gva - surf_buf.gva;
+        // 2-entry binding table: [0]=RT (unchanged), [1]=texture. Overrides the 1-entry table
+        // setup_render_state wrote; point rs.binding_table_off at the new one.
+        let bt2 = state::binding_table_2(rs.rt_surface_off, tex_surf_off);
+        let bt2_gva = surf_buf.write(&bt2, 64)?;
+        rs.binding_table_off = bt2_gva - surf_buf.gva;
+        // SAMPLER_STATE (NEAREST/CLAMP) into dynamic state; 32B-aligned per the SSP field.
+        let samp_gva = dyn_buf.write(&state::sampler_state_nearest_clamp(), 32)?;
+        let sampler_off = samp_gva - dyn_buf.gva;
+        crate::serial_println!(
+            "[STATE] tex_gva={:#x} tex_surf_off={:#x} bt2_off={:#x} sampler_off={:#x}",
+            tex_gva, tex_surf_off, rs.binding_table_off, sampler_off
+        );
 
         let (verts, colors, indices) = cube_geometry_colored();
         // Reserve the vertex block (24 verts * (pos vec4 + color vec4) = 192 dwords) at a
@@ -465,6 +494,7 @@ impl RenderEngine {
             surf_buf,
             dyn_buf,
             vbo_buf,
+            tex_buf,
             rs,
             verts,
             colors,
@@ -475,6 +505,7 @@ impl RenderEngine {
             idx_count: indices.len(),
             vs_off,
             ps_off,
+            sampler_off,
         })
     }
 
@@ -503,18 +534,12 @@ impl RenderEngine {
         let idx_gva = g.idx_gva;
         let idx_count = g.idx_count;
         let vbo_dwords = g.vbo_dwords;
+        let sampler_off = g.sampler_off; // Boot C: SAMPLER_STATE offset from dynamic base
 
-        // Clear the RT to DARK GRAY (0x30 in every byte -> 0x30303030 BGRA, ~RGB(48,48,48))
-        // instead of black. DIAGNOSTIC (Boot A bring-up): the panel was "totally black, no
-        // shape ever," which is ambiguous — a cube drawn with RGB=0 is invisible on a black
-        // background, and so is a cube that never drew at all. A non-black clear disambiguates:
-        //   * dark/black cube silhouette on gray -> geometry+present OK, bug is only the PS
-        //     color read (attribute value from setup GRFs g2/g3);
-        //   * colored cube on gray -> the whole attribute path works (we were fooled by
-        //     black-on-black);
-        //   * uniform gray, no shape -> geometry/present is broken (the 497-sample readback
-        //     was stale/misleading), a different fix entirely.
-        const CLEAR_BYTE: u8 = 0x30;
+        // Clear the render target to black. (Boot A/C bring-up used a 0x30 gray diagnostic
+        // clear to disambiguate "black-on-black" from "never drew"; no longer needed now that
+        // the textured cube renders correctly.)
+        const CLEAR_BYTE: u8 = 0x00;
         let bytes = (pitch * height) as usize;
         core::ptr::write_bytes(bb_cpu as *mut u8, CLEAR_BYTE, bytes);
         let mut off = 0usize;
@@ -694,7 +719,10 @@ impl RenderEngine {
         cs.push(h(so::DEPTH_BUFFER, 8)).push(7u32 << 29);
         for _ in 0..6 { cs.push(0); } // SURFTYPE_NULL
         cs.push(h(so::BINDING_TABLE_POINTERS_PS, 2)).push(rs.binding_table_off);
-        cs.push(h(so::SAMPLER_STATE_POINTERS_PS, 2)).push(0);
+        // Boot C: point the PS sampler-state table at our NEAREST/CLAMP SAMPLER_STATE. The
+        // field is Pointer to PS Sampler State [63:37] = DW1[31:5]; sampler_off is 32B-aligned
+        // so its low 5 bits are already 0 and it drops straight into the field.
+        cs.push(h(so::SAMPLER_STATE_POINTERS_PS, 2)).push(sampler_off);
         self.progress(&mut cs, 5);
         // Boot #8 showed 6 draws STILL hang -> draw count is not the cause. Back to ONE indexed
         // 36-draw (clean geometry). Boot #9 tests the LAST Set-B suspect: the 2-slot VUE, by
@@ -780,38 +808,6 @@ impl RenderEngine {
                 "[CUBE] cull check: PS_inv={} (expect ~half of 329108; full=cull off, 0=winding inverted)",
                 ps
             );
-            // Pixel readback: with the gray (0x30303030) diagnostic clear, "cube pixels" are
-            // the ones that DIFFER from the background. Count those, and also (a) count how many
-            // of them are pure-black-RGB (0x??000000 -> the "drawn but RGB=0" signature) and
-            // (b) capture up to 4 distinct non-background pixel values so the boot log itself
-            // shows whether the PS wrote real colors (e.g. 0xFFFF0000 red) or black.
-            const CLEAR_U32: u32 = 0x3030_3030;
-            let px = (pitch / 4) as usize;
-            let mut o = 0usize;
-            while o < bytes { self.flush_line(bb_cpu as usize + o); o += 64; }
-            let mut non_bg = 0u32;
-            let mut rgb_black = 0u32;
-            let mut samples = [0u32; 4];
-            let mut nsamp = 0usize;
-            let mut yy = 0u32;
-            while yy < height {
-                let mut xx = 0u32;
-                while xx < width {
-                    let v = (bb_cpu as *const u32).add(yy as usize * px + xx as usize).read_volatile();
-                    if v != CLEAR_U32 {
-                        non_bg += 1;
-                        if (v & 0x00FF_FFFF) == 0 { rgb_black += 1; } // RGB=0 (alpha-only)
-                        if nsamp < 4 && !samples[..nsamp].contains(&v) {
-                            samples[nsamp] = v; nsamp += 1;
-                        }
-                    }
-                    xx += 13;
-                }
-                yy += 13;
-            }
-            crate::serial_println!(
-                "[CUBE] readback: {} non-bg samples ({} of them RGB=0/black); distinct vals: {:#010x} {:#010x} {:#010x} {:#010x}",
-                non_bg, rgb_black, samples[0], samples[1], samples[2], samples[3]);
         }
 
         if present {
@@ -950,7 +946,11 @@ impl RenderEngine {
     unsafe fn emit_ps(&self, cs: &mut CmdStream, kernel_off: u32) {
         cs.push(h(so::PS, 12));
         cs.push(kernel_off).push(0); // Kernel Start Pointer 0
-        cs.push(1 << 18); // DW3: Binding Table Entry Count = 1 [121:114] (blorp sets this)
+        // DW3: Binding Table Entry Count [121:114]=DW3[25:18], Sampler Count [125:123]=DW3[29:27].
+        // Boot C: 2 binding-table entries (RT + texture) and 1 sampler (1-4 Samplers=1) so the
+        // PSD prefetches the sampler state. (Only the cube path runs at boot; the Phase-5
+        // triangle path shares this and would over-prefetch harmlessly.)
+        cs.push((2 << 18) | (1 << 27));
         cs.push(0).push(0); // scratch base
         // DW6: 8 Pixel Dispatch Enable(bit0) | Max threads per PSD 63 (<<23).
         cs.push(1 | (63 << 23));
@@ -971,16 +971,18 @@ struct CubeGpu {
     surf_buf: StateBuffer,
     dyn_buf: StateBuffer,
     vbo_buf: StateBuffer,
+    tex_buf: StateBuffer,            // Boot C: procedural checkerboard texture (GVA_TEXTURES)
     rs: state::RenderState,
     verts: [super::math::Vec3; 24],  // 24 face-vertices (model space), transformed per frame
-    colors: [[f32; 4]; 24],          // per-vertex color (static), interleaved into the VBO
+    colors: [[f32; 4]; 24],          // per-vertex UV as (u,v,0,1) (static), interleaved into VBO
     vbo_cpu: *mut u32, // CPU ptr to the reserved vertex block (points into vbo_buf)
     vbo_gva: u32,      // GVA of the vertex block (stable across frames)
-    vbo_dwords: usize, // size of the vertex block in dwords (192 = 24 verts * (pos4 + color4))
+    vbo_dwords: usize, // size of the vertex block in dwords (192 = 24 verts * (pos4 + uv4))
     idx_gva: u32,
     idx_count: usize,
     vs_off: u32,
-    ps_off: u32,       // single per-vertex-color PS kernel (Phase 7 Boot A)
+    ps_off: u32,       // single textured PS kernel (Phase 7 Boot C)
+    sampler_off: u32,  // SAMPLER_STATE offset from dynamic state base (Boot C)
 }
 
 /// Unit cube centered at the origin (side 1.0): 8 corners + 36 indices (12 triangles).
@@ -1036,15 +1038,16 @@ fn cube_geometry_colored() -> ([super::math::Vec3; 24], [[f32; 4]; 24], [u32; 36
         ([3, 7, 6, 2], [0.3, 1.0, 1.0, 1.0]), // top   (+y) cyan
         ([0, 1, 5, 4], [1.0, 0.4, 1.0, 1.0]), // bottom(-y) magenta
     ];
-    // Boot B (perspective interpolation): give the 4 corners of every face DISTINCT colors so
-    // pln produces a visible smooth gradient across each face (flat per-face color would look
-    // identical to Boot A and prove nothing). Corner ramp: red, green, blue, white. The base
-    // per-face color is ignored for Boot B; kept in `faces` for the Boot-A/flat reference.
-    let corner_ramp: [[f32; 4]; 4] = [
-        [1.0, 0.0, 0.0, 1.0], // corner 0 red
-        [0.0, 1.0, 0.0, 1.0], // corner 1 green
-        [0.0, 0.0, 1.0, 1.0], // corner 2 blue
-        [1.0, 1.0, 1.0, 1.0], // corner 3 white
+    // Boot C (texture): the varying now carries UV, not color. Map each face's 4 corners to
+    // the unit square (0,0)-(1,1) so the whole checkerboard tiles across every face. The vec4
+    // slot is (u, v, 0, 1); the PS pln-interpolates channels 0/1 into the sampler's U/V. The
+    // corner order matches the quad winding (base+{0,1,2,3}); the base per-face color in
+    // `faces` is now unused (kept for the Boot-A/B reference).
+    let corner_uv: [[f32; 4]; 4] = [
+        [0.0, 0.0, 0.0, 1.0], // corner 0 -> UV (0,0)
+        [1.0, 0.0, 0.0, 1.0], // corner 1 -> UV (1,0)
+        [1.0, 1.0, 0.0, 1.0], // corner 2 -> UV (1,1)
+        [0.0, 1.0, 0.0, 1.0], // corner 3 -> UV (0,1)
     ];
     let mut pos = [Vec3::new(0.0, 0.0, 0.0); 24];
     let mut col = [[0.0f32; 4]; 24];
@@ -1053,7 +1056,7 @@ fn cube_geometry_colored() -> ([super::math::Vec3; 24], [[f32; 4]; 24], [u32; 36
         let base = (f * 4) as u32;
         for (j, &cid) in corner_ids.iter().enumerate() {
             pos[f * 4 + j] = c[cid];
-            col[f * 4 + j] = corner_ramp[j];
+            col[f * 4 + j] = corner_uv[j];
         }
         // Quad (base+0,1,2,3) -> two triangles preserving the original winding.
         let t = [base, base + 1, base + 2, base, base + 2, base + 3];

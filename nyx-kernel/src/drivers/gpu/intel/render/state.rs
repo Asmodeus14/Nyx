@@ -164,6 +164,49 @@ pub fn binding_table_1(surface_state_offset: u32) -> [u32; 1] {
     [surface_state_offset & !0x3F]
 }
 
+/// A two-entry BINDING_TABLE_STATE (Boot C): entry[0] = render target, entry[1] = texture.
+/// Each entry is a surface-state offset from Surface State Base in bits [31:6]. The PS RT
+/// write targets BTI 0; the sampler `sample` message targets BTI 1.
+pub fn binding_table_2(rt_surface_offset: u32, tex_surface_offset: u32) -> [u32; 2] {
+    [rt_surface_offset & !0x3F, tex_surface_offset & !0x3F]
+}
+
+/// SAMPLER_STATE (4 dwords, PRM Vol5 / genxml). Boot C sampler: NEAREST min/mag (crisp
+/// checkerboard, no blur), no mipmapping (single level), CLAMP address modes on all axes,
+/// normalized [0,1] coordinates, sampler enabled. Field bits (genxml SAMPLER_STATE):
+///   DW0: Min Mode Filter [16:14]=NEAREST(0), Mag Mode Filter [19:17]=NEAREST(0),
+///        Mip Mode Filter [21:20]=NONE(0), Sampler Disable [31]=0  -> all zero.
+///   DW1: Min LOD [63:52]=0, Max LOD [51:40]=0, Border Color Pointer [87:70]=0 -> zero
+///        (Min=Max LOD 0 pins sampling to the base level regardless of computed LOD).
+///   DW2: TCZ [98:96], TCY [101:99], TCX [102:104] Address Control = CLAMP(2); within DW2
+///        that is bits [2:0],[5:3],[8:6]. Non-normalized Coordinate Enable [106]=0.
+///   DW3: 0.
+pub fn sampler_state_nearest_clamp() -> [u32; 4] {
+    const CLAMP: u32 = 2; // TCM_CLAMP
+    let dw2 = CLAMP | (CLAMP << 3) | (CLAMP << 6); // TCZ | TCY | TCX
+    [0, 0, dw2, 0]
+}
+
+/// Fill a `w`x`h` B8G8R8A8_UNORM checkerboard into `cpu` (row pitch `pitch` bytes), with
+/// `square` texels per checker cell. Two colors so UV bugs are obvious: white vs. blue.
+/// B8G8R8A8 in memory is [B,G,R,A]; as a little-endian u32 that is A<<24 | R<<16 | G<<8 | B.
+pub unsafe fn fill_checkerboard(cpu: *mut u8, w: u32, h: u32, pitch: u32, square: u32) {
+    const WHITE: u32 = 0xFFFF_FFFF; // A=FF R=FF G=FF B=FF
+    const BLUE: u32 = 0xFF00_00FF; // A=FF R=00 G=00 B=FF
+    let mut y = 0u32;
+    while y < h {
+        let mut x = 0u32;
+        while x < w {
+            let cell = ((x / square) + (y / square)) & 1;
+            let texel = if cell == 0 { WHITE } else { BLUE };
+            let p = cpu.add((y * pitch + x * 4) as usize) as *mut u32;
+            p.write_volatile(texel);
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
 /// BLEND_STATE (1 dw header) + one BLEND_STATE_ENTRY (2 dw): blend disabled, write RGBA.
 /// Matches blorp: Pre/Post-blend color clamp enabled, clamp range = RT format — without
 /// this the shader's float output isn't converted into the render-target format.

@@ -186,6 +186,7 @@ mod enc {
     // SFIDs
     pub const SFID_URB: u32 = 6;
     pub const SFID_RENDER_CACHE: u32 = 5;
+    pub const SFID_SAMPLER: u32 = 2; // 3D sampler / sampling engine
 }
 use enc::*;
 
@@ -300,6 +301,39 @@ fn send_eot(exec: u32, sfid: u32, base_grf: u32, desc: u32) -> [u32; 4] {
     set(&mut i, 90, 89, RF_IMM);
     i[3] = desc; // full 32-bit descriptor incl. EOT(31), mlen[28:25], rlen[24:20], header(19)
     i
+}
+
+/// `send(exec) gDst<1>:UD  gBase<8;8,1>:UD  desc` — a message that RETURNS data to a GRF
+/// (Response Length > 0 in `desc`) and is NOT end-of-thread. The thread keeps running after
+/// the writeback lands, so a later message (e.g. the RT write) can consume the result. This
+/// is the first message in this file with a nonzero response length (the sampler `sample`).
+fn send_msg(exec: u32, sfid: u32, dst_grf: u32, base_grf: u32, desc: u32) -> [u32; 4] {
+    let mut i = base(OP_SEND, exec);
+    set(&mut i, 27, 24, sfid);
+    set_dst(&mut i, RF_GRF, TY_UD, dst_grf, 0, HS_1); // response lands here (rlen GRFs)
+    set_src0_grf(&mut i, TY_UD, base_grf, 0, VS_8, W_8, HS_1);
+    set(&mut i, 90, 89, RF_IMM); // immediate descriptor in DW3
+    i[3] = desc;
+    i
+}
+
+/// 3D sampler `sample` message descriptor. Field layout (PRM Vol7 "3D Sampler" + Mesa
+/// `brw_sampler_desc`, gfx7+): Binding Table Index [7:0], Sampler Index [11:8], Message Type
+/// [16:12], SIMD Mode [18:17]; then the send-common Header Present [19], Response Length
+/// [24:20], Message Length [28:25], EOT [31]. Header is OMITTED — the Sampler State Pointer is
+/// supplied by 3DSTATE_SAMPLER_STATE_POINTERS_PS (PRM Vol7: "may be delivered from the Command
+/// Streamer without the need for a Message Header"). EOT stays 0 (the RT write is the EOT msg).
+/// For SIMD8 the payload is N coordinate GRFs (mlen = N, u then v) and the writeback is 4 GRFs
+/// of RGBA (rlen = 4) — PRM Vol7 "Message Lengths / Response Length" tables.
+fn sampler_desc(bti: u32, sampler: u32, msg_type: u32, simd_mode: u32, mlen: u32, rlen: u32) -> u32 {
+    (bti & 0xFF)
+        | (sampler << 8)     // Sampler Index [11:8]
+        | (msg_type << 12)   // Message Type [16:12] (SAMPLE = 0)
+        | (simd_mode << 17)  // SIMD Mode [18:17] (SIMD8 = 1)
+        // header present [19] = 0 (headerless)
+        | (rlen << 20)       // Response Length [24:20]
+        | (mlen << 25)       // Message Length [28:25]
+    // EOT [31] = 0
 }
 
 /// Push a 16-byte instruction (little-endian) onto a kernel byte buffer.
@@ -475,6 +509,29 @@ pub fn build_ps_attr() -> Vec<u8> {
     k
 }
 
+/// Boot C: TEXTURED pixel shader. Interpolates the per-vertex UV varying (via `pln`, exactly
+/// as Boot B did for color) and uses it to `sample` a texture, then RT-writes the sampled
+/// RGBA. Reuses the whole Boot B payload layout (BIM_PERSPECTIVE_PIXEL, Dispatch GRF Start for
+/// Setup = 4): g0/g1 = header, g2/g3 = barycentric (b1,b2), g4/g5 = attribute-0 plane setup.
+/// UV rides in the first two channels of attribute 0 (the VS forwards it into VUE DW8-11 just
+/// like the color varying — no VS/SBE change; only the vertex DATA is UV instead of RGB).
+///   U = pln(setup ch0 @g4.0, bary @g2) -> g14
+///   V = pln(setup ch1 @g4 sub .4=byte16, bary @g2) -> g15
+///   sample(SIMD8, BTI=1, sampler 0): payload g14(U),g15(V) mlen 2, rlen 4 -> g16..g19 = RGBA
+///   RT write g16..g19 (headerless, EOT, BTI 0) — the sampled texel becomes the pixel color.
+/// The sampler `send` is NOT eot; the RT-write `send_eot` terminates the thread after the
+/// texel returns. Coordinate order (u then v) and SIMD8 sizes are from PRM Vol7 message tables.
+pub fn build_ps_tex() -> Vec<u8> {
+    let mut k = Vec::new();
+    emit(&mut k, pln(EXEC_SIMD8, 14, 4, 0, 2));  // U <- attribute-0 channel 0
+    emit(&mut k, pln(EXEC_SIMD8, 15, 4, 16, 2)); // V <- attribute-0 channel 1
+    // sample: BTI 1 (texture surface), sampler 0, msg type SAMPLE(0), SIMD8(1), mlen 2, rlen 4.
+    emit(&mut k, send_msg(EXEC_SIMD8, SFID_SAMPLER, 16, 14, sampler_desc(1, 0, 0, 1, 2, 4)));
+    // RT write the sampled RGBA (g16..g19), headerless, EOT.
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 16, rt_write_desc(4, 0)));
+    k
+}
+
 /// Validate the encoder core against a `mov(8) g2<1>:F g1<8;8,1>:F`. DW0 must carry
 /// hardware opcode 1 (mov) in [6:0] and SIMD8 (3) in [23:21] => 0x0060_0001. (The old
 /// reference used 0x0060_0002, i.e. opcode 2 = `sel` — it validated the bug. Fixed to
@@ -507,13 +564,14 @@ pub unsafe fn build_and_dump_kernels(mmio_base: u64) -> Result<KernelStore, Rend
     store.vs_off = vs_off;
     store.dump("VS pass-through", vs_off, vs.len());
 
-    // Phase 7 Boot A: a SINGLE pixel shader that outputs the per-vertex color varying
-    // interpolated (flat) through the SF, replacing the six constant-color face kernels.
-    let ps = build_ps_attr();
+    // Phase 7 Boot C: a SINGLE textured pixel shader — interpolate the UV varying (pln, as
+    // Boot B) and sample a checkerboard texture. build_ps_attr (Boot A flat) / build_ps_attr
+    // wrapper for Boot B color are kept above for reference.
+    let ps = build_ps_tex();
     let ps_off = store.place(&ps)?;
     store.ps_off = ps_off;
-    store.ps_offs = [ps_off; 6]; // all faces share the one attribute PS (back-compat)
-    store.dump("PS per-vertex color (flat)", ps_off, ps.len());
+    store.ps_offs = [ps_off; 6]; // all faces share the one textured PS (back-compat)
+    store.dump("PS textured (sampler)", ps_off, ps.len());
 
     crate::serial_println!(
         "[EU] kernels placed: VS={:#x}, PS(attr)={:#x} (offsets from instruction base)",
