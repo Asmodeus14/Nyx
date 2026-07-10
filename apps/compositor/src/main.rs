@@ -17,6 +17,41 @@ use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, Cursor
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// Whole-hour offset applied to the raw hardware RTC before display. 0 = show the RTC verbatim
+/// (the machine's CMOS holds local time). Bump this if the panel clock is off by whole hours.
+const TZ_OFFSET_HOURS: i32 = 0;
+
+/// Append a zero-padded 2-digit number to `buf` at `pos`, returning the new position.
+fn push_2d(buf: &mut [u8], pos: usize, v: u8) -> usize {
+    buf[pos] = b'0' + (v / 10) % 10;
+    buf[pos + 1] = b'0' + v % 10;
+    pos + 2
+}
+
+/// Append a small unsigned decimal (no padding) to `buf` at `pos`, returning the new position.
+fn push_num(buf: &mut [u8], mut pos: usize, mut v: usize) -> usize {
+    if v == 0 {
+        buf[pos] = b'0';
+        return pos + 1;
+    }
+    let start = pos;
+    let mut tmp = [0u8; 10];
+    let mut n = 0;
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        buf[pos] = tmp[n];
+        pos += 1;
+    }
+    let _ = start;
+    pos
+}
+
+
 pub struct WindowClient {
     pub win: Window,
     pub owner_pid: u64,
@@ -49,6 +84,14 @@ pub struct CompositorState {
 
     pub start_menu_open: bool,
     pub screen_w: usize, pub screen_h: usize, pub screen_stride: usize,
+
+    // U0 instrumentation + live clock.
+    pub last_clock_sec: usize,   // whole-second value of the last clock tick (drives 1Hz redraw)
+    pub frame_count: u64,        // total redraws since boot
+    pub last_frame_ms: usize,    // draw time of the most recent frame (ms)
+    pub fps: usize,              // frames composited in the last rolling 1s window
+    pub fps_window_start: usize, // uptime-ms at the start of the current FPS window
+    pub fps_window_frames: usize,// frames counted so far in the current window
 }
 
 impl CompositorState {
@@ -63,6 +106,9 @@ impl CompositorState {
             is_resizing: false, resizing_win_idx: None,
             start_menu_open: false,
             screen_w: w, screen_h: h, screen_stride: stride,
+            last_clock_sec: 0,
+            frame_count: 0, last_frame_ms: 0,
+            fps: 0, fps_window_start: 0, fps_window_frames: 0,
         }
     }
 
@@ -329,13 +375,23 @@ pub extern "C" fn _start() -> ! {
         state.update();
 
         let now = sys_get_time();
-        if !state.needs_redraw && now.wrapping_sub(last_frame) < ms_per_frame { 
-            sys_sleep_ms(2); 
-            continue; 
+
+        // Live-clock tick: once the whole-second value changes, force a recomposite so the taskbar
+        // clock (and FPS overlay) advance even on an otherwise idle desktop.
+        let now_sec = now / 1000;
+        if now_sec != state.last_clock_sec {
+            state.last_clock_sec = now_sec;
+            state.needs_redraw = true;
+        }
+
+        if !state.needs_redraw && now.wrapping_sub(last_frame) < ms_per_frame {
+            sys_sleep_ms(2);
+            continue;
         }
         last_frame = now;
 
         if state.needs_redraw {
+            let frame_start = now;
             state.mark_dirty(state.mx.saturating_sub(15), state.my.saturating_sub(15), 35, 35);
 
             // 1. Submit GPU background fill for the ENTIRE screen (Asynchronous)
@@ -373,8 +429,18 @@ pub extern "C" fn _start() -> ! {
             let btn_x = (screen_stride / 2) - 35;
             canvas.fill_rect(btn_x, start_y + 6, 70, 24, Color::ACCENT_PRIMARY);
 
-            // Draw taskbar text
-            canvas.print_str(20, start_y + 14, "10:20 AM", Color::TEXT_DARK, 1);
+            // Draw taskbar text: live wall clock (HH:MM:SS) from the hardware RTC.
+            let rtc = sys_get_rtc();
+            let mut disp_hour = rtc.hour as i32 + TZ_OFFSET_HOURS;
+            disp_hour = ((disp_hour % 24) + 24) % 24; // wrap into 0..23
+            let mut clk = [0u8; 8];
+            let mut p = push_2d(&mut clk, 0, disp_hour as u8);
+            clk[p] = b':'; p += 1;
+            p = push_2d(&mut clk, p, rtc.min);
+            clk[p] = b':'; p += 1;
+            p = push_2d(&mut clk, p, rtc.sec);
+            let clk_str = core::str::from_utf8(&clk[..p]).unwrap_or("--:--:--");
+            canvas.print_str(20, start_y + 14, clk_str, Color::TEXT_DARK, 1);
             canvas.print_str(btn_x + 15, start_y + 8, "NYX", Color::WHITE, 1);
             
             let net_x = screen_stride - 50; let btn_y = screen_h - 36 + 6;
@@ -396,12 +462,45 @@ pub extern "C" fn _start() -> ! {
                 canvas.print_str(menu_x + 20, menu_y + 212, "> GL Cube (3D)", Color::WHITE, 1);
             }
 
+            // U0 baseline overlay: FPS + last frame's composite time (top-left, unobtrusive).
+            // Shows the previous frame's numbers (this frame's are measured after present below).
+            let mut ov = [0u8; 24];
+            let mut op = 0usize;
+            for &b in b"FPS " { ov[op] = b; op += 1; }
+            op = push_num(&mut ov, op, state.fps);
+            for &b in b"  " { ov[op] = b; op += 1; }
+            op = push_num(&mut ov, op, state.last_frame_ms);
+            ov[op] = b'm'; op += 1; ov[op] = b's'; op += 1;
+            let ov_str = core::str::from_utf8(&ov[..op]).unwrap_or("FPS ?");
+            canvas.print_str(4, 2, ov_str, Color::TEXT_MUTED, 1);
+
             draw_cursor(canvas.buffer, screen_stride, screen_h, state.mx, state.my, CursorType::Arrow);
 
             sys_swap_buffers();
             sys_gpu_sync();
 
-            state.prev_mx = state.mx; 
+            // U0 instrumentation: measure this frame's composite cost + rolling 1s FPS.
+            let frame_end = sys_get_time();
+            state.last_frame_ms = frame_end.wrapping_sub(frame_start);
+            state.frame_count = state.frame_count.wrapping_add(1);
+            state.fps_window_frames += 1;
+            if frame_end.wrapping_sub(state.fps_window_start) >= 1000 {
+                state.fps = state.fps_window_frames;
+                state.fps_window_frames = 0;
+                state.fps_window_start = frame_end;
+                let mut log = [0u8; 64];
+                let mut lp = 0usize;
+                for &b in b"[UI] frame " { log[lp] = b; lp += 1; }
+                lp = push_num(&mut log, lp, state.frame_count as usize);
+                for &b in b": draw=" { log[lp] = b; lp += 1; }
+                lp = push_num(&mut log, lp, state.last_frame_ms);
+                for &b in b"ms fps=" { log[lp] = b; lp += 1; }
+                lp = push_num(&mut log, lp, state.fps);
+                log[lp] = b'\n'; lp += 1;
+                if let Ok(s) = core::str::from_utf8(&log[..lp]) { sys_print(s); }
+            }
+
+            state.prev_mx = state.mx;
             state.prev_my = state.my;
             state.dirty_min_x = screen_stride; state.dirty_min_y = screen_h; 
             state.dirty_max_x = 0; state.dirty_max_y = 0;

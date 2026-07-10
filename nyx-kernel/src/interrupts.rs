@@ -1220,9 +1220,14 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
              }
         },
 
-        504 => { 
+        504 => {
             // Return true uptime, completely immune to CPU frequency scaling!
-            frame.rax = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed); 
+            frame.rax = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed);
+        },
+
+        528 => {
+            // SYS_GET_RTC: battery-backed wall clock, packed year<<40|month<<32|day<<24|hour<<16|min<<8|sec.
+            frame.rax = crate::rtc::read_packed();
         },
 
         

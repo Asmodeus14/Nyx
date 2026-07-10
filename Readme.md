@@ -160,6 +160,7 @@ Build:  Rust nightly + LLD linker + ACPICA C bridge (bindgen)
 - **Intel Gen9.5 3D Engine (RCS)** — A from-scratch 3D renderer driving the Comet Lake integrated GPU's RENDER command streamer in legacy ring-buffer mode. It brings up the render engine (forcewake, MOCS, GGTT), submits the full Gen9 3D pipeline directly to the RCS ring (STATE_BASE_ADDRESS, URB, hand-encoded EU vertex/pixel shaders, SBE/WM barycentric interpolation, back-face culling, binding tables, samplers), and renders textured, perspective-correct, indexed triangle meshes. Features proven on bare metal: MVP-transformed spinning meshes, multi-mesh scenes under one shared state-base, procedural textures via the sampler, render-to-texture (offscreen Y-tiled render targets), and **SSAA antialiasing** (2×2 supersampling with a free hardware-bilinear box-downsample resolve). Exposed to userspace as a mini-GL API (syscalls 514–516/527); a userspace client renders into its **own compositor window** — the engine resolves into a per-context backbuffer that the kernel copies into the client's window surface, so 3D apps compose alongside 2D windows instead of taking over the scanout. Validated end-to-end by the `glcube` app (a spinning textured cube in a window). Tested on real hardware only — QEMU cannot emulate the render engine.
 - **GPU Fallback** — All GPU operations fall back gracefully to CPU-side software rendering if the Intel GPU driver is unavailable.
 - **Window Manager** — `window.rs` maintains a list of application windows with position, size, and z-order. `WINDOW_MANAGER` is a global spinlock-protected instance.
+- **Desktop Compositor** — the userspace `compositor` app is an event-driven window server: it composites client SHM window buffers, decorations, taskbar, and start menu, redrawing only when something is dirty. The taskbar shows a **live wall clock** (`HH:MM:SS`) sourced from the hardware RTC via `sys_get_rtc` (528), ticking once per second even on an idle desktop. A lightweight **U0 instrumentation overlay** (`FPS NN  Xms`) plus a per-second `[UI] frame …` serial log establish the baseline frame time / frame rate that the ongoing GPU UI-acceleration work (`UI-ACCELERATION-PLAN.md`) is measured against.
 - **Mouse Input** — PS/2 mouse driver with atomic state (`MOUSE_STATE`) tracking X/Y position and button state. Cursor rendering is currently handled in software by the compositor (composited into the framebuffer each frame); moving it to the GPU's hardware cursor plane is a planned UI-acceleration item.
 - **Pixel Format** — BGRA 32-bit (4 bytes per pixel), stride-aware layout sourced from the UEFI framebuffer info.
 
@@ -292,6 +293,7 @@ These syscalls are unique to Nyx OS and provide access to the kernel's quantum, 
 | `524` | `sys_get_system_info` | `SystemInfo*` | `0` | Populate a `SystemInfo` struct with: CPU temperature, active cooling state, CPU and GPU fan RPM, and up to 64 task descriptors (PID, name, CPU ticks, state). |
 | `525` | `sys_sleep_ms` | `ms` | `0` | Sleep for `ms` milliseconds. Sets the calling task to `Blocked` state with a TSC-derived wake deadline and yields the CPU. Wakes on timer expiry or external interrupt. |
 | `526` | `sys_get_dsdt_data` | `buf*, max_len` | `u64` | Copy the raw ACPI DSDT table bytes into the caller's buffer. Returns bytes copied. |
+| `528` | `sys_get_rtc` | — | Packed `u64` | Read the battery-backed CMOS/RTC wall clock. Returns the current date/time packed as `[year:24][month:8][day:8][hour:8][min:8][sec:8]` (bits 63–0), with all fields binary and 24-hour normalized by the kernel. Distinct from `sys_get_uptime_ms` (504), which is monotonic uptime, not calendar time. |
 
 #### AI Entity and Identity
 
@@ -474,10 +476,10 @@ Nyx/
 │   │   ├── mouse.rs            # PS/2 mouse driver, MOUSE_STATE global
 │   │   ├── shell.rs            # Kernel key queue for userspace polling
 │   │   ├── usb.rs              # xHCI host controller driver
-│   │   ├── drm.rs              # DRM/KMS interface stubs (Nouveau handshake WIP)
 │   │   ├── thermal.rs          # Intel silicon temperature, HWP, fan control
 │   │   ├── laptop_fans.rs      # Dell SMBus fan RPM telemetry
 │   │   ├── time.rs             # TSC calibration, UPTIME_MS atomic
+│   │   ├── rtc.rs              # MC146818 CMOS/RTC wall-clock reader (sys_get_rtc)
 │   │   ├── tarfs.rs            # Initrd TAR filesystem parser
 │   │   ├── allocator.rs        # Kernel heap initialization
 │   │   ├── serial.rs           # Serial port logging, BOOT_LOG buffer
@@ -498,7 +500,21 @@ Nyx/
 │   │       │   ├── iwlwifi.rs  # Intel WiFi prototype driver
 │   │       │   └── mod.rs      # smoltcp network interface, DHCP, DNS
 │   │       └── gpu/
-│   │           └── intel.rs    # Intel integrated GPU (BLT engine, GGTT, vsync)
+│   │           ├── mod.rs       # GPU driver dispatch / fallback
+│   │           └── intel/
+│   │               ├── mod.rs   # Intel iGPU: BLT engine, GGTT, forcewake, vsync
+│   │               └── render/  # Gen9.5 RCS 3D engine (from-scratch mini-GL)
+│   │                   ├── mod.rs      # RenderEngine bring-up, GVA map, boot self-test
+│   │                   ├── ring.rs     # RCS ring buffer submission
+│   │                   ├── cmd.rs      # 3D command / PIPE_CONTROL encoders
+│   │                   ├── urb.rs      # URB allocation
+│   │                   ├── eu.rs       # Hand-encoded EU vertex/pixel shader kernels
+│   │                   ├── state.rs    # STATE_BASE, surface/sampler/RT state, tiling
+│   │                   ├── math.rs     # Vec/Mat4, perspective, lookAt
+│   │                   ├── engine.rs   # Mesh/Scene/Texture API types
+│   │                   ├── pipeline.rs # draw_scene / draw_resolve (SSAA two-pass)
+│   │                   ├── gl.rs       # Persistent GL_CONTEXT (mini-GL syscalls 514–516/527)
+│   │                   └── decode.rs   # Offline command-stream decoder
 │   ├── acpica-core/            # ACPICA C source tree (Intel reference implementation)
 │   ├── acpica-includes/        # ACPICA header files
 │   ├── lwext4/                 # lwext4 C library (ext4 filesystem implementation)
@@ -526,12 +542,13 @@ Nyx/
 │           └── bin/qclang.rs   # CLI: compile, run, benchmark, info, update
 │
 ├── apps/                       # Userspace applications (ELF64, Ring 3)
-│   ├── compositor/             # Windowing compositor
+│   ├── compositor/             # Windowing compositor (live RTC clock, U0 FPS overlay)
 │   ├── terminal/               # Terminal emulator
 │   ├── explorer/               # File system explorer
 │   ├── sysmon/                 # System monitor (CPU, memory, tasks)
 │   ├── network/                # Network configuration manager
 │   ├── settings/               # System settings application
+│   ├── glcube/                 # mini-GL validation app (spinning textured cube in a window)
 │   └── init/                   # PID 1 init process
 │
 ├── libs/                       # Shared userspace libraries

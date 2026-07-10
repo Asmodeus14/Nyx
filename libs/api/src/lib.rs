@@ -257,6 +257,35 @@ pub fn sys_get_time() -> usize {
     syscall(504, 0, 0, 0, 0, 0, 0) as usize
 }
 
+pub const SYS_GET_RTC: u64 = 528;
+
+/// A wall-clock reading from the machine's battery-backed CMOS RTC (syscall 528). Fields are binary
+/// and 24-hour normalized by the kernel. This is real calendar time, unlike `sys_get_time` (uptime).
+#[derive(Clone, Copy)]
+pub struct RtcTime {
+    pub sec: u8,
+    pub min: u8,
+    pub hour: u8,
+    pub day: u8,
+    pub month: u8,
+    pub year: u16,
+}
+
+/// Read the hardware wall clock. Unpacks the kernel's packed u64
+/// (year<<40 | month<<32 | day<<24 | hour<<16 | min<<8 | sec).
+pub fn sys_get_rtc() -> RtcTime {
+    let p = syscall(SYS_GET_RTC, 0, 0, 0, 0, 0, 0);
+    RtcTime {
+        sec: (p & 0xFF) as u8,
+        min: ((p >> 8) & 0xFF) as u8,
+        hour: ((p >> 16) & 0xFF) as u8,
+        day: ((p >> 24) & 0xFF) as u8,
+        month: ((p >> 32) & 0xFF) as u8,
+        year: ((p >> 40) & 0xFFFF) as u16,
+    }
+}
+
+
 pub fn sys_get_context_switches() -> u64 {
     syscall(523, 0, 0, 0, 0, 0, 0)
 }

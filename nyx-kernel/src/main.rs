@@ -21,6 +21,7 @@ pub mod ioapic;
 pub mod smp;
 pub mod percpu;
 pub mod time;
+pub mod rtc;
 pub mod task;
 pub mod executor;
 pub mod scheduler;
