@@ -1,0 +1,13 @@
+[package]
+name = "nyx-glcube"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 9 validation app: drives the mini-GL syscalls (514/515/516/527) directly.
+# Deliberately depends on ONLY nyx-api — NOT nyx-gui — so it is unaffected by the
+# nyx-gui rustc ICE and needs no heap allocator (all buffers are fixed stack arrays).
+[dependencies]
+nyx-api = { path = "../../libs/api" }
+
+[profile.release]
+panic = "abort"

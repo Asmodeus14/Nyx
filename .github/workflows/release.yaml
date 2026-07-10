@@ -17,11 +17,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # PINNED nightly (must match rust-toolchain.toml). A floating @nightly is non-deterministic.
       - name: Setup Rust Nightly Toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-07-01
           components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
+          # x86_64-unknown-uefi is REQUIRED (this was the real CI failure): the runner's bootloader
+          # 0.11.15 build script builds a UEFI bootloader for that target — build.rs fails with E0463
+          # "can't find crate for std" → exit 101 without it. x86_64-unknown-none is the kernel target.
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2

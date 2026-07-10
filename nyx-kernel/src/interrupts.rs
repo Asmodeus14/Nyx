@@ -1383,6 +1383,91 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = 0;
         },
 
+        // ---------------------------------------------------------------------
+        // Phase 9: mini-GL 3D syscalls. These wrap the RCS render engine's Scene
+        // path (SSAA-antialiased, textured, multi-mesh) for userspace. The heavy
+        // data (verts/texels) is copied into kernel Vecs once at upload; per frame
+        // only the MVP matrices cross the boundary. See render/gl.rs.
+        // ---------------------------------------------------------------------
+        514 => { // sys_gl_init(width, height, dst_pixels_ptr) -> 1 ok / 0 err
+            // Windowed GL: the app passes the CPU pointer to ITS OWN SHM window pixel buffer. The GL
+            // path resolves into a private kernel backbuffer and copies it here each frame, so the
+            // compositor composites glcube as a normal window (no scanout blit). Validate the buffer.
+            let width = arg1 as u32;
+            let height = arg2 as u32;
+            let dst_ptr = arg3 as *const u8;
+            let bytes = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+            if width == 0 || height == 0 || bytes == 0 || !is_valid_user_ptr(dst_ptr, bytes) {
+                frame.rax = 0;
+            } else {
+                match crate::drivers::gpu::intel::render::gl::gl_init(width, height, dst_ptr as u64) {
+                    Ok(()) => frame.rax = 1,
+                    Err(_) => frame.rax = 0,
+                }
+            }
+        },
+
+        515 => { // sys_gl_upload_mesh(desc_ptr) -> handle (>=0) or u64::MAX on error
+            // desc layout (repr(C), all u64): [verts_ptr, vert_count, idx_ptr, idx_count,
+            //                                  texel_ptr, tex_w, tex_h]
+            let desc_ptr = arg1 as *const u64;
+            if !is_valid_user_ptr(desc_ptr as *const u8, 7 * 8) {
+                frame.rax = u64::MAX;
+            } else {
+                let d = unsafe { core::slice::from_raw_parts(desc_ptr, 7) };
+                let verts_ptr = d[0] as *const crate::drivers::gpu::intel::render::gl::GlVertex;
+                let vert_count = d[1] as usize;
+                let idx_ptr = d[2] as *const u32;
+                let idx_count = d[3] as usize;
+                let texel_ptr = d[4] as *const u32;
+                let tex_w = d[5] as u32;
+                let tex_h = d[6] as u32;
+                let vbytes = vert_count.saturating_mul(28); // 7 f32
+                let ibytes = idx_count.saturating_mul(4);
+                let tbytes = (tex_w as usize).saturating_mul(tex_h as usize).saturating_mul(4);
+                if vert_count == 0 || idx_count == 0 || tex_w == 0 || tex_h == 0
+                    || !is_valid_user_ptr(verts_ptr as *const u8, vbytes)
+                    || !is_valid_user_ptr(idx_ptr as *const u8, ibytes)
+                    || !is_valid_user_ptr(texel_ptr as *const u8, tbytes)
+                {
+                    frame.rax = u64::MAX;
+                } else {
+                    let verts = unsafe { core::slice::from_raw_parts(verts_ptr, vert_count) };
+                    let indices = unsafe { core::slice::from_raw_parts(idx_ptr, idx_count) };
+                    let texels = unsafe {
+                        core::slice::from_raw_parts(texel_ptr, (tex_w * tex_h) as usize)
+                    };
+                    match crate::drivers::gpu::intel::render::gl::gl_upload_mesh(
+                        verts, indices, texels, tex_w, tex_h,
+                    ) {
+                        Ok(h) => frame.rax = h as u64,
+                        Err(_) => frame.rax = u64::MAX,
+                    }
+                }
+            }
+        },
+
+        516 => { // sys_gl_render(mvps_ptr, count) -> 1 ok / 0 err. mvps = count * 16 f32 (column-major).
+            let mvps_ptr = arg1 as *const f32;
+            let count = arg2 as usize;
+            let floats = count.saturating_mul(16);
+            let bytes = floats.saturating_mul(4);
+            if count == 0 || !is_valid_user_ptr(mvps_ptr as *const u8, bytes) {
+                frame.rax = 0;
+            } else {
+                let flat = unsafe { core::slice::from_raw_parts(mvps_ptr, floats) };
+                match crate::drivers::gpu::intel::render::gl::gl_render_flat(flat, count) {
+                    Ok(()) => frame.rax = 1,
+                    Err(_) => frame.rax = 0,
+                }
+            }
+        },
+
+        527 => { // sys_gl_reset()
+            crate::drivers::gpu::intel::render::gl::gl_reset();
+            frame.rax = 1;
+        },
+
         517 => {
             let buf_ptr = arg1 as *mut u8;
             let buf_len = arg2 as usize;

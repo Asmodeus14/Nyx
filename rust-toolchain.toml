@@ -1,3 +1,12 @@
 [toolchain]
-channel = "nightly"
+# PINNED nightly. A floating `nightly` breaks CI non-deterministically. This exact date is
+# verified to build the ENTIRE workspace + the runner's UEFI bootloader image clean.
+# NOTE: do NOT downgrade to early-2026 nightlies — those regress an annotate_snippets rustc
+# ICE ("slice index starts at N but ends at M") that crashes on any warning with a source
+# snippet, including third-party crates like proc-macro2 inside the bootloader build.
+channel = "nightly-2026-07-01"
 components = ["rust-src", "llvm-tools-preview"]
+# x86_64-unknown-none = the kernel. x86_64-unknown-uefi = required by the runner's
+# bootloader 0.11.15 build script (it builds a UEFI bootloader for that target; without it
+# build.rs aborts with E0463 "can't find crate for std", exit 101). THIS was the real CI failure.
+targets = ["x86_64-unknown-none", "x86_64-unknown-uefi"]

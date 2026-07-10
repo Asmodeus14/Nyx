@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(warnings)] // avoid the annotate_snippets renderer ICE on snippet-bearing warnings (see libs/gui)
 
 use nyx_api::*;
 

@@ -1,5 +1,9 @@
 #![no_std]
 #![no_main]
+// See libs/gui/src/lib.rs: some pinned nightlies ICE in the annotate_snippets diagnostic
+// renderer while drawing ANY warning with a source snippet, aborting the build. Suppress lints
+// (project idiom; matches the other apps) so the buggy renderer is never entered.
+#![allow(warnings)]
 extern crate alloc;
 
 use linked_list_allocator::LockedHeap;
@@ -158,7 +162,7 @@ impl CompositorState {
 
             let btn_w = 70; let btn_x = (self.screen_stride / 2) - 35; let btn_y = self.screen_h - 36 + 6; 
             let net_x = self.screen_stride - 50; let net_w = 30;
-            let menu_w = 180; let menu_h = 200;
+            let menu_w = 180; let menu_h = 240;
             let menu_x = (self.screen_stride / 2) - (menu_w / 2); let menu_y = self.screen_h - 36 - menu_h - 10;
 
             if self.start_menu_open && self.mx >= menu_x && self.mx <= menu_x + menu_w && self.my >= menu_y && self.my <= menu_y + menu_h {
@@ -167,7 +171,8 @@ impl CompositorState {
                 else if rel_y < 80 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Settings.nyx/run.bin\0"); sys_exit(1); } }
                 else if rel_y < 120 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Explorer.nyx/run.bin\0"); sys_exit(1); } }
                 else if rel_y < 160 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Network.nyx/run.bin\0"); sys_exit(1); } }
-                else { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0"); sys_exit(1); } }
+                else if rel_y < 200 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0"); sys_exit(1); } }
+                else { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/GlCube.nyx/run.bin\0"); sys_exit(1); } }
                 
                 self.start_menu_open = false; 
                 self.mark_full_redraw();
@@ -377,17 +382,18 @@ pub extern "C" fn _start() -> ! {
 
             // Draw Start Menu on top of windows
             if state.start_menu_open {
-                let menu_w = 180; let menu_h = 200;
+                let menu_w = 180; let menu_h = 240;
                 let menu_x = (screen_stride / 2) - (menu_w / 2); let menu_y = screen_h - 36 - menu_h - 10;
-                
+
                 canvas.fill_rect(menu_x, menu_y, menu_w, menu_h, 0xFF_111111);
                 canvas.fill_rect(menu_x, menu_y, menu_w, 2, Color::NYX_ORANGE);
-                
+
                 canvas.print_str(menu_x + 20, menu_y + 12, "> Terminal", Color::WHITE, 1);
                 canvas.print_str(menu_x + 20, menu_y + 52, "> Settings", Color::WHITE, 1);
                 canvas.print_str(menu_x + 20, menu_y + 92, "> Explorer", Color::WHITE, 1);
                 canvas.print_str(menu_x + 20, menu_y + 132, "> Network Suite", Color::WHITE, 1);
                 canvas.print_str(menu_x + 20, menu_y + 172, "> System Monitor", Color::WHITE, 1);
+                canvas.print_str(menu_x + 20, menu_y + 212, "> GL Cube (3D)", Color::WHITE, 1);
             }
 
             draw_cursor(canvas.buffer, screen_stride, screen_h, state.mx, state.my, CursorType::Arrow);

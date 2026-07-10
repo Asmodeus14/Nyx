@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(warnings)] // avoid the annotate_snippets renderer ICE on snippet-bearing warnings (see libs/gui)
 
 use core::arch::asm;
 
@@ -157,6 +158,99 @@ pub fn sys_swap_buffers() {
 
 pub fn sys_gpu_fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     syscall(501, x as u64, y as u64, w as u64, h as u64, color as u64, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9: mini-GL 3D API. Wraps the kernel's RCS render engine (textured,
+// multi-mesh, SSAA-antialiased). Typical use:
+//
+//     sys_gl_init(w, h);
+//     let cube = sys_gl_upload_mesh(&verts, &indices, &texels, tw, th);
+//     loop { sys_gl_render(&mvps); }   // one Mat4 (16 f32, column-major) per mesh
+//
+// Vertex layout is GlVertex (pos xyz + varying: uv,0,1 for textured, or rgba).
+// ---------------------------------------------------------------------------
+
+pub const SYS_GL_INIT: u64 = 514;
+pub const SYS_GL_UPLOAD_MESH: u64 = 515;
+pub const SYS_GL_RENDER: u64 = 516;
+pub const SYS_GL_RESET: u64 = 527;
+
+/// One interleaved 3D vertex, matching the kernel `GlVertex` (repr(C), 7 f32 = 28 bytes):
+/// position (x,y,z) in model space + a 4-component varying. For a textured mesh set the varying to
+/// (u, v, 0.0, 1.0); the pixel shader samples the mesh's texture at (u,v).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GlVertex {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub vz: f32,
+    pub vw: f32,
+}
+
+impl GlVertex {
+    /// Convenience: a textured vertex at (x,y,z) sampling UV (u,v).
+    pub const fn textured(x: f32, y: f32, z: f32, u: f32, v: f32) -> Self {
+        Self { x, y, z, vx: u, vy: v, vz: 0.0, vw: 1.0 }
+    }
+}
+
+/// Descriptor passed to sys_gl_upload_mesh (repr(C), 7 u64) — pointers + counts for the mesh's
+/// vertices, indices, and B8G8R8A8 texels. Built internally by the wrapper.
+#[repr(C)]
+struct GlMeshDesc {
+    verts_ptr: u64,
+    vert_count: u64,
+    idx_ptr: u64,
+    idx_count: u64,
+    texel_ptr: u64,
+    tex_w: u64,
+    tex_h: u64,
+}
+
+/// Initialize the GL context for a `width`x`height` WINDOW. `dst_pixels` is this app's SHM window
+/// pixel buffer (B8G8R8A8, tightly packed at `width*4` pitch); the kernel copies each resolved frame
+/// into it so the compositor composites the cube as a normal window (no scanout blit). Returns true on
+/// success. Call once before uploading meshes.
+pub fn sys_gl_init(width: u32, height: u32, dst_pixels: *const u32) -> bool {
+    syscall(SYS_GL_INIT, width as u64, height as u64, dst_pixels as u64, 0, 0, 0) == 1
+}
+
+/// Upload a mesh + its texture. `texels` is `tex_w * tex_h` B8G8R8A8 pixels (A<<24|R<<16|G<<8|B).
+/// Returns the mesh handle (0-based index) on success, or None on error. Call before the first
+/// render; the mesh set is fixed once rendering begins (use sys_gl_reset to rebuild).
+pub fn sys_gl_upload_mesh(
+    verts: &[GlVertex],
+    indices: &[u32],
+    texels: &[u32],
+    tex_w: u32,
+    tex_h: u32,
+) -> Option<usize> {
+    let desc = GlMeshDesc {
+        verts_ptr: verts.as_ptr() as u64,
+        vert_count: verts.len() as u64,
+        idx_ptr: indices.as_ptr() as u64,
+        idx_count: indices.len() as u64,
+        texel_ptr: texels.as_ptr() as u64,
+        tex_w: tex_w as u64,
+        tex_h: tex_h as u64,
+    };
+    let r = syscall(SYS_GL_UPLOAD_MESH, &desc as *const GlMeshDesc as u64, 0, 0, 0, 0, 0);
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Render one frame. `mvps` is one 4x4 MVP matrix per uploaded mesh (in upload order), each 16 f32
+/// column-major. The kernel renders all meshes (SSAA-antialiased) and presents. Returns true on ok.
+pub fn sys_gl_render(mvps: &[[f32; 16]]) -> bool {
+    syscall(SYS_GL_RENDER, mvps.as_ptr() as u64, mvps.len() as u64, 0, 0, 0, 0) == 1
+}
+
+/// Tear down the GL context so it can be re-initialized and re-uploaded.
+pub fn sys_gl_reset() {
+    syscall(SYS_GL_RESET, 0, 0, 0, 0, 0, 0);
 }
 
 pub fn sys_get_time() -> usize {

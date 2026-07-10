@@ -27,6 +27,8 @@ pub mod eu;
 pub mod state;
 pub mod urb;
 pub mod pipeline;
+pub mod engine;
+pub mod gl;
 pub mod decode;
 pub mod math;
 
@@ -76,6 +78,22 @@ pub const GVA_VERTEX_BUFFERS: u32 = 0x1B00_0000;
 pub const GVA_DEPTH_BUFFER: u32 = 0x1C00_0000;
 pub const GVA_TEXTURES: u32 = 0x1D00_0000;
 pub const GVA_RCS_FENCE: u32 = 0x1E00_0000; // fence / scratch
+// MSAA-track Boot 3 (SSAA): the supersampled scene RT is 2x the display in each axis (4x the
+// pixels). At 1080p the Y-tiled 3840x2160 RT is ~32 MB, which overflows the 16 MB slot between
+// GVA_DEPTH_BUFFER (0x1C00_0000) and GVA_TEXTURES (0x1D00_0000). Placed high in the 4 GB GGTT
+// (8 MB of PTEs at BAR0+8 MB back the full 32-bit GVA space), clear of the BLT windows
+// (0x2000_0000+) and test region (0x3000_0000): 0x4000_0000 gives >256 MB of headroom.
+pub const GVA_SSAA_RT: u32 = 0x4000_0000;
+
+/// Windowed-GL resolve backbuffer. The userspace mini-GL path (render/gl.rs) resolves into THIS
+/// private linear buffer instead of the shared fullscreen backbuffer (0x1400_0000), then the kernel
+/// copies it into the app's SHM window buffer — so glcube renders inside a compositor window and never
+/// blits the scanout. MUST NOT collide with any other GVA slot: it is placed high (clear of the
+/// 0x16-0x1E state slots AND the SSAA RT at 0x4000_0000+~5MB) at 0x5000_0000. HISTORICAL BUG: this was
+/// 0x1600_0000, which is EXACTLY GVA_RCS_RING — allocating the window backbuffer there rewrote the
+/// ring's GGTT PTEs, so after a TLB invalidate the engine fetched the window buffer as commands and
+/// hung (HEAD stuck, FAULT=0, fence never signalled). Only the GL path hit it (ring-0 runs first).
+pub const GVA_GL_WIN_BB: u32 = 0x5000_0000;
 
 /// The RCS ring is one 4 KiB page = 1024 dwords, matching the BLT ring.
 pub const RCS_RING_DWORDS: u32 = 1024;
@@ -175,7 +193,8 @@ impl RenderEngine {
         for i in 0..32u32 {
             self.write_reg(0xB020 + i * 4, 0x0030_0030);
         }
-        crate::serial_println!("[RCS] MOCS table programmed (all entries -> LLC WB cached).");
+        // NOTE: intentionally NOT logged here — `ensure_ready()` reprograms MOCS every submission, so a
+        // per-call log floods the boot-log at frame rate (drowning [SCENE] STATS). bring_up logs it once.
     }
 
     // --- Power / reset ---
@@ -196,6 +215,63 @@ impl RenderEngine {
                 break;
             }
         }
+    }
+
+    /// Re-assert the RENDER power well + ring before a submission, so rendering works even after
+    /// the engine has gone idle since boot. `forcewake_render` was previously only called once in
+    /// `bring_up`; the render domain's forcewake (0xA278) is SEPARATE from the BLT domain (0xA188)
+    /// the compositor keeps awake, so nothing holds RCS awake between the boot self-test and a
+    /// later userspace `gl_render`. Once the render well parks (RC6), MMIO writes to the 0x2000
+    /// range are dropped and the 3DPRIMITIVE never executes — the RT is only ever cleared, giving
+    /// a BLACK screen with no geometry. This makes every render path wake the domain first.
+    ///
+    /// Idempotent: at boot the well is already awake and the ring enabled, so the re-arm branch is
+    /// skipped and this is just a cheap forcewake re-assert. At runtime it wakes the domain and, if
+    /// RC6 also cleared the ring registers (legacy ring mode keeps no hw context), re-programs them.
+    /// The engine is idle here (no in-flight batch), and `rcs_submit` reads TAIL from the register
+    /// every call, so resetting HEAD/TAIL to 0 resyncs automatically — safe.
+    pub unsafe fn ensure_ready(&mut self) {
+        self.forcewake_render();
+
+        // Only touch engine-MODE registers (GFX_MODE ring-select) + MOCS when the ring actually needs
+        // re-arming. Rewriting RCS_GFX_MODE (ring-mode select) on a LIVE engine every frame stalled
+        // the pipeline: the stream ran to the final fence PIPE_CONTROL but it never retired
+        // (FAULT=0, HEAD near end, fence stuck at 0 — a drain stall, not a page fault). forcewake is
+        // held from bring_up and never released, so the render well is NOT actually parking (RC6);
+        // the earlier "reprogram MOCS every frame" defense was for an RC6 that isn't happening here.
+        // If the ring ever IS found disabled (genuine context loss), the branch below restores MOCS +
+        // GFX_MODE + ring pointers together, as bring_up does.
+        let ctl = self.read_reg(RENDER_RING_CTL);
+        if (ctl & 0x1) == 0 {
+            // Ring lost its programming while parked — re-arm it (mirrors bring_up's ring setup).
+            self.program_mocs(); // MOCS lives in render context; restore alongside the ring.
+            self.write_reg(RCS_GFX_MODE, 1 << (15 + 16)); // legacy ring mode (clear execlist-enable)
+            self.write_reg(RENDER_RING_CTL, 0);
+            self.write_reg(RENDER_RING_HEAD, 0);
+            self.write_reg(RENDER_RING_TAIL, 0);
+            self.write_reg(RENDER_RING_START, self.ring_gva);
+            self.write_reg(RENDER_RING_CTL, 0x1);
+            crate::serial_println!(
+                "[RCS] ensure_ready: re-armed ring after idle (CTL was {:#010x}, START={:#x})",
+                ctl, self.ring_gva
+            );
+        }
+    }
+
+    /// Invalidate the GGTT TLB so the render engine sees GGTT PTEs that were re-mapped after the
+    /// engine already cached translations for those GVAs. Gen8+ mechanism (mirrors i915
+    /// `gen8_ggtt_invalidate`): write GFX_FLSH_CNTL_GEN6 (0x101008) = GFX_FLSH_CNTL_EN (1).
+    ///
+    /// Load-bearing for the userspace GL path: the boot self-test (`spin_scene`) is the FIRST user of
+    /// the fixed state GVAs (GVA_SURFACE_STATE / GVA_DYNAMIC_STATE / GVA_SSAA_RT / …). glcube's
+    /// `gl_init`/`create_scene` then RE-map those same GVAs to fresh physical frames. Without a TLB
+    /// invalidate the RCS keeps serving the boot self-test's stale translations, so glcube's viewport/
+    /// state reads hit the wrong pages → a garbage/zero viewport → every triangle collapses to zero
+    /// coverage (CL_prims>0 but PS_inv=0, black RT). The compositor avoids this by mapping each window
+    /// at a UNIQUE GVA (never re-mapping), which is why its BLT path needs no flush.
+    pub unsafe fn invalidate_ggtt_tlb(&self) {
+        self.write_reg(0x101008, 1);
+        let _ = self.read_reg(0x101008); // posting read
     }
 
     /// Per-engine render reset (Gen8 sequence): request via RESET_CTL, wait
@@ -251,6 +327,7 @@ impl RenderEngine {
 
         // Program the MOCS table (REQUIRED on Gen9 for render-cache writes to reach memory).
         self.program_mocs();
+        crate::serial_println!("[RCS] MOCS table programmed (all entries -> LLC WB cached).");
 
         // Ensure LEGACY ring-buffer mode: clear the execlist-enable bit in GFX_MODE
         // (masked reg: mask bit 15 set in [31:16], data bit 15 = 0). Firmware may have
@@ -541,16 +618,17 @@ pub fn init_render_engine(mmio_base: u64) -> bool {
                 (1920, 1080, 1920, 4)
             };
             if bb_cpu != 0 {
-                // Phase 6, Step 3: spin the back-face-culled cube. spin_cube allocates GPU
-                // resources once and renders/presents N frames at increasing rotation
-                // (buffers reused per frame, no leak). ~300 frames * 12ms ≈ 3.6 s of motion.
+                // Phase 8b: spin a cube AND a pyramid side by side in one shared-buffer scene,
+                // drawn in one command stream per frame (proves the mesh API generalizes + that
+                // multiple GPU-resident meshes coexist). ~300 frames * 12ms ≈ 3.6 s of motion.
+                // (spin_cube is still available for the single-mesh path.)
                 let pitch = stride * bpp;
-                match eng.spin_cube(0x1400_0000, bb_cpu, w, h, pitch, 300) {
+                match eng.spin_scene(0x1400_0000, bb_cpu, w, h, pitch, 300) {
                     Ok(()) => {
-                        crate::serial_println!("[CUBE] spin done; holding final frame 2s.");
+                        crate::serial_println!("[SCENE] spin done; holding final frame 2s.");
                         crate::time::sleep_ms(2000);
                     }
-                    Err(e) => crate::serial_println!("[CUBE] spin_cube failed: {:?}", e),
+                    Err(e) => crate::serial_println!("[SCENE] spin_scene failed: {:?}", e),
                 }
             }
         }

@@ -15,7 +15,7 @@ use super::cmd::{self, gfxpipe_header, CmdStream, PIPELINE_3D};
 use super::state::{self, StateBuffer};
 use super::{
     RenderEngine, RenderError, GVA_DYNAMIC_STATE, GVA_RCS_FENCE, GVA_SURFACE_STATE,
-    GVA_TEXTURES, GVA_VERTEX_BUFFERS,
+    GVA_VERTEX_BUFFERS,
 };
 
 // --- 3D command sub-opcodes (verified against gen9.xml) ---
@@ -131,7 +131,7 @@ impl RenderEngine {
         let mut surf_buf = StateBuffer::new(mmio, GVA_SURFACE_STATE, 1)?;
         let mut dyn_buf = StateBuffer::new(mmio, GVA_DYNAMIC_STATE, 1)?;
         let mut vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 1)?;
-        let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch)?;
+        let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch, state::TILEMODE_LINEAR)?;
 
         // Dump the RENDER_SURFACE_STATE + binding table to cross-check against isl.
         {
@@ -432,101 +432,28 @@ impl RenderEngine {
         Ok(())
     }
 
-    /// Set up the persistent GPU resources for the cube ONCE (surface/dynamic/vertex state
-    /// buffers, render state, a reserved vertex block, and the static index buffer). These
-    /// are reused across frames by [`draw_cube_frame`], so an animation loop does not leak a
-    /// GGTT mapping / contiguous frame per frame. The vertex block is left uninitialised —
-    /// each frame rewrites it with fresh clip-space positions.
-    unsafe fn setup_cube_gpu(
+    /// Render ONE frame of `g` transformed by `mvp` into `rt_gva`. Rewrites only the vertex
+    /// block (CPU-applying `mvp` to each model-space position -> clip space), then re-emits the
+    /// full known-good Phase-5..7 pipeline (index buffer + indexed 3DPRIMITIVE, back-face
+    /// culled, textured/sampled). The caller owns the camera + animation: `mvp` is a finished
+    /// projection*view*model matrix. `present` copies the result to scanout; `verbose` logs the
+    /// decoded stream + pipeline stats (first frame only during animation).
+    ///
+    /// This is the generic Phase-8 draw primitive (Phase 9's syscalls wrap it). The emitted
+    /// command stream is identical to the Phase-7 cube; only geometry/texture/MVP are inputs.
+    pub unsafe fn draw(
         &mut self,
-        rt_gva: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-    ) -> Result<CubeGpu, RenderError> {
-        let (vs_off, ps_off) = match &self.kernels {
-            Some(k) => (k.vs_off, k.ps_off),
-            None => return Err(RenderError::NotInitialized),
-        };
-        let mmio = self.mmio_base;
-        let mut surf_buf = StateBuffer::new(mmio, GVA_SURFACE_STATE, 1)?;
-        let mut dyn_buf = StateBuffer::new(mmio, GVA_DYNAMIC_STATE, 1)?;
-        let mut vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 1)?;
-        let mut rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch)?;
-
-        // --- Boot C: procedural checkerboard texture + sampler + 2-entry binding table ---
-        // Upload a 64x64 B8G8R8A8 checkerboard (8-texel cells) to GVA_TEXTURES. 64*64*4 = 16KB
-        // = 4 pages; pitch 256B is a 64B multiple (linear-surface requirement, PRM Vol2a).
-        const TEX_W: u32 = 64;
-        const TEX_H: u32 = 64;
-        const TEX_PITCH: u32 = TEX_W * 4; // 256 B
-        let mut tex_buf = StateBuffer::new(mmio, GVA_TEXTURES, 4)?;
-        let (tex_cpu, tex_gva) = tex_buf.alloc((TEX_W * TEX_H) as usize, 4096)?;
-        state::fill_checkerboard(tex_cpu as *mut u8, TEX_W, TEX_H, TEX_PITCH, 8);
-        tex_buf.flush_range(tex_gva, (TEX_H * TEX_PITCH) as usize);
-        // Texture RENDER_SURFACE_STATE (LINEAR 2D, same builder as the RT — a linear sampled
-        // surface is allowed on Gen9; if the sampler rejects it we fall back to X-tiling).
-        let ts = state::render_surface_state_2d(
-            state::SURFACE_FORMAT_B8G8R8A8_UNORM, TEX_W, TEX_H, TEX_PITCH, tex_gva);
-        let tex_surf_gva = surf_buf.write(&ts, 64)?;
-        let tex_surf_off = tex_surf_gva - surf_buf.gva;
-        // 2-entry binding table: [0]=RT (unchanged), [1]=texture. Overrides the 1-entry table
-        // setup_render_state wrote; point rs.binding_table_off at the new one.
-        let bt2 = state::binding_table_2(rs.rt_surface_off, tex_surf_off);
-        let bt2_gva = surf_buf.write(&bt2, 64)?;
-        rs.binding_table_off = bt2_gva - surf_buf.gva;
-        // SAMPLER_STATE (NEAREST/CLAMP) into dynamic state; 32B-aligned per the SSP field.
-        let samp_gva = dyn_buf.write(&state::sampler_state_nearest_clamp(), 32)?;
-        let sampler_off = samp_gva - dyn_buf.gva;
-        crate::serial_println!(
-            "[STATE] tex_gva={:#x} tex_surf_off={:#x} bt2_off={:#x} sampler_off={:#x}",
-            tex_gva, tex_surf_off, rs.binding_table_off, sampler_off
-        );
-
-        let (verts, colors, indices) = cube_geometry_colored();
-        // Reserve the vertex block (24 verts * (pos vec4 + color vec4) = 192 dwords) at a
-        // stable GVA; positions are rewritten every frame, colors are static. Indices are
-        // static, so write them once after the block.
-        let (vbo_cpu, vbo_gva) = vbo_buf.alloc(192, 64)?;
-        let idx_gva = vbo_buf.write(&indices, 64)?;
-
-        Ok(CubeGpu {
-            surf_buf,
-            dyn_buf,
-            vbo_buf,
-            tex_buf,
-            rs,
-            verts,
-            colors,
-            vbo_cpu,
-            vbo_gva,
-            vbo_dwords: 192,
-            idx_gva,
-            idx_count: indices.len(),
-            vs_off,
-            ps_off,
-            sampler_off,
-        })
-    }
-
-    /// Render ONE frame of the cube at rotation `angle` into `rt_gva`, using the pre-built
-    /// `g`. Rewrites only the vertex block, then re-emits the full known-good Phase-5
-    /// pipeline (index buffer + indexed 3DPRIMITIVE, back-face culled). `present` copies the
-    /// result to scanout; `verbose` logs the decoded stream + pipeline stats + pixel
-    /// readback (first frame only during animation, to avoid flooding serial).
-    unsafe fn draw_cube_frame(
-        &mut self,
-        g: &mut CubeGpu,
+        g: &mut super::engine::GpuMesh,
+        mvp: &super::math::Mat4,
         rt_gva: u32,
         bb_cpu: u64,
         width: u32,
         height: u32,
         pitch: u32,
-        angle: f32,
         present: bool,
         verbose: bool,
     ) -> Result<(), RenderError> {
-        use super::math::{self, Mat4, Vec3, Vec4};
+        use super::math::{Vec4};
 
         let vs_off = g.vs_off;
         let ps_off = g.ps_off;
@@ -534,7 +461,7 @@ impl RenderEngine {
         let idx_gva = g.idx_gva;
         let idx_count = g.idx_count;
         let vbo_dwords = g.vbo_dwords;
-        let sampler_off = g.sampler_off; // Boot C: SAMPLER_STATE offset from dynamic base
+        let sampler_off = g.sampler_off; // SAMPLER_STATE offset from dynamic base (0 = untextured)
 
         // Clear the render target to black. (Boot A/C bring-up used a 0x30 gray diagnostic
         // clear to disambiguate "black-on-black" from "never drew"; no longer needed now that
@@ -548,33 +475,23 @@ impl RenderEngine {
             off += 64;
         }
 
-        // --- CPU transform: MVP * cube corners -> clip space, into the persistent VBO ---
-        let aspect = width as f32 / height as f32;
-        let proj = Mat4::perspective(math::radians(60.0), aspect, 0.1, 100.0);
-        let view = Mat4::look_at(
-            Vec3::new(0.0, 0.0, 3.0),
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-        );
-        let model = Mat4::rotate_y(angle).mul(&Mat4::rotate_x(angle * 0.6));
-        let mvp = proj.mul(&view).mul(&model);
-
-        // Interleaved layout per vertex: [pos.x pos.y pos.z pos.w  col.r col.g col.b col.a]
-        // = 8 dwords (pitch 32B). Positions are MVP-transformed to clip space each frame;
-        // colors are static (element 1, read by the VS as the color varying).
-        for i in 0..g.verts.len() {
-            let clip = mvp.mul_vec4(Vec4::from_point(g.verts[i]));
+        // --- CPU transform: MVP * model-space positions -> clip space, into the persistent
+        // VBO. Interleaved layout per vertex: [pos.x pos.y pos.z pos.w  var.x var.y var.z var.w]
+        // = 8 dwords (pitch 32B). Positions are MVP-transformed each frame; the varying (UV,
+        // element 1) is static but rewritten alongside to keep the loop uniform. ---
+        for (i, v) in g.verts.iter().enumerate() {
+            let clip = mvp.mul_vec4(Vec4::from_point(v.pos));
             let p = clip.to_bits();
-            let c = g.colors[i];
+            let c = v.varying;
             let base = i * 8;
             g.vbo_cpu.add(base).write_volatile(p[0]);
             g.vbo_cpu.add(base + 1).write_volatile(p[1]);
             g.vbo_cpu.add(base + 2).write_volatile(p[2]);
             g.vbo_cpu.add(base + 3).write_volatile(p[3]);
-            g.vbo_cpu.add(base + 4).write_volatile(c[0].to_bits());
-            g.vbo_cpu.add(base + 5).write_volatile(c[1].to_bits());
-            g.vbo_cpu.add(base + 6).write_volatile(c[2].to_bits());
-            g.vbo_cpu.add(base + 7).write_volatile(c[3].to_bits());
+            g.vbo_cpu.add(base + 4).write_volatile(c.x.to_bits());
+            g.vbo_cpu.add(base + 5).write_volatile(c.y.to_bits());
+            g.vbo_cpu.add(base + 6).write_volatile(c.z.to_bits());
+            g.vbo_cpu.add(base + 7).write_volatile(c.w.to_bits());
         }
         g.vbo_buf.flush_range(vbo_gva, vbo_dwords * 4);
         let rs = &g.rs;
@@ -753,8 +670,8 @@ impl RenderEngine {
         for _ in 0..16 { cs.push(cmd::MI_NOOP); }
 
         if verbose {
-            crate::serial_println!("[CUBE] submitting {} dwords (angle={}.{:02})",
-                cs.len(), angle as i32, ((angle - angle as i32 as f32) * 100.0) as i32);
+            crate::serial_println!("[DRAW] submitting {} dwords ({} verts, {} indices)",
+                cs.len(), g.verts.len(), idx_count);
             super::decode::decode_and_print(cs.as_slice());
         }
         self.fence_virt.write_volatile(0);
@@ -817,8 +734,29 @@ impl RenderEngine {
         Ok(())
     }
 
-    /// One-shot cube draw (Steps 1-2 entry point): allocate resources and render a single
-    /// static frame at `angle`. Kept as a thin wrapper over the reusable frame path.
+    /// The perspective * view (camera) matrix used by the demo cube: eye at z=3 looking at
+    /// the origin, 60-degree vertical FOV. Split out so both draw_mesh and spin_cube share it
+    /// and it reads as the caller-owned half of the MVP (Phase 8: transforms are inputs).
+    fn demo_camera(width: u32, height: u32) -> super::math::Mat4 {
+        use super::math::{self, Mat4, Vec3};
+        let aspect = width as f32 / height as f32;
+        let proj = Mat4::perspective(math::radians(60.0), aspect, 0.1, 100.0);
+        let view = Mat4::look_at(
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        proj.mul(&view)
+    }
+
+    /// The cube's model (spin) matrix at rotation `angle`: tumble about Y and, more slowly, X.
+    fn demo_spin(angle: f32) -> super::math::Mat4 {
+        use super::math::Mat4;
+        Mat4::rotate_y(angle).mul(&Mat4::rotate_x(angle * 0.6))
+    }
+
+    /// One-shot textured-cube draw: upload the cube mesh + checkerboard once and render a
+    /// single static frame at `angle`. Thin wrapper over the generic upload_mesh + draw API.
     pub unsafe fn draw_mesh(
         &mut self,
         rt_gva: u32,
@@ -830,14 +768,18 @@ impl RenderEngine {
         present: bool,
         verbose: bool,
     ) -> Result<(), RenderError> {
-        let mut g = self.setup_cube_gpu(rt_gva, width, height, pitch)?;
-        self.draw_cube_frame(&mut g, rt_gva, bb_cpu, width, height, pitch, angle, present, verbose)
+        use super::engine::{cube_mesh, Texture};
+        let mesh = cube_mesh();
+        let tex = Texture::checkerboard(64, 8);
+        let mut g = self.upload_mesh(&mesh, Some(&tex), rt_gva, width, height, pitch)?;
+        let mvp = Self::demo_camera(width, height).mul(&Self::demo_spin(angle));
+        self.draw(&mut g, &mvp, rt_gva, bb_cpu, width, height, pitch, present, verbose)
     }
 
-    /// Phase 6, Step 3: spin the cube. Allocate GPU resources ONCE, then render `frames`
-    /// frames at increasing rotation and present each to the scanout. Only the first frame
-    /// logs stats / decodes the stream, so serial isn't flooded. Reusing the buffers every
-    /// frame is what makes an animation loop viable (no per-frame GGTT-mapping leak).
+    /// Phase 6/7 demo: spin the textured cube. Uploads GPU resources ONCE via the generic
+    /// engine API, then renders `frames` frames at increasing rotation, computing a fresh MVP
+    /// per frame and presenting each to the scanout. Only the first frame logs stats / decodes
+    /// the stream. Reusing the buffers every frame is what makes the animation loop viable.
     pub unsafe fn spin_cube(
         &mut self,
         rt_gva: u32,
@@ -847,11 +789,16 @@ impl RenderEngine {
         pitch: u32,
         frames: u32,
     ) -> Result<(), RenderError> {
-        let mut g = self.setup_cube_gpu(rt_gva, width, height, pitch)?;
+        use super::engine::{cube_mesh, Texture};
+        let mesh = cube_mesh();
+        let tex = Texture::checkerboard(64, 8);
+        let mut g = self.upload_mesh(&mesh, Some(&tex), rt_gva, width, height, pitch)?;
+        let camera = Self::demo_camera(width, height);
         for f in 0..frames {
             let angle = f as f32 * 0.03; // ~0.03 rad/frame -> a smooth, steady tumble
             let verbose = f == 0; // stats/decode on the first frame only
-            self.draw_cube_frame(&mut g, rt_gva, bb_cpu, width, height, pitch, angle, true, verbose)?;
+            let mvp = camera.mul(&Self::demo_spin(angle));
+            self.draw(&mut g, &mvp, rt_gva, bb_cpu, width, height, pitch, true, verbose)?;
             // Heartbeat: prove the loop advances the angle (and at what cadence) in the boot
             // log, independent of what the panel shows. With the VF-cache invalidate in place
             // each logged angle should correspond to a visibly different cube pose.
@@ -865,6 +812,526 @@ impl RenderEngine {
         Ok(())
     }
 
+    /// Phase 8b: allocate the SHARED state buffers for a multi-mesh scene and build the shared
+    /// render state (RT surface for BTI 0, blend/cc/viewports) + one NEAREST/CLAMP sampler.
+    /// Meshes are added with [`Scene::add_mesh`] and drawn with [`RenderEngine::draw_scene`].
+    /// Unlike upload_mesh (one buffer set per mesh, colliding GVAs), a Scene sub-allocates every
+    /// mesh out of ONE set of buffers under ONE STATE_BASE_ADDRESS.
+    pub unsafe fn create_scene(
+        &mut self,
+        rt_gva: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        rt_tile_mode: u32,
+    ) -> Result<super::engine::Scene, RenderError> {
+        use super::engine::Scene;
+        let (vs_off, ps_off) = match &self.kernels {
+            Some(k) => (k.vs_off, k.ps_off),
+            None => return Err(RenderError::NotInitialized),
+        };
+        let mmio = self.mmio_base;
+        // Shared buffers: surf (RT surf + per-mesh tex surfaces + binding tables), dyn (blend/cc/
+        // viewport + sampler), vbo (per-mesh vertex + index blocks), tex (8 pages = two 64x64
+        // textures). Sized generously; the bump allocator packs meshes in order.
+        let mut surf_buf = StateBuffer::new(mmio, GVA_SURFACE_STATE, 1)?;
+        let mut dyn_buf = StateBuffer::new(mmio, GVA_DYNAMIC_STATE, 1)?;
+        let vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 2)?;
+        let tex_buf = StateBuffer::new(mmio, super::GVA_TEXTURES, 8)?;
+        // `pitch` here is the RT ROW pitch (bytes): the Y-tiled pitch when rt_tile_mode=YMAJOR
+        // (a 128B multiple), else the linear scanout pitch. The RT surface points BTI 0 at it.
+        let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch, rt_tile_mode)?;
+        // One shared sampler for every mesh (NEAREST/CLAMP), 32B-aligned per the SSP field.
+        let samp_gva = dyn_buf.write(&state::sampler_state_nearest_clamp(), 32)?;
+        let sampler_off = samp_gva - dyn_buf.gva;
+        crate::serial_println!(
+            "[SCENE] created: surf_base={:#x} dyn_base={:#x} sampler_off={:#x}",
+            surf_buf.gva, dyn_buf.gva, sampler_off
+        );
+        Ok(Scene {
+            surf_buf,
+            dyn_buf,
+            vbo_buf,
+            tex_buf,
+            rs,
+            sampler_off,
+            resolve_sampler_off: 0, // set by add_resolve_quad (Boot-3 SSAA bilinear downsample)
+            resolve_sf_clip_off: 0, // set by add_resolve_quad (display-dims resolve viewport)
+            vs_off,
+            ps_off,
+            meshes: alloc::vec::Vec::new(),
+            resolve: None,
+        })
+    }
+
+    /// Phase 8b: render ALL meshes in `scene` (each transformed by its matching entry in `mvps`)
+    /// into `rt_gva` as ONE fenced command stream. The full fixed-function pipeline state is
+    /// emitted ONCE (shared), then a per-mesh tail swaps VERTEX_BUFFERS / INDEX_BUFFER /
+    /// BINDING_TABLE_POINTERS_PS / 3DSTATE_PS and issues a 3DPRIMITIVE — the same pipelined-
+    /// state-swap pattern Phase 6 Step 4 proved for 6 per-face PS kernels. `mvps.len()` must
+    /// equal `scene.meshes.len()`.
+    /// `bb_cpu` is the CPU-visible base of the render-target backing store (linear OR Y-tiled).
+    /// When `tiled_pitch != 0` the RT is Y-tiled: the whole `rt_buf_bytes` region is cleared and
+    /// the present path DE-TILES into the linear scanout (`pitch` = scanout row pitch). When
+    /// `tiled_pitch == 0` the RT is linear (`pitch` is its row pitch, `rt_buf_bytes` ignored).
+    pub unsafe fn draw_scene(
+        &mut self,
+        scene: &mut super::engine::Scene,
+        mvps: &[super::math::Mat4],
+        rt_gva: u32,
+        bb_cpu: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        tiled_pitch: u32,
+        rt_buf_bytes: usize,
+        present: bool,
+        verbose: bool,
+    ) -> Result<(), RenderError> {
+        use super::math::Vec4;
+        let _ = rt_gva;
+
+        // Clear the render target to black. Black = all-zero bytes, which is layout-independent,
+        // so a Y-tiled RT is cleared by simply zeroing its whole backing store.
+        const CLEAR_BYTE: u8 = 0x00;
+        let clear_bytes = if tiled_pitch != 0 { rt_buf_bytes } else { (pitch * height) as usize };
+        core::ptr::write_bytes(bb_cpu as *mut u8, CLEAR_BYTE, clear_bytes);
+        let mut off = 0usize;
+        while off < clear_bytes {
+            self.flush_line(bb_cpu as usize + off);
+            off += 64;
+        }
+
+        // CPU-transform each mesh's model-space verts -> clip space into its own vbo block.
+        for (mi, mesh) in scene.meshes.iter().enumerate() {
+            let mvp = &mvps[mi];
+            for (i, v) in mesh.verts.iter().enumerate() {
+                let clip = mvp.mul_vec4(Vec4::from_point(v.pos));
+                if verbose && mi == 0 && i == 0 {
+                    // Actual clip coords fed to the GPU (x1000, integer-formatted to dodge no_std
+                    // float fmt). Sane cube v0 ~ (±small, ±small, 0..w, w>0); if w<=0 or wild, the
+                    // MVP/vertex data is bad; if sane but ps=0, the failure is rasterizer state.
+                    crate::serial_println!(
+                        "[DS] mesh0 v0 clipx1e3=({},{},{},{})",
+                        (clip.x * 1000.0) as i32, (clip.y * 1000.0) as i32,
+                        (clip.z * 1000.0) as i32, (clip.w * 1000.0) as i32
+                    );
+                }
+                let p = clip.to_bits();
+                let c = v.varying;
+                let base = i * 8;
+                mesh.vbo_cpu.add(base).write_volatile(p[0]);
+                mesh.vbo_cpu.add(base + 1).write_volatile(p[1]);
+                mesh.vbo_cpu.add(base + 2).write_volatile(p[2]);
+                mesh.vbo_cpu.add(base + 3).write_volatile(p[3]);
+                mesh.vbo_cpu.add(base + 4).write_volatile(c.x.to_bits());
+                mesh.vbo_cpu.add(base + 5).write_volatile(c.y.to_bits());
+                mesh.vbo_cpu.add(base + 6).write_volatile(c.z.to_bits());
+                mesh.vbo_cpu.add(base + 7).write_volatile(c.w.to_bits());
+            }
+            scene.vbo_buf.flush_range(mesh.vbo_gva, mesh.vbo_dwords * 4);
+        }
+
+        let rs = &scene.rs;
+        let vs_off = scene.vs_off;
+        let sampler_off = scene.sampler_off;
+
+        // Shared fixed-function prologue (extracted so the resolve pass reuses the exact bytes).
+        let mut cs = CmdStream::new();
+        // Mesh pass: shared NEAREST sampler + rs viewport (baked at the RT's — supersampled — dims).
+        self.emit_pipeline_prologue(&mut cs, rs, vs_off, sampler_off, rs.sf_clip_viewport_off, width, height, 3 << 16); // cull BACK
+
+        // Per-mesh tail: swap VB / IB / binding table / PS and draw. Pipelined 3DSTATE, legal to
+        // change between draws in one stream (proven: Phase 6 Step 4).
+        for (mi, mesh) in scene.meshes.iter().enumerate() {
+            self.emit_draw_one(&mut cs, mesh, 0x20 + mi as u32);
+        }
+
+        let hung = self.finish_submit_and_wait(&mut cs, verbose, scene.meshes.len());
+
+        if present {
+            if tiled_pitch != 0 {
+                // The RT is Y-tiled: de-swizzle it into the linear scanout as we copy.
+                self.present_to_scanout_detiled(bb_cpu, width, height, pitch, tiled_pitch);
+            } else {
+                self.present_to_scanout(bb_cpu, (pitch * height) as usize);
+            }
+        }
+        if hung { return Err(RenderError::EngineHang); }
+        Ok(())
+    }
+
+    /// Emit the shared fixed-function pipeline prologue (everything up to and including the
+    /// sampler pointer, but NO per-draw VB/IB/BT/PS/3DPRIMITIVE). Byte-identical to the proven
+    /// Boot-1 scene stream; shared by draw_scene and draw_resolve.
+    unsafe fn emit_pipeline_prologue(
+        &self,
+        cs: &mut CmdStream,
+        rs: &state::RenderState,
+        vs_off: u32,
+        sampler_off: u32,
+        sf_clip_off: u32,
+        width: u32,
+        height: u32,
+        raster_cull_dw1: u32,
+    ) {
+        self.progress(cs, 0x10);
+        cmd::pipe_control(
+            cs,
+            cmd::pc::CS_STALL
+                | cmd::pc::VF_CACHE_INVALIDATE
+                | cmd::pc::STATE_CACHE_INVALIDATE
+                | cmd::pc::CONSTANT_CACHE_INVALIDATE
+                // TEXTURE_CACHE_INVALIDATE is load-bearing for the resolve pass: it samples the
+                // offscreen scene RT, which is re-rendered every frame at a FIXED GVA. Without it
+                // the sampler returns stale texels from a prior frame -> a frozen resolve image
+                // (same failure class as the Phase-6 VF-cache freeze). Harmless for the mesh pass
+                // (its checkerboard textures are static, just re-fetched once).
+                | cmd::pc::TEXTURE_CACHE_INVALIDATE
+                | cmd::pc::INSTRUCTION_CACHE_INVALIDATE
+                // TLB_INVALIDATE flushes the RCS engine's INTERNAL GGTT TLB in-stream. The chipset
+                // GTT flush (GFX_FLSH_CNTL, invalidate_ggtt_tlb) does NOT cover the per-engine TLB, so
+                // when the GL path re-maps the fixed state GVAs the boot self-test first populated, the
+                // engine keeps serving stale translations -> garbage viewport/VBO reads -> zero
+                // coverage (CL>0, PS_inv=0, black). Legal here: this PIPE_CONTROL has CS_STALL and no
+                // post-sync write, and does not flush RT/depth. The boot self-test uses the same
+                // prologue, so if this were unsafe its ring-0 cube would break too.
+                | cmd::pc::TLB_INVALIDATE,
+            0,
+            0,
+        );
+        cs.push(cmd::pipeline_select(cmd::PIPELINE_SELECT_3D));
+        self.progress(cs, 1);
+        self.emit_state_base_address(cs);
+        self.progress(cs, 2);
+        cs.push(h1(so::PUSH_CONSTANT_ALLOC_VS, 2)).push(2);
+        cs.push(h1(so::PUSH_CONSTANT_ALLOC_PS, 2)).push((2 << 16) | 2);
+        let vs_entries = 64u32;
+        let vs_alloc = 0u32;
+        let vs_start = 4u32;
+        let vs_bytes = vs_entries * (vs_alloc + 1) * 64;
+        let empty_start = vs_start + (vs_bytes + 8191) / 8192;
+        cs.push(h(so::URB_VS, 2)).push(vs_entries | (vs_alloc << 16) | (vs_start << 25));
+        cs.push(h(so::URB_HS, 2)).push(empty_start << 25);
+        cs.push(h(so::URB_DS, 2)).push(empty_start << 25);
+        cs.push(h(so::URB_GS, 2)).push(empty_start << 25);
+        self.progress(cs, 3);
+        self.emit_vertex_elements(cs);
+        cs.push(h(so::VF, 2)).push(0);
+        cs.push(h(so::VF_INSTANCING, 3)).push(0).push(0);
+        cs.push(h(so::VF_TOPOLOGY, 2)).push(4); // TRILIST
+        self.emit_vs(cs, vs_off);
+        cs.push(h(so::HS, 9));
+        for _ in 0..8 { cs.push(0); }
+        cs.push(h(so::DS, 11));
+        for _ in 0..10 { cs.push(0); }
+        cs.push(h(so::GS, 10));
+        for _ in 0..9 { cs.push(0); }
+        cs.push(h(so::TE, 4));
+        for _ in 0..3 { cs.push(0); }
+        cs.push(h(so::STREAMOUT, 5));
+        for _ in 0..4 { cs.push(0); }
+        self.progress(cs, 4);
+        cs.push(h(so::CLIP, 4)).push(1 << 10).push((1 << 31) | (1 << 28) | (1 << 26)).push(0);
+        cs.push(h(so::SF, 4)).push((1 << 1) | (1 << 10)).push(0).push(0);
+        // Cull mode is caller-supplied: meshes use BACK (3<<16); the full-screen resolve quad
+        // uses NONE (1<<16) because its identity transform inverts screen winding vs the meshes'
+        // winding-flipping MVP, and a blit quad must never be culled.
+        cs.push(h(so::RASTER, 5)).push(raster_cull_dw1).push(0).push(0).push(0);
+        cs.push(h(so::SBE, 6)).push((1 << 5) | (1 << 11) | (1 << 21) | (1 << 22) | (1 << 28) | (1 << 29));
+        cs.push(0);
+        cs.push(0);
+        cs.push(3).push(0);
+        cs.push(h(so::SBE_SWIZ, 11));
+        for _ in 0..10 { cs.push(0); }
+        cs.push(h(so::WM, 2)).push((1 << 31) | (1 << 11));
+        // Viewport is caller-supplied: the mesh pass uses rs.sf_clip_viewport_off (baked at the
+        // supersampled RT dims); the resolve pass passes its own display-dims viewport so the blit
+        // covers the whole backbuffer. `width`/`height` (DRAWING_RECTANGLE below) match accordingly.
+        cs.push(h(so::VIEWPORT_SF_CLIP, 2)).push(sf_clip_off);
+        cs.push(h(so::VIEWPORT_CC, 2)).push(rs.cc_viewport_off);
+        cs.push(h1(so::DRAWING_RECTANGLE, 4)).push(0).push(((height - 1) << 16) | (width - 1)).push(0);
+        cs.push(h(so::PS_EXTRA, 2)).push((1u32 << 31) | (1 << 8));
+        cs.push(h(so::PS_BLEND, 2)).push(1u32 << 30);
+        cs.push(h(so::CC_STATE_POINTERS, 2)).push(rs.cc_off | 1);
+        cs.push(h(so::BLEND_STATE_POINTERS, 2)).push(rs.blend_off | 1);
+        cs.push(h(so::WM_DEPTH_STENCIL, 4)).push(0).push(0).push(0);
+        cs.push(h(so::MULTISAMPLE, 2)).push(0);
+        cs.push(h(so::SAMPLE_MASK, 2)).push(1);
+        cs.push(h(so::DEPTH_BUFFER, 8)).push(7u32 << 29);
+        for _ in 0..6 { cs.push(0); }
+        cs.push(h(so::SAMPLER_STATE_POINTERS_PS, 2)).push(sampler_off);
+    }
+
+    /// Emit one indexed draw (VB + IB + binding table + PS + 3DPRIMITIVE) for `mesh`, tagged with
+    /// `progress_marker` so a mid-stream hang localizes the draw. Byte-identical to the proven
+    /// Boot-1 per-mesh tail; shared by draw_scene and draw_resolve.
+    unsafe fn emit_draw_one(&self, cs: &mut CmdStream, mesh: &super::engine::SceneMesh, progress_marker: u32) {
+        self.emit_vertex_buffers(cs, mesh.vbo_gva, 32, (mesh.vbo_dwords * 4) as u32);
+        cs.push(h(so::INDEX_BUFFER, 5))
+            .push(2 << 8)
+            .push(mesh.idx_gva)
+            .push(0)
+            .push((mesh.idx_count * 4) as u32);
+        cs.push(h(so::BINDING_TABLE_POINTERS_PS, 2)).push(mesh.binding_table_off);
+        self.emit_ps(cs, mesh.ps_off);
+        self.progress(cs, progress_marker);
+        cs.push(super::cmd::gfxpipe_header(PIPELINE_3D, 3, 0, 7 - 2));
+        cs.push(4 | (1 << 8)); // TRILIST + Vertex Access Type = RANDOM
+        cs.push(mesh.idx_count as u32);
+        cs.push(0); // Start Index Location
+        cs.push(1); // Instance Count
+        cs.push(0); // Start Instance
+        cs.push(0); // Base Vertex
+    }
+
+    /// Emit the shared epilogue (RT flush + fence), submit the stream, and spin-wait for the DONE
+    /// fence (with the fault dump on hang). Returns true if it hung. Shared by draw_scene and
+    /// draw_resolve. `count` is logged as the draw/mesh count.
+    unsafe fn finish_submit_and_wait(&mut self, cs: &mut CmdStream, verbose: bool, count: usize) -> bool {
+        self.progress(cs, 6);
+        cmd::pipe_control(
+            cs,
+            cmd::pc::CS_STALL | cmd::pc::RENDER_TARGET_CACHE_FLUSH | cmd::pc::DC_FLUSH_ENABLE,
+            0,
+            0,
+        );
+        self.progress(cs, 7);
+        const DONE: u32 = 0x00D0_5EED;
+        cmd::pipe_control(
+            cs,
+            cmd::pc::CS_STALL | cmd::pc::POST_SYNC_WRITE_IMM | cmd::pc::DEST_ADDRESS_GTT,
+            GVA_RCS_FENCE,
+            DONE as u64,
+        );
+        for _ in 0..16 { cs.push(cmd::MI_NOOP); }
+
+        if verbose {
+            crate::serial_println!("[SCENE] submitting {} dwords, {} draws", cs.len(), count);
+            super::decode::decode_and_print(cs.as_slice());
+        }
+        self.fence_virt.write_volatile(0);
+        self.flush_line(self.fence_virt as usize);
+        if self.rcs_submit(cs.as_slice()).is_err() {
+            return true;
+        }
+
+        let mut t = 0u32;
+        let mut last = 0u32;
+        loop {
+            self.flush_line(self.fence_virt as usize);
+            let v = self.fence_virt.read_volatile();
+            if v != last { last = v; }
+            if v == DONE { break; }
+            core::hint::spin_loop();
+            t += 1;
+            if t > 30_000_000 {
+                let fault = self.read_reg(super::RENDER_FAULT_REG);
+                crate::serial_println!(
+                    "[SCENE] HUNG. last_progress={:#x} FAULT={:#010x} HEAD={:#x}",
+                    last, fault, self.read_reg(super::RENDER_RING_HEAD)
+                );
+                if fault & 1 != 0 {
+                    let d0 = self.read_reg(0x4b10);
+                    let d1 = self.read_reg(0x4b14);
+                    let va = ((d0 as u64) << 12) | (((d1 & 0xF) as u64) << 44);
+                    crate::serial_println!("[SCENE]  FAULT_VA={:#x} (D0={:#010x} D1={:#010x})", va, d0, d1);
+                }
+                // Reset the render domain so the engine doesn't stay wedged for every following frame
+                // (a hung RCS with a half-consumed ring never drains, so the next submit hangs too —
+                // that repetition is what pins the CPU and overheats the box). ensure_ready() re-arms
+                // the ring on the next call (CTL reads 0 after GDRST).
+                if self.reset_render().is_err() {
+                    crate::serial_println!("[SCENE]  reset_render after hang FAILED");
+                }
+                return true;
+            }
+        }
+        if verbose {
+            let clp = self.read_reg(0x2340);
+            let ps = self.read_reg(0x2348);
+            crate::serial_println!("[SCENE] STATS: CL_prims={} PS_inv={}", clp, ps);
+        }
+        false
+    }
+
+    /// MSAA-track Boot 2: the resolve pass. Draws the full-screen quad (bound to the offscreen
+    /// scene RT as a texture, writing the LINEAR backbuffer via its binding table), then presents
+    /// the backbuffer. This boot the quad's PS is the plain textured PS (1:1 copy — no visual
+    /// change, jaggies remain); Boot 3 makes the scene RT multisampled and averages samples here.
+    pub unsafe fn draw_resolve(
+        &mut self,
+        scene: &mut super::engine::Scene,
+        bb_cpu: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        present: bool,
+        verbose: bool,
+    ) -> Result<(), RenderError> {
+        use super::math::Vec4;
+        let resolve = match &scene.resolve {
+            Some(r) => r,
+            None => return Err(RenderError::NotInitialized),
+        };
+
+        // The quad's positions are already clip-space (w=1); write them once with an identity
+        // transform. (Cheap to redo each frame; keeps the vbo warm for the VF cache invalidate.)
+        for (i, v) in resolve.verts.iter().enumerate() {
+            let pv = Vec4::from_point(v.pos);
+            if verbose && i == 0 {
+                // Static full-screen quad v0 must be ~(-1000,-1000,0,1000) (NDC corner, w=1). If it's
+                // anything else, the resolve VBO/geometry is corrupt; if it's correct but res_ps=0,
+                // the resolve rasterizer state (viewport/drawing-rect ptr) is at fault.
+                crate::serial_println!(
+                    "[DR] resolve v0 posx1e3=({},{},{},{}) vbo_gva={:#x}",
+                    (pv.x * 1000.0) as i32, (pv.y * 1000.0) as i32,
+                    (pv.z * 1000.0) as i32, (pv.w * 1000.0) as i32, resolve.vbo_gva
+                );
+            }
+            let p = pv.to_bits();
+            let c = v.varying;
+            let base = i * 8;
+            resolve.vbo_cpu.add(base).write_volatile(p[0]);
+            resolve.vbo_cpu.add(base + 1).write_volatile(p[1]);
+            resolve.vbo_cpu.add(base + 2).write_volatile(p[2]);
+            resolve.vbo_cpu.add(base + 3).write_volatile(p[3]);
+            resolve.vbo_cpu.add(base + 4).write_volatile(c.x.to_bits());
+            resolve.vbo_cpu.add(base + 5).write_volatile(c.y.to_bits());
+            resolve.vbo_cpu.add(base + 6).write_volatile(c.z.to_bits());
+            resolve.vbo_cpu.add(base + 7).write_volatile(c.w.to_bits());
+        }
+        scene.vbo_buf.flush_range(resolve.vbo_gva, resolve.vbo_dwords * 4);
+
+        // Clear the backbuffer to black first: the full-screen quad should overwrite every pixel,
+        // but clearing makes any coverage gap (e.g. the quad culled/mis-sized) show as BLACK rather
+        // than stale garbage — an unambiguous failure signal.
+        let bytes = (pitch * height) as usize;
+        core::ptr::write_bytes(bb_cpu as *mut u8, 0u8, bytes);
+        let mut off = 0usize;
+        while off < bytes { self.flush_line(bb_cpu as usize + off); off += 64; }
+
+        let mut cs = CmdStream::new();
+        // Cull NONE for the full-screen blit (1<<16); its identity transform inverts screen
+        // winding relative to the meshes' MVP, so BACK cull would drop it. The resolve uses the
+        // BILINEAR sampler (box-averages each 2x2 supersample block) and a DISPLAY-dims viewport
+        // (scene.rs viewport was baked at the larger supersampled RT dims). Fall back to the shared
+        // NEAREST sampler / rs viewport if add_resolve_quad hasn't populated them (defensive; the
+        // resolve path always sets both).
+        let resolve_sampler = if scene.resolve_sampler_off != 0 { scene.resolve_sampler_off } else { scene.sampler_off };
+        let resolve_sf_clip = if scene.resolve_sf_clip_off != 0 { scene.resolve_sf_clip_off } else { scene.rs.sf_clip_viewport_off };
+        self.emit_pipeline_prologue(&mut cs, &scene.rs, scene.vs_off, resolve_sampler, resolve_sf_clip, width, height, 1 << 16);
+        self.emit_draw_one(&mut cs, resolve, 0x30);
+        let hung = self.finish_submit_and_wait(&mut cs, verbose, 1);
+
+        // Present ONLY on success. draw_resolve CPU-clears bb to black up front, so presenting after
+        // a hung/failed resolve would blit a solid-black frame over the whole live scanout — which is
+        // precisely how a GL render failure nukes the desktop AND the on-screen sysmon boot-log we
+        // rely on to diagnose it (no serial on this HW). On failure, leave the last good frame up.
+        if hung { return Err(RenderError::EngineHang); }
+        // The resolve wrote the LINEAR backbuffer. `present` chooses the destination: the boot
+        // self-test (spin_scene) blits straight to the scanout; the windowed userspace GL path passes
+        // present=false and instead has gl_render copy bb_cpu into the app's SHM window buffer, so the
+        // compositor composites it (no fighting over the scanout).
+        if present {
+            self.present_to_scanout(bb_cpu, (pitch * height) as usize);
+        }
+        Ok(())
+    }
+
+    /// Phase 8b demo/boot entry: spin a cube AND a pyramid side by side in one scene. Uploads
+    /// both meshes (each with its own checkerboard) into one shared buffer set, then renders
+    /// `frames` frames — each mesh at its own transform, tumbling in opposite directions so they
+    /// read as independent objects. Proves the mesh API is not cube-shaped and that multiple
+    /// GPU-resident meshes coexist and draw in one command stream.
+    pub unsafe fn spin_scene(
+        &mut self,
+        rt_gva: u32,
+        bb_cpu: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        frames: u32,
+    ) -> Result<(), RenderError> {
+        use super::engine::{cube_mesh, pyramid_mesh, Texture};
+        use super::math::{Mat4, Vec3};
+
+        // --- MSAA track, Boot 3: SSAA (2x2 supersampling). Render the scene into a Y-TILED RT that
+        // is 2x the display in each axis (4x the pixels), then downsample to the display backbuffer
+        // in the resolve pass. The resolve uses a BILINEAR sampler whose UVs land on 2x2 block
+        // centers, so hardware box-averages the 4 supersamples per output pixel — free antialiasing
+        // with no shader arithmetic (which the EU encoder can't emit). Reuses Boot-1 Y-tiling and
+        // the Boot-2 render-to-texture resolve pass unchanged; only the RT is bigger + one sampler
+        // flips to LINEAR. The 2x RT (~32 MB at 1080p) lives at GVA_SSAA_RT (16 MB DEPTH slot too
+        // small). Tiled row pitch must be a 128B multiple; height rounds up to 32-row tiles. ---
+        const SS: u32 = 2; // supersample factor per axis
+        let ss_w = width * SS;
+        let ss_h = height * SS;
+        let tiled_pitch = (ss_w * 4 + 127) & !127;       // 128B-aligned row pitch (supersampled)
+        let tiled_rows = (ss_h + 31) & !31;              // 32-row tile alignment (supersampled)
+        let rt_buf_bytes = (tiled_pitch * tiled_rows) as usize;
+        let pages = (rt_buf_bytes + 4095) / 4096;
+        let rt_buf = StateBuffer::new(self.mmio_base, super::GVA_SSAA_RT, pages)?;
+        let rt_tiled_gva = rt_buf.gva;
+        let rt_tiled_cpu = rt_buf.virt;
+        crate::serial_println!(
+            "[SCENE] SSAA {}x Y-tiled RT: gva={:#x} {}x{} pitch={} rows={} bytes={} pages={}",
+            SS, rt_tiled_gva, ss_w, ss_h, tiled_pitch, tiled_rows, rt_buf_bytes, pages
+        );
+
+        // Scene (mesh pass) is built at SUPERSAMPLED dims: RT surface, viewport, DRAWING_RECTANGLE
+        // all use ss_w/ss_h so the meshes rasterize at 2x resolution into the big RT.
+        let mut scene = self.create_scene(rt_tiled_gva, ss_w, ss_h, tiled_pitch, state::TILEMODE_YMAJOR)?;
+        // Cube: coarse (8-texel) checker; pyramid: finer (4-texel) checker so it's obvious each
+        // mesh samples its OWN texture.
+        scene.add_mesh(&cube_mesh(), &Texture::checkerboard(64, 8))?;
+        scene.add_mesh(&pyramid_mesh(), &Texture::checkerboard(64, 4))?;
+        // Resolve quad: samples the SUPERSAMPLED scene RT (ss_w x ss_h) and writes the DISPLAY-size
+        // linear backbuffer (width x height, GVA 0x1400_0000 still mapped to bb_cpu). The BILINEAR
+        // sampler averages each 2x2 block -> antialiased downsample.
+        let bb_gva = rt_gva; // the original linear backbuffer GVA passed into spin_scene
+        scene.add_resolve_quad(rt_tiled_gva, tiled_pitch, ss_w, ss_h, bb_gva, width, height)?;
+
+        // Camera pulled back to z=4 so both objects (centers 1.8 apart) fit in view. Aspect is the
+        // display aspect (SSAA scales both axes equally, so ss_w/ss_h == width/height).
+        let aspect = width as f32 / height as f32;
+        let proj = Mat4::perspective(super::math::radians(60.0), aspect, 0.1, 100.0);
+        let view = Mat4::look_at(
+            Vec3::new(0.0, 0.0, 4.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let camera = proj.mul(&view);
+        // Static placement: cube left, pyramid right; both scaled to 0.65 (half-diagonal ~0.46,
+        // centers 1.8 apart -> never overlap, so back-face culling alone suffices, no depth).
+        let place_cube = Mat4::translate(Vec3::new(-0.9, 0.0, 0.0)).mul(&Mat4::scale(Vec3::new(0.65, 0.65, 0.65)));
+        let place_pyr = Mat4::translate(Vec3::new(0.9, 0.0, 0.0)).mul(&Mat4::scale(Vec3::new(0.65, 0.65, 0.65)));
+
+        for f in 0..frames {
+            let a = f as f32 * 0.03;
+            let verbose = f == 0;
+            // Cube tumbles about Y+X; pyramid spins the opposite way about Y so they look independent.
+            let mvp_cube = camera.mul(&place_cube).mul(&Mat4::rotate_y(a).mul(&Mat4::rotate_x(a * 0.6)));
+            let mvp_pyr = camera.mul(&place_pyr).mul(&Mat4::rotate_y(-a * 0.8));
+            let mvps = [mvp_cube, mvp_pyr];
+            // Pass 1: render the meshes into the Y-tiled offscreen scene RT at SUPERSAMPLED dims
+            // (ss_w x ss_h; no present). `pitch` here is unused for a tiled RT (clear uses
+            // rt_buf_bytes), so the display scanout pitch is fine to pass through.
+            self.draw_scene(&mut scene, &mvps, rt_tiled_gva, rt_tiled_cpu, ss_w, ss_h,
+                pitch, tiled_pitch, rt_buf_bytes, false, verbose)?;
+            // Pass 2: resolve — box-downsample the supersampled scene RT with the full-screen quad,
+            // write the DISPLAY-size linear backbuffer, and present it (boot self-test: straight to scanout).
+            self.draw_resolve(&mut scene, bb_cpu, width, height, pitch, true, verbose)?;
+            if f % 60 == 0 {
+                crate::serial_println!("[SCENE] frame {}/{} angle={}.{:02} rad",
+                    f, frames, a as i32, ((a - a as i32 as f32) * 100.0) as i32);
+            }
+            crate::time::sleep_ms(12);
+        }
+        crate::serial_println!("[SCENE] spin complete: {} frames ({} meshes each)", frames, scene.meshes.len());
+        Ok(())
+    }
+
     /// Copy the rendered backbuffer straight onto the live scanout framebuffer (same
     /// BGRA/stride layout). Shared by the Phase-5 proof-of-life present and the cube.
     unsafe fn present_to_scanout(&self, bb_cpu: u64, bytes: usize) {
@@ -872,6 +1339,50 @@ impl RenderEngine {
         if let Some(painter) = (*sp).as_mut() {
             let n = bytes.min(painter.buffer.len());
             crate::gui::turbo_copy(painter.buffer.as_mut_ptr(), bb_cpu as *const u8, n);
+        }
+    }
+
+    /// Present a Y-TILED render target: de-swizzle each pixel from the Gen9 Tile-Y layout in
+    /// `rt_cpu` into the LINEAR scanout framebuffer. `scanout_pitch`/`tiled_pitch` are byte row
+    /// pitches. See [[gen9-tiley-layout]] — a tile is 128B x 32 rows; within a tile the byte at
+    /// (u = X%128, v = Y%32) sits at ((u>>4)<<9) | (v<<4) | (u&0xF); the tile itself is at
+    /// (Y/32)*(32*pitch) + (X/128)*4096. Bit-6 channel swizzle is disabled on Gen8+, so there is
+    /// no XOR term. A BGRA pixel (4 bytes) never straddles a 16B column, so we gather it as one
+    /// u32. This is a per-pixel CPU gather (~2M/frame at 1080p) — fine for the demo; a tiled BLT
+    /// or GPU resolve would replace it later.
+    unsafe fn present_to_scanout_detiled(
+        &self,
+        rt_cpu: u64,
+        width: u32,
+        height: u32,
+        scanout_pitch: u32,
+        tiled_pitch: u32,
+    ) {
+        let sp = core::ptr::addr_of_mut!(crate::gui::SCREEN_PAINTER);
+        let painter = match (*sp).as_mut() { Some(p) => p, None => return };
+        let dst = painter.buffer.as_mut_ptr();
+        let dst_len = painter.buffer.len();
+        let tile_row_bytes = 32u32 * tiled_pitch; // bytes spanned by one row of tiles (32 rows tall)
+        let mut py = 0u32;
+        while py < height {
+            let tile_y = py / 32;
+            let v = py % 32;
+            let row_tile_base = tile_y * tile_row_bytes;
+            let dst_row = (py * scanout_pitch) as usize;
+            let mut px = 0u32;
+            while px < width {
+                let x = px * 4; // byte column (BGRA)
+                let u = x % 128;
+                let src = (row_tile_base + (x / 128) * 4096
+                    + ((u >> 4) << 9) + (v << 4) + (u & 0xF)) as usize;
+                let doff = dst_row + (px * 4) as usize;
+                if doff + 4 <= dst_len {
+                    let texel = (rt_cpu as *const u32).byte_add(src).read_volatile();
+                    (dst.add(doff) as *mut u32).write_volatile(texel);
+                }
+                px += 1;
+            }
+            py += 1;
         }
     }
 
@@ -963,104 +1474,7 @@ impl RenderEngine {
     }
 }
 
-/// Persistent GPU resources for an animated mesh: the state buffers + render state are
-/// allocated ONCE and reused every frame (avoids leaking a GGTT mapping + contiguous frame
-/// per frame). Only the vertex block is rewritten per frame; the index buffer and every
-/// state object (surface/binding/blend/viewport) are static across the animation.
-struct CubeGpu {
-    surf_buf: StateBuffer,
-    dyn_buf: StateBuffer,
-    vbo_buf: StateBuffer,
-    tex_buf: StateBuffer,            // Boot C: procedural checkerboard texture (GVA_TEXTURES)
-    rs: state::RenderState,
-    verts: [super::math::Vec3; 24],  // 24 face-vertices (model space), transformed per frame
-    colors: [[f32; 4]; 24],          // per-vertex UV as (u,v,0,1) (static), interleaved into VBO
-    vbo_cpu: *mut u32, // CPU ptr to the reserved vertex block (points into vbo_buf)
-    vbo_gva: u32,      // GVA of the vertex block (stable across frames)
-    vbo_dwords: usize, // size of the vertex block in dwords (192 = 24 verts * (pos4 + uv4))
-    idx_gva: u32,
-    idx_count: usize,
-    vs_off: u32,
-    ps_off: u32,       // single textured PS kernel (Phase 7 Boot C)
-    sampler_off: u32,  // SAMPLER_STATE offset from dynamic state base (Boot C)
-}
-
-/// Unit cube centered at the origin (side 1.0): 8 corners + 36 indices (12 triangles).
-/// Winding is CCW-front-facing for later back-face culling (Step 2); with cull NONE it
-/// is irrelevant. Index order groups the 6 faces (front/back/left/right/top/bottom).
-fn cube_geometry() -> ([super::math::Vec3; 8], [u32; 36]) {
-    use super::math::Vec3;
-    let v = [
-        Vec3::new(-0.5, -0.5, -0.5), // 0
-        Vec3::new(0.5, -0.5, -0.5),  // 1
-        Vec3::new(0.5, 0.5, -0.5),   // 2
-        Vec3::new(-0.5, 0.5, -0.5),  // 3
-        Vec3::new(-0.5, -0.5, 0.5),  // 4
-        Vec3::new(0.5, -0.5, 0.5),   // 5
-        Vec3::new(0.5, 0.5, 0.5),    // 6
-        Vec3::new(-0.5, 0.5, 0.5),   // 7
-    ];
-    let idx = [
-        4, 5, 6, 4, 6, 7, // front  (+z)
-        1, 0, 3, 1, 3, 2, // back   (-z)
-        0, 4, 7, 0, 7, 3, // left   (-x)
-        5, 1, 2, 5, 2, 6, // right  (+x)
-        3, 7, 6, 3, 6, 2, // top    (+y)
-        0, 1, 5, 0, 5, 4, // bottom (-y)
-    ];
-    (v, idx)
-}
-
-/// Phase 7 Boot A: a per-vertex COLORED cube. Unlike `cube_geometry` (8 shared corners),
-/// this lays out 24 vertices = 6 faces x 4 unique corners, so each face's corners can carry
-/// that face's color as a per-vertex attribute. Winding matches `cube_geometry`'s (the same
-/// corner order per face), so back-face culling still removes the 3 hidden faces. Returns
-/// (positions[24], colors[24], indices[36] as 6 quads: base+{0,1,2, 0,2,3}).
-fn cube_geometry_colored() -> ([super::math::Vec3; 24], [[f32; 4]; 24], [u32; 36]) {
-    use super::math::Vec3;
-    // The 8 canonical corners (same coordinates as cube_geometry).
-    let c = [
-        Vec3::new(-0.5, -0.5, -0.5), // 0
-        Vec3::new(0.5, -0.5, -0.5),  // 1
-        Vec3::new(0.5, 0.5, -0.5),   // 2
-        Vec3::new(-0.5, 0.5, -0.5),  // 3
-        Vec3::new(-0.5, -0.5, 0.5),  // 4
-        Vec3::new(0.5, -0.5, 0.5),   // 5
-        Vec3::new(0.5, 0.5, 0.5),    // 6
-        Vec3::new(-0.5, 0.5, 0.5),   // 7
-    ];
-    // Each face: its 4 corners in the winding order cube_geometry() referenced, + a color.
-    let faces: [([usize; 4], [f32; 4]); 6] = [
-        ([4, 5, 6, 7], [1.0, 0.2, 0.2, 1.0]), // front (+z) red
-        ([1, 0, 3, 2], [0.2, 1.0, 0.2, 1.0]), // back  (-z) green
-        ([0, 4, 7, 3], [0.3, 0.5, 1.0, 1.0]), // left  (-x) blue
-        ([5, 1, 2, 6], [1.0, 0.9, 0.2, 1.0]), // right (+x) yellow
-        ([3, 7, 6, 2], [0.3, 1.0, 1.0, 1.0]), // top   (+y) cyan
-        ([0, 1, 5, 4], [1.0, 0.4, 1.0, 1.0]), // bottom(-y) magenta
-    ];
-    // Boot C (texture): the varying now carries UV, not color. Map each face's 4 corners to
-    // the unit square (0,0)-(1,1) so the whole checkerboard tiles across every face. The vec4
-    // slot is (u, v, 0, 1); the PS pln-interpolates channels 0/1 into the sampler's U/V. The
-    // corner order matches the quad winding (base+{0,1,2,3}); the base per-face color in
-    // `faces` is now unused (kept for the Boot-A/B reference).
-    let corner_uv: [[f32; 4]; 4] = [
-        [0.0, 0.0, 0.0, 1.0], // corner 0 -> UV (0,0)
-        [1.0, 0.0, 0.0, 1.0], // corner 1 -> UV (1,0)
-        [1.0, 1.0, 0.0, 1.0], // corner 2 -> UV (1,1)
-        [0.0, 1.0, 0.0, 1.0], // corner 3 -> UV (0,1)
-    ];
-    let mut pos = [Vec3::new(0.0, 0.0, 0.0); 24];
-    let mut col = [[0.0f32; 4]; 24];
-    let mut idx = [0u32; 36];
-    for (f, (corner_ids, _color)) in faces.iter().enumerate() {
-        let base = (f * 4) as u32;
-        for (j, &cid) in corner_ids.iter().enumerate() {
-            pos[f * 4 + j] = c[cid];
-            col[f * 4 + j] = corner_uv[j];
-        }
-        // Quad (base+0,1,2,3) -> two triangles preserving the original winding.
-        let t = [base, base + 1, base + 2, base, base + 2, base + 3];
-        idx[f * 6..f * 6 + 6].copy_from_slice(&t);
-    }
-    (pos, col, idx)
-}
+// Persistent per-mesh GPU resources (`GpuMesh`) and the mesh/texture builders now live in
+// `engine.rs`; the cube is just the first client of that generic API (engine::cube_mesh +
+// Texture::checkerboard). The 8-corner cube_geometry / 24-vertex cube_geometry_colored
+// helpers and the CubeGpu struct were removed in the Phase 8 refactor.

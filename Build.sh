@@ -30,10 +30,13 @@ echo "[5/7] Building Explorer Suite (explorer)..."
 echo "[6/7] Building Network Suite (network)..."
 (cd apps/network && $BUILD_CMD)
 
-echo "[7/7] Building System Monitor (sysmon)..."
+echo "[7/8] Building System Monitor (sysmon)..."
 (cd apps/sysmon && $BUILD_CMD)
 
-echo "[8/8] Generating App Tarball..."
+echo "[8/8] Building GL Cube validation app (glcube)..."
+(cd apps/glcube && $BUILD_CMD)
+
+echo "[9/9] Generating App Tarball..."
 rm -rf build_initrd
 
 # 1. Create the App Folders
@@ -44,6 +47,7 @@ mkdir -p build_initrd/apps/Settings.nyx
 mkdir -p build_initrd/apps/Explorer.nyx
 mkdir -p build_initrd/apps/Network.nyx
 mkdir -p build_initrd/apps/SystemMonitor.nyx
+mkdir -p build_initrd/apps/GlCube.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
@@ -54,6 +58,7 @@ cp target/x86_64-nyx/release/nyx-settings build_initrd/apps/Settings.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-explorer build_initrd/apps/Explorer.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-network build_initrd/apps/Network.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-sysmon build_initrd/apps/SystemMonitor.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-glcube build_initrd/apps/GlCube.nyx/run.bin
 
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true
@@ -63,6 +68,7 @@ cp apps/settings/*.json build_initrd/apps/Settings.nyx/ 2>/dev/null || true
 cp apps/explorer/*.json build_initrd/apps/Explorer.nyx/ 2>/dev/null || true
 cp apps/network/*.json build_initrd/apps/Network.nyx/ 2>/dev/null || true
 cp apps/sysmon/*.json build_initrd/apps/SystemMonitor.nyx/ 2>/dev/null || true
+cp apps/glcube/*.json build_initrd/apps/GlCube.nyx/ 2>/dev/null || true
 
 # 4. Package it into a lightweight tape archive
 cd build_initrd

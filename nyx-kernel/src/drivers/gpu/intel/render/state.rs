@@ -127,22 +127,26 @@ pub const SCS_ALPHA: u32 = 7;
 /// all state to RAM before submit. (Revisit for perf once drawing works.)
 pub const MOCS: u32 = 0;
 
-/// Build a RENDER_SURFACE_STATE (16 dwords) for a 2D LINEAR render target.
-/// `base_gva` is the surface's GGTT byte address; `pitch` in bytes.
+/// Build a RENDER_SURFACE_STATE (16 dwords) for a 2D render target/texture.
+/// `base_gva` is the surface's GGTT byte address; `pitch` in bytes; `tile_mode` is one of
+/// TILEMODE_LINEAR / TILEMODE_YMAJOR / TILEMODE_XMAJOR. For a Y-tiled (YMAJOR) surface the
+/// pitch must be a 128-byte multiple and the base 4KB-aligned (VALIGN_4 is already set, which
+/// the PRM requires for all tiled-Y render targets).
 pub fn render_surface_state_2d(
     format: u32,
     width: u32,
     height: u32,
     pitch: u32,
     base_gva: u32,
+    tile_mode: u32,
 ) -> [u32; 16] {
     let mut s = [0u32; 16];
-    // DW0: type[31:29]=2D, format[27:18], HAlign[15:14], VAlign[17:16], TileMode[13:12]=LINEAR.
+    // DW0: type[31:29]=2D, format[27:18], HAlign[15:14], VAlign[17:16], TileMode[13:12].
     s[0] = (SURFTYPE_2D << 29)
         | ((format & 0x3FF) << 18)
         | (VALIGN_4 << 16)
         | (HALIGN_4 << 14)
-        | (TILEMODE_LINEAR << 12);
+        | ((tile_mode & 0x3) << 12);
     // DW1: MOCS[62:56] -> bits [30:24] of DW1.
     s[1] = (MOCS & 0x7F) << 24;
     // DW2: Width-1 [13:0], Height-1 [29:16].
@@ -185,6 +189,22 @@ pub fn sampler_state_nearest_clamp() -> [u32; 4] {
     const CLAMP: u32 = 2; // TCM_CLAMP
     let dw2 = CLAMP | (CLAMP << 3) | (CLAMP << 6); // TCZ | TCY | TCX
     [0, 0, dw2, 0]
+}
+
+/// SAMPLER_STATE with BILINEAR (MAPFILTER_LINEAR) Min/Mag filtering + CLAMP addressing. Used by
+/// the MSAA-track Boot-3 SSAA resolve: the resolve quad samples the 2x-larger scene RT so each
+/// backbuffer pixel's coordinate lands EXACTLY on a 2x2 texel-block center — bilinear then averages
+/// the 4 texels 0.25 each, giving a free, exact box-filter downsample (no shader arithmetic, which
+/// the EU encoder can't emit). Field layout (mesa-gen9.xml SAMPLER_STATE):
+///   DW0: Min Mode Filter [16:14] = MAPFILTER_LINEAR(1); Mag Mode Filter [19:17] = LINEAR(1);
+///        Mip Mode Filter [21:20] = MIPFILTER_NONE(0) so bilinear reads the base level only.
+///   DW2: TCX/TCY/TCZ Address Control = CLAMP(2) (same as the nearest sampler).
+pub fn sampler_state_linear_clamp() -> [u32; 4] {
+    const CLAMP: u32 = 2; // TCM_CLAMP
+    const LINEAR: u32 = 1; // MAPFILTER_LINEAR
+    let dw0 = (LINEAR << 14) | (LINEAR << 17); // Min[16:14] | Mag[19:17]; Mip[21:20]=NONE(0)
+    let dw2 = CLAMP | (CLAMP << 3) | (CLAMP << 6); // TCZ | TCY | TCX
+    [dw0, 0, dw2, 0]
 }
 
 /// Fill a `w`x`h` B8G8R8A8_UNORM checkerboard into `cpu` (row pitch `pitch` bytes), with
@@ -276,9 +296,10 @@ pub unsafe fn setup_render_state(
     width: u32,
     height: u32,
     pitch: u32,
+    rt_tile_mode: u32,
 ) -> Result<RenderState, RenderError> {
     // --- Surface State Base contents: RENDER_SURFACE_STATE + BINDING_TABLE ---
-    let ss = render_surface_state_2d(SURFACE_FORMAT_B8G8R8A8_UNORM, width, height, pitch, rt_gva);
+    let ss = render_surface_state_2d(SURFACE_FORMAT_B8G8R8A8_UNORM, width, height, pitch, rt_gva, rt_tile_mode);
     let rt_surface_gva = surf_buf.write(&ss, 64)?; // surface state: 64B aligned
     let rt_surface_off = rt_surface_gva - surf_buf.gva;
 
