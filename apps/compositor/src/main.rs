@@ -51,6 +51,46 @@ fn push_num(buf: &mut [u8], mut pos: usize, mut v: usize) -> usize {
     pos
 }
 
+/// The 16x11 arrow (0 = transparent, 1 = dark outline, 2 = white fill) matching the software cursor,
+/// rasterized into the top-left of a 64x64 ARGB buffer for the hardware cursor plane. Hotspot at (0,0).
+const ARROW_HW: [[u8; 11]; 16] = [
+    [1,1,0,0,0,0,0,0,0,0,0],
+    [1,2,1,0,0,0,0,0,0,0,0],
+    [1,2,2,1,0,0,0,0,0,0,0],
+    [1,2,2,2,1,0,0,0,0,0,0],
+    [1,2,2,2,2,1,0,0,0,0,0],
+    [1,2,2,2,2,2,1,0,0,0,0],
+    [1,2,2,2,2,2,2,1,0,0,0],
+    [1,2,2,2,2,2,2,2,1,0,0],
+    [1,2,2,2,2,2,2,2,2,1,0],
+    [1,2,2,2,2,2,2,2,2,2,1],
+    [1,2,2,2,2,2,2,1,1,1,1],
+    [1,2,2,1,2,2,1,0,0,0,0],
+    [1,2,1,0,1,2,2,1,0,0,0],
+    [1,1,0,0,1,2,2,1,0,0,0],
+    [1,0,0,0,0,1,2,2,1,0,0],
+    [0,0,0,0,0,0,1,1,0,0,0],
+];
+
+/// Build the 64x64 ARGB cursor bitmap and hand it to the kernel. Transparent (alpha 0) outside the
+/// arrow; 0xFF-alpha dark outline / white fill inside — the display engine alpha-composites it.
+fn upload_arrow_cursor() {
+    let mut img = [0u32; 64 * 64];
+    for (r, row) in ARROW_HW.iter().enumerate() {
+        for (c, &p) in row.iter().enumerate() {
+            let color = match p {
+                1 => Color::TEXT_DARK, // already 0xFF-alpha ARGB
+                2 => Color::WHITE,
+                _ => 0, // transparent
+            };
+            if color != 0 {
+                img[r * 64 + c] = color;
+            }
+        }
+    }
+    sys_cursor_set_image(&img);
+}
+
 
 pub struct WindowClient {
     pub win: Window,
@@ -85,6 +125,10 @@ pub struct CompositorState {
     pub start_menu_open: bool,
     pub screen_w: usize, pub screen_h: usize, pub screen_stride: usize,
 
+    // U1: true once the GPU hardware cursor plane is live — the compositor then stops drawing and
+    // dirtying the software cursor (the kernel moves the HW cursor straight from the mouse IRQ).
+    pub hw_cursor: bool,
+
     // U0 instrumentation + live clock.
     pub last_clock_sec: usize,   // whole-second value of the last clock tick (drives 1Hz redraw)
     pub frame_count: u64,        // total redraws since boot
@@ -92,6 +136,7 @@ pub struct CompositorState {
     pub fps: usize,              // frames composited in the last rolling 1s window
     pub fps_window_start: usize, // uptime-ms at the start of the current FPS window
     pub fps_window_frames: usize,// frames counted so far in the current window
+    pub fps_logs: usize,         // number of [UI] baseline lines emitted (capped, then silent)
 }
 
 impl CompositorState {
@@ -106,9 +151,10 @@ impl CompositorState {
             is_resizing: false, resizing_win_idx: None,
             start_menu_open: false,
             screen_w: w, screen_h: h, screen_stride: stride,
+            hw_cursor: false,
             last_clock_sec: 0,
             frame_count: 0, last_frame_ms: 0,
-            fps: 0, fps_window_start: 0, fps_window_frames: 0,
+            fps: 0, fps_window_start: 0, fps_window_frames: 0, fps_logs: 0,
         }
     }
 
@@ -198,9 +244,13 @@ impl CompositorState {
         self.left_click = left_click;
 
         if self.mx != self.prev_mx || self.my != self.prev_my {
-            let pad = 20;
-            self.mark_dirty(self.prev_mx.saturating_sub(pad), self.prev_my.saturating_sub(pad), pad * 2, pad * 2);
-            self.mark_dirty(self.mx.saturating_sub(pad), self.my.saturating_sub(pad), pad * 2, pad * 2);
+            // Only the software cursor needs a redraw on move; the hardware cursor is composited by
+            // the scanout engine, so a bare pointer move dirties nothing (the U1 win).
+            if !self.hw_cursor {
+                let pad = 20;
+                self.mark_dirty(self.prev_mx.saturating_sub(pad), self.prev_my.saturating_sub(pad), pad * 2, pad * 2);
+                self.mark_dirty(self.mx.saturating_sub(pad), self.my.saturating_sub(pad), pad * 2, pad * 2);
+            }
         }
 
         if self.left_click && !self.prev_left {
@@ -364,6 +414,16 @@ pub extern "C" fn _start() -> ! {
     
     let mut state = CompositorState::new(screen_w, screen_h, screen_stride);
 
+    // U1: try to bring up the GPU hardware cursor plane. On success, upload the arrow bitmap and stop
+    // drawing/dirtying the software cursor; on failure, the software cursor path stays as fallback.
+    state.hw_cursor = sys_cursor_init();
+    if state.hw_cursor {
+        upload_arrow_cursor();
+        sys_print("[COMPOSITOR] Hardware cursor enabled (GPU cursor plane).\n");
+    } else {
+        sys_print("[COMPOSITOR] Hardware cursor unavailable; using software cursor.\n");
+    }
+
     let mut last_frame = sys_get_time();
     let ms_per_frame = 1000 / 60; 
 
@@ -392,7 +452,9 @@ pub extern "C" fn _start() -> ! {
 
         if state.needs_redraw {
             let frame_start = now;
-            state.mark_dirty(state.mx.saturating_sub(15), state.my.saturating_sub(15), 35, 35);
+            if !state.hw_cursor {
+                state.mark_dirty(state.mx.saturating_sub(15), state.my.saturating_sub(15), 35, 35);
+            }
 
             // 1. Submit GPU background fill for the ENTIRE screen (Asynchronous)
             sys_gpu_fill_rect(0, 0, screen_stride, screen_h, Color::WARM_BG);
@@ -474,7 +536,10 @@ pub extern "C" fn _start() -> ! {
             let ov_str = core::str::from_utf8(&ov[..op]).unwrap_or("FPS ?");
             canvas.print_str(4, 2, ov_str, Color::TEXT_MUTED, 1);
 
-            draw_cursor(canvas.buffer, screen_stride, screen_h, state.mx, state.my, CursorType::Arrow);
+            // Software cursor only when the GPU hardware cursor plane isn't driving the pointer.
+            if !state.hw_cursor {
+                draw_cursor(canvas.buffer, screen_stride, screen_h, state.mx, state.my, CursorType::Arrow);
+            }
 
             sys_swap_buffers();
             sys_gpu_sync();
@@ -488,16 +553,21 @@ pub extern "C" fn _start() -> ! {
                 state.fps = state.fps_window_frames;
                 state.fps_window_frames = 0;
                 state.fps_window_start = frame_end;
-                let mut log = [0u8; 64];
-                let mut lp = 0usize;
-                for &b in b"[UI] frame " { log[lp] = b; lp += 1; }
-                lp = push_num(&mut log, lp, state.frame_count as usize);
-                for &b in b": draw=" { log[lp] = b; lp += 1; }
-                lp = push_num(&mut log, lp, state.last_frame_ms);
-                for &b in b"ms fps=" { log[lp] = b; lp += 1; }
-                lp = push_num(&mut log, lp, state.fps);
-                log[lp] = b'\n'; lp += 1;
-                if let Ok(s) = core::str::from_utf8(&log[..lp]) { sys_print(s); }
+                // Only emit the serial baseline for the first few windows, then go quiet — otherwise the
+                // once-per-second clock tick floods the boot log and buries the [HWCURSOR]/startup lines.
+                if state.fps_logs < 5 {
+                    state.fps_logs += 1;
+                    let mut log = [0u8; 64];
+                    let mut lp = 0usize;
+                    for &b in b"[UI] frame " { log[lp] = b; lp += 1; }
+                    lp = push_num(&mut log, lp, state.frame_count as usize);
+                    for &b in b": draw=" { log[lp] = b; lp += 1; }
+                    lp = push_num(&mut log, lp, state.last_frame_ms);
+                    for &b in b"ms fps=" { log[lp] = b; lp += 1; }
+                    lp = push_num(&mut log, lp, state.fps);
+                    log[lp] = b'\n'; lp += 1;
+                    if let Ok(s) = core::str::from_utf8(&log[..lp]) { sys_print(s); }
+                }
             }
 
             state.prev_mx = state.mx;

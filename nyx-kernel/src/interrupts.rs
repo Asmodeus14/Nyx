@@ -1230,6 +1230,23 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = crate::rtc::read_packed();
         },
 
+        529 => {
+            // SYS_CURSOR_INIT: bring up the display hardware cursor plane. 1 = enabled, 0 = fell back.
+            frame.rax = crate::drivers::gpu::intel::cursor::init() as u64;
+        },
+
+        535 => {
+            // SYS_CURSOR_SET_IMAGE(argb_ptr): upload a 64x64 ARGB cursor bitmap. 1 ok / 0 err.
+            let ptr = arg1 as *const u32;
+            let bytes = 64 * 64 * 4;
+            if is_valid_user_ptr(ptr as *const u8, bytes) {
+                let img = unsafe { core::slice::from_raw_parts(ptr, 64 * 64) };
+                frame.rax = crate::drivers::gpu::intel::cursor::set_image(img) as u64;
+            } else {
+                frame.rax = EFAULT as u64;
+            }
+        },
+
         
         505 => { 
             // THE FIX: Shield the spinlock from hardware interrupts!

@@ -75,14 +75,19 @@ impl MouseDriver {
 }
 
 pub fn update_from_usb(dx: i8, dy: i8, buttons: u8) {
-    let mut state = MOUSE_STATE.lock();
-    let new_x = state.x as i64 + (dx as i64); 
-    let new_y = state.y as i64 + (dy as i64); 
-    state.x = new_x.clamp(0, (state.screen_width - 1) as i64) as usize;
-    state.y = new_y.clamp(0, (state.screen_height - 1) as i64) as usize;
-    state.left_click = (buttons & 0x01) != 0;
-    state.right_click = (buttons & 0x02) != 0;
-    state.middle_click = (buttons & 0x04) != 0;
+    let (nx, ny) = {
+        let mut state = MOUSE_STATE.lock();
+        let new_x = state.x as i64 + (dx as i64);
+        let new_y = state.y as i64 + (dy as i64);
+        state.x = new_x.clamp(0, (state.screen_width - 1) as i64) as usize;
+        state.y = new_y.clamp(0, (state.screen_height - 1) as i64) as usize;
+        state.left_click = (buttons & 0x01) != 0;
+        state.right_click = (buttons & 0x02) != 0;
+        state.middle_click = (buttons & 0x04) != 0;
+        (state.x, state.y)
+    };
+    // Drive the hardware cursor plane directly (no-op if it isn't enabled). Lockless MMIO.
+    crate::drivers::gpu::intel::cursor::move_to(nx, ny);
 }
 
 pub fn handle_interrupt(packet_byte: u8) {
@@ -103,13 +108,19 @@ pub fn handle_interrupt(packet_byte: u8) {
                 let mut state = MOUSE_STATE.lock();
                 let multiplier = 2; // Increase mouse sensitivity!
                 let new_x = state.x as i32 + (rel_x as i32 * multiplier);
-                let new_y = state.y as i32 - (rel_y as i32 * multiplier); 
+                let new_y = state.y as i32 - (rel_y as i32 * multiplier);
 
                 state.x = new_x.clamp(0, state.screen_width as i32 - 1) as usize;
                 state.y = new_y.clamp(0, state.screen_height as i32 - 1) as usize;
                 state.left_click = (flags & 0x01) != 0;
                 state.right_click = (flags & 0x02) != 0;
+                let (nx, ny) = (state.x, state.y);
+                drop(state);
                 driver.cycle = 0;
+
+                // Drive the hardware cursor plane straight from the IRQ (no-op if disabled). This is
+                // the zero-latency, zero-redraw path: a single CURPOS+CURBASE MMIO write, no locks.
+                crate::drivers::gpu::intel::cursor::move_to(nx, ny);
             }
             _ => driver.cycle = 0,
         }

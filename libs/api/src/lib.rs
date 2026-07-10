@@ -285,6 +285,23 @@ pub fn sys_get_rtc() -> RtcTime {
     }
 }
 
+pub const SYS_CURSOR_INIT: u64 = 529;
+pub const SYS_CURSOR_SET_IMAGE: u64 = 535;
+
+/// Bring up the display controller's hardware cursor plane. Returns true if the GPU cursor is now
+/// live (the caller should then stop drawing a software cursor); false if it fell back (keep the
+/// software cursor). Once up, the kernel moves the cursor straight from the mouse IRQ — the caller
+/// only needs to upload an image.
+pub fn sys_cursor_init() -> bool {
+    syscall(SYS_CURSOR_INIT, 0, 0, 0, 0, 0, 0) == 1
+}
+
+/// Upload a 64x64 ARGB (0xAARRGGBB) bitmap for the hardware cursor. `img` must be exactly 64*64 = 4096
+/// pixels. Returns true on success. No-op (false) if the hardware cursor isn't initialized.
+pub fn sys_cursor_set_image(img: &[u32; 64 * 64]) -> bool {
+    syscall(SYS_CURSOR_SET_IMAGE, img.as_ptr() as u64, 0, 0, 0, 0, 0) == 1
+}
+
 
 pub fn sys_get_context_switches() -> u64 {
     syscall(523, 0, 0, 0, 0, 0, 0)

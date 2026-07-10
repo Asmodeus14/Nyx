@@ -9,6 +9,9 @@ use spin::Mutex;
 // brings up the RENDER command streamer (base 0x2000) and the 3D pipeline.
 pub mod render;
 
+// Phase U1: display-controller hardware cursor plane (see cursor.rs). Driven from the mouse IRQ.
+pub mod cursor;
+
 pub static INTEL_GPU: Mutex<Option<IntelGpuDriver>> = Mutex::new(None);
 pub static BACKBUFFER_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 
