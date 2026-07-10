@@ -330,10 +330,12 @@ pub fn gl_render(mvps: &[Mat4]) -> Result<(), RenderError> {
         // writes stopped becoming CPU-visible). The in-stream prologue TLB_INVALIDATE PIPE_CONTROL
         // (proven safe: ring-0 passes 300 frames with it) does the real engine-TLB flush, so the
         // chipset register poke is both redundant and the suspected wedge. Removed.
-        // Pass 1: render all meshes into the supersampled Y-tiled scene RT (no present).
+        // Pass 1: render all meshes into the supersampled Y-tiled scene RT (no present). blend=false:
+        // glcube's cube is opaque, so keep the GL mesh pass byte-identical to its HW-proven stream.
+        // (Per-mesh GL blending is a later addition when the GPU compositor path needs translucency.)
         eng.draw_scene(
             scene, &mvps_owned, rt_tiled_gva, rt_tiled_cpu, ss_w, ss_h, pitch, tiled_pitch,
-            rt_buf_bytes, false, verbose,
+            rt_buf_bytes, false, false, verbose,
         )?;
     }
     let cl1 = unsafe { eng.read_reg(0x2340) };

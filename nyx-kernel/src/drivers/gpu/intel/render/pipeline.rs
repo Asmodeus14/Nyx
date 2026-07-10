@@ -832,12 +832,13 @@ impl RenderEngine {
         };
         let mmio = self.mmio_base;
         // Shared buffers: surf (RT surf + per-mesh tex surfaces + binding tables), dyn (blend/cc/
-        // viewport + sampler), vbo (per-mesh vertex + index blocks), tex (8 pages = two 64x64
-        // textures). Sized generously; the bump allocator packs meshes in order.
+        // viewport + sampler), vbo (per-mesh vertex + index blocks), tex (16 pages: each texture is
+        // page-aligned, so two 64x64 (4 pages each) + smaller meshes' textures fit with headroom —
+        // the U2 blend panel is a 3rd mesh, so 8 pages (exactly two 64x64) is no longer enough).
         let mut surf_buf = StateBuffer::new(mmio, GVA_SURFACE_STATE, 1)?;
         let mut dyn_buf = StateBuffer::new(mmio, GVA_DYNAMIC_STATE, 1)?;
         let vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 2)?;
-        let tex_buf = StateBuffer::new(mmio, super::GVA_TEXTURES, 8)?;
+        let tex_buf = StateBuffer::new(mmio, super::GVA_TEXTURES, 16)?;
         // `pitch` here is the RT ROW pitch (bytes): the Y-tiled pitch when rt_tile_mode=YMAJOR
         // (a 128B multiple), else the linear scanout pitch. The RT surface points BTI 0 at it.
         let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch, rt_tile_mode)?;
@@ -886,6 +887,7 @@ impl RenderEngine {
         tiled_pitch: u32,
         rt_buf_bytes: usize,
         present: bool,
+        blend: bool,
         verbose: bool,
     ) -> Result<(), RenderError> {
         use super::math::Vec4;
@@ -939,7 +941,7 @@ impl RenderEngine {
         // Shared fixed-function prologue (extracted so the resolve pass reuses the exact bytes).
         let mut cs = CmdStream::new();
         // Mesh pass: shared NEAREST sampler + rs viewport (baked at the RT's — supersampled — dims).
-        self.emit_pipeline_prologue(&mut cs, rs, vs_off, sampler_off, rs.sf_clip_viewport_off, width, height, 3 << 16); // cull BACK
+        self.emit_pipeline_prologue(&mut cs, rs, vs_off, sampler_off, rs.sf_clip_viewport_off, width, height, 3 << 16, blend); // cull BACK
 
         // Per-mesh tail: swap VB / IB / binding table / PS and draw. Pipelined 3DSTATE, legal to
         // change between draws in one stream (proven: Phase 6 Step 4).
@@ -974,6 +976,7 @@ impl RenderEngine {
         width: u32,
         height: u32,
         raster_cull_dw1: u32,
+        blend: bool,
     ) {
         self.progress(cs, 0x10);
         cmd::pipe_control(
@@ -1052,9 +1055,20 @@ impl RenderEngine {
         cs.push(h(so::VIEWPORT_CC, 2)).push(rs.cc_viewport_off);
         cs.push(h1(so::DRAWING_RECTANGLE, 4)).push(0).push(((height - 1) << 16) | (width - 1)).push(0);
         cs.push(h(so::PS_EXTRA, 2)).push((1u32 << 31) | (1 << 8));
-        cs.push(h(so::PS_BLEND, 2)).push(1u32 << 30);
+        // U2 alpha blending: when `blend`, enable src-over in BOTH 3DSTATE_PS_BLEND and the pointed-to
+        // BLEND_STATE (they must agree). Opaque path (blend=false) is byte-identical to the proven
+        // pre-U2 stream: PS_BLEND = Has-Writeable-RT only, BLEND_STATE = blend-disabled. The PS_BLEND
+        // dw1 src-over encoding (Has-WR-RT bit30 | BlendEnable bit29 | srcBF SRC_ALPHA[18:14] |
+        // dstBF INV_SRC_ALPHA[13:9] | srcABF ONE[28:24] | dstABF INV_SRC_ALPHA[23:19]) = 0x6198_E600,
+        // sourced from the SKL genxml 3DSTATE_PS_BLEND field bits.
+        let (ps_blend_dw1, blend_off) = if blend {
+            (0x6198_E600u32, rs.blend_src_over_off)
+        } else {
+            (1u32 << 30, rs.blend_off)
+        };
+        cs.push(h(so::PS_BLEND, 2)).push(ps_blend_dw1);
         cs.push(h(so::CC_STATE_POINTERS, 2)).push(rs.cc_off | 1);
-        cs.push(h(so::BLEND_STATE_POINTERS, 2)).push(rs.blend_off | 1);
+        cs.push(h(so::BLEND_STATE_POINTERS, 2)).push(blend_off | 1);
         cs.push(h(so::WM_DEPTH_STENCIL, 4)).push(0).push(0).push(0);
         cs.push(h(so::MULTISAMPLE, 2)).push(0);
         cs.push(h(so::SAMPLE_MASK, 2)).push(1);
@@ -1220,7 +1234,7 @@ impl RenderEngine {
         // resolve path always sets both).
         let resolve_sampler = if scene.resolve_sampler_off != 0 { scene.resolve_sampler_off } else { scene.sampler_off };
         let resolve_sf_clip = if scene.resolve_sf_clip_off != 0 { scene.resolve_sf_clip_off } else { scene.rs.sf_clip_viewport_off };
-        self.emit_pipeline_prologue(&mut cs, &scene.rs, scene.vs_off, resolve_sampler, resolve_sf_clip, width, height, 1 << 16);
+        self.emit_pipeline_prologue(&mut cs, &scene.rs, scene.vs_off, resolve_sampler, resolve_sf_clip, width, height, 1 << 16, false);
         self.emit_draw_one(&mut cs, resolve, 0x30);
         let hung = self.finish_submit_and_wait(&mut cs, verbose, 1);
 
@@ -1253,7 +1267,7 @@ impl RenderEngine {
         pitch: u32,
         frames: u32,
     ) -> Result<(), RenderError> {
-        use super::engine::{cube_mesh, pyramid_mesh, Texture};
+        use super::engine::{cube_mesh, panel_mesh, pyramid_mesh, ui_quad_mesh, Texture};
         use super::math::{Mat4, Vec3};
 
         // --- MSAA track, Boot 3: SSAA (2x2 supersampling). Render the scene into a Y-TILED RT that
@@ -1286,6 +1300,17 @@ impl RenderEngine {
         // mesh samples its OWN texture.
         scene.add_mesh(&cube_mesh(), &Texture::checkerboard(64, 8))?;
         scene.add_mesh(&pyramid_mesh(), &Texture::checkerboard(64, 4))?;
+        // U2 blend gate: a translucent orange panel (alpha 0x80) placed in FRONT of the two opaque
+        // meshes and drawn LAST, so src-over composites it over them. With blending ON you see the
+        // cube/pyramid tinted-through the panel; with blending OFF (regression) it would be a solid
+        // opaque orange rectangle occluding them. Solid 16x16 texture (pitch 64B, sampler-safe).
+        scene.add_mesh(&panel_mesh(), &Texture::solid(16, 0x80_FF6000))?;
+        // U3 screen-space ortho quads: two overlapping translucent rectangles positioned in PIXEL
+        // space (top-left origin), drawn last. Proves draw_quad(x,y,w,h) works and that quad-over-quad
+        // src-over composites (green over cyan where they overlap). No perspective/camera — the MVP is
+        // pure ortho. This is exactly the primitive U4's GPU compositor draws each window as.
+        scene.add_mesh(&ui_quad_mesh(), &Texture::solid(16, 0xA0_00C0FF))?; // cyan, alpha 0xA0
+        scene.add_mesh(&ui_quad_mesh(), &Texture::solid(16, 0xA0_40FF40))?; // green, alpha 0xA0
         // Resolve quad: samples the SUPERSAMPLED scene RT (ss_w x ss_h) and writes the DISPLAY-size
         // linear backbuffer (width x height, GVA 0x1400_0000 still mapped to bb_cpu). The BILINEAR
         // sampler averages each 2x2 block -> antialiased downsample.
@@ -1306,6 +1331,15 @@ impl RenderEngine {
         // centers 1.8 apart -> never overlap, so back-face culling alone suffices, no depth).
         let place_cube = Mat4::translate(Vec3::new(-0.9, 0.0, 0.0)).mul(&Mat4::scale(Vec3::new(0.65, 0.65, 0.65)));
         let place_pyr = Mat4::translate(Vec3::new(0.9, 0.0, 0.0)).mul(&Mat4::scale(Vec3::new(0.65, 0.65, 0.65)));
+        // Translucent panel: static, centered, in FRONT of the meshes (z=+1.2, camera at z=4), wide
+        // enough to overlap both. Drawn last -> src-over over the opaque scene.
+        let place_panel = Mat4::translate(Vec3::new(0.0, 0.0, 1.2)).mul(&Mat4::scale(Vec3::new(2.6, 1.4, 1.0)));
+        let mvp_panel = camera.mul(&place_panel);
+        // U3: pixel-space ortho quads (top-left origin). MVP = ortho * translate(x,y) * scale(w,h);
+        // NO camera. Two overlapping rects near the top-left corner so the overlap (blend) is obvious.
+        let ortho = Mat4::ortho_screen(width as f32, height as f32);
+        let mvp_q1 = ortho.mul(&Mat4::translate(Vec3::new(40.0, 40.0, 0.0))).mul(&Mat4::scale(Vec3::new(340.0, 150.0, 1.0)));
+        let mvp_q2 = ortho.mul(&Mat4::translate(Vec3::new(220.0, 110.0, 0.0))).mul(&Mat4::scale(Vec3::new(340.0, 150.0, 1.0)));
 
         for f in 0..frames {
             let a = f as f32 * 0.03;
@@ -1313,12 +1347,12 @@ impl RenderEngine {
             // Cube tumbles about Y+X; pyramid spins the opposite way about Y so they look independent.
             let mvp_cube = camera.mul(&place_cube).mul(&Mat4::rotate_y(a).mul(&Mat4::rotate_x(a * 0.6)));
             let mvp_pyr = camera.mul(&place_pyr).mul(&Mat4::rotate_y(-a * 0.8));
-            let mvps = [mvp_cube, mvp_pyr];
+            let mvps = [mvp_cube, mvp_pyr, mvp_panel, mvp_q1, mvp_q2];
             // Pass 1: render the meshes into the Y-tiled offscreen scene RT at SUPERSAMPLED dims
             // (ss_w x ss_h; no present). `pitch` here is unused for a tiled RT (clear uses
             // rt_buf_bytes), so the display scanout pitch is fine to pass through.
             self.draw_scene(&mut scene, &mvps, rt_tiled_gva, rt_tiled_cpu, ss_w, ss_h,
-                pitch, tiled_pitch, rt_buf_bytes, false, verbose)?;
+                pitch, tiled_pitch, rt_buf_bytes, false, true, verbose)?;
             // Pass 2: resolve — box-downsample the supersampled scene RT with the full-screen quad,
             // write the DISPLAY-size linear backbuffer, and present it (boot self-test: straight to scanout).
             self.draw_resolve(&mut scene, bb_cpu, width, height, pitch, true, verbose)?;

@@ -238,6 +238,23 @@ pub fn blend_state() -> [u32; 3] {
     [0, 0, (1 << 0) | (1 << 1) | (2 << 2)]
 }
 
+/// BLEND_STATE + one BLEND_STATE_ENTRY configured for SOURCE-OVER alpha blending (U2):
+///   out.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)      [SRC_ALPHA / INV_SRC_ALPHA, ADD]
+///   out.a   = src.a   * 1     + dst.a   * (1 - src.a)      [ONE       / INV_SRC_ALPHA, ADD]
+/// Only the entry's DW0 (blend enable + factors) differs from `blend_state()`; the clamp DW1 is
+/// identical. All field bit positions + blend-factor enum values are sourced from the SKL genxml
+/// (BLEND_STATE_ENTRY: Color Buffer Blend Enable=31, Source Blend Factor[30:26], Destination Blend
+/// Factor[25:21], Color Blend Function[20:18], Source Alpha Blend Factor[17:13], Destination Alpha
+/// Blend Factor[12:8], Alpha Blend Function[7:5]; SRC_ALPHA=3, INV_SRC_ALPHA=19, ONE=1, ADD=0).
+pub fn blend_state_src_over() -> [u32; 3] {
+    // Entry DW0:
+    //   (1<<31) enable | (3<<26) srcBF=SRC_ALPHA | (19<<21) dstBF=INV_SRC_ALPHA
+    //   | (0<<18) colorFn=ADD | (1<<13) srcABF=ONE | (19<<8) dstABF=INV_SRC_ALPHA | (0<<5) alphaFn=ADD
+    //   = 0x8E60_3300.
+    let entry_dw0: u32 = (1 << 31) | (3 << 26) | (19 << 21) | (1 << 13) | (19 << 8);
+    [0, entry_dw0, (1 << 0) | (1 << 1) | (2 << 2)]
+}
+
 /// COLOR_CALC_STATE (6 dwords): defaults (blend constant color 0, alpha ref 0).
 pub fn color_calc_state() -> [u32; 6] {
     [0; 6]
@@ -280,7 +297,8 @@ pub struct RenderState {
     pub dynamic_state_base: u32, // == GVA_DYNAMIC_STATE (Dynamic State Base Address)
     pub rt_surface_off: u32,     // RENDER_SURFACE_STATE offset from surface base
     pub binding_table_off: u32,  // BINDING_TABLE_STATE offset from surface base
-    pub blend_off: u32,          // BLEND_STATE offset from dynamic base
+    pub blend_off: u32,          // BLEND_STATE offset from dynamic base (opaque, blend disabled)
+    pub blend_src_over_off: u32,  // BLEND_STATE offset for SRC_ALPHA/INV_SRC_ALPHA src-over (U2)
     pub cc_off: u32,             // COLOR_CALC_STATE offset from dynamic base
     pub cc_viewport_off: u32,    // CC_VIEWPORT offset from dynamic base
     pub sf_clip_viewport_off: u32, // SF_CLIP_VIEWPORT offset from dynamic base
@@ -309,6 +327,7 @@ pub unsafe fn setup_render_state(
 
     // --- Dynamic State Base contents: BLEND / COLOR_CALC / viewports ---
     let blend_gva = dyn_buf.write(&blend_state(), 64)?;
+    let blend_src_over_gva = dyn_buf.write(&blend_state_src_over(), 64)?;
     let cc_gva = dyn_buf.write(&color_calc_state(), 64)?;
     let ccv_gva = dyn_buf.write(&cc_viewport(0.0, 1.0), 32)?;
     let sfv_gva = dyn_buf.write(&sf_clip_viewport(width, height), 64)?;
@@ -319,6 +338,7 @@ pub unsafe fn setup_render_state(
         rt_surface_off,
         binding_table_off,
         blend_off: blend_gva - dyn_buf.gva,
+        blend_src_over_off: blend_src_over_gva - dyn_buf.gva,
         cc_off: cc_gva - dyn_buf.gva,
         cc_viewport_off: ccv_gva - dyn_buf.gva,
         sf_clip_viewport_off: sfv_gva - dyn_buf.gva,

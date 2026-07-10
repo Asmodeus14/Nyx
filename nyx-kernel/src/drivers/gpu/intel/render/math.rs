@@ -231,6 +231,24 @@ impl Mat4 {
         r
     }
 
+    /// U3: orthographic screen-space projection. Maps pixel coordinates in `[0,w] x [0,h]`
+    /// (origin top-left, +y down) to clip/NDC `[-1,1] x [-1,1]` with Y flipped so pixel-top lands at
+    /// NDC +y (the sf_clip viewport then flips NDC +y back to screen-top — net: pixel top-left == screen
+    /// top-left). z collapses to a constant plane (no depth). No perspective: w passes through = 1, so a
+    /// quad `MVP = ortho_screen(W,H) * translate(x,y,0) * scale(w,h,1)` places a pixel-space rectangle.
+    /// This is the atom U4's GPU compositor draws each window as. Column-major (m[col*4+row]).
+    pub fn ortho_screen(w: f32, h: f32) -> Mat4 {
+        let mut r = Mat4::zero();
+        r.m[0] = 2.0 / w;   // col0,row0: x scale
+        r.m[5] = -2.0 / h;  // col1,row1: y scale (flip)
+        r.m[10] = 0.0;      // col2,row2: z -> constant plane
+        r.m[12] = -1.0;     // col3,row0: x translate
+        r.m[13] = 1.0;      // col3,row1: y translate
+        r.m[14] = 0.0;      // col3,row2: z plane = 0 (inside [0,1] depth range)
+        r.m[15] = 1.0;      // col3,row3: w = 1 (affine, no perspective divide)
+        r
+    }
+
     pub fn rotate_x(a: f32) -> Mat4 {
         let (c, s) = (cos(a), sin(a));
         let mut r = Mat4::identity();

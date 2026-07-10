@@ -90,6 +90,13 @@ impl Texture {
         }
         Self { width: size, height: size, pitch: size * 4, texels }
     }
+
+    /// A `size`x`size` texture filled with one B8G8R8A8 color (A<<24|R<<16|G<<8|B). Used by the U2
+    /// blend gate: a half-alpha panel that must show the meshes behind it when src-over is on.
+    pub fn solid(size: u32, argb: u32) -> Self {
+        let texels = alloc::vec![argb; (size * size) as usize];
+        Self { width: size, height: size, pitch: size * 4, texels }
+    }
 }
 
 /// Persistent per-mesh GPU resources: state buffers + render state allocated ONCE and reused
@@ -488,6 +495,50 @@ pub fn pyramid_mesh() -> Mesh {
     vertices.push(Vertex::new(b3, Vec4::new(0.0, 1.0, 0.0, 1.0)));
     indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
 
+    Mesh::new(vertices, indices)
+}
+
+/// A unit quad centered at the origin in the z=0 plane, facing +z (toward the camera), wound to
+/// match the cube's front (+z) face so the shared BACK-cull keeps it. Model coords span [-0.5,0.5]
+/// in x/y; UVs map the unit square. Used by the U2 blend gate as a translucent panel: placed in
+/// front of the opaque meshes and drawn last so src-over composites it over them.
+pub fn panel_mesh() -> Mesh {
+    let v = [
+        Vec3::new(-0.5, -0.5, 0.0),
+        Vec3::new(0.5, -0.5, 0.0),
+        Vec3::new(0.5, 0.5, 0.0),
+        Vec3::new(-0.5, 0.5, 0.0),
+    ];
+    let uv = [
+        Vec4::new(0.0, 0.0, 0.0, 1.0),
+        Vec4::new(1.0, 0.0, 0.0, 1.0),
+        Vec4::new(1.0, 1.0, 0.0, 1.0),
+        Vec4::new(0.0, 1.0, 0.0, 1.0),
+    ];
+    let vertices = alloc::vec![
+        Vertex::new(v[0], uv[0]),
+        Vertex::new(v[1], uv[1]),
+        Vertex::new(v[2], uv[2]),
+        Vertex::new(v[3], uv[3]),
+    ];
+    // Clockwise winding (viewed from +z) so BACK-cull keeps it front-facing.
+    let indices = alloc::vec![0u32, 2, 1, 0, 3, 2];
+    Mesh::new(vertices, indices)
+}
+
+/// A unit quad spanning [0,1]x[0,1] in the z=0 plane (UVs = position), for U3 screen-space drawing:
+/// `MVP = Mat4::ortho_screen(W,H) * translate(x,y,0) * scale(w,h,1)` places a pixel-space rectangle.
+/// Winding: CCW `[0,1,2, 0,2,3]`. The ortho matrix's Y-flip plus the sf_clip viewport's Y-flip compose
+/// to TWO flips (vs. the perspective panel's one), so the front-facing order is the OPPOSITE of
+/// `panel_mesh` — if it renders invisible (back-face culled), swap to `[0,2,1, 0,3,2]`.
+pub fn ui_quad_mesh() -> Mesh {
+    let vertices = alloc::vec![
+        Vertex::new(Vec3::new(0.0, 0.0, 0.0), Vec4::new(0.0, 0.0, 0.0, 1.0)),
+        Vertex::new(Vec3::new(1.0, 0.0, 0.0), Vec4::new(1.0, 0.0, 0.0, 1.0)),
+        Vertex::new(Vec3::new(1.0, 1.0, 0.0), Vec4::new(1.0, 1.0, 0.0, 1.0)),
+        Vertex::new(Vec3::new(0.0, 1.0, 0.0), Vec4::new(0.0, 1.0, 0.0, 1.0)),
+    ];
+    let indices = alloc::vec![0u32, 1, 2, 0, 2, 3];
     Mesh::new(vertices, indices)
 }
 
