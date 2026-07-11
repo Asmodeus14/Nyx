@@ -1247,6 +1247,23 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         },
 
+        536 => {
+            // SYS_GPU_COMPOSITE(list_ptr, count): GPU-composite `count` WindowQuads into the backbuffer.
+            // 1 ok / 0 => caller falls back to CPU compositing.
+            use crate::drivers::gpu::intel::render::compositor::WindowQuad;
+            let ptr = arg1 as *const WindowQuad;
+            let count = arg2 as usize;
+            let bytes = count.saturating_mul(core::mem::size_of::<WindowQuad>());
+            if count == 0 {
+                frame.rax = 1;
+            } else if is_valid_user_ptr(ptr as *const u8, bytes) {
+                let quads = unsafe { core::slice::from_raw_parts(ptr, count) };
+                frame.rax = crate::drivers::gpu::intel::render::compositor::composite(quads) as u64;
+            } else {
+                frame.rax = EFAULT as u64;
+            }
+        },
+
         
         505 => { 
             // THE FIX: Shield the spinlock from hardware interrupts!

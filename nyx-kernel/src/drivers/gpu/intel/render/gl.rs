@@ -335,7 +335,7 @@ pub fn gl_render(mvps: &[Mat4]) -> Result<(), RenderError> {
         // (Per-mesh GL blending is a later addition when the GPU compositor path needs translucency.)
         eng.draw_scene(
             scene, &mvps_owned, rt_tiled_gva, rt_tiled_cpu, ss_w, ss_h, pitch, tiled_pitch,
-            rt_buf_bytes, false, false, verbose,
+            rt_buf_bytes, false, false, true, verbose,
         )?;
     }
     let cl1 = unsafe { eng.read_reg(0x2340) };

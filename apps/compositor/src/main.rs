@@ -12,7 +12,7 @@ use alloc::vec;
 
 use nyx_api::*;
 use nyx_gui::canvas::{Canvas, Color};
-use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_cursor, Window, CursorType};
+use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_window_chrome, round_window_corners, draw_cursor, Window, CursorType};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -462,22 +462,63 @@ pub extern "C" fn _start() -> ! {
             // 2. Synchronize! Wait for GPU wallpaper clear to finish before CPU starts drawing
             sys_gpu_sync();
 
+            // 2b. U4: GPU-composite each visible window's CONTENT as a textured ortho quad directly
+            // into the backbuffer (over the wallpaper). tex_gva = the window's page-aligned pixels =
+            // gpu_gva + WindowHeader size. On success the CPU skips the per-window composite_buffer
+            // copy and only draws chrome; on failure (e.g. non-16-aligned width) we fall back to the
+            // full CPU composite for correctness.
+            let hdr = core::mem::size_of::<WindowHeader>() as u32;
+            let mut quads: Vec<WindowQuad> = Vec::new();
+            for client in state.clients.iter() {
+                if client.win.exists && !client.win.is_minimized && client.gpu_gva != 0 {
+                    quads.push(WindowQuad {
+                        tex_gva: client.gpu_gva + hdr,
+                        src_w: client.buf_w as u32,
+                        src_h: client.buf_h as u32,
+                        src_pitch: (client.buf_w as u32) * 4,
+                        dst_x: client.win.x as i32,
+                        dst_y: (client.win.y + 30) as i32,
+                        // U4 Boot 3 live resize: draw the content at the SHELL size (win.w/win.h), not
+                        // the buffer size (buf_w/buf_h). src stays the real (pitch-aligned) buffer, so
+                        // the GPU stretches the current content to follow the frame instantly during a
+                        // resize drag; it sharpens when the app reallocates its SHM (MSG_WINDOW_UPDATE_
+                        // SHM updates buf_w/buf_h). No scene rebuild or pitch fallback during the drag.
+                        dst_w: client.win.w as u32,
+                        dst_h: client.win.h as u32,
+                        // U4 Boot 2: honor the window's opacity on the GPU path (fade-in on open,
+                        // dimmed/translucent windows). The CPU fallback already applies it via
+                        // composite_buffer(.., win.opacity). Same clients-iter Z-order => back-to-front.
+                        opacity: client.win.opacity as u32,
+                    });
+                }
+            }
+            let gpu_composited = sys_gpu_composite(&quads);
+            if gpu_composited { sys_gpu_sync(); }
+
             // 3. Perform CPU drawing (Text, Window Borders, Windows, Taskbar, Cursor)
             let mut canvas = Canvas::new(hardware_fb, screen_stride, screen_h);
 
             // Draw window decorations and CPU client compositing sequentially in Z-order
             for client in state.clients.iter() {
                 if client.win.exists {
-                    // Draw window border, white background, and title bar
-                    draw_window_rounded(canvas.buffer, screen_stride, screen_h, &client.win);
-                    
-                    if !client.win.is_minimized {
-                        if client.buffer.is_null() || client.buffer as u64 == 0 { continue; }
-                        
-                        let expected_size = client.buf_w * client.buf_h;
-                        let client_pixels = unsafe { core::slice::from_raw_parts(client.buffer, expected_size) };
-                        canvas.composite_buffer(client.win.x, client.win.y + 30, client_pixels, client.buf_w, client.buf_h, client.win.opacity);
+                    if gpu_composited {
+                        // GPU already drew the content; CPU draws only the title bar + frame on top.
+                        draw_window_chrome(canvas.buffer, screen_stride, screen_h, &client.win);
+                    } else {
+                        // Fallback: full CPU path — white fill + copy the window's pixels.
+                        draw_window_rounded(canvas.buffer, screen_stride, screen_h, &client.win);
+                        if !client.win.is_minimized {
+                            if client.buffer.is_null() || client.buffer as u64 == 0 { continue; }
+                            let expected_size = client.buf_w * client.buf_h;
+                            let client_pixels = unsafe { core::slice::from_raw_parts(client.buffer, expected_size) };
+                            canvas.composite_buffer(client.win.x, client.win.y + 30, client_pixels, client.buf_w, client.buf_h, client.win.opacity);
+                        }
                     }
+                    // U4 Boot 3: round the TRUE window outline last, once, on whichever content is now
+                    // on the backbuffer (GPU or CPU) — carves the real 4 corners to the wallpaper.
+                    // Constant 12px radius, size-independent. Must run AFTER composite_buffer in the
+                    // fallback path (which would otherwise overwrite carved bottom corners).
+                    round_window_corners(canvas.buffer, screen_stride, screen_h, &client.win, 12);
                 }
             }
 

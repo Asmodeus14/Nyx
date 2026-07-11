@@ -6,12 +6,17 @@ use core::arch::asm;
 #[repr(C)]
 pub struct WindowHeader {
     pub magic: u32,
-    pub requested_x: i32, 
+    pub requested_x: i32,
     pub requested_y: i32,
     pub width: u32,
     pub height: u32,
     pub flags: u32,
-    pub title: [u8; 64], 
+    pub title: [u8; 64],
+    // U4: pad the header so the pixel data that follows (`shm + size_of::<WindowHeader>()`) is
+    // PAGE-ALIGNED. The GPU compositor binds that pixel region as a sampled texture, and every proven
+    // texture surface in the render engine uses a 4KB-aligned base — this makes window surfaces match,
+    // with zero alignment risk. All apps compute the pixel offset via size_of, so this is transparent.
+    pub _pad: [u8; 4096 - 88],
 }
 
 pub const WIN_MAGIC: u32 = 0x4E595857; 
@@ -300,6 +305,38 @@ pub fn sys_cursor_init() -> bool {
 /// pixels. Returns true on success. No-op (false) if the hardware cursor isn't initialized.
 pub fn sys_cursor_set_image(img: &[u32; 64 * 64]) -> bool {
     syscall(SYS_CURSOR_SET_IMAGE, img.as_ptr() as u64, 0, 0, 0, 0, 0) == 1
+}
+
+pub const SYS_GPU_COMPOSITE: u64 = 536;
+
+/// One window to composite on the GPU (U4). `tex_gva` is the window's pixel data GVA — the SHM is
+/// already GGTT-mapped by sys_gpu_map_shm at `gpu_gva`, and the pixels are page-aligned at
+/// `gpu_gva + size_of::<WindowHeader>()`. `src_w/src_h/src_pitch` describe the window's B8G8R8A8
+/// surface; `dst_*` is where to draw it on screen (pixels). The kernel draws it as one textured ortho
+/// quad into the backbuffer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WindowQuad {
+    pub tex_gva: u32,
+    pub src_w: u32,
+    pub src_h: u32,
+    pub src_pitch: u32,
+    pub dst_x: i32,
+    pub dst_y: i32,
+    pub dst_w: u32,
+    pub dst_h: u32,
+    /// U4 Boot 2: per-window opacity, 0..=255 (255 = opaque). The kernel writes this into the
+    /// window quad's RT alpha and src-over-blends it over what's behind — enabling fades and
+    /// translucent/inactive windows on the GPU path. Must match the kernel `WindowQuad` layout.
+    pub opacity: u32,
+}
+
+/// GPU-composite `quads` (back-to-front z-order) into the backbuffer over the current wallpaper.
+/// The compositor calls this instead of CPU-copying each window's pixels. Returns true on success;
+/// on false the caller should fall back to software compositing. Chrome/taskbar are drawn by the
+/// caller on top afterward.
+pub fn sys_gpu_composite(quads: &[WindowQuad]) -> bool {
+    syscall(SYS_GPU_COMPOSITE, quads.as_ptr() as u64, quads.len() as u64, 0, 0, 0, 0) == 1
 }
 
 

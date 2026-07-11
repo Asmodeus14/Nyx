@@ -154,6 +154,89 @@ pub fn draw_window_rounded(buffer: &mut [u32], stride: usize, screen_h: usize, w
     canvas.print_str(win.x + (win.w / 2) - ((title_str.len() * 8) / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
 }
 
+/// U4 GPU-compositor chrome: draw ONLY the title bar + border frame, NOT the content-area fill (the
+/// GPU composited the window's pixels into the content region, so filling it white would erase them).
+/// Mirrors `draw_window_rounded` minus the full-surface fill. Content area is `[x, y+30]..`.
+/// Turn the four square corners of `[x,y, w×h]` into a proper ROUNDED-RECTANGLE outline of `radius`.
+/// For each pixel in a corner's rxr box, by its distance `d` to the inset arc center (radius,radius):
+///   d >  radius+0.5  → OUTSIDE the window: paint `bg` (carves the square corner; the compositor's
+///                       wallpaper shows through). This also erases the straight frame border's tips.
+///   d in ~[r] (±0.5) → ON the arc: paint `border` — a 1px curved stroke that continues the straight
+///                       top/left/bottom/right edges (which stop at `radius` from each corner) around
+///                       the curve, so the BORDER follows the rounding instead of staying square.
+///   d <  radius-0.5  → INSIDE: leave the window content/fill untouched.
+/// Constant pixel `radius` regardless of window size.
+fn round_rect_corners(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usize, radius: usize, bg: u32, border: u32) {
+    if w < 2 * radius || h < 2 * radius { return; }
+    let r = radius as f32;
+    let outer = (r + 0.5) * (r + 0.5); // squared thresholds — avoids sqrt (no libm in this crate)
+    let inner = (r - 0.5) * (r - 0.5);
+    for dy in 0..radius {
+        for dx in 0..radius {
+            // Squared distance from this corner cell to the arc center inset (radius, radius).
+            let fx = (radius - dx) as f32;
+            let fy = (radius - dy) as f32;
+            let d2 = fx * fx + fy * fy;
+            let c = if d2 > outer {
+                bg
+            } else if d2 > inner {
+                border
+            } else {
+                continue; // inside the arc — keep the window content
+            };
+            canvas.fill_rect(x + dx, y + dy, 1, 1, c);                     // top-left
+            canvas.fill_rect(x + w - 1 - dx, y + dy, 1, 1, c);             // top-right
+            canvas.fill_rect(x + dx, y + h - 1 - dy, 1, 1, c);             // bottom-left
+            canvas.fill_rect(x + w - 1 - dx, y + h - 1 - dy, 1, 1, c);     // bottom-right
+        }
+    }
+}
+
+/// Round the four corners of a window's TRUE outline (title bar + content) into a rounded-rectangle
+/// border, constant `radius` px. The compositor calls this ONCE per window AFTER the content is on the
+/// backbuffer (GPU composite or CPU fallback) and AFTER `draw_window_chrome`/`draw_window_rounded` drew
+/// the straight frame — so it carves the real corners to the wallpaper and draws the connecting arc
+/// border. Size-independent (unlike the window-proportional GPU-mask experiment).
+pub fn round_window_corners(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, radius: usize) {
+    let mut canvas = Canvas::new(buffer, stride, screen_h);
+    let total_h = if win.is_minimized { 30 } else { win.h + 30 };
+    let border = apply_opacity(Color::WARM_BORDER, win.opacity);
+    // The frame borders (draw_window_chrome/draw_window_rounded) put the RIGHT border at column x+w and
+    // the BOTTOM border at row y+total_h — one past the x..x+w-1 / y..y+total_h-1 content box. So the
+    // rounded rect must be w+1 × total_h+1 to include (and curve) those right/bottom border lines;
+    // otherwise they stay straight with square corners.
+    round_rect_corners(&mut canvas, win.x, win.y, win.w + 1, total_h + 1, radius, Color::WARM_BG, border);
+}
+
+pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window) {
+    let mut canvas = Canvas::new(buffer, stride, screen_h);
+    let surface = apply_opacity(Color::WARM_SURFACE, win.opacity);
+    let border = apply_opacity(Color::WARM_BORDER, win.opacity);
+    let total_h = if win.is_minimized { 30 } else { win.h + 30 };
+
+    // Title bar strip (top 30px) — solid surface fill; the content below is GPU-drawn.
+    canvas.fill_rect(win.x, win.y, win.w, 30, surface);
+    // Frame borders around the whole window.
+    canvas.fill_rect(win.x, win.y, win.w, 1, border);
+    canvas.fill_rect(win.x, win.y + total_h, win.w, 1, border);
+    canvas.fill_rect(win.x, win.y, 1, total_h, border);
+    canvas.fill_rect(win.x + win.w, win.y, 1, total_h + 1, border);
+    // Separator under the title bar.
+    canvas.fill_rect(win.x, win.y + 30, win.w, 1, border);
+
+    // Header controls (close / min / max) — same layout as draw_window_rounded.
+    let icon_color = apply_opacity(0x60_000000, win.opacity);
+    canvas.fill_rect(win.x + 12, win.y + 10, 12, 12, apply_opacity(0xFF_FF5F56, win.opacity));
+    canvas.print_str(win.x + 14, win.y + 12, "x", icon_color, 1);
+    canvas.fill_rect(win.x + 28, win.y + 10, 12, 12, apply_opacity(0xFF_FFBD2E, win.opacity));
+    canvas.print_str(win.x + 30, win.y + 11, "-", icon_color, 1);
+    canvas.fill_rect(win.x + 44, win.y + 10, 12, 12, apply_opacity(0xFF_28C940, win.opacity));
+    canvas.print_str(win.x + 46, win.y + 12, "+", icon_color, 1);
+
+    let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
+    canvas.print_str(win.x + (win.w / 2) - ((title_str.len() * 8) / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // PHASE 3: POLYMORPHIC WIDGET TOOLKIT
 // ─────────────────────────────────────────────────────────────────────────

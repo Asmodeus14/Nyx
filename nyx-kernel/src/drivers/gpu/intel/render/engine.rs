@@ -97,6 +97,59 @@ impl Texture {
         let texels = alloc::vec![argb; (size * size) as usize];
         Self { width: size, height: size, pitch: size * 4, texels }
     }
+
+    /// U4 Boot 3: a `size`x`size` ROUNDED-CORNER ALPHA MASK. RGB is white (irrelevant — the rounded
+    /// PS keeps the window's RGB and uses only this texture's ALPHA). Alpha is 255 across the interior
+    /// and ramps to 0 inside each ENABLED corner's `radius` quarter-circle, with a ~1px anti-aliased
+    /// edge so the rounded corner is smooth when sampled bilinearly and stretched over a window. The
+    /// mask is sampled with UV 0..1 across the whole window, so the corner radius is PROPORTIONAL to
+    /// window size (constant-pixel radius is a later refinement). `size` must be a multiple of 16
+    /// (64-byte pitch); `radius` in mask texels (~size/8). `corners` is a bitmask selecting which
+    /// corners round: bit0=top-left, bit1=top-right, bit2=bottom-left, bit3=bottom-right. The window
+    /// CONTENT quad uses bottom-only (BL|BR) so the title-bar/content seam stays flush; the title bar
+    /// rounds its own top corners CPU-side.
+    pub fn corner_mask(size: u32, radius: u32, corners: u8) -> Self {
+        let n = size as i32;
+        let r = radius as f32;
+        let mut texels = alloc::vec![0xFFFF_FFFFu32; (size * size) as usize];
+        // (center_x, center_y, enabled) for TL, TR, BL, BR — each r texels in from its corner.
+        let centers = [
+            (r - 0.5, r - 0.5, corners & 0b0001 != 0),                       // top-left
+            (n as f32 - r - 0.5, r - 0.5, corners & 0b0010 != 0),            // top-right
+            (r - 0.5, n as f32 - r - 0.5, corners & 0b0100 != 0),           // bottom-left
+            (n as f32 - r - 0.5, n as f32 - r - 0.5, corners & 0b1000 != 0), // bottom-right
+        ];
+        let mut y = 0i32;
+        while y < n {
+            let mut x = 0i32;
+            while x < n {
+                let (px, py) = (x as f32, y as f32);
+                // Find the nearest ENABLED corner-circle center whose rxr box this pixel lies in.
+                let mut best = f32::MAX;
+                for &(cx, cy, on) in centers.iter() {
+                    if !on { continue; }
+                    // Only pixels between the corner and the circle center can be carved.
+                    let inx = (cx < r && px < r) || (cx > r && px >= n as f32 - r);
+                    let iny = (cy < r && py < r) || (cy > r && py >= n as f32 - r);
+                    if inx && iny {
+                        let dx = px - cx;
+                        let dy = py - cy;
+                        let d = super::math::sqrt(dx * dx + dy * dy);
+                        if d < best { best = d; }
+                    }
+                }
+                if best != f32::MAX {
+                    // Coverage: 1 inside the arc, 0 outside, ~1px AA ramp at d == r.
+                    let cov = (r - best + 0.5).clamp(0.0, 1.0);
+                    let a = (cov * 255.0 + 0.5) as u32;
+                    texels[(y * n + x) as usize] = (a << 24) | 0x00FF_FFFF;
+                }
+                x += 1;
+            }
+            y += 1;
+        }
+        Self { width: size, height: size, pitch: size * 4, texels }
+    }
 }
 
 /// Persistent per-mesh GPU resources: state buffers + render state allocated ONCE and reused
@@ -261,6 +314,15 @@ pub struct Scene {
     pub(super) resolve_sf_clip_off: u32,  // SF_CLIP_VIEWPORT at DISPLAY dims (resolve output)
     pub(super) vs_off: u32,
     pub(super) ps_off: u32,
+    /// U4 Boot 2: PS kernel that writes per-window opacity (varying.z) into the RT alpha. Window
+    /// quads use this instead of `ps_off`; 0 falls back to the opaque textured PS.
+    pub(super) ps_opacity_off: u32,
+    /// U4 Boot 3: PS kernel that also multiplies a corner-mask alpha in (rounded corners). Used by
+    /// window quads when `mask_surf_off != 0`; 0 falls back to `ps_opacity_off`.
+    pub(super) ps_rounded_off: u32,
+    /// U4 Boot 3: surface-state offset of the uploaded corner alpha-mask (BTI 2 for window quads).
+    /// 0 = no mask uploaded yet → window quads use the 2-entry / opacity-only path.
+    pub(super) mask_surf_off: u32,
     pub(super) meshes: Vec<SceneMesh>,
     /// MSAA-track Boot 2: the full-screen resolve quad. When present, the scene is rendered to an
     /// offscreen (tiled) RT, then this quad samples that RT as a texture and writes it to the
@@ -321,7 +383,117 @@ impl Scene {
         Ok(())
     }
 
-    /// MSAA-track Boot 2: register the full-screen resolve quad. `scene_rt_gva` is the offscreen
+    /// U4 GPU compositor: register a WINDOW as a textured ortho quad. Unlike `add_mesh`, the texels are
+    /// NOT uploaded — `win_gva` is an already-GGTT-mapped surface (the client's SHM window buffer,
+    /// mapped by sys_gpu_map_shm), so we only build a LINEAR B8G8R8A8 texture surface over it (BTI 1),
+    /// a binding table [0]=backbuffer RT, [1]=window, and a `ui_quad_mesh` VBO/IB. The caller supplies
+    /// the ortho MVP per frame (pixel rect placement). Same "bind an existing GVA as a sampled texture"
+    /// pattern as `add_resolve_quad`'s scene-RT binding.
+    pub unsafe fn add_window_quad(
+        &mut self,
+        win_gva: u32,
+        win_pitch: u32,
+        win_w: u32,
+        win_h: u32,
+    ) -> Result<(), RenderError> {
+        // LINEAR texture surface over the window's existing pixels (no upload).
+        let ws = state::render_surface_state_2d(
+            state::SURFACE_FORMAT_B8G8R8A8_UNORM, win_w, win_h, win_pitch, win_gva, state::TILEMODE_LINEAR);
+        let win_surf_gva = self.surf_buf.write(&ws, 64)?;
+        let win_surf_off = win_surf_gva - self.surf_buf.gva;
+
+        // Binding table + PS depend on whether a corner mask is bound:
+        //  - mask present  -> 3-entry [RT, window, mask] + the rounded PS (samples BTI 2, folds mask
+        //    alpha into the window alpha => rounded corners).
+        //  - no mask       -> 2-entry [RT, window] + the opacity PS (Boot 2), or the opaque textured
+        //    PS if the opacity kernel wasn't placed. Guarantees the PS never samples an unbound BTI 2.
+        let rounded = self.mask_surf_off != 0 && self.ps_rounded_off != 0;
+        let (bt_gva, ps_off) = if rounded {
+            let bt = state::binding_table_3(self.rs.rt_surface_off, win_surf_off, self.mask_surf_off);
+            (self.surf_buf.write(&bt, 64)?, self.ps_rounded_off)
+        } else {
+            let bt = state::binding_table_2(self.rs.rt_surface_off, win_surf_off);
+            let ps = if self.ps_opacity_off != 0 { self.ps_opacity_off } else { self.ps_off };
+            (self.surf_buf.write(&bt, 64)?, ps)
+        };
+        let binding_table_off = bt_gva - self.surf_buf.gva;
+
+        // Unit [0,1]^2 quad (UVs = position); caller's ortho MVP places it in pixel space.
+        let quad = ui_quad_mesh();
+        // Default the opacity varying (channel 2 / varying.z) to 1.0 = OPAQUE. `ui_quad_mesh` sets
+        // varying=(u,v,0,1), so z is 0 — and the opacity PS reads z as alpha, so leaving it 0 would
+        // make the window fully transparent. The compositor sets real opacity per frame via
+        // `set_quad_opacity`; this guarantees a window is never accidentally invisible.
+        let mut quad = quad;
+        for v in quad.vertices.iter_mut() {
+            v.varying.z = 1.0;
+        }
+        let vbo_dwords = quad.vertices.len() * VERTEX_DWORDS;
+        let (vbo_cpu, vbo_gva) = self.vbo_buf.alloc(vbo_dwords, 64)?;
+        let idx_gva = self.vbo_buf.write(&quad.indices, 64)?;
+
+        crate::serial_println!(
+            "[COMPOSIT] window quad {}: win_gva={:#x} {}x{} pitch={} surf_off={:#x} bt_off={:#x}",
+            self.meshes.len(), win_gva, win_w, win_h, win_pitch, win_surf_off, binding_table_off
+        );
+
+        self.meshes.push(SceneMesh {
+            verts: quad.vertices.clone(),
+            vbo_cpu,
+            vbo_gva,
+            vbo_dwords,
+            idx_gva,
+            idx_count: quad.indices.len(),
+            binding_table_off,
+            ps_off,
+        });
+        Ok(())
+    }
+
+    /// U4 Boot 3: upload the shared rounded-corner alpha MASK once and record its surface offset so
+    /// every subsequent `add_window_quad` binds it at BTI 2 and selects the rounded PS. Idempotent —
+    /// re-uploads if called again (cheap; only the compositor calls it, once per scene rebuild). The
+    /// mask is a small B8G8R8A8 texture whose alpha is 0 in the corners; only its alpha is used. Same
+    /// upload path as `add_mesh` (tex_buf alloc → flush → LINEAR surface). Call AFTER `create_scene`
+    /// and BEFORE adding window quads. glcube/spin_scene never call it → they keep the 2-entry path.
+    pub unsafe fn upload_corner_mask(&mut self, mask: &Texture) -> Result<(), RenderError> {
+        let (tex_cpu, tex_gva) = self.tex_buf.alloc(mask.texels.len(), 4096)?;
+        for (i, &t) in mask.texels.iter().enumerate() {
+            tex_cpu.add(i).write_volatile(t);
+        }
+        self.tex_buf.flush_range(tex_gva, mask.texels.len() * 4);
+        let ms = state::render_surface_state_2d(
+            state::SURFACE_FORMAT_B8G8R8A8_UNORM, mask.width, mask.height, mask.pitch, tex_gva,
+            state::TILEMODE_LINEAR);
+        let mask_surf_gva = self.surf_buf.write(&ms, 64)?;
+        self.mask_surf_off = mask_surf_gva - self.surf_buf.gva;
+        // Diagnostic: sample the mask alpha at the very bottom-left corner texel vs. the center. A
+        // working mask reads corner_a≈0 and center_a=255. If corner_a is also 255 the CPU carve is
+        // wrong (→ the shape bug is here, not the shader); if corner_a≈0 but windows still render
+        // square, the shader's mask multiply is the culprit.
+        let n = mask.width as usize;
+        let corner_a = mask.texels[(n - 1) * n + 0] >> 24;        // bottom-left texel
+        let center_a = mask.texels[(n / 2) * n + (n / 2)] >> 24;  // center texel
+        crate::serial_println!(
+            "[COMPOSIT] corner mask uploaded: {}x{} tex_gva={:#x} mask_surf_off={:#x} (BL_alpha={} center_alpha={})",
+            mask.width, mask.height, tex_gva, self.mask_surf_off, corner_a, center_a
+        );
+        Ok(())
+    }
+
+    /// U4 Boot 2: set the per-window opacity of window quad `idx` (0.0 = fully transparent, 1.0 =
+    /// opaque) by writing it into the quad's per-vertex `varying.z`. `draw_scene` re-uploads
+    /// `verts` every frame, so this takes effect next present WITHOUT a scene rebuild — a fade only
+    /// touches 4 floats per window and never changes the rebuild signature. No-op if `idx` is out of
+    /// range or the mesh isn't a 4-vertex quad.
+    pub fn set_quad_opacity(&mut self, idx: usize, opacity: f32) {
+        if let Some(mesh) = self.meshes.get_mut(idx) {
+            let o = if opacity < 0.0 { 0.0 } else if opacity > 1.0 { 1.0 } else { opacity };
+            for v in mesh.verts.iter_mut() {
+                v.varying.z = o;
+            }
+        }
+    }
     /// (Y-tiled) render target the meshes draw into; `scene_rt_pitch` its tiled row pitch;
     /// `bb_gva` the LINEAR backbuffer the resolve writes to. Builds:
     ///   - a LINEAR backbuffer RENDER_SURFACE_STATE (the resolve pass's RT, BTI 0),

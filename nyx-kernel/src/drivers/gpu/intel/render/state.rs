@@ -175,6 +175,14 @@ pub fn binding_table_2(rt_surface_offset: u32, tex_surface_offset: u32) -> [u32;
     [rt_surface_offset & !0x3F, tex_surface_offset & !0x3F]
 }
 
+/// A three-entry BINDING_TABLE_STATE (U4 Boot 3 rounded corners): entry[0] = render target,
+/// entry[1] = window texture, entry[2] = corner alpha-mask. The rounded-corner PS RT-writes to
+/// BTI 0, samples the window at BTI 1, and samples the mask at BTI 2. Each entry is a surface-state
+/// offset from Surface State Base in bits [31:6] (64B-aligned).
+pub fn binding_table_3(rt_surface_offset: u32, tex_surface_offset: u32, mask_surface_offset: u32) -> [u32; 3] {
+    [rt_surface_offset & !0x3F, tex_surface_offset & !0x3F, mask_surface_offset & !0x3F]
+}
+
 /// SAMPLER_STATE (4 dwords, PRM Vol5 / genxml). Boot C sampler: NEAREST min/mag (crisp
 /// checkerboard, no blur), no mipmapping (single level), CLAMP address modes on all axes,
 /// normalized [0,1] coordinates, sampler enabled. Field bits (genxml SAMPLER_STATE):

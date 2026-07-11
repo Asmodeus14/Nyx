@@ -29,6 +29,7 @@ pub mod urb;
 pub mod pipeline;
 pub mod engine;
 pub mod gl;
+pub mod compositor;
 pub mod decode;
 pub mod math;
 

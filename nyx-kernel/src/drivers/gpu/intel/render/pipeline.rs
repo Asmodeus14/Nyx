@@ -826,27 +826,35 @@ impl RenderEngine {
         rt_tile_mode: u32,
     ) -> Result<super::engine::Scene, RenderError> {
         use super::engine::Scene;
-        let (vs_off, ps_off) = match &self.kernels {
-            Some(k) => (k.vs_off, k.ps_off),
+        let (vs_off, ps_off, ps_opacity_off, ps_rounded_off) = match &self.kernels {
+            Some(k) => (k.vs_off, k.ps_off, k.ps_opacity_off, k.ps_rounded_off),
             None => return Err(RenderError::NotInitialized),
         };
         let mmio = self.mmio_base;
         // Shared buffers: surf (RT surf + per-mesh tex surfaces + binding tables), dyn (blend/cc/
-        // viewport + sampler), vbo (per-mesh vertex + index blocks), tex (16 pages: each texture is
-        // page-aligned, so two 64x64 (4 pages each) + smaller meshes' textures fit with headroom —
-        // the U2 blend panel is a 3rd mesh, so 8 pages (exactly two 64x64) is no longer enough).
+        // viewport + sampler), vbo (per-mesh vertex + index blocks), tex (20 pages: each texture is
+        // page-aligned. Mesh path: two 64x64 (4 pages each) + panel/quads. Compositor path: only the
+        // 128x128 corner mask (16 pages) — the U4 rounded-corner mask; window quads bind existing SHM
+        // GVAs (no tex_buf upload). 20 gives headroom for either path.
         let mut surf_buf = StateBuffer::new(mmio, GVA_SURFACE_STATE, 1)?;
         let mut dyn_buf = StateBuffer::new(mmio, GVA_DYNAMIC_STATE, 1)?;
         let vbo_buf = StateBuffer::new(mmio, GVA_VERTEX_BUFFERS, 2)?;
-        let tex_buf = StateBuffer::new(mmio, super::GVA_TEXTURES, 16)?;
+        let tex_buf = StateBuffer::new(mmio, super::GVA_TEXTURES, 20)?;
         // `pitch` here is the RT ROW pitch (bytes): the Y-tiled pitch when rt_tile_mode=YMAJOR
         // (a 128B multiple), else the linear scanout pitch. The RT surface points BTI 0 at it.
         let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch, rt_tile_mode)?;
-        // One shared sampler for every mesh (NEAREST/CLAMP), 32B-aligned per the SSP field.
-        let samp_gva = dyn_buf.write(&state::sampler_state_nearest_clamp(), 32)?;
+        // Sampler array for every mesh. Index 0 = NEAREST/CLAMP (all meshes, crisp), index 1 =
+        // LINEAR/CLAMP (U4 rounded-corner mask — smooth AA edge). They MUST be exactly 16B apart
+        // (one SAMPLER_STATE = 4 dwords) so the sampler-index field in the `sample` message resolves
+        // index 1 to the linear entry; write both as one contiguous 32B-aligned blob. `sampler_off`
+        // points at index 0 (unchanged for cube/glcube).
+        let mut samplers = [0u32; 8];
+        samplers[0..4].copy_from_slice(&state::sampler_state_nearest_clamp());
+        samplers[4..8].copy_from_slice(&state::sampler_state_linear_clamp());
+        let samp_gva = dyn_buf.write(&samplers, 32)?;
         let sampler_off = samp_gva - dyn_buf.gva;
         crate::serial_println!(
-            "[SCENE] created: surf_base={:#x} dyn_base={:#x} sampler_off={:#x}",
+            "[SCENE] created: surf_base={:#x} dyn_base={:#x} sampler_off={:#x} (idx0 nearest, idx1 linear)",
             surf_buf.gva, dyn_buf.gva, sampler_off
         );
         Ok(Scene {
@@ -860,6 +868,9 @@ impl RenderEngine {
             resolve_sf_clip_off: 0, // set by add_resolve_quad (display-dims resolve viewport)
             vs_off,
             ps_off,
+            ps_opacity_off,
+            ps_rounded_off,
+            mask_surf_off: 0, // set by Scene::upload_corner_mask (compositor rounded corners)
             meshes: alloc::vec::Vec::new(),
             resolve: None,
         })
@@ -888,20 +899,23 @@ impl RenderEngine {
         rt_buf_bytes: usize,
         present: bool,
         blend: bool,
+        clear: bool,
         verbose: bool,
     ) -> Result<(), RenderError> {
         use super::math::Vec4;
         let _ = rt_gva;
 
-        // Clear the render target to black. Black = all-zero bytes, which is layout-independent,
-        // so a Y-tiled RT is cleared by simply zeroing its whole backing store.
+        // Clear the render target to black — UNLESS clear=false (the GPU compositor draws over a
+        // wallpaper the BLT engine already filled into the backbuffer; clearing would erase it).
         const CLEAR_BYTE: u8 = 0x00;
         let clear_bytes = if tiled_pitch != 0 { rt_buf_bytes } else { (pitch * height) as usize };
-        core::ptr::write_bytes(bb_cpu as *mut u8, CLEAR_BYTE, clear_bytes);
-        let mut off = 0usize;
-        while off < clear_bytes {
-            self.flush_line(bb_cpu as usize + off);
-            off += 64;
+        if clear {
+            core::ptr::write_bytes(bb_cpu as *mut u8, CLEAR_BYTE, clear_bytes);
+            let mut off = 0usize;
+            while off < clear_bytes {
+                self.flush_line(bb_cpu as usize + off);
+                off += 64;
+            }
         }
 
         // CPU-transform each mesh's model-space verts -> clip space into its own vbo block.
@@ -1352,7 +1366,7 @@ impl RenderEngine {
             // (ss_w x ss_h; no present). `pitch` here is unused for a tiled RT (clear uses
             // rt_buf_bytes), so the display scanout pitch is fine to pass through.
             self.draw_scene(&mut scene, &mvps, rt_tiled_gva, rt_tiled_cpu, ss_w, ss_h,
-                pitch, tiled_pitch, rt_buf_bytes, false, true, verbose)?;
+                pitch, tiled_pitch, rt_buf_bytes, false, true, true, verbose)?;
             // Pass 2: resolve — box-downsample the supersampled scene RT with the full-screen quad,
             // write the DISPLAY-size linear backbuffer, and present it (boot self-test: straight to scanout).
             self.draw_resolve(&mut scene, bb_cpu, width, height, pitch, true, verbose)?;
@@ -1492,10 +1506,10 @@ impl RenderEngine {
         cs.push(h(so::PS, 12));
         cs.push(kernel_off).push(0); // Kernel Start Pointer 0
         // DW3: Binding Table Entry Count [121:114]=DW3[25:18], Sampler Count [125:123]=DW3[29:27].
-        // Boot C: 2 binding-table entries (RT + texture) and 1 sampler (1-4 Samplers=1) so the
-        // PSD prefetches the sampler state. (Only the cube path runs at boot; the Phase-5
-        // triangle path shares this and would over-prefetch harmlessly.)
-        cs.push((2 << 18) | (1 << 27));
+        // 3 binding-table entries (RT + window texture + corner mask, the U4 rounded-corner max) and
+        // 1 sampler group (1-4 Samplers=1, covers sampler indices 0 and 1). Over-counting entries for
+        // simpler meshes (cube = 2 entries) only over-prefetches harmlessly.
+        cs.push((3 << 18) | (1 << 27));
         cs.push(0).push(0); // scratch base
         // DW6: 8 Pixel Dispatch Enable(bit0) | Max threads per PSD 63 (<<23).
         cs.push(1 | (63 << 23));

@@ -45,6 +45,15 @@ pub struct KernelStore {
     /// Six constant-color PS kernels, one per cube face (Phase 6 Step 4 per-face color).
     /// `ps_off` aliases `ps_offs[0]` for the single-color callers.
     pub ps_offs: [u32; 6],
+    /// U4 Boot 2: textured PS that OVERWRITES the sampled alpha with a per-window opacity
+    /// interpolated from the varying's channel 2 (`varying.z`). Used ONLY by window quads
+    /// (`Scene::add_window_quad`); the cube/pyramid/panel/glcube keep the byte-identical
+    /// `ps_off` shader, so this adds zero regression surface to the proven textured path.
+    pub ps_opacity_off: u32,
+    /// U4 Boot 3: opacity PS + corner-mask multiply (rounded window corners). Used by window quads
+    /// when a corner mask is bound (BTI 2); samples the mask (sampler 1, bilinear) and folds its
+    /// alpha into the window alpha. 0 until placed → add_window_quad falls back to ps_opacity_off.
+    pub ps_rounded_off: u32,
 }
 
 impl KernelStore {
@@ -75,6 +84,8 @@ impl KernelStore {
             vs_off: 0,
             ps_off: 0,
             ps_offs: [0; 6],
+            ps_opacity_off: 0,
+            ps_rounded_off: 0,
         })
     }
 
@@ -181,6 +192,11 @@ mod enc {
     pub const OP_MOV: u32 = 1;
     pub const OP_SEND: u32 = 49; // legacy single-descriptor send (matches our encoding)
     pub const OP_PLN: u32 = 90;  // plane: dst = p*u + q*v + r (2-source, perspective interp)
+    // add=0x40, mul=0x41 — the ALU-arithmetic opcode block (gen4..gen11 "pre_xe", same table as the
+    // HW-verified mov/send/pln/nop above). Cross-checked against the Intel Gen ISA PRM instruction-
+    // encoding table (ADD=0x40, MUL=0x41). Used by the U4 rounded-corner PS to multiply the corner
+    // mask's alpha into the window alpha. The encoder core is already validated by encoder_selftest().
+    pub const OP_MUL: u32 = 0x41; // 65
     pub const OP_NOP: u32 = 126;
 
     // SFIDs
@@ -266,6 +282,19 @@ fn mov_imm_f(exec: u32, dst: u32, imm: f32) -> [u32; 4] {
     let mut i = base(OP_MOV, exec);
     set_dst(&mut i, RF_GRF, TY_F, dst, 0, HS_1);
     set_src0_imm(&mut i, TY_F, imm.to_bits());
+    i
+}
+
+/// `mul(exec) gDst<1>:F  gSrc0<8;8,1>:F  gSrc1<8;8,1>:F` — per-lane float multiply (2-source ALU).
+/// Reuses the same region encoders as every other instruction here; src0/src1 are full SIMD8 GRF
+/// vectors. Used by the U4 rounded-corner PS to fold the corner mask's alpha into the window alpha
+/// (`alpha = opacity * mask_alpha`). dst may alias src0 (read-modify-write of the same GRF is legal;
+/// the HW scoreboard serializes the in-place update).
+fn mul_grf(exec: u32, dst: u32, src0: u32, src1: u32) -> [u32; 4] {
+    let mut i = base(OP_MUL, exec);
+    set_dst(&mut i, RF_GRF, TY_F, dst, 0, HS_1);
+    set_src0_grf(&mut i, TY_F, src0, 0, VS_8, W_8, HS_1);
+    set_src1_grf(&mut i, TY_F, src1, 0, VS_8, W_8, HS_1);
     i
 }
 
@@ -532,7 +561,70 @@ pub fn build_ps_tex() -> Vec<u8> {
     k
 }
 
-/// Validate the encoder core against a `mov(8) g2<1>:F g1<8;8,1>:F`. DW0 must carry
+/// U4 Boot 2: TEXTURED pixel shader with PER-WINDOW OPACITY. Identical to `build_ps_tex`
+/// (interpolate UV, sample BTI 1 -> g16..g19 = RGBA), but before the RT write it OVERWRITES the
+/// sampled alpha (g19) with a per-window opacity value interpolated from attribute-0 CHANNEL 2
+/// (the vertex `varying.z`). RGB (g16..g18) is untouched; the src-over blender then computes
+/// `dst = O*texel.rgb + (1-O)*dst` — a uniform window fade, independent of whatever alpha the
+/// app did (or, usually, did NOT) author into its SHM pixels. This is why opacity is *written
+/// into* alpha rather than multiplied with the (commonly-zero) texel alpha: a plain `blend=true`
+/// over an alpha=0 window would make it fully transparent (invisible).
+///
+/// Sourcing (NOT guessed): the channel-2 plane-setup register is `g5.0`, exactly the register
+/// `build_ps_attr` (Boot B, HW-verified) reads for its 3rd color channel — `pln(.., 5, 0, 2)`.
+/// The SF already delivers all four channels of attribute-0 (Boot B interpolated ch0/ch1/ch2),
+/// so no SBE / 3DSTATE_SBE change is needed; only this one extra `pln` is added. The opacity
+/// attribute is CONSTANT across the quad (all 4 verts carry the same `varying.z`), so `pln`
+/// interpolates it to that constant on every pixel. Payload layout matches `build_ps_tex`:
+/// g0/g1 = header, g2/g3 = barycentric, g4/g5 = attribute-0 plane setup.
+pub fn build_ps_tex_opacity() -> Vec<u8> {
+    let mut k = Vec::new();
+    emit(&mut k, pln(EXEC_SIMD8, 14, 4, 0, 2));  // U <- attribute-0 channel 0 (g4.0)
+    emit(&mut k, pln(EXEC_SIMD8, 15, 4, 16, 2)); // V <- attribute-0 channel 1 (g4.4)
+    // sample: BTI 1, sampler 0, SAMPLE(0), SIMD8(1), mlen 2, rlen 4 -> g16..g19 = RGBA.
+    emit(&mut k, send_msg(EXEC_SIMD8, SFID_SAMPLER, 16, 14, sampler_desc(1, 0, 0, 1, 2, 4)));
+    // Opacity <- attribute-0 channel 2 (g5.0), overwriting the sampled alpha in g19. Same
+    // channel-2 setup register proven by build_ps_attr's B = pln(.., 5, 0, 2).
+    emit(&mut k, pln(EXEC_SIMD8, 19, 5, 0, 2));
+    // RT write RGB (sampled) + A (opacity), headerless, EOT.
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 16, rt_write_desc(4, 0)));
+    k
+}
+
+/// U4 Boot 3: TEXTURED + OPACITY + ROUNDED-CORNER pixel shader. Extends `build_ps_tex_opacity` with a
+/// SECOND texture sample — a corner alpha-MASK at BTI 2 — whose alpha is multiplied into the window
+/// alpha. Where the mask alpha is 0 (the rounded-off corners) the final alpha is 0, so src-over shows
+/// the desktop through → rounded corners. Elsewhere the mask alpha is 1, leaving the per-window opacity
+/// untouched. Final alpha = opacity * mask_alpha.
+///
+/// Sampler choice: the WINDOW is sampled with sampler index 0 (NEAREST — byte-identical to
+/// `build_ps_tex_opacity`, keeps content crisp), the MASK with sampler index 1 (BILINEAR — that's where
+/// the smooth anti-aliased corner edge comes from). Both use the same interpolated UV (g14/g15). Payload
+/// as before: g0/g1 header, g2/g3 barycentric, g4/g5 attribute-0 plane setup.
+///   sample BTI 1, sampler 0 -> g16..g19  (window RGBA)
+///   sample BTI 2, sampler 1 -> g20..g23  (mask; alpha in g23)
+///   pln g19 = opacity (attr-0 ch2 @ g5.0)   ; alpha = per-window opacity
+///   mul g19 = g19 * g23                      ; alpha = opacity * mask_alpha  -> rounded
+///   RT-write g16..g19 (RGB from window, A folded), headerless, EOT.
+pub fn build_ps_tex_opacity_rounded() -> Vec<u8> {
+    let mut k = Vec::new();
+    emit(&mut k, pln(EXEC_SIMD8, 14, 4, 0, 2));  // U <- attribute-0 channel 0 (g4.0)
+    emit(&mut k, pln(EXEC_SIMD8, 15, 4, 16, 2)); // V <- attribute-0 channel 1 (g4.4)
+    // Window texture: BTI 1, sampler 0 (NEAREST) -> g16..g19 = RGBA.
+    emit(&mut k, send_msg(EXEC_SIMD8, SFID_SAMPLER, 16, 14, sampler_desc(1, 0, 0, 1, 2, 4)));
+    // Corner mask: BTI 2, sampler 0 (same NEAREST sampler as the window — avoids relying on a 2nd
+    // SAMPLER_STATE entry / Sampler Count prefetch; BTI and sampler index are independent). -> g20..g23
+    // (mask alpha in g23), same U/V payload. Bilinear (sampler 1) is a smoothness upgrade once the mask
+    // path is confirmed working.
+    emit(&mut k, send_msg(EXEC_SIMD8, SFID_SAMPLER, 20, 14, sampler_desc(2, 0, 0, 1, 2, 4)));
+    // Opacity <- attribute-0 channel 2 (g5.0), into g19 (overwrites the window's sampled alpha).
+    emit(&mut k, pln(EXEC_SIMD8, 19, 5, 0, 2));
+    // Fold the mask alpha in: g19 = opacity * mask_alpha.
+    emit(&mut k, mul_grf(EXEC_SIMD8, 19, 19, 23));
+    // RT write RGB (window) + A (opacity*mask), headerless, EOT.
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 16, rt_write_desc(4, 0)));
+    k
+}
 /// hardware opcode 1 (mov) in [6:0] and SIMD8 (3) in [23:21] => 0x0060_0001. (The old
 /// reference used 0x0060_0002, i.e. opcode 2 = `sel` — it validated the bug. Fixed to
 /// the real mov opcode; see gen_opcodes.py pre_xe.)
@@ -572,6 +664,20 @@ pub unsafe fn build_and_dump_kernels(mmio_base: u64) -> Result<KernelStore, Rend
     store.ps_off = ps_off;
     store.ps_offs = [ps_off; 6]; // all faces share the one textured PS (back-compat)
     store.dump("PS textured (sampler)", ps_off, ps.len());
+
+    // U4 Boot 2: the per-window-opacity variant of the textured PS. Only window quads use it
+    // (via Scene::add_window_quad); everything else keeps `ps_off` unchanged.
+    let pso = build_ps_tex_opacity();
+    let ps_opacity_off = store.place(&pso)?;
+    store.ps_opacity_off = ps_opacity_off;
+    store.dump("PS textured+opacity", ps_opacity_off, pso.len());
+
+    // U4 Boot 3: opacity + corner-mask multiply (rounded corners). Window quads use it when a corner
+    // mask is bound at BTI 2; else they fall back to ps_opacity_off. Cube/glcube keep `ps_off`.
+    let psr = build_ps_tex_opacity_rounded();
+    let ps_rounded_off = store.place(&psr)?;
+    store.ps_rounded_off = ps_rounded_off;
+    store.dump("PS textured+opacity+rounded", ps_rounded_off, psr.len());
 
     crate::serial_println!(
         "[EU] kernels placed: VS={:#x}, PS(attr)={:#x} (offsets from instruction base)",
