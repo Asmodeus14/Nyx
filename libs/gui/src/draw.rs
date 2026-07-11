@@ -14,29 +14,33 @@ pub fn draw_rect_simple(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, 
     }
 }
 
-/// Draws a single character using the font module
+/// Draws a single character using the font module (proportional TTF, antialiased). `x,y` is the
+/// top-left of the line cell; the glyph sits at its bearing relative to the baseline (y + ascent).
 pub fn draw_char(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, c: char, color: u32) {
-    if let Some(raster) = font::get_char_raster(c) {
-        for (ri, row) in raster.raster().iter().enumerate() {
-            for (ci, val) in row.iter().enumerate() {
-                if *val > 10 { // Intensity threshold
-                    let px = x + ci;
-                    let py = y + ri;
-                    if px < w && py < h {
-                        fb[py * w + px] = color;
-                    }
-                }
+    let px = font::px_for(1);
+    let baseline = y as i32 + font::ascent(1) as i32;
+    font::with_glyph(c, px, |g| {
+        for row in 0..g.h {
+            let py = baseline - g.bearing_y + row as i32;
+            if py < 0 || py as usize >= h { continue; }
+            for col in 0..g.w {
+                let cov = g.cov[row * g.w + col];
+                if cov == 0 { continue; }
+                let sx = x as i32 + g.bearing_x + col as i32;
+                if sx < 0 || sx as usize >= w { continue; }
+                let idx = py as usize * w + sx as usize;
+                fb[idx] = 0xFF00_0000 | blend_color(color, fb[idx], cov);
             }
         }
-    }
+    });
 }
 
-/// Draws a string of text
+/// Draws a string of text (proportional advance).
 pub fn draw_text(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, text: &str, color: u32) {
     let mut cx = x;
     for c in text.chars() {
         draw_char(fb, w, h, cx, y, c, color);
-        cx += font::CHAR_WIDTH;
+        cx += font::advance(c, 1);
     }
 }
 

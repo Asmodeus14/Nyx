@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod font;
 pub mod draw;
 pub mod ui;
-pub mod canvas; 
+pub mod canvas;
 pub mod effects;
 pub mod app;
+pub mod gpu_text;

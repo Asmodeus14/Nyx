@@ -26,8 +26,11 @@ struct SysMonApp {
     bootlog_buf: Vec<u8>,
     bootlog_lines: Vec<String>,
     bootlog_last_len: usize,
-    bootlog_scroll: usize,
+    bootlog_scroll: usize,     // scroll position in LINES
+    last_h: usize,             // last window content height (for the scrollbar max-scroll clamp)
 }
+
+const LINE_H: usize = 18;      // bootlog line height in px (F1: DejaVu@14px ≈17px lines + 1px lead)
 
 impl SysMonApp {
     fn new() -> Self {
@@ -41,8 +44,14 @@ impl SysMonApp {
             bootlog_lines: Vec::new(),
             bootlog_last_len: 0,
             bootlog_scroll: 0,
+            last_h: 480,
         }
     }
+
+    /// Visible bootlog lines for the current window height (the log panel is height-80 px tall).
+    fn visible_lines(&self) -> usize { self.last_h.saturating_sub(80) / LINE_H }
+    /// Max first-line scroll index so the last page is fully shown.
+    fn max_scroll_lines(&self) -> usize { self.bootlog_lines.len().saturating_sub(self.visible_lines()) }
 }
 
 impl NyxApp for SysMonApp {
@@ -79,9 +88,21 @@ impl NyxApp for SysMonApp {
         false
     }
 
+    // Boot B: report scroll state so the compositor draws + drives a window-aligned scrollbar. Only the
+    // Bootlog view scrolls; content_h in px = total lines × line height (0 elsewhere → no scrollbar).
+    fn content_height(&self) -> usize {
+        if self.state == SysMonState::Bootlog { self.bootlog_lines.len() * LINE_H } else { 0 }
+    }
+    fn scroll_offset(&self) -> usize { self.bootlog_scroll * LINE_H }
+    fn on_scroll(&mut self, off_px: usize) -> bool {
+        let new = (off_px / LINE_H).min(self.max_scroll_lines());
+        if new != self.bootlog_scroll { self.bootlog_scroll = new; true } else { false }
+    }
+
     fn draw(&mut self, canvas: &mut Canvas) {
         let width = canvas.width;
         let height = canvas.height;
+        self.last_h = height; // remember for the scrollbar clamp
 
         canvas.fill_rect(0, 0, width, height, Color::WARM_BG);
         canvas.fill_rect(0, 0, 150, height, Color::WARM_SURFACE);
@@ -168,18 +189,8 @@ impl NyxApp for SysMonApp {
                     canvas.print_str(cx + 10, draw_y, &self.bootlog_lines[i], 0xFF_CCCCCC, 1);
                     draw_y += 16;
                 }
-
-                if total > max_lines {
-                    let track_x = cx + cw - 15;
-                    canvas.fill_rect(track_x, log_y, 15, log_h, 0xFF_2A2A2A);
-                    
-                    let thumb_h = core::cmp::max(20, (max_lines * log_h) / total);
-                    let max_scroll = total.saturating_sub(max_lines);
-                    let scroll_pct = if max_scroll > 0 { (self.bootlog_scroll * 100) / max_scroll } else { 0 };
-                    
-                    let thumb_y = log_y + ((log_h.saturating_sub(thumb_h)) * scroll_pct) / 100;
-                    canvas.fill_rect(track_x + 2, thumb_y, 11, thumb_h, 0xFF_666666);
-                }
+                // Boot B: the scrollbar is now drawn by the COMPOSITOR on the window's right edge
+                // (fed by content_height/scroll_offset above). No inline scrollbar here anymore.
             }
         }
     }
@@ -195,22 +206,8 @@ impl NyxApp for SysMonApp {
             if self.state != old_state { needs_redraw = true; }
         }
 
-        if self.state == SysMonState::Bootlog {
-            let cx = 170; // We assume default layout width for hit testing
-            // Because width is dynamic, we need to know the canvas width for perfect hit testing.
-            // A simple approximation is checking the far right of the screen.
-            if mx > 500 {
-                if my < 200 { 
-                    self.bootlog_scroll = self.bootlog_scroll.saturating_sub(5); 
-                } else { 
-                    self.bootlog_scroll = core::cmp::min(
-                        self.bootlog_scroll.saturating_add(5), 
-                        self.bootlog_lines.len().saturating_sub(24) // Approx max lines
-                    ); 
-                }
-                needs_redraw = true;
-            }
-        }
+        // Boot B: bootlog scrolling is now handled by the compositor's window scrollbar (on_scroll),
+        // so the old click-to-scroll region is removed.
         needs_redraw
     }
 }

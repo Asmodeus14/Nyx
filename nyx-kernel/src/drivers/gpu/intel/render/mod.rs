@@ -30,6 +30,7 @@ pub mod pipeline;
 pub mod engine;
 pub mod gl;
 pub mod compositor;
+pub mod text;
 pub mod decode;
 pub mod math;
 
@@ -95,6 +96,20 @@ pub const GVA_SSAA_RT: u32 = 0x4000_0000;
 /// ring's GGTT PTEs, so after a TLB invalidate the engine fetched the window buffer as commands and
 /// hung (HEAD stuck, FAULT=0, fence never signalled). Only the GL path hit it (ring-0 runs first).
 pub const GVA_GL_WIN_BB: u32 = 0x5000_0000;
+
+/// U5 GPU-text render context. The text pass needs its OWN state buffers so it can coexist with the
+/// CACHED compositor scene (which owns the fixed 0x19–0x1D state GVAs) without clobbering it — otherwise
+/// every text draw would force a full compositor scene rebuild. Placed high, clear of the compositor
+/// state slots, SSAA RT (0x4000_0000), GL window backbuffer (0x5000_0000) and HW cursor (0x5100_0000).
+/// The text pass shares the render engine's shaders (GVA_INSTRUCTION_BASE) and renders into the SAME
+/// backbuffer (0x1400_0000) as everything else — only its dynamic/surface/vertex/tex state is separate.
+pub const GVA_TEXT_DYNAMIC: u32 = 0x6000_0000; // blend/cc/viewport + sampler for the text scene
+pub const GVA_TEXT_SURFACE: u32 = 0x6100_0000; // RT + atlas surface state + binding table
+pub const GVA_TEXT_VERTEX: u32 = 0x6200_0000;  // batched glyph verts + indices (16 pages of headroom)
+pub const GVA_TEXT_TEX: u32 = 0x6300_0000;     // unused upload region (atlas is bound by GVA, no upload)
+/// GVA the userspace font atlas SHM is mapped to (via sys_gpu_map_shm). Bound as a LINEAR sampled
+/// surface by the text pass — same "bind an existing GVA, no upload" trick window quads use.
+pub const GVA_TEXT_ATLAS: u32 = 0x6400_0000;
 
 /// The RCS ring is one 4 KiB page = 1024 dwords, matching the BLT ring.
 pub const RCS_RING_DWORDS: u32 = 1024;

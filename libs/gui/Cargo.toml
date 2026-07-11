@@ -6,4 +6,10 @@ edition = "2021"
 [dependencies]
 nyx-api = { path = "../api" }
 linked_list_allocator = "0.10.5"
-noto-sans-mono-bitmap = "0.2"      
+noto-sans-mono-bitmap = "0.2"
+# F1: proportional TTF font. ttf-parser reads DejaVuSans.ttf glyph outlines; ab_glyph_rasterizer
+# fills them to grayscale coverage (needs libm for no_std float ops — new to the tree, pure Rust).
+ttf-parser = { version = "0.25", default-features = false, features = ["no-std-float"] }
+ab_glyph_rasterizer = { version = "0.1", default-features = false, features = ["libm"] }
+libm = "0.2"
+spin = "0.9"

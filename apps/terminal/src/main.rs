@@ -53,35 +53,39 @@ impl NyxApp for TerminalApp {
 
     fn draw(&mut self, canvas: &mut Canvas) {
         canvas.fill_rect(0, 0, canvas.width, canvas.height, BG_COLOR);
-        
+
+        // F1: proportional TTF metrics — advance per glyph, line height from the font. FONT_W/FONT_H
+        // remain only as a fallback caret size.
+        let line_h = nyx_gui::font::line_height(1);
         let mut cx = 10;
         let mut cy = 10;
-        
+
         // Draw History
         for c in self.output_history.chars() {
-            if c == '\n' { cx = 10; cy += FONT_H + 4; continue; }
+            if c == '\n' { cx = 10; cy += line_h; continue; }
             canvas.draw_char(cx, cy, c, FG_COLOR, 1);
-            cx += FONT_W;
-            if cx >= canvas.width - 15 { cx = 10; cy += FONT_H + 4; }
+            cx += nyx_gui::font::advance(c, 1);
+            if cx >= canvas.width - 15 { cx = 10; cy += line_h; }
         }
 
         // Draw Prompt
         let prompt = "N> ";
         for c in prompt.chars() {
             canvas.draw_char(cx, cy, c, FG_COLOR, 1);
-            cx += FONT_W;
+            cx += nyx_gui::font::advance(c, 1);
         }
 
         // Draw Input Buffer
         for c in self.input_buffer.chars() {
             canvas.draw_char(cx, cy, c, FG_COLOR, 1);
-            cx += FONT_W;
-            if cx >= canvas.width - 15 { cx = 10; cy += FONT_H + 4; }
+            cx += nyx_gui::font::advance(c, 1);
+            if cx >= canvas.width - 15 { cx = 10; cy += line_h; }
         }
 
-        // Draw Cursor
+        // Draw Cursor — a caret sized to a space advance × line height, at the current pen.
         if self.cursor_visible {
-            canvas.fill_rect(cx, cy, FONT_W, FONT_H, FG_COLOR);
+            let cw = nyx_gui::font::advance(' ', 1).max(FONT_W);
+            canvas.fill_rect(cx, cy, cw, line_h.min(FONT_H * 2), FG_COLOR);
         }
     }
 

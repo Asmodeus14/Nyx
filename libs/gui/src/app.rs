@@ -8,11 +8,20 @@ pub trait NyxApp {
     fn initial_height(&self) -> usize { 400 }
     
     fn init(&mut self) {}
-    
+
     fn update(&mut self) -> bool { false }
     fn draw(&mut self, canvas: &mut Canvas);
     fn on_mouse(&mut self, _mx: usize, _my: usize, _clicked: bool) -> bool { false }
     fn on_key(&mut self, _key: char) -> bool { false }
+
+    /// Scrollbar (Boot B): opt-in. Return the app's FULL scrollable content height in px; `0` (default)
+    /// means not scrollable → the compositor draws no scrollbar. Reported into the WindowHeader each frame.
+    fn content_height(&self) -> usize { 0 }
+    /// Scrollbar: the app's current top scroll offset in px (reported into the header for the thumb).
+    fn scroll_offset(&self) -> usize { 0 }
+    /// Scrollbar: the compositor moved the bar to `new_offset` (px, already clamped to the track). Apply
+    /// it to the app's scroll state and return true to trigger a redraw. Default: ignore.
+    fn on_scroll(&mut self, _new_offset: usize) -> bool { false }
 }
 
 pub fn run<T: NyxApp>(mut app: T) -> ! {
@@ -90,6 +99,10 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
                         event_redraw |= app.on_key(key);
                     }
                 },
+                MSG_SCROLL => {
+                    // Compositor moved our scrollbar → apply the new offset (data1) to scroll state.
+                    event_redraw |= app.on_scroll(msg.data1 as usize);
+                },
                 _ => {}
             }
         }
@@ -102,7 +115,11 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
             
             // 1. Fully paint the buffer
             app.draw(&mut canvas);
-            
+
+            // 1b. Report scroll state into the header so the compositor can draw/drive the scrollbar.
+            header.content_h = app.content_height() as u32;
+            header.scroll_off = app.scroll_offset() as u32;
+
             // 2. NOW safely tell the Compositor the buffer is ready
             if let Some(shm_id) = pending_shm_swap {
                 sys_ipc_send(COMPOSITOR_PID, MSG_WINDOW_UPDATE_SHM, shm_id, 0);

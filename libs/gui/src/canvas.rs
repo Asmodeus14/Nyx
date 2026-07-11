@@ -125,47 +125,79 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Draw `text` with the proportional TTF font. `cx,cy` is the TOP-LEFT of the first line (the pen
+    /// baseline is derived internally via the font ascent, so existing top-left call sites keep working).
+    /// Advances per-glyph by each glyph's own advance (proportional). Wraps near the right edge and on
+    /// '\n'. `scale` rasterizes at `BASE_PX*scale` (sharp), not pixel-replicated.
     pub fn print_str(&mut self, mut cx: usize, mut cy: usize, text: &str, color: u32, scale: usize) {
-        let font_w = crate::font::CHAR_WIDTH * scale;
-        let font_h = crate::font::CHAR_HEIGHT * scale;
-        
-        let start_x = cx; 
-        
+        let line_h = crate::font::line_height(scale);
+        let start_x = cx;
         for c in text.chars() {
             if c == '\n' {
-                cx = start_x; 
-                cy += font_h;
-            } else {
-                self.draw_char(cx, cy, c, color, scale);
-                cx += font_w;
-            }
-            
-            if cx + font_w >= self.width - 10 {
                 cx = start_x;
-                cy += font_h;
+                cy += line_h;
+                continue;
+            }
+            self.draw_char(cx, cy, c, color, scale);
+            cx += crate::font::advance(c, scale);
+            if cx + line_h >= self.width.saturating_sub(10) {
+                cx = start_x;
+                cy += line_h;
             }
         }
     }
 
-    pub fn draw_char(&mut self, x: usize, y: usize, c: char, color: u32, scale: usize) {
-        if let Some(raster) = crate::font::get_char_raster(c) {
-            for (ri, row) in raster.raster().iter().enumerate() {
-                for (ci, val) in row.iter().enumerate() {
-                    if *val > 50 { 
-                        for dy in 0..scale {
-                            for dx in 0..scale {
-                                let px = x + (ci * scale) + dx;
-                                let py = y + (ri * scale) + dy;
-                                
-                                if px < self.width && py < self.height {
-                                    let idx = py * self.width + px;
-                                    self.buffer[idx] = color; 
-                                }
-                            }
-                        }
-                    }
-                }
+    /// Pixel width of `text` at `scale` (sum of per-glyph advances up to the first newline — callers
+    /// that center/right-align use this instead of the old `len()*CHAR_WIDTH`). Multi-line text returns
+    /// the width of its widest line.
+    pub fn text_width(text: &str, scale: usize) -> usize {
+        let mut w = 0usize;
+        let mut max = 0usize;
+        for c in text.chars() {
+            if c == '\n' {
+                if w > max { max = w; }
+                w = 0;
+            } else {
+                w += crate::font::advance(c, scale);
             }
         }
+        if w > max { max = w; }
+        max
+    }
+
+    /// Draw one glyph. `x,y` is the top-left of the line cell; the glyph is placed at its bearing
+    /// relative to the baseline (`y + ascent`). Each texel's grayscale COVERAGE blends `color` over the
+    /// existing pixel — real antialiasing (replaces the old binary `>50` write).
+    pub fn draw_char(&mut self, x: usize, y: usize, c: char, color: u32, scale: usize) {
+        let px = crate::font::px_for(scale);
+        let baseline = y as i32 + crate::font::ascent(scale) as i32;
+        let width = self.width;
+        let height = self.height;
+        crate::font::with_glyph(c, px, |g| {
+            if g.w == 0 || g.h == 0 {
+                return;
+            }
+            for row in 0..g.h {
+                let py = baseline - g.bearing_y + row as i32;
+                if py < 0 || py as usize >= height {
+                    continue;
+                }
+                let row_base = py as usize * width;
+                let cov_row = row * g.w;
+                for col in 0..g.w {
+                    let cov = g.cov[cov_row + col];
+                    if cov == 0 {
+                        continue;
+                    }
+                    let sx = x as i32 + g.bearing_x + col as i32;
+                    if sx < 0 || sx as usize >= width {
+                        continue;
+                    }
+                    let idx = row_base + sx as usize;
+                    let blended = crate::effects::blend_color(color, self.buffer[idx], cov);
+                    self.buffer[idx] = 0xFF00_0000 | blended;
+                }
+            }
+        });
     }
 }

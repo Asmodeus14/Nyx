@@ -494,6 +494,64 @@ impl Scene {
             }
         }
     }
+
+    /// U5 GPU text: bind an already-GGTT-mapped font ATLAS (a userspace SHM surface mapped via
+    /// sys_gpu_map_shm) as a LINEAR B8G8R8A8 sampled surface — NO upload, the same "bind an existing
+    /// GVA" trick as `add_window_quad`. Also writes a 2-entry binding table `[0]=RT, [1]=atlas` and
+    /// returns its offset. Call ONCE per atlas (the text pass caches it across frames); it consumes a
+    /// fixed slice of `surf_buf` and never touches `meshes`, so it survives per-frame run rebuilds.
+    pub unsafe fn add_text_atlas(
+        &mut self,
+        atlas_gva: u32,
+        atlas_pitch: u32,
+        atlas_w: u32,
+        atlas_h: u32,
+    ) -> Result<u32, RenderError> {
+        let asurf = state::render_surface_state_2d(
+            state::SURFACE_FORMAT_B8G8R8A8_UNORM, atlas_w, atlas_h, atlas_pitch, atlas_gva,
+            state::TILEMODE_LINEAR);
+        let asurf_gva = self.surf_buf.write(&asurf, 64)?;
+        let asurf_off = asurf_gva - self.surf_buf.gva;
+        let bt = state::binding_table_2(self.rs.rt_surface_off, asurf_off);
+        let bt_gva = self.surf_buf.write(&bt, 64)?;
+        Ok(bt_gva - self.surf_buf.gva)
+    }
+
+    /// U5 GPU text: (re)build the single BATCHED glyph-run mesh for this frame. `verts` are already in
+    /// PIXEL space (pos.x/.y) with `varying.xy` = the glyph's atlas UV; `indices` reference them (4 verts
+    /// + 6 indices per glyph, `4*g + [0,1,2,0,2,3]`). All glyphs share the atlas binding table
+    /// (`binding_table_off` from `add_text_atlas`) and the plain textured PS. Because the text scene's
+    /// `vbo_buf` holds ONLY this run, its bump cursor is reset each frame (no leak) and the run is rebuilt
+    /// — glyph strings change every frame with no surf_buf/scene rebuild. `draw_scene` fills the vertex
+    /// block (transform by the ortho MVP) at draw time, exactly like window quads.
+    pub unsafe fn set_text_mesh(
+        &mut self,
+        binding_table_off: u32,
+        verts: Vec<Vertex>,
+        indices: Vec<u32>,
+    ) -> Result<(), RenderError> {
+        self.vbo_buf.used = 0;
+        self.meshes.clear();
+        if verts.is_empty() || indices.is_empty() {
+            return Ok(());
+        }
+        let vbo_dwords = verts.len() * VERTEX_DWORDS;
+        let (vbo_cpu, vbo_gva) = self.vbo_buf.alloc(vbo_dwords, 64)?;
+        let idx_gva = self.vbo_buf.write(&indices, 64)?;
+        let idx_count = indices.len();
+        self.meshes.push(SceneMesh {
+            verts,
+            vbo_cpu,
+            vbo_gva,
+            vbo_dwords,
+            idx_gva,
+            idx_count,
+            binding_table_off,
+            ps_off: self.ps_off,
+        });
+        Ok(())
+    }
+
     /// (Y-tiled) render target the meshes draw into; `scene_rt_pitch` its tiled row pitch;
     /// `bb_gva` the LINEAR backbuffer the resolve writes to. Builds:
     ///   - a LINEAR backbuffer RENDER_SURFACE_STATE (the resolve pass's RT, BTI 0),

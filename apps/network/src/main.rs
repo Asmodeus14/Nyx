@@ -234,13 +234,14 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn draw_text_wrapped(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usize, text: &str, color: u32) {
+    let lh = nyx_gui::font::line_height(1);
     let mut cx = x; let mut cy = y;
     for c in text.chars() {
-        if c == '\n' { cx = x; cy += 16; continue; }
+        if c == '\n' { cx = x; cy += lh; continue; }
         canvas.draw_char(cx, cy, c, color, 1);
-        cx += 9;
-        if cx > x + w - 9 { cx = x; cy += 16; }
-        if cy > y + h - 16 { break; } 
+        cx += nyx_gui::font::advance(c, 1);
+        if cx > x + w.saturating_sub(9) { cx = x; cy += lh; }
+        if cy > y + h.saturating_sub(lh) { break; }
     }
 }
 

@@ -1264,8 +1264,32 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         },
 
-        
-        505 => { 
+        537 => {
+            // SYS_GPU_DRAW_TEXT(atlas_gva, atlas_w, atlas_h, atlas_pitch, glyph_ptr, glyph_count):
+            // U5 — GPU-draw a batched glyph run sampling the userspace font atlas into the backbuffer.
+            // 1 ok / 0 => caller falls back to CPU text.
+            use crate::drivers::gpu::intel::render::text::GlyphQuad;
+            let atlas_gva = arg1 as u32;
+            let atlas_w = arg2 as u32;
+            let atlas_h = arg3 as u32;
+            let atlas_pitch = arg4 as u32;
+            let ptr = arg5 as *const GlyphQuad;
+            let count = arg6 as usize;
+            let bytes = count.saturating_mul(core::mem::size_of::<GlyphQuad>());
+            if count == 0 {
+                frame.rax = 1;
+            } else if is_valid_user_ptr(ptr as *const u8, bytes) {
+                let glyphs = unsafe { core::slice::from_raw_parts(ptr, count) };
+                frame.rax = crate::drivers::gpu::intel::render::text::draw_text(
+                    atlas_gva, atlas_w, atlas_h, atlas_pitch, glyphs,
+                ) as u64;
+            } else {
+                frame.rax = EFAULT as u64;
+            }
+        },
+
+
+        505 => {
             // THE FIX: Shield the spinlock from hardware interrupts!
             // This prevents IRQ 12 from firing while we are reading the mouse state.
             let m_val = x86_64::instructions::interrupts::without_interrupts(|| {

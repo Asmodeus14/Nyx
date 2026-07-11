@@ -11,15 +11,25 @@ pub struct WindowHeader {
     pub width: u32,
     pub height: u32,
     pub flags: u32,
+    // Scrollbar (Boot B): the app reports its FULL scrollable content height and current top offset
+    // here each frame; the compositor reads them to draw + drive a window-aligned scrollbar. `content_h
+    // <= height` (or 0) means "not scrollable" → no bar. No new IPC round-trip (already-mapped header).
+    pub content_h: u32,
+    pub scroll_off: u32,
     pub title: [u8; 64],
     // U4: pad the header so the pixel data that follows (`shm + size_of::<WindowHeader>()`) is
     // PAGE-ALIGNED. The GPU compositor binds that pixel region as a sampled texture, and every proven
     // texture surface in the render engine uses a 4KB-aligned base — this makes window surfaces match,
     // with zero alignment risk. All apps compute the pixel offset via size_of, so this is transparent.
-    pub _pad: [u8; 4096 - 88],
+    // Fixed part is now 96 bytes (8×u32 + 64 title), so pad to keep the total exactly 4096.
+    pub _pad: [u8; 4096 - 96],
 }
 
-pub const WIN_MAGIC: u32 = 0x4E595857; 
+// U4 invariant: the header MUST stay exactly one page so the pixel data after it is 4KB-aligned for
+// the GPU texture binding. This const-assert breaks the build if a field addition changes the size.
+const _: () = assert!(core::mem::size_of::<WindowHeader>() == 4096);
+
+pub const WIN_MAGIC: u32 = 0x4E595857;
 pub const WIN_FLAG_NONE: u32 = 0;
 pub const WIN_FLAG_FRAMELESS: u32 = 1;
 pub const WIN_FLAG_TRANSPARENT: u32 = 2;
@@ -33,8 +43,11 @@ pub const MSG_FLUSH_WINDOW: u64 = 3;
 pub const MSG_KEY_EVENT: u64 = 4;
 pub const MSG_MOUSE_EVENT: u64 = 5;
 pub const MSG_WINDOW_CLOSE: u64 = 6;
-pub const MSG_WINDOW_RESIZED: u64 = 7; 
+pub const MSG_WINDOW_RESIZED: u64 = 7;
 pub const MSG_WINDOW_UPDATE_SHM: u64 = 8;
+/// Compositor → app: the user moved this window's scrollbar. `data1` = the new top scroll offset (px).
+/// The app clamps it, updates its scroll state, re-renders, and flushes.
+pub const MSG_SCROLL: u64 = 9;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -337,6 +350,43 @@ pub struct WindowQuad {
 /// caller on top afterward.
 pub fn sys_gpu_composite(quads: &[WindowQuad]) -> bool {
     syscall(SYS_GPU_COMPOSITE, quads.as_ptr() as u64, quads.len() as u64, 0, 0, 0, 0) == 1
+}
+
+pub const SYS_GPU_DRAW_TEXT: u64 = 537;
+
+/// One glyph to GPU-draw (U5), matching the kernel `GlyphQuad` (repr(C), 9 x 4 = 36 bytes). `dst_*` is
+/// the destination pixel rect in the backbuffer; `u0,v0..u1,v1` is the glyph's normalized sub-rect in
+/// the font atlas (0..1). `color` is reserved for the colored-text path (ignored by the coverage/white
+/// path — a coverage-in-alpha atlas blends as white antialiased text through the plain textured PS).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GlyphQuad {
+    pub dst_x: i32,
+    pub dst_y: i32,
+    pub dst_w: u32,
+    pub dst_h: u32,
+    pub u0: f32,
+    pub v0: f32,
+    pub u1: f32,
+    pub v1: f32,
+    pub color: u32,
+}
+
+/// GPU-draw a batched glyph run (U5). `atlas_gva` is the font atlas surface's GVA — the atlas SHM must
+/// already be GGTT-mapped via `sys_gpu_map_shm`, is LINEAR B8G8R8A8, `atlas_w` x `atlas_h`, `atlas_pitch`
+/// bytes/row (64-byte aligned). Each `GlyphQuad` places one glyph; the kernel draws them all as one
+/// textured-quad mesh sampling the atlas, blended over whatever is already in the backbuffer. Returns
+/// true on success; false → the caller should fall back to CPU text (`canvas.print_str`).
+pub fn sys_gpu_draw_text(atlas_gva: u32, atlas_w: u32, atlas_h: u32, atlas_pitch: u32, glyphs: &[GlyphQuad]) -> bool {
+    syscall(
+        SYS_GPU_DRAW_TEXT,
+        atlas_gva as u64,
+        atlas_w as u64,
+        atlas_h as u64,
+        atlas_pitch as u64,
+        glyphs.as_ptr() as u64,
+        glyphs.len() as u64,
+    ) == 1
 }
 
 

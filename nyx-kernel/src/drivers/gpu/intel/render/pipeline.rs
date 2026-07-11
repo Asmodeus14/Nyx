@@ -189,7 +189,7 @@ impl RenderEngine {
         cs.push(cmd::pipeline_select(cmd::PIPELINE_SELECT_3D));
         self.progress(&mut cs, 1);
 
-        self.emit_state_base_address(&mut cs);
+        self.emit_state_base_address(&mut cs, GVA_SURFACE_STATE, GVA_DYNAMIC_STATE);
         self.progress(&mut cs, 2);
 
         // Push-constant alloc (VS then PS) — carve regions before URB.
@@ -518,7 +518,7 @@ impl RenderEngine {
         );
         cs.push(cmd::pipeline_select(cmd::PIPELINE_SELECT_3D));
         self.progress(&mut cs, 1);
-        self.emit_state_base_address(&mut cs);
+        self.emit_state_base_address(&mut cs, GVA_SURFACE_STATE, GVA_DYNAMIC_STATE);
         self.progress(&mut cs, 2);
         cs.push(h1(so::PUSH_CONSTANT_ALLOC_VS, 2)).push(2);
         cs.push(h1(so::PUSH_CONSTANT_ALLOC_PS, 2)).push((2 << 16) | 2);
@@ -876,6 +876,60 @@ impl RenderEngine {
         })
     }
 
+    /// U5 GPU text: create a Scene for the text pass on its OWN state-buffer GVAs (GVA_TEXT_*), so it
+    /// coexists with the cached compositor scene instead of clobbering the shared 0x19–0x1D slots. Same
+    /// shape as `create_scene` (shared shaders + RT), but: surface/dynamic/vertex/tex buffers live at the
+    /// text-context GVAs, and the vertex buffer is 16 pages (a batched glyph run is 4 verts + 6 idx per
+    /// glyph — far more than the compositor's window quads). The atlas is bound by GVA (no upload), so the
+    /// tex buffer is a single unused page. `rt_gva` is the shared backbuffer (0x1400_0000).
+    pub unsafe fn create_text_scene(
+        &mut self,
+        rt_gva: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+    ) -> Result<super::engine::Scene, RenderError> {
+        use super::engine::Scene;
+        use super::{GVA_TEXT_DYNAMIC, GVA_TEXT_SURFACE, GVA_TEXT_VERTEX, GVA_TEXT_TEX};
+        let (vs_off, ps_off, ps_opacity_off, ps_rounded_off) = match &self.kernels {
+            Some(k) => (k.vs_off, k.ps_off, k.ps_opacity_off, k.ps_rounded_off),
+            None => return Err(RenderError::NotInitialized),
+        };
+        let mmio = self.mmio_base;
+        let mut surf_buf = StateBuffer::new(mmio, GVA_TEXT_SURFACE, 1)?;
+        let mut dyn_buf = StateBuffer::new(mmio, GVA_TEXT_DYNAMIC, 1)?;
+        let vbo_buf = StateBuffer::new(mmio, GVA_TEXT_VERTEX, 16)?;
+        let tex_buf = StateBuffer::new(mmio, GVA_TEXT_TEX, 1)?;
+        // RT is LINEAR (the backbuffer) — text blends over whatever is already composited there.
+        let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch, state::TILEMODE_LINEAR)?;
+        let mut samplers = [0u32; 8];
+        samplers[0..4].copy_from_slice(&state::sampler_state_nearest_clamp());
+        samplers[4..8].copy_from_slice(&state::sampler_state_linear_clamp());
+        let samp_gva = dyn_buf.write(&samplers, 32)?;
+        let sampler_off = samp_gva - dyn_buf.gva;
+        crate::serial_println!(
+            "[TEXT] scene created: surf_base={:#x} dyn_base={:#x} vbo_base={:#x}",
+            surf_buf.gva, dyn_buf.gva, vbo_buf.gva
+        );
+        Ok(Scene {
+            surf_buf,
+            dyn_buf,
+            vbo_buf,
+            tex_buf,
+            rs,
+            sampler_off,
+            resolve_sampler_off: 0,
+            resolve_sf_clip_off: 0,
+            vs_off,
+            ps_off,
+            ps_opacity_off,
+            ps_rounded_off,
+            mask_surf_off: 0,
+            meshes: alloc::vec::Vec::new(),
+            resolve: None,
+        })
+    }
+
     /// Phase 8b: render ALL meshes in `scene` (each transformed by its matching entry in `mvps`)
     /// into `rt_gva` as ONE fenced command stream. The full fixed-function pipeline state is
     /// emitted ONCE (shared), then a per-mesh tail swaps VERTEX_BUFFERS / INDEX_BUFFER /
@@ -951,11 +1005,16 @@ impl RenderEngine {
         let rs = &scene.rs;
         let vs_off = scene.vs_off;
         let sampler_off = scene.sampler_off;
+        // State-base MUST match the buffers this scene wrote its binding tables / samplers into: the
+        // main scene lives at GVA_SURFACE/DYNAMIC_STATE, the U5 text scene at GVA_TEXT_SURFACE/DYNAMIC.
+        // (Hardcoding the constants made the text pass sample the compositor RT — the screen.)
+        let surf_base = scene.surf_buf.gva;
+        let dyn_base = scene.dyn_buf.gva;
 
         // Shared fixed-function prologue (extracted so the resolve pass reuses the exact bytes).
         let mut cs = CmdStream::new();
         // Mesh pass: shared NEAREST sampler + rs viewport (baked at the RT's — supersampled — dims).
-        self.emit_pipeline_prologue(&mut cs, rs, vs_off, sampler_off, rs.sf_clip_viewport_off, width, height, 3 << 16, blend); // cull BACK
+        self.emit_pipeline_prologue(&mut cs, rs, vs_off, sampler_off, rs.sf_clip_viewport_off, width, height, 3 << 16, blend, surf_base, dyn_base); // cull BACK
 
         // Per-mesh tail: swap VB / IB / binding table / PS and draw. Pipelined 3DSTATE, legal to
         // change between draws in one stream (proven: Phase 6 Step 4).
@@ -991,6 +1050,8 @@ impl RenderEngine {
         height: u32,
         raster_cull_dw1: u32,
         blend: bool,
+        surf_base: u32,
+        dyn_base: u32,
     ) {
         self.progress(cs, 0x10);
         cmd::pipe_control(
@@ -1019,7 +1080,7 @@ impl RenderEngine {
         );
         cs.push(cmd::pipeline_select(cmd::PIPELINE_SELECT_3D));
         self.progress(cs, 1);
-        self.emit_state_base_address(cs);
+        self.emit_state_base_address(cs, surf_base, dyn_base);
         self.progress(cs, 2);
         cs.push(h1(so::PUSH_CONSTANT_ALLOC_VS, 2)).push(2);
         cs.push(h1(so::PUSH_CONSTANT_ALLOC_PS, 2)).push((2 << 16) | 2);
@@ -1248,7 +1309,7 @@ impl RenderEngine {
         // resolve path always sets both).
         let resolve_sampler = if scene.resolve_sampler_off != 0 { scene.resolve_sampler_off } else { scene.sampler_off };
         let resolve_sf_clip = if scene.resolve_sf_clip_off != 0 { scene.resolve_sf_clip_off } else { scene.rs.sf_clip_viewport_off };
-        self.emit_pipeline_prologue(&mut cs, &scene.rs, scene.vs_off, resolve_sampler, resolve_sf_clip, width, height, 1 << 16, false);
+        self.emit_pipeline_prologue(&mut cs, &scene.rs, scene.vs_off, resolve_sampler, resolve_sf_clip, width, height, 1 << 16, false, scene.surf_buf.gva, scene.dyn_buf.gva);
         self.emit_draw_one(&mut cs, resolve, 0x30);
         let hung = self.finish_submit_and_wait(&mut cs, verbose, 1);
 
@@ -1447,15 +1508,23 @@ impl RenderEngine {
 
     /// STATE_BASE_ADDRESS: general/surface/dynamic/instruction bases + buffer sizes.
     /// Length 18 (bindless-size dword dropped per WaBindlessSurfaceStateModifyEnable).
-    unsafe fn emit_state_base_address(&self, cs: &mut CmdStream) {
+    ///
+    /// `surf_base`/`dyn_base` are the CURRENT scene's surface- and dynamic-state buffer GVAs. The
+    /// per-mesh `binding_table_off` / `sampler_off` are offsets RELATIVE to these bases, so the bases
+    /// MUST match the buffers the scene actually wrote its binding tables / samplers into. The main
+    /// scene (create_scene) allocates at GVA_SURFACE_STATE / GVA_DYNAMIC_STATE, so it passes those; the
+    /// U5 text scene (create_text_scene) lives at GVA_TEXT_SURFACE / GVA_TEXT_DYNAMIC and passes those.
+    /// Hardcoding the constants (as this once did) made the text pass read the compositor's cached
+    /// binding table -> it sampled the compositor RT (the screen) instead of the font atlas.
+    unsafe fn emit_state_base_address(&self, cs: &mut CmdStream, surf_base: u32, dyn_base: u32) {
         let instr_base = super::GVA_INSTRUCTION_BASE;
         // header: subtype COMMON(0), opcode 1, subop 1, length 0x10 (18 dwords).
         cs.push(gfxpipe_header(0, 1, 1, 0x10));
         let m = 1u32; // modify-enable bit 0; MOCS 0
         cs.push((0 & 0xFFFFF000) | m).push(0); // General State
         cs.push(0); // Stateless DataPort MOCS
-        cs.push((GVA_SURFACE_STATE & 0xFFFFF000) | m).push(0); // Surface State
-        cs.push((GVA_DYNAMIC_STATE & 0xFFFFF000) | m).push(0); // Dynamic State
+        cs.push((surf_base & 0xFFFFF000) | m).push(0); // Surface State
+        cs.push((dyn_base & 0xFFFFF000) | m).push(0); // Dynamic State
         cs.push(0).push(0); // Indirect Object (disabled)
         cs.push((instr_base & 0xFFFFF000) | m).push(0); // Instruction
         cs.push((0xFFFFF << 12) | 1); // General State buffer size

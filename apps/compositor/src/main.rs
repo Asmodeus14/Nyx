@@ -12,7 +12,7 @@ use alloc::vec;
 
 use nyx_api::*;
 use nyx_gui::canvas::{Canvas, Color};
-use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_window_chrome, round_window_corners, draw_cursor, Window, CursorType};
+use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_window_chrome, round_window_corners, draw_window_shadow, draw_scrollbar, SCROLLBAR_W, draw_cursor, Window, CursorType};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -91,6 +91,37 @@ fn upload_arrow_cursor() {
     sys_cursor_set_image(&img);
 }
 
+/// Draw the bottom taskbar strip (opaque white bar + top border, Start button, live RTC wall clock,
+/// NYX label, WIFI). Self-contained and fully opaque, so it can be repainted on its own without any
+/// under-pixels — the damage-tracked idle path relies on that to refresh only the clock once per second
+/// without recompositing the whole desktop. Called by both the full recomposite and the partial path.
+fn render_taskbar(canvas: &mut Canvas, screen_stride: usize, screen_h: usize) {
+    let bar_h = 36;
+    let start_y = screen_h - bar_h;
+    canvas.fill_rect(0, start_y, screen_stride, bar_h, 0xFF_FFFFFF); // Opaque white taskbar
+    canvas.fill_rect(0, start_y, screen_stride, 1, 0xFF_D1D1D1);     // Border
+
+    let btn_x = (screen_stride / 2) - 35;
+    canvas.fill_rect(btn_x, start_y + 6, 70, 24, Color::ACCENT_PRIMARY);
+
+    // Live wall clock (HH:MM:SS) from the hardware RTC.
+    let rtc = sys_get_rtc();
+    let mut disp_hour = rtc.hour as i32 + TZ_OFFSET_HOURS;
+    disp_hour = ((disp_hour % 24) + 24) % 24; // wrap into 0..23
+    let mut clk = [0u8; 8];
+    let mut p = push_2d(&mut clk, 0, disp_hour as u8);
+    clk[p] = b':'; p += 1;
+    p = push_2d(&mut clk, p, rtc.min);
+    clk[p] = b':'; p += 1;
+    p = push_2d(&mut clk, p, rtc.sec);
+    let clk_str = core::str::from_utf8(&clk[..p]).unwrap_or("--:--:--");
+    canvas.print_str(20, start_y + 14, clk_str, Color::TEXT_DARK, 1);
+    canvas.print_str(btn_x + 15, start_y + 8, "NYX", Color::WHITE, 1);
+
+    let net_x = screen_stride - 50; let btn_y = screen_h - 36 + 6;
+    canvas.print_str(net_x, btn_y + 4, "[WIFI]", Color::WHITE, 1);
+}
+
 
 pub struct WindowClient {
     pub win: Window,
@@ -103,6 +134,29 @@ pub struct WindowClient {
 }
 
 fn get_str_len(buf: &[u8; 64]) -> usize { buf.iter().position(|&c| c == 0).unwrap_or(64) }
+
+/// Boot B: read a client's reported scroll state from its (already-mapped) WindowHeader. The pixel
+/// buffer starts at `header + size_of::<WindowHeader>()`, so the header sits just before `buffer`.
+fn client_scroll(client: &WindowClient) -> (usize, usize) {
+    if client.buffer.is_null() { return (0, 0); }
+    let hdr = unsafe {
+        &*((client.buffer as *const u8).sub(core::mem::size_of::<WindowHeader>()) as *const WindowHeader)
+    };
+    (hdr.content_h as usize, hdr.scroll_off as usize)
+}
+
+/// Boot B: map a mouse Y within a scrollbar track to a content scroll offset, centering the thumb on
+/// the cursor. `bar_y` = track top, `viewport` = track height (= visible content height), `content` =
+/// total content height. Returns the clamped top offset in px.
+fn mouse_to_scroll(my: usize, bar_y: usize, viewport: usize, content: usize) -> usize {
+    if content <= viewport { return 0; }
+    let (_, thumb_h) = nyx_gui::ui::scrollbar_thumb(viewport, content, viewport, 0);
+    let track_range = viewport.saturating_sub(thumb_h); // how far the thumb can travel
+    if track_range == 0 { return 0; }
+    let rel = my.saturating_sub(bar_y).saturating_sub(thumb_h / 2).min(track_range);
+    let max_scroll = content - viewport;
+    rel * max_scroll / track_range
+}
 
 pub struct CompositorState {
     pub clients: Vec<WindowClient>,
@@ -121,6 +175,9 @@ pub struct CompositorState {
     
     pub is_resizing: bool,
     pub resizing_win_idx: Option<usize>,
+
+    // Boot B: the window whose scrollbar the user is dragging (None = not scrolling).
+    pub scrolling_win_idx: Option<usize>,
 
     pub start_menu_open: bool,
     pub screen_w: usize, pub screen_h: usize, pub screen_stride: usize,
@@ -149,6 +206,7 @@ impl CompositorState {
             needs_redraw: true,
             dragging_win_idx: None, drag_off_x: 0, drag_off_y: 0,
             is_resizing: false, resizing_win_idx: None,
+            scrolling_win_idx: None,
             start_menu_open: false,
             screen_w: w, screen_h: h, screen_stride: stride,
             hw_cursor: false,
@@ -337,9 +395,27 @@ impl CompositorState {
                         clicked_idx = Some(idx); break; 
                     }
                     
+                    // Boot B: scrollbar hit-test (content-area right edge). Only if the app reports a
+                    // scrollable content height. Takes priority over the general content click below.
+                    if !client.win.is_minimized {
+                        let (content_h, _) = client_scroll(client);
+                        let viewport = client.win.h;
+                        if content_h > viewport {
+                            let bar_x0 = win_x + win_w - SCROLLBAR_W;
+                            let bar_y = win_y + 30;
+                            if self.mx >= bar_x0 && self.mx <= win_x + win_w && self.my >= bar_y && self.my <= bar_y + viewport {
+                                self.scrolling_win_idx = Some(idx);
+                                let target = mouse_to_scroll(self.my, bar_y, viewport, content_h);
+                                sys_ipc_send(client.owner_pid, MSG_SCROLL, target as u64, 0);
+                                self.mark_dirty(win_x, win_y, win_w + 15, win_h + 15);
+                                clicked_idx = Some(idx); break;
+                            }
+                        }
+                    }
+
                     if !client.win.is_minimized && self.mx >= win_x && self.mx <= win_x + win_w && self.my > win_y + 30 && self.my <= win_y + win_h {
                         sys_ipc_send(client.owner_pid, MSG_MOUSE_EVENT, (self.mx - win_x) as u64, (self.my - (win_y + 30)) as u64);
-                        clicked_idx = Some(idx); break; 
+                        clicked_idx = Some(idx); break;
                     }
                 }
 
@@ -371,15 +447,30 @@ impl CompositorState {
             } else if let Some(idx) = self.dragging_win_idx {
                 let w = self.clients[idx].win.w + 15; let h = self.clients[idx].win.h + 45;
                 self.mark_dirty(self.clients[idx].win.x, self.clients[idx].win.y, w, h);
-                
-                self.clients[idx].win.x = self.mx.saturating_sub(self.drag_off_x); 
+
+                self.clients[idx].win.x = self.mx.saturating_sub(self.drag_off_x);
                 self.clients[idx].win.y = self.my.saturating_sub(self.drag_off_y);
-                
+
                 self.mark_dirty(self.clients[idx].win.x, self.clients[idx].win.y, w, h);
+            } else if let Some(idx) = self.scrolling_win_idx {
+                // Boot B: dragging the scrollbar thumb — recompute the target offset from the mouse Y
+                // and push it to the app, which clamps + re-renders. Redraw the window region.
+                if idx < self.clients.len() {
+                    let (content_h, _) = client_scroll(&self.clients[idx]);
+                    let viewport = self.clients[idx].win.h;
+                    if content_h > viewport {
+                        let bar_y = self.clients[idx].win.y + 30;
+                        let target = mouse_to_scroll(self.my, bar_y, viewport, content_h);
+                        sys_ipc_send(self.clients[idx].owner_pid, MSG_SCROLL, target as u64, 0);
+                        self.mark_dirty(self.clients[idx].win.x, self.clients[idx].win.y,
+                                        self.clients[idx].win.w + 15, self.clients[idx].win.h + 45);
+                    }
+                }
             }
-        } else if !self.left_click { 
-            self.dragging_win_idx = None; 
+        } else if !self.left_click {
+            self.dragging_win_idx = None;
             self.resizing_win_idx = None;
+            self.scrolling_win_idx = None;
             self.is_resizing = false;
         }
         
@@ -424,8 +515,32 @@ pub extern "C" fn _start() -> ! {
         sys_print("[COMPOSITOR] Hardware cursor unavailable; using software cursor.\n");
     }
 
+    // U5 Boot T1: build the GPU font atlas ONCE (rasterize printable ASCII → a mapped B8G8R8A8 atlas
+    // surface) so the compositor can draw a proof banner via the GPU text path (sys_gpu_draw_text).
+    // None → keep everything CPU-drawn (no banner); the desktop is unaffected either way.
+    let gpu_font = nyx_gui::gpu_text::GpuFont::prepare();
+    if let Some(f) = &gpu_font {
+        // DIAGNOSTIC: log the atlas metrics so we can sanity-check cell size / atlas dims from serial.
+        let mut m = [0u8; 96];
+        let mut mp = 0usize;
+        for &b in b"[COMPOSITOR] U5 atlas ready: cell=" { m[mp] = b; mp += 1; }
+        mp = push_num(&mut m, mp, f.cell_w());
+        m[mp] = b'x'; mp += 1;
+        mp = push_num(&mut m, mp, f.cell_h());
+        for &b in b" atlas=" { m[mp] = b; mp += 1; }
+        mp = push_num(&mut m, mp, f.atlas_w as usize);
+        m[mp] = b'x'; mp += 1;
+        mp = push_num(&mut m, mp, f.atlas_h as usize);
+        for &b in b" pitch=" { m[mp] = b; mp += 1; }
+        mp = push_num(&mut m, mp, f.atlas_pitch as usize);
+        m[mp] = b'\n'; mp += 1;
+        if let Ok(s) = core::str::from_utf8(&m[..mp]) { sys_print(s); }
+    } else {
+        sys_print("[COMPOSITOR] U5 GPU font atlas unavailable; CPU text only.\n");
+    }
+
     let mut last_frame = sys_get_time();
-    let ms_per_frame = 1000 / 60; 
+    let ms_per_frame = 1000 / 60;
 
     sys_print("[COMPOSITOR] Nyx Window Server Online. (Floating WM Restored)\n");
 
@@ -436,8 +551,13 @@ pub extern "C" fn _start() -> ! {
 
         let now = sys_get_time();
 
-        // Live-clock tick: once the whole-second value changes, force a recomposite so the taskbar
-        // clock (and FPS overlay) advance even on an otherwise idle desktop.
+        // Live-clock tick: once the whole-second value changes, force a full recomposite so the taskbar
+        // clock (and FPS overlay) advance even on an idle desktop. NOTE: this per-second full render is
+        // deliberately kept (an idle-only "repaint just the taskbar strip" optimization was tried and
+        // REVERTED — it let the RENDER ENGINE go cold/RC6 during long idle, and the first composite after
+        // idle then hung in wait_for_idle with lost MOCS/forcewake, freezing the whole compositor while
+        // the HW cursor kept moving. Keeping a full GPU frame every second keeps the engine warm. Proper
+        // region damage is the scissor-based boot D1, which readies the engine before compositing.)
         let now_sec = now / 1000;
         if now_sec != state.last_clock_sec {
             state.last_clock_sec = now_sec;
@@ -514,6 +634,18 @@ pub extern "C" fn _start() -> ! {
                             canvas.composite_buffer(client.win.x, client.win.y + 30, client_pixels, client.buf_w, client.buf_h, client.win.opacity);
                         }
                     }
+                    // Boot B: if the app reports scrollable content, draw a scrollbar on the content
+                    // area's right edge (below the title bar, inside the border). Drawn BEFORE corner
+                    // rounding so the carve trims its bottom-right into the rounded corner.
+                    if !client.win.is_minimized {
+                        let (content_h, scroll_off) = client_scroll(client);
+                        if content_h > client.win.h {
+                            let bar_x = client.win.x + client.win.w - SCROLLBAR_W;
+                            let bar_y = client.win.y + 30;
+                            draw_scrollbar(&mut canvas, bar_x, bar_y, SCROLLBAR_W, client.win.h,
+                                           content_h, client.win.h, scroll_off);
+                        }
+                    }
                     // U4 Boot 3: round the TRUE window outline last, once, on whichever content is now
                     // on the backbuffer (GPU or CPU) — carves the real 4 corners to the wallpaper.
                     // Constant 12px radius, size-independent. Must run AFTER composite_buffer in the
@@ -522,32 +654,28 @@ pub extern "C" fn _start() -> ! {
                 }
             }
 
-            // 5. Draw Taskbar on top of windows (CPU-based fills and text)
-            let bar_h = 36;
-            let start_y = screen_h - bar_h;
-            canvas.fill_rect(0, start_y, screen_stride, bar_h, 0xFF_FFFFFF); // Opaque white taskbar
-            canvas.fill_rect(0, start_y, screen_stride, 1, 0xFF_D1D1D1);     // Border
-            
-            // Draw Start Button
-            let btn_x = (screen_stride / 2) - 35;
-            canvas.fill_rect(btn_x, start_y + 6, 70, 24, Color::ACCENT_PRIMARY);
+            // 4. Drop shadows — FINAL pass, drawn AFTER all window content+chrome so each window's
+            // shadow correctly falls ON TOP of the windows BELOW it (fixes the pre-pass, where a lower
+            // window's later-composited content covered an upper window's shadow). For window i, the
+            // rects of every window ABOVE it (j>i in the back-to-front clients vec) are skipped, so a
+            // higher window is never darkened by a lower one's shadow. Soft/toned-down (alpha ~42).
+            for i in 0..state.clients.len() {
+                let c = &state.clients[i];
+                if !c.win.exists || c.win.is_minimized || c.win.opacity <= 40 { continue; }
+                let mut above: Vec<(i32, i32, i32, i32)> = Vec::new();
+                for j in (i + 1)..state.clients.len() {
+                    let u = &state.clients[j];
+                    if u.win.exists && !u.win.is_minimized {
+                        let th = (u.win.h + 30) as i32;
+                        above.push((u.win.x as i32, u.win.y as i32,
+                                    u.win.x as i32 + u.win.w as i32, u.win.y as i32 + th));
+                    }
+                }
+                draw_window_shadow(canvas.buffer, screen_stride, screen_h, &c.win, &above);
+            }
 
-            // Draw taskbar text: live wall clock (HH:MM:SS) from the hardware RTC.
-            let rtc = sys_get_rtc();
-            let mut disp_hour = rtc.hour as i32 + TZ_OFFSET_HOURS;
-            disp_hour = ((disp_hour % 24) + 24) % 24; // wrap into 0..23
-            let mut clk = [0u8; 8];
-            let mut p = push_2d(&mut clk, 0, disp_hour as u8);
-            clk[p] = b':'; p += 1;
-            p = push_2d(&mut clk, p, rtc.min);
-            clk[p] = b':'; p += 1;
-            p = push_2d(&mut clk, p, rtc.sec);
-            let clk_str = core::str::from_utf8(&clk[..p]).unwrap_or("--:--:--");
-            canvas.print_str(20, start_y + 14, clk_str, Color::TEXT_DARK, 1);
-            canvas.print_str(btn_x + 15, start_y + 8, "NYX", Color::WHITE, 1);
-            
-            let net_x = screen_stride - 50; let btn_y = screen_h - 36 + 6;
-            canvas.print_str(net_x, btn_y + 4, "[WIFI]", Color::WHITE, 1);
+            // 5. Draw Taskbar on top of windows (CPU-based fills and text)
+            render_taskbar(&mut canvas, screen_stride, screen_h);
 
             // Draw Start Menu on top of windows
             if state.start_menu_open {
@@ -576,6 +704,25 @@ pub extern "C" fn _start() -> ! {
             ov[op] = b'm'; op += 1; ov[op] = b's'; op += 1;
             let ov_str = core::str::from_utf8(&ov[..op]).unwrap_or("FPS ?");
             canvas.print_str(4, 2, ov_str, Color::TEXT_MUTED, 1);
+
+            // U5 Boot T1 PROOF: draw a banner via the GPU text path. This renders glyph quads sampling
+            // the font atlas directly into the backbuffer (blended over the CPU-drawn chrome), proving
+            // real GPU text on the live desktop. First CPU-draw a dark backing strip so the opaque WHITE
+            // glyphs are readable on the light wallpaper and stable over any window; then GPU-draw the
+            // text ON TOP of it (also proving GPU text composites over CPU-drawn content). Sync afterward
+            // so the render completes before the swap BLT reads the backbuffer. On failure nothing but
+            // the strip shows — the desktop is otherwise unaffected.
+            if let Some(font) = &gpu_font {
+                let text = "NYX GPU TEXT";
+                let bx = 272usize;
+                let by = 2usize;
+                let bw = text.len() * font.advance(2) + 16;
+                let bh = font.line_height(2) + 8;
+                canvas.fill_rect(bx, by, bw, bh, 0xFF_1A1A1A);
+                let glyphs = font.layout_str((bx + 8) as i32, (by + 4) as i32, text, 2, Color::WHITE);
+                let drew = sys_gpu_draw_text(font.atlas_gva, font.atlas_w, font.atlas_h, font.atlas_pitch, &glyphs);
+                if drew { sys_gpu_sync(); }
+            }
 
             // Software cursor only when the GPU hardware cursor plane isn't driving the pointer.
             if !state.hw_cursor {
@@ -613,7 +760,7 @@ pub extern "C" fn _start() -> ! {
 
             state.prev_mx = state.mx;
             state.prev_my = state.my;
-            state.dirty_min_x = screen_stride; state.dirty_min_y = screen_h; 
+            state.dirty_min_x = screen_stride; state.dirty_min_y = screen_h;
             state.dirty_max_x = 0; state.dirty_max_y = 0;
             state.needs_redraw = false;
         }

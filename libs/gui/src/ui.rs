@@ -151,7 +151,8 @@ pub fn draw_window_rounded(buffer: &mut [u32], stride: usize, screen_h: usize, w
     canvas.print_str(win.x + 46, win.y + 12, "+", icon_color, 1);
     
     let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
-    canvas.print_str(win.x + (win.w / 2) - ((title_str.len() * 8) / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
+    let tw = crate::canvas::Canvas::text_width(title_str, 1);
+    canvas.print_str(win.x + (win.w / 2).saturating_sub(tw / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
 }
 
 /// U4 GPU-compositor chrome: draw ONLY the title bar + border frame, NOT the content-area fill (the
@@ -208,6 +209,130 @@ pub fn round_window_corners(buffer: &mut [u32], stride: usize, screen_h: usize, 
     round_rect_corners(&mut canvas, win.x, win.y, win.w + 1, total_h + 1, radius, Color::WARM_BG, border);
 }
 
+/// Newton-Raphson sqrt (2 iters off a bit-twiddle seed). No libm in this crate; adequate for the
+/// shadow's soft-edge falloff.
+fn fsqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    let i = x.to_bits();
+    let i = 0x5f37_5a86u32.wrapping_sub(i >> 1);
+    let mut y = f32::from_bits(i);
+    y = y * (1.5 - 0.5 * x * y * y);
+    y = y * (1.5 - 0.5 * x * y * y);
+    x * y
+}
+
+/// Draw a soft rounded DROP SHADOW for a window onto `buffer`. Called by the compositor AFTER window
+/// content is composited: the shadow lands on the wallpaper and on any window BELOW this one, but
+/// `above` (on-screen rects of windows stacked higher) is skipped so a higher window is never darkened
+/// by a lower window's shadow. The casting window's own rect is skipped too (its content covers it).
+/// Rounded outline offset down a few px, feathered by a rounded-rect signed-distance field; only the
+/// visible MARGIN band is blended (interior jumped past). Pure alpha `fill_rect`, no GPU.
+pub fn draw_window_shadow(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, above: &[(i32, i32, i32, i32)]) {
+    let mut canvas = Canvas::new(buffer, stride, screen_h);
+    let total_h = if win.is_minimized { 30 } else { win.h + 30 } as i32;
+    let rw = win.w as i32;
+    if rw <= 0 || total_h <= 0 { return; }
+
+    let blur: i32 = 9;      // feather width (px) — softer/tighter
+    let off_y: i32 = 4;     // shadow drop below the window
+    let max_a: f32 = 42.0;  // peak shadow alpha (0..255) — toned down from 90
+    let radius: f32 = 12.0; // match the window corner radius
+
+    // Shadow rounded-rect = window rect shifted down by off_y. SDF uses center + half-extents.
+    let rx = win.x as i32;
+    let ry = win.y as i32 + off_y;
+    let rh = total_h;
+    let cx = rx as f32 + rw as f32 * 0.5;
+    let cy = ry as f32 + rh as f32 * 0.5;
+    let hx = rw as f32 * 0.5;
+    let hy = rh as f32 * 0.5;
+    let r = radius.min(hx).min(hy);
+
+    // The window's own opaque rect (its content will cover these pixels — skip them).
+    let wx0 = win.x as i32;
+    let wy0 = win.y as i32;
+    let wx1 = wx0 + rw;
+    let wy1 = wy0 + total_h;
+
+    let y0 = (ry - blur).max(0);
+    let y1 = (ry + rh + blur).min(screen_h as i32);
+    let x0 = (rx - blur).max(0);
+    let x1 = (rx + rw + blur).min(stride as i32);
+
+    let mut py = y0;
+    while py < y1 {
+        let mut px = x0;
+        while px < x1 {
+            // Skip the span the window covers on this row (jump straight past it).
+            if px >= wx0 && px < wx1 && py >= wy0 && py < wy1 {
+                px = wx1;
+                continue;
+            }
+            // Skip pixels covered by any window stacked ABOVE this one — a higher window must never be
+            // darkened by a lower window's shadow (this is the correct painter order the pre-pass lacked).
+            let mut occluded = false;
+            for &(ox0, oy0, ox1, oy1) in above {
+                if px >= ox0 && px < ox1 && py >= oy0 && py < oy1 { occluded = true; break; }
+            }
+            if occluded { px += 1; continue; }
+            // Rounded-rect signed distance (negative inside, positive outside).
+            let qx = (px as f32 - cx).abs() - (hx - r);
+            let qy = (py as f32 - cy).abs() - (hy - r);
+            let mx = qx.max(0.0);
+            let my = qy.max(0.0);
+            let d = fsqrt(mx * mx + my * my) + qx.max(qy).min(0.0) - r;
+            let a = if d <= 0.0 {
+                max_a
+            } else if d < blur as f32 {
+                max_a * (1.0 - d / blur as f32)
+            } else {
+                px += 1;
+                continue;
+            };
+            let ai = a as u32;
+            if ai > 0 {
+                canvas.fill_rect(px as usize, py as usize, 1, 1, ai << 24); // black, alpha=ai
+            }
+            px += 1;
+        }
+        py += 1;
+    }
+}
+
+/// Fixed pixel width of a window scrollbar.
+pub const SCROLLBAR_W: usize = 12;
+/// Minimum thumb height so a tiny thumb stays grabbable.
+const SCROLLBAR_MIN_THUMB: usize = 24;
+
+/// Compute a vertical scrollbar thumb's `(offset_within_track, height)` in px, for a `track_h` track
+/// showing `viewport` of `content` px scrolled to `scroll_off`. Shared by the draw and hit-test paths
+/// so the visual thumb and the grabbable region always match. If not scrollable, returns the full track.
+pub fn scrollbar_thumb(track_h: usize, content: usize, viewport: usize, scroll_off: usize) -> (usize, usize) {
+    if content <= viewport || track_h == 0 { return (0, track_h); }
+    let min_thumb = SCROLLBAR_MIN_THUMB.min(track_h);
+    let mut thumb_h = viewport * track_h / content;
+    if thumb_h < min_thumb { thumb_h = min_thumb; }
+    if thumb_h > track_h { thumb_h = track_h; }
+    let max_scroll = content - viewport;
+    let off = scroll_off.min(max_scroll);
+    let thumb_y = if max_scroll == 0 { 0 } else { (track_h - thumb_h) * off / max_scroll };
+    (thumb_y, thumb_h)
+}
+
+/// Draw a vertical scrollbar (track + rounded thumb) at `(x, y)`, `w × track_h`, reflecting
+/// content/viewport/scroll. No-op when not scrollable (`content <= viewport`). Palette colors.
+pub fn draw_scrollbar(canvas: &mut Canvas, x: usize, y: usize, w: usize, track_h: usize, content: usize, viewport: usize, scroll_off: usize) {
+    if content <= viewport || w == 0 || track_h == 0 { return; }
+    // Subtle track.
+    canvas.fill_rect(x, y, w, track_h, Color::WARM_BORDER);
+    let (ty, th) = scrollbar_thumb(track_h, content, viewport, scroll_off);
+    // Thumb inset 2px on each side; darker than the track.
+    let inset = 2;
+    if w > 2 * inset && th > 2 * inset {
+        canvas.fill_rect(x + inset, y + ty + inset, w - 2 * inset, th - 2 * inset, Color::TEXT_MUTED);
+    }
+}
+
 pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window) {
     let mut canvas = Canvas::new(buffer, stride, screen_h);
     let surface = apply_opacity(Color::WARM_SURFACE, win.opacity);
@@ -234,7 +359,8 @@ pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, wi
     canvas.print_str(win.x + 46, win.y + 12, "+", icon_color, 1);
 
     let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
-    canvas.print_str(win.x + (win.w / 2) - ((title_str.len() * 8) / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
+    let tw = crate::canvas::Canvas::text_width(title_str, 1);
+    canvas.print_str(win.x + (win.w / 2).saturating_sub(tw / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
