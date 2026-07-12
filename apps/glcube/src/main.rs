@@ -207,6 +207,99 @@ fn build_texture() -> [u32; (TEX_W * TEX_H) as usize] {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Loader screen. glcube is nyx-api-only (no nyx-gui / no font engine), so we embed a tiny 5x7
+// bitmap font covering ONLY the glyphs in the startup message and CPU-paint the window's SHM
+// buffer directly. Shown while the GL context spins up (context alloc + mesh upload + first
+// frame), so the window reads "INITIALIZING 3D ENGINE …" instead of flashing blank until the
+// first GPU frame overwrites it.
+// ---------------------------------------------------------------------------------------------
+
+/// 5x7 glyph (7 rows, low 5 bits each, bit4 = leftmost column). Only the characters used by the
+/// loader message are encoded; everything else (incl. space) is blank.
+fn glyph(c: u8) -> [u8; 7] {
+    match c {
+        b'I' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F],
+        b'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        b'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+        b'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E],
+        b'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
+        b'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        b'3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+        _ => [0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+#[inline]
+unsafe fn put_px(px: *mut u32, w: u32, h: u32, x: i32, y: i32, c: u32) {
+    if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+        *px.add((y as u32 * w + x as u32) as usize) = c;
+    }
+}
+
+/// Fill an axis-aligned rect (clipped) with a solid colour.
+unsafe fn fill_rect(px: *mut u32, w: u32, h: u32, x0: i32, y0: i32, rw: i32, rh: i32, c: u32) {
+    let mut dy = 0;
+    while dy < rh {
+        let mut dx = 0;
+        while dx < rw {
+            put_px(px, w, h, x0 + dx, y0 + dy, c);
+            dx += 1;
+        }
+        dy += 1;
+    }
+}
+
+/// Draw an ASCII string in the 5x7 font, `scale`x, left-aligned at (x0,y0).
+unsafe fn draw_text(px: *mut u32, w: u32, h: u32, s: &[u8], x0: i32, y0: i32, scale: i32, color: u32) {
+    let mut cx = x0;
+    for &ch in s {
+        let g = glyph(ch);
+        let mut row = 0i32;
+        while row < 7 {
+            let bits = g[row as usize];
+            let mut col = 0i32;
+            while col < 5 {
+                if (bits >> (4 - col) as u32) & 1 == 1 {
+                    fill_rect(px, w, h, cx + col * scale, y0 + row * scale, scale, scale, color);
+                }
+                col += 1;
+            }
+            row += 1;
+        }
+        cx += 6 * scale; // 5 columns + 1 blank spacing
+    }
+}
+
+/// Paint the whole loader frame into the window SHM buffer. `phase` animates the trailing dots.
+unsafe fn draw_loader(px: *mut u32, w: u32, h: u32, phase: u32) {
+    // Dark slate background.
+    fill_rect(px, w, h, 0, 0, w as i32, h as i32, 0xFF14181C);
+
+    let msg: &[u8] = b"INITIALIZING 3D ENGINE";
+    let scale = 3i32;
+    let text_w = msg.len() as i32 * 6 * scale - scale; // drop the trailing inter-glyph gap
+    let x0 = (w as i32 - text_w) / 2;
+    let y0 = h as i32 / 2 - 40;
+    draw_text(px, w, h, msg, x0, y0, scale, 0xFFE8E8E8);
+
+    // Three dots below the message; (phase % 4) of them light up in the accent colour.
+    let lit = (phase % 4) as i32;
+    let dot = 12i32;
+    let gap = 24i32;
+    let base_x = w as i32 / 2 - (gap + dot / 2);
+    let dy = y0 + 44;
+    let mut i = 0i32;
+    while i < 3 {
+        let c = if i < lit { 0xFFE67E22 } else { 0xFF33383E };
+        fill_rect(px, w, h, base_x + i * gap, dy, dot, dot, c);
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 
 const COMPOSITOR_PID: u64 = 4;
 const WIN_W: u32 = 640;
@@ -215,8 +308,6 @@ const WIN_H: u32 = 480;
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
-    sys_print("[GLCUBE] Phase 9 validation: textured cube in a compositor WINDOW via mini-GL\n");
-
     // ── Create a normal compositor window (same protocol as libs/gui app::run, but we drive GL
     //    instead of a CPU canvas). The GL path renders into THIS window's SHM buffer; the compositor
     //    composites it — glcube no longer blits the whole scanout, so it can't fight the desktop. ──
@@ -260,7 +351,12 @@ pub extern "C" fn _start() -> ! {
         }
     }
     let pixels_ptr = unsafe { base_ptr.add(hdr_size) } as *mut u32;
-    sys_print("[GLCUBE] window created\n");
+
+    // ── Show the loader immediately: paint "INITIALIZING 3D ENGINE" into the window buffer and ask
+    //    the compositor to composite it, so the window never flashes blank while the GL context spins
+    //    up (context alloc + mesh upload + first GPU frame). Pure CPU paint into our own SHM. ──
+    unsafe { draw_loader(pixels_ptr, WIN_W, WIN_H, 0); }
+    sys_ipc_send(COMPOSITOR_PID, MSG_FLUSH_WINDOW, 0, 0);
 
     // ── Init GL to render into THIS window's pixel buffer, then upload the cube + checkerboard. ──
     if !sys_gl_init(WIN_W, WIN_H, pixels_ptr as *const u32) {
@@ -273,7 +369,6 @@ pub extern "C" fn _start() -> ! {
         sys_print("[GLCUBE] FATAL: sys_gl_upload_mesh failed\n");
         sys_exit(2);
     }
-    sys_print("[GLCUBE] mesh uploaded, entering render loop\n");
 
     let aspect = WIN_W as f32 / WIN_H as f32;
     let proj = perspective(PI / 4.0, aspect, 0.1, 100.0);
@@ -284,12 +379,16 @@ pub extern "C" fn _start() -> ! {
     //    is always visible; a GPU failure just leaves a stale/black WINDOW, never a black machine. ──
     let mut angle: f32 = 0.0;
     let mut fails: u32 = 0;
+    // Until the FIRST successful GPU frame lands, keep animating the loader (dots cycle) so the user
+    // sees progress rather than a frozen screen — the first good `sys_gl_render` overwrites it with
+    // the cube.
+    let mut engine_up = false;
+    let mut spin: u32 = 0;
     loop {
         // Drain compositor events (non-blocking). Close = tear down GL + exit cleanly.
         while sys_ipc_recv(&mut msg, false) {
             if msg.msg_type == MSG_WINDOW_CLOSE {
                 sys_gl_reset();
-                sys_print("[GLCUBE] window closed — exiting\n");
                 sys_exit(0);
             }
             // MSG_MOUSE_EVENT / MSG_KEY_EVENT / MSG_WINDOW_RESIZED ignored for this validation app.
@@ -303,15 +402,30 @@ pub extern "C" fn _start() -> ! {
 
         if sys_gl_render(&mvps) {
             fails = 0;
+            if !engine_up {
+                engine_up = true;
+            }
             // Frame is now in our SHM window buffer — ask the compositor to composite it.
             sys_ipc_send(COMPOSITOR_PID, MSG_FLUSH_WINDOW, 0, 0);
+        } else if !engine_up {
+            // Still coming up (context warm-up / first-frame RC6 wake): keep the ANIMATED loader on
+            // screen instead of flashing blank or bailing early. Patient window (~5s) before giving up.
+            fails += 1;
+            spin += 1;
+            unsafe { draw_loader(pixels_ptr, WIN_W, WIN_H, spin / 8); }
+            sys_ipc_send(COMPOSITOR_PID, MSG_FLUSH_WINDOW, 0, 0);
+            if fails >= 300 {
+                sys_print("[GLCUBE] engine never rendered a frame (300 tries) — exiting\n");
+                sys_gl_reset();
+                sys_exit(3);
+            }
         } else {
-            // A window can't brick the desktop, but don't hot-spin a persistently failing render.
+            // Was rendering fine, now failing — don't hot-spin a persistently failing render.
             fails += 1;
             sys_print("[GLCUBE] render call returned false (see sysmon [SCENE] HUNG/FAULT_VA)\n");
             if fails >= 3 {
-                // Bail FAST (was 30) so a GPU fault/hang doesn't freeze userspace for a minute: 3
-                // failed frames give us the [SCENE] HUNG FAULT_VA lines, then we exit to the desktop.
+                // Bail FAST so a GPU fault/hang doesn't freeze userspace: 3 failed frames give us the
+                // [SCENE] HUNG FAULT_VA lines, then we exit to the desktop.
                 sys_print("[GLCUBE] giving up after 3 render failures — exiting (read sysmon FAULT_VA)\n");
                 sys_gl_reset();
                 sys_exit(3);

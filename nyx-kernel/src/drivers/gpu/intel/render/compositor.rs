@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 
 use super::engine::Scene;
 use super::math::{Mat4, Vec3};
-use super::{state, RENDER_ENGINE};
+use super::{RENDER_ENGINE};
 
 /// One window to composite, matching the userspace `WindowQuad` (repr(C), 9 x u32/i32 = 36 bytes).
 #[repr(C)]
@@ -92,7 +92,7 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
     let sig: Vec<(u32, u32, u32)> = quads.iter().map(|q| (q.tex_gva, q.src_w, q.src_h)).collect();
     if ctx.scene.is_none() || ctx.sig != sig {
         let mut scene = match unsafe {
-            eng.create_scene(0x1400_0000, sw, sh, pitch, state::TILEMODE_LINEAR)
+            eng.create_compositor_scene(0x1400_0000, sw, sh, pitch)
         } {
             Ok(s) => s,
             Err(_) => return false,
@@ -111,7 +111,8 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
         }
         ctx.scene = Some(scene);
         ctx.sig = sig;
-        crate::serial_println!("[COMPOSIT] scene rebuilt: {} windows", quads.len());
+        // (Silenced: this fired on every window layout change — drag/resize/open/close — and spammed
+        //  the serial log during normal UI use. Re-enable locally when debugging scene rebuilds.)
     }
 
     // Per-frame ortho MVPs from the destination rects (pixel space, top-left origin).

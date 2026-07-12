@@ -1192,23 +1192,63 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         },
 
-        502 => { // sys_swap_buffers
+        502 => { // sys_swap_buffers — present backbuffer -> owned scanout buffer (P1a), plane armed once.
              unsafe {
                  if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
                      if let Some(p) = &crate::gui::SCREEN_PAINTER {
                          let w = p.info.width as u32;
                          let h = p.info.height as u32;
                          let pitch = (p.info.stride * 4) as u32;
-                         
+                         // BLT the backbuffer into our owned scanout buffer (active_gva == scanout_gva when
+                         // P1a init succeeded, else the firmware-luck GVA 0). Same fast path as before —
+                         // NO per-frame wait_for_idle or flip (those stalled on the fence timeout).
                          let _ = gpu.copy_rect(
-                             0, 0, pitch, 0x1400_0000,   // Source: Backbuffer GVA
-                             0, 0, pitch, gpu.active_gva, // Dest: The Stolen EFI GVA!
+                             0, 0, pitch, 0x1400_0000,
+                             0, 0, pitch, gpu.active_gva,
                              w, h
                          );
                          gpu.submit_fence();
+                         gpu.arm_scanout_plane(); // point the plane at scanout_gva once (no-op after first)
                      }
                  }
              }
+        },
+
+        538 => { // sys_swap_buffers_rect(x, y, w, h) — D1 region present.
+            // Identical to 502 (backbuffer 0x1400_0000 -> active_gva at the full screen pitch) except it
+            // BLTs only the damage sub-rect. Because src_x==dst_x==x, src_y==dst_y==y and the pitch is the
+            // full screen stride for BOTH surfaces, the rect lands at the exact same scanout pixels 502
+            // would have written — so it inherits whatever makes the full present visible (no new address
+            // assumptions). The compositor uses this instead of 502 when only a partial region changed.
+            let x = arg1 as u32;
+            let y = arg2 as u32;
+            let w = arg3 as u32;
+            let h = arg4 as u32;
+            unsafe {
+                if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
+                    if let Some(p) = &crate::gui::SCREEN_PAINTER {
+                        let sw = p.info.width as u32;
+                        let sh = p.info.height as u32;
+                        let pitch = (p.info.stride * 4) as u32;
+                        // Clamp the rect to the screen so a stale/oversized damage box can never blit
+                        // out of bounds (the copy_rect BLT has no internal clip).
+                        if w > 0 && h > 0 && x < sw && y < sh {
+                            let cw = w.min(sw - x);
+                            let ch = h.min(sh - y);
+                            // D1 region present into the owned scanout buffer (active_gva == scanout_gva
+                            // after P1a init). Single buffer, so a partial BLT is valid — the untouched
+                            // pixels retain the previous frame. Arm the plane once (no-op after first).
+                            let _ = gpu.copy_rect(
+                                x, y, pitch, 0x1400_0000,
+                                x, y, pitch, gpu.active_gva,
+                                cw, ch
+                            );
+                            gpu.submit_fence();
+                            gpu.arm_scanout_plane();
+                        }
+                    }
+                }
+            }
         },
 
         503 => { // sys_gpu_sync
@@ -1437,13 +1477,14 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 0;
             }
         }
-        513 => { // sys_wait_vsync
+        513 => { // sys_wait_vsync — returns 1 if the vblank was observed, 0 on timeout / no GPU.
+            let mut seen = 0u64;
             unsafe {
                 if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
-                    gpu.wait_for_vsync();
+                    seen = if gpu.wait_for_vsync() { 1 } else { 0 };
                 }
             }
-            frame.rax = 0;
+            frame.rax = seen;
         },
 
         // ---------------------------------------------------------------------
@@ -1699,6 +1740,19 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if let Some(id) = crate::memory::create_shm_block(size) {
                 frame.rax = id;
             } else { frame.rax = 0; }
+        },
+
+        539 => { // SYS_DESTROY_SHM(id, base_vaddr) — R1: owner frees a resized-away buffer.
+            let id = arg1;
+            let base_vaddr = arg2;
+            frame.rax = if crate::memory::destroy_shm_block(id, base_vaddr) { 1 } else { 0 };
+        },
+
+        540 => { // SYS_UNMAP_SHM(base_vaddr, size) — R1: release caller's mapping only (no frame free).
+            let base_vaddr = arg1;
+            let size = arg2 as usize;
+            crate::memory::unmap_shm_range(base_vaddr, size);
+            frame.rax = 1;
         },
 
         531 => { // SYS_MAP_SHM

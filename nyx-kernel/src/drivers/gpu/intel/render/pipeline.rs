@@ -321,10 +321,8 @@ impl RenderEngine {
         // The batch-buffer path is unreliable on this HW (test 2a: MI_STORE-in-batch
         // silently fails), but the ring is proven solid (Phase 1). The pipeline is
         // ~240 dwords, well within the 1024-dword ring.
-        crate::serial_println!("[TRI] submitting {} dwords to RCS ring", cs.len());
-        // GPU X-ray: decode the stream on-device into readable lines so the whole
-        // pipeline can be captured in a single photo of the screen (no OCR of raw hex).
-        super::decode::decode_and_print(cs.as_slice());
+        // (Silenced: the "[TRI] submitting …" log + on-device decode_and_print stream dump. Re-enable
+        //  locally when bringing the triangle path back up.)
         self.fence_virt.write_volatile(0);
         self.flush_line(self.fence_virt as usize);
         self.rcs_submit(cs.as_slice())?;
@@ -672,7 +670,6 @@ impl RenderEngine {
         if verbose {
             crate::serial_println!("[DRAW] submitting {} dwords ({} verts, {} indices)",
                 cs.len(), g.verts.len(), idx_count);
-            super::decode::decode_and_print(cs.as_slice());
         }
         self.fence_virt.write_volatile(0);
         self.flush_line(self.fence_virt as usize);
@@ -853,10 +850,8 @@ impl RenderEngine {
         samplers[4..8].copy_from_slice(&state::sampler_state_linear_clamp());
         let samp_gva = dyn_buf.write(&samplers, 32)?;
         let sampler_off = samp_gva - dyn_buf.gva;
-        crate::serial_println!(
-            "[SCENE] created: surf_base={:#x} dyn_base={:#x} sampler_off={:#x} (idx0 nearest, idx1 linear)",
-            surf_buf.gva, dyn_buf.gva, sampler_off
-        );
+        // (Silenced: "[SCENE] created …" fired on every scene create — glcube finalize + compositor
+        //  rebuild. Re-enable locally when debugging surface/dynamic base + sampler layout.)
         Ok(Scene {
             surf_buf,
             dyn_buf,
@@ -870,6 +865,7 @@ impl RenderEngine {
             ps_off,
             ps_opacity_off,
             ps_rounded_off,
+            ps_text_off: 0, // main scene never draws glyph runs
             mask_surf_off: 0, // set by Scene::upload_corner_mask (compositor rounded corners)
             meshes: alloc::vec::Vec::new(),
             resolve: None,
@@ -891,8 +887,8 @@ impl RenderEngine {
     ) -> Result<super::engine::Scene, RenderError> {
         use super::engine::Scene;
         use super::{GVA_TEXT_DYNAMIC, GVA_TEXT_SURFACE, GVA_TEXT_VERTEX, GVA_TEXT_TEX};
-        let (vs_off, ps_off, ps_opacity_off, ps_rounded_off) = match &self.kernels {
-            Some(k) => (k.vs_off, k.ps_off, k.ps_opacity_off, k.ps_rounded_off),
+        let (vs_off, ps_off, ps_opacity_off, ps_rounded_off, ps_text_off) = match &self.kernels {
+            Some(k) => (k.vs_off, k.ps_off, k.ps_opacity_off, k.ps_rounded_off, k.ps_text_off),
             None => return Err(RenderError::NotInitialized),
         };
         let mmio = self.mmio_base;
@@ -907,10 +903,8 @@ impl RenderEngine {
         samplers[4..8].copy_from_slice(&state::sampler_state_linear_clamp());
         let samp_gva = dyn_buf.write(&samplers, 32)?;
         let sampler_off = samp_gva - dyn_buf.gva;
-        crate::serial_println!(
-            "[TEXT] scene created: surf_base={:#x} dyn_base={:#x} vbo_base={:#x}",
-            surf_buf.gva, dyn_buf.gva, vbo_buf.gva
-        );
+        // (Silenced: "[TEXT] scene created …" — the text scene is (re)built whenever the chrome-text
+        //  cache is invalidated. Re-enable locally when debugging the GPU-text state buffers.)
         Ok(Scene {
             surf_buf,
             dyn_buf,
@@ -924,7 +918,60 @@ impl RenderEngine {
             ps_off,
             ps_opacity_off,
             ps_rounded_off,
+            ps_text_off,
             mask_surf_off: 0,
+            meshes: alloc::vec::Vec::new(),
+            resolve: None,
+        })
+    }
+
+    /// Desktop-compositor window-composite scene, on its OWN state GVAs (GVA_COMP_*) so it never
+    /// clobbers the mini-GL (glcube) context's cached state at the shared 0x19–0x1D slots. Same shape
+    /// as `create_scene` (shared shaders, LINEAR RT = the backbuffer, nearest+linear samplers, tex_buf
+    /// sized for the rounded-corner mask), but every StateBuffer lives at a GVA_COMP_* address. Fixes
+    /// the "glcube alone shows a white window" bug: previously the compositor's create_scene remapped
+    /// the GGTT PTEs at GVA_SURFACE_STATE/etc. to its own frames, so glcube's next frame rendered
+    /// against the compositor's surface state → blank RT. See [[nyx-gpu-architecture]].
+    pub unsafe fn create_compositor_scene(
+        &mut self,
+        rt_gva: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+    ) -> Result<super::engine::Scene, RenderError> {
+        use super::engine::Scene;
+        use super::{GVA_COMP_DYNAMIC, GVA_COMP_SURFACE, GVA_COMP_VERTEX, GVA_COMP_TEX};
+        let (vs_off, ps_off, ps_opacity_off, ps_rounded_off) = match &self.kernels {
+            Some(k) => (k.vs_off, k.ps_off, k.ps_opacity_off, k.ps_rounded_off),
+            None => return Err(RenderError::NotInitialized),
+        };
+        let mmio = self.mmio_base;
+        let mut surf_buf = StateBuffer::new(mmio, GVA_COMP_SURFACE, 1)?;
+        let mut dyn_buf = StateBuffer::new(mmio, GVA_COMP_DYNAMIC, 1)?;
+        let vbo_buf = StateBuffer::new(mmio, GVA_COMP_VERTEX, 2)?;
+        let tex_buf = StateBuffer::new(mmio, GVA_COMP_TEX, 20)?;
+        // RT is LINEAR (the shared backbuffer 0x1400_0000); windows blend over the wallpaper there.
+        let rs = state::setup_render_state(&mut surf_buf, &mut dyn_buf, rt_gva, width, height, pitch, state::TILEMODE_LINEAR)?;
+        let mut samplers = [0u32; 8];
+        samplers[0..4].copy_from_slice(&state::sampler_state_nearest_clamp());
+        samplers[4..8].copy_from_slice(&state::sampler_state_linear_clamp());
+        let samp_gva = dyn_buf.write(&samplers, 32)?;
+        let sampler_off = samp_gva - dyn_buf.gva;
+        Ok(Scene {
+            surf_buf,
+            dyn_buf,
+            vbo_buf,
+            tex_buf,
+            rs,
+            sampler_off,
+            resolve_sampler_off: 0,
+            resolve_sf_clip_off: 0,
+            vs_off,
+            ps_off,
+            ps_opacity_off,
+            ps_rounded_off,
+            ps_text_off: 0, // the composite scene never draws glyph runs
+            mask_surf_off: 0, // set by Scene::upload_corner_mask if rounded corners are enabled
             meshes: alloc::vec::Vec::new(),
             resolve: None,
         })
@@ -1197,7 +1244,6 @@ impl RenderEngine {
 
         if verbose {
             crate::serial_println!("[SCENE] submitting {} dwords, {} draws", cs.len(), count);
-            super::decode::decode_and_print(cs.as_slice());
         }
         self.fence_virt.write_volatile(0);
         self.flush_line(self.fence_virt as usize);

@@ -48,6 +48,11 @@ pub const MSG_WINDOW_UPDATE_SHM: u64 = 8;
 /// Compositor → app: the user moved this window's scrollbar. `data1` = the new top scroll offset (px).
 /// The app clamps it, updates its scroll state, re-renders, and flushes.
 pub const MSG_SCROLL: u64 = 9;
+/// R1: Compositor → app. The compositor has finished switching to the app's RESIZED buffer and has
+/// released (unmapped) its own mapping of the OLD buffer, whose SHM id is in `data1`. On receipt the
+/// old buffer is single-owner (only the app still maps it), so the app may safely `sys_destroy_shm` it.
+/// This ACK is what makes the resize re-allocation loop reclaim memory instead of leaking every drag.
+pub const MSG_SHM_RELEASED: u64 = 10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +177,15 @@ pub fn sys_gpu_sync() {
 
 pub fn sys_swap_buffers() {
     syscall(502, 0, 0, 0, 0, 0, 0);
+}
+
+/// D1 region present: BLT only the damage sub-rect (x,y,w,h in screen px) from the backbuffer to
+/// scanout, instead of the whole screen. Lands at the exact same scanout pixels `sys_swap_buffers`
+/// would write for that rect (same source/dest/pitch), so it's a drop-in partial present. The kernel
+/// clamps the rect to the screen. Use when only a bounded region changed; fall back to
+/// `sys_swap_buffers` for a full-screen frame.
+pub fn sys_swap_buffers_rect(x: usize, y: usize, w: usize, h: usize) {
+    syscall(538, x as u64, y as u64, w as u64, h as u64, 0, 0);
 }
 
 pub fn sys_gpu_fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
@@ -414,8 +428,11 @@ pub fn sys_get_active_cores() -> usize {
     syscall(522, 0, 0, 0, 0, 0, 0) as usize
 }
 
-pub fn sys_wait_vsync() {
-    syscall(513, 0, 0, 0, 0, 0, 0);
+/// Block until the display's next vertical blank (pipe A). Returns true if the vblank was observed,
+/// false on timeout (pipe off / bounded spin elapsed) so the caller can present unpaced rather than
+/// stall. Call right before `sys_swap_buffers` to start the scanout BLT inside the blanking interval.
+pub fn sys_wait_vsync() -> bool {
+    syscall(513, 0, 0, 0, 0, 0, 0) != 0
 }
 
 pub fn sys_get_mouse() -> (usize, usize, bool, bool) {
@@ -484,6 +501,21 @@ pub fn sys_create_shm(size_bytes: usize) -> u64 {
 
 pub fn sys_map_shm(shm_id: u64) -> u64 {
     syscall(531, shm_id, 0, 0, 0, 0, 0)
+}
+
+/// R1: tear down the CALLER's mapping of an SHM region (pages covering `size` bytes at `base_vaddr`)
+/// WITHOUT freeing the physical frames. The compositor calls this on its OLD window mapping after it has
+/// switched to the resized buffer, so it no longer references the old frames when the owner frees them.
+pub fn sys_unmap_shm(base_vaddr: u64, size: usize) {
+    syscall(540, base_vaddr, size as u64, 0, 0, 0, 0);
+}
+
+/// R1: destroy an SHM block created with `sys_create_shm` — unmap the CALLER's mapping at `base_vaddr`,
+/// return every physical frame to the kernel allocator, and remove it from the registry. Only the owner
+/// (the app that created it) should call this, and only once the block is single-owner (after the
+/// compositor's `MSG_SHM_RELEASED` ACK). Returns true on success.
+pub fn sys_destroy_shm(shm_id: u64, base_vaddr: u64) -> bool {
+    syscall(539, shm_id, base_vaddr, 0, 0, 0, 0) == 1
 }
 
 pub fn sys_ipc_send(target_pid: u64, msg_type: u64, data1: u64, data2: u64) -> bool {

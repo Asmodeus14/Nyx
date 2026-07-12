@@ -24,10 +24,13 @@ const FORCEWAKE_BLT: u32 = 0xA188;
 const FORCEWAKE_ACK_BLT: u32 = 0x130044;
 const PIPEA_STAT: u32 = 0x70024;
 
-// --- Display Plane Surface Registers (Gen9+) ---
-const PLANE_SURF_1_A: u32 = 0x701C4;
-const PLANE_SURF_1_B: u32 = 0x711C4;
-const PLANE_SURF_1_C: u32 = 0x721C4;
+// --- Display Plane Surface Registers (Gen9/SKL) ---
+// PLANE_SURF (surface base, write-arms-flip) is at pipe_base+0x19C, NOT 0x1C4. The old 0x1C4 values
+// were wrong (a different plane register) — they were never exercised (get_active_framebuffer_gva has
+// no callers, test_screen_blit never ran), so the error went unnoticed until the P1 page-flip.
+const PLANE_SURF_1_A: u32 = 0x7019C;
+const PLANE_SURF_1_B: u32 = 0x7119C;
+const PLANE_SURF_1_C: u32 = 0x7219C;
 
 const VGA_CONTROL: u32 = 0x41000;
 const VGA_DISP_DISABLE: u32 = 1 << 31;
@@ -60,6 +63,13 @@ pub struct IntelGpuDriver {
     pub fence_virt: *mut u32,
     pub next_fence_val: u32,
     pub current_fence_target: u32,
+    // P1a page-flip (stable config): ONE owned LINEAR scanout buffer (GVA 0x1600_0000). The present BLTs
+    // the backbuffer into it and we point the display plane at it ONCE — replacing the firmware-luck GVA-0
+    // alias with a surface we own. (True double-buffered tear-free flip deferred: per-frame flip+sync hit
+    // a fence-wait stall; see project_page-flip.)
+    pub scanout_gva: u32,          // GVA of our owned scanout buffer (0 => fall back to GVA-0)
+    pub active_surf_reg: u32,      // MMIO offset of the ENABLED plane's SURF register (pipe+0x19C)
+    pub plane_armed: bool,         // have we pointed the plane at scanout_gva yet? (arm once)
 }
 
 unsafe impl Send for IntelGpuDriver {}
@@ -88,7 +98,8 @@ impl IntelGpuDriver {
             stolen_memory_base: 0, stolen_memory_size: 0,
             backbuffer_phys: 0, backbuffer_size: 0,
             fence_phys: 0, fence_virt: core::ptr::null_mut(),
-            next_fence_val: 0, current_fence_target: 0
+            next_fence_val: 0, current_fence_target: 0,
+            scanout_gva: 0, active_surf_reg: 0, plane_armed: false,
         }
     }
 
@@ -127,16 +138,43 @@ impl IntelGpuDriver {
         if surf_a != 0 { return surf_a; }
         if surf_b != 0 { return surf_b; }
         if surf_c != 0 { return surf_c; }
-        0 
+        0
     }
 
-    pub unsafe fn wait_for_vsync(&self) {
+    /// P1a: find the MMIO offset of the ENABLED display plane's SURF register by scanning pipes A/B/C
+    /// planes 1-3 for the CTL enable bit (31) — the primary plane is not guaranteed to be pipe A / plane
+    /// 1. Returns 0 if none is enabled (then we leave the present on its existing GVA-0 path). Register
+    /// layout matches the driver's own get_active_framebuffer_gva / test_screen_blit: CTL=pipe+0x180,
+    /// SURF=pipe+0x1C4, +0x100 per plane index.
+    pub unsafe fn find_enabled_plane_surf_reg(&self) -> u32 {
+        let pipes = [0x70000u32, 0x71000, 0x72000];
+        for &pipe in &pipes {
+            for plane in 1u32..=3 {
+                let ctl = self.read_reg(pipe + 0x180 + (plane - 1) * 0x100);
+                if (ctl & (1 << 31)) != 0 {
+                    // PLANE_SURF (surface base; writing it arms the flip at vblank) is at pipe+0x19C on
+                    // Gen9/SKL — NOT 0x1C4 (a long-standing bug in this driver's PLANE_SURF_* consts).
+                    // Corroborated by i915 _PLANE_SURF_1_A=0x7019c, the legacy DSPASURF alias, and this
+                    // driver's own correct STRIDE(0x188)/SIZE(0x190) offsets placing SURF next at 0x19C.
+                    return pipe + 0x19C + (plane - 1) * 0x100;
+                }
+            }
+        }
+        0
+    }
+
+
+    /// Wait for the pipe-A vertical blank. Write-clears the VBLANK status bit, then polls until it
+    /// re-latches (bounded spin). Returns true if the vblank was observed, false on timeout (e.g. the
+    /// pipe is off or the register moved) so the caller can fall back to plain present without stalling.
+    pub unsafe fn wait_for_vsync(&self) -> bool {
         self.write_reg(PIPEA_STAT, 1 << 1);
         let mut timeout = 0;
         while (self.read_reg(PIPEA_STAT) & (1 << 1)) == 0 && timeout < 150_000 {
             core::hint::spin_loop();
             timeout += 1;
         }
+        timeout < 150_000
     }
 
     pub unsafe fn fill_rect(&mut self, dest_gpu_addr: u32, x: u32, y: u32, w: u32, h: u32, color: u32, pitch: u32) -> Result<(), GpuHangError> {
@@ -353,7 +391,44 @@ impl IntelGpuDriver {
                 self.map_ggtt_page(0x1500_0000 / 4096, f_phys, true);
                 crate::serial_println!("[INTEL GPU] Allocated hardware fence page at Phys {:#x} (mapped to GVA 0x15000000)", f_phys);
             }
+
+            // 5. P1a page-flip: allocate ONE LINEAR scanout buffer (same size/stride as the backbuffer)
+            // mapped to GGTT 0x1600_0000, and locate the enabled display plane. The present is redirected
+            // into this owned buffer (active_gva) and the plane is pointed at it once — replacing the
+            // firmware-luck "present to GVA 0". Enabled only if the plane scan AND the allocation succeed;
+            // otherwise scanout_gva stays 0 and the present falls back to the working GVA-0 path.
+            let surf_reg = self.find_enabled_plane_surf_reg();
+            if surf_reg != 0 {
+                if let Some(fb) = crate::memory::allocate_contiguous(pages_needed as usize, 4096, true) {
+                    let phys = fb.start_address().as_u64();
+                    if let Some(v) = crate::memory::phys_to_virt(phys) {
+                        core::ptr::write_bytes(v as *mut u8, 0, (pages_needed * 4096) as usize);
+                    }
+                    for i in 0..pages_needed {
+                        self.map_ggtt_page((0x1600_0000 / 4096) + i as u32, phys + (i * 4096), true);
+                    }
+                    self.scanout_gva = 0x1600_0000;
+                    self.active_gva = 0x1600_0000; // present targets our owned buffer
+                    self.active_surf_reg = surf_reg;
+                    crate::serial_println!("[INTEL GPU] P1a owned scanout: GVA 0x16000000; plane SURF reg {:#x}", surf_reg);
+                } else {
+                    crate::serial_println!("[INTEL GPU] P1a: scanout buffer alloc FAILED; staying on GVA-0 present path");
+                }
+            } else {
+                crate::serial_println!("[INTEL GPU] P1a: no enabled display plane found; staying on GVA-0 present path");
+            }
         }
+    }
+
+    /// P1a: point the enabled display plane at our owned scanout buffer, ONCE, after the first present
+    /// has filled it (so we never flip to a black/garbage surface, and the firmware GOP framebuffer keeps
+    /// scanning out until the compositor is producing frames). PLANE_SURF self-arms the flip at the next
+    /// vblank. Called from the present path each frame but no-ops after the first (plane_armed).
+    pub unsafe fn arm_scanout_plane(&mut self) {
+        if self.plane_armed || self.scanout_gva == 0 || self.active_surf_reg == 0 { return; }
+        self.write_reg(self.active_surf_reg, self.scanout_gva);
+        self.plane_armed = true;
+        crate::serial_println!("[INTEL GPU] P1a: display plane armed -> GVA {:#x}", self.scanout_gva);
     }
 
     pub fn test_blitter(&mut self) {

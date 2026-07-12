@@ -180,10 +180,6 @@ pub fn gl_init(width: u32, height: u32, dst_cpu: u64) -> Result<(), RenderError>
     ctx.staged.clear();
     ctx.scene = None;
 
-    crate::serial_println!(
-        "[GL] init WINDOW {}x{} SSAA {}x -> RT {}x{} gva={:#x} winbb_gva={:#x} dst_cpu={:#x}",
-        width, height, SS, ss_w, ss_h, rt_tiled_gva, bb_gva, dst_cpu
-    );
     Ok(())
 }
 
@@ -224,10 +220,6 @@ pub fn gl_upload_mesh(
 
     let handle = ctx.staged.len();
     ctx.staged.push(StagedMesh { mesh, texture });
-    crate::serial_println!(
-        "[GL] upload_mesh handle={} verts={} idx={} tex={}x{}",
-        handle, verts.len(), indices.len(), tex_w, tex_h
-    );
     Ok(handle)
 }
 
@@ -281,7 +273,6 @@ pub fn gl_render(mvps: &[Mat4]) -> Result<(), RenderError> {
         };
         drop(eng);
         ctx.scene = Some(scene);
-        crate::serial_println!("[GL] scene finalized: {} meshes", ctx.staged.len());
     }
 
     let mesh_count = ctx.staged.len();
@@ -307,7 +298,10 @@ pub fn gl_render(mvps: &[Mat4]) -> Result<(), RenderError> {
     // diagnosed from the sysmon boot-log without a serial cable: CL_prims==0 => geometry/transform,
     // CL_prims>0 & PS_inv==0 => cull/winding, PS_inv>0 but black => present/scanout contention.
     let frame = ctx.frame;
-    let verbose = frame < 3;
+    // Per-frame pipeline diagnostics ([DS]/[SCENE] submitting+STATS/[DR]/[GL] frame …) are OFF now
+    // that the GL path is proven. Flip to `frame < 3` to bring back the first-few-frames X-ray when
+    // diagnosing a black/garbled cube on new hardware.
+    let verbose = false;
     ctx.frame = frame.wrapping_add(1);
 
     let scene = ctx.scene.as_mut().unwrap();
@@ -409,5 +403,4 @@ pub fn gl_reset() {
     ctx.scene = None;
     ctx.staged.clear();
     ctx.initialized = false;
-    crate::serial_println!("[GL] context reset");
 }

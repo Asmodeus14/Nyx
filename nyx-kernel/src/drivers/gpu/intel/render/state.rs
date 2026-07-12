@@ -352,10 +352,7 @@ pub unsafe fn setup_render_state(
         sf_clip_viewport_off: sfv_gva - dyn_buf.gva,
     };
 
-    crate::serial_println!(
-        "[STATE] surf_base={:#x} rt_surf_off={:#x} bt_off={:#x} | dyn_base={:#x} blend={:#x} cc={:#x} ccv={:#x} sfv={:#x}",
-        rs.surface_state_base, rs.rt_surface_off, rs.binding_table_off,
-        rs.dynamic_state_base, rs.blend_off, rs.cc_off, rs.cc_viewport_off, rs.sf_clip_viewport_off
-    );
+    // (Silenced: this fired on every render-state setup — glcube finalize + every compositor scene
+    //  rebuild. Re-enable locally when debugging surface/dynamic-state base offsets.)
     Ok(rs)
 }

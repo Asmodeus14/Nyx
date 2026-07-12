@@ -1,15 +1,15 @@
 // libs/gui/src/gpu_text.rs
 //
-// Phase U5: userspace font-atlas builder + text layout for GPU text (syscall 537). The kernel has no
-// font (noto lives here in libs/gui), so we rasterize the printable ASCII glyphs ONCE into a packed
-// B8G8R8A8 atlas, map that atlas to a GVA (like a window surface), and then every frame hand the kernel
-// a list of `GlyphQuad`s (destination pixel rect + the glyph's atlas UV sub-rect). The kernel draws them
-// as one textured-quad mesh sampling the atlas, blended over the backbuffer.
+// U5 GPU text atlas builder + layout. Userspace rasterizes the printable ASCII glyphs ONCE (via the F1
+// TTF font engine) into a packed B8G8R8A8 atlas, maps it to a GVA (like a window surface), then each
+// frame hands the kernel a list of `GlyphQuad`s (dst pixel rect + the glyph's atlas UV sub-rect + colour).
+// The kernel draws them as one textured-quad mesh sampling the atlas, blended over the backbuffer.
 //
-// Coverage/white text (this boot): each atlas texel is WHITE (R=G=B=255) with the glyph's antialiasing
-// COVERAGE in the alpha byte. With the render engine's src-over blend (dst = a*src + (1-a)*dst) that
-// yields crisp white antialiased text over whatever is behind it — through the existing textured PS, no
-// new shader. (Colored text is a later boot: a PS that tints a per-quad color by the sampled coverage.)
+// T2: the atlas is now PROPORTIONAL (per-glyph cell sized to the glyph, packed into a shelf layout) and
+// stores REAL antialiasing COVERAGE in the alpha channel (RGB = white). The kernel's TEXT pixel shader
+// (`build_ps_text`) samples that coverage and tints it to a per-quad LUMINANCE (derived from GlyphQuad
+// .color), so src-over blend draws smooth grayscale text in the requested colour. `layout_str` places
+// each glyph by its own advance/bearing (no monospace cell) and emits a tight dst rect + UV sub-rect.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -24,46 +24,85 @@ const ATLAS_GVA: u32 = 0x6400_0000;
 const FIRST: u8 = 0x20; // space
 const LAST: u8 = 0x7E;  // '~'
 const N_GLYPHS: usize = (LAST - FIRST + 1) as usize; // 95
-const COLS: usize = 16; // atlas grid columns; rows = ceil(N_GLYPHS / COLS)
 
-/// A prepared GPU font: the mapped atlas + the metrics needed to place glyphs and to compute each
-/// glyph's atlas UV sub-rect. Build once with `GpuFont::prepare()`, reuse every frame via `layout_str`.
+/// Per-glyph metrics + atlas placement (proportional). `ax,ay,gw,gh` locate the glyph's coverage
+/// bitmap inside the atlas; `bearing_x/_y` and `advance` position it against the pen at layout time.
+#[derive(Clone, Copy, Default)]
+struct GlyphMeta {
+    ax: u32,
+    ay: u32,
+    gw: u32,
+    gh: u32,
+    bearing_x: i32,
+    bearing_y: i32,
+    advance: u32,
+}
+
+/// A prepared GPU font: the mapped atlas + a per-glyph metrics table. Build once with
+/// `GpuFont::prepare()`, reuse every frame via `layout_str`.
 pub struct GpuFont {
     pub atlas_gva: u32,
     pub atlas_w: u32,
     pub atlas_h: u32,
     pub atlas_pitch: u32,
-    cell_w: usize,
-    cell_h: usize,
-    atlas_cpu: *const u32, // CPU view of the atlas SHM (for the debug blit / inspection)
+    ascent: i32,
+    line_h: usize,
+    space_adv: usize,
+    glyphs: [GlyphMeta; N_GLYPHS],
+    atlas_cpu: *const u32, // CPU view of the atlas SHM (inspection)
     ready: bool,
 }
 
 impl GpuFont {
-    /// Build the atlas and map it. Returns None if a reference glyph can't be rasterized or the SHM
-    /// can't be created/mapped (caller then keeps using CPU `print_str`).
+    /// Build the proportional coverage atlas and map it. Returns None if the SHM can't be
+    /// created/mapped (caller then keeps using CPU `print_str`).
     pub fn prepare() -> Option<GpuFont> {
-        // F1: atlas is now sourced from the proportional TTF engine, but still packed into a MONOSPACE
-        // grid (uniform cell) for this boot — the GPU banner is a T1 proof; a true per-glyph proportional
-        // atlas (per-glyph UV/advance) is the T2 GPU-chrome-text boot. Cell height = the font line
-        // height; cell width = the WIDEST printable-glyph advance (keeps columns aligned). Baseline sits
-        // at `ascent` rows down inside each cell; glyphs are placed at their bearing.
         let px = crate::font::px_for(1);
-        let cell_h = crate::font::line_height(1).max(1);
+        let line_h = crate::font::line_height(1).max(1);
         let ascent = crate::font::ascent(1) as i32;
-        let mut cell_w = 1usize;
+        let space_adv = crate::font::advance(' ', 1).max(1);
+
+        // First pass: gather each glyph's bitmap size + metrics, and shelf-pack them into rows of the
+        // atlas. Shelf packing: lay glyphs left-to-right; when a row overflows `atlas_w`, drop to the
+        // next shelf. 1px gutter between glyphs so bilinear-ish sampling of one cell never bleeds a
+        // neighbour. Atlas width is fixed generously; height grows by shelves.
+        const ATLAS_W: usize = 512; // 512*4 = 2048B pitch (64B-aligned) — ample for 95 small glyphs
+        const GUT: usize = 1;
+
+        // Measure all glyphs and compute placement (without touching pixels yet).
+        let mut metas = [GlyphMeta::default(); N_GLYPHS];
+        let mut sizes: [(usize, usize, i32, i32, usize); N_GLYPHS] = [(0, 0, 0, 0, 0); N_GLYPHS];
         for i in 0..N_GLYPHS {
             let c = (FIRST + i as u8) as char;
-            let a = crate::font::advance(c, 1);
-            if a > cell_w { cell_w = a; }
+            crate::font::with_glyph(c, px, |g| {
+                sizes[i] = (g.w, g.h, g.bearing_x, g.bearing_y, g.advance);
+            });
         }
-        let rows = (N_GLYPHS + COLS - 1) / COLS;
 
-        // LINEAR sampled surface needs a 64-byte-aligned row pitch => atlas width (px) must be a
-        // multiple of 16 (16 px * 4 B = 64 B). Pad the grid width up.
-        let grid_w = COLS * cell_w;
-        let atlas_w = (grid_w + 15) & !15;
-        let atlas_h = rows * cell_h;
+        let mut cx = GUT;
+        let mut cy = GUT;
+        let mut shelf_h = 0usize;
+        for i in 0..N_GLYPHS {
+            let (gw, gh, bx, by, adv) = sizes[i];
+            if gw == 0 || gh == 0 {
+                // whitespace / no outline: advance-only glyph, no atlas cell.
+                metas[i] = GlyphMeta { ax: 0, ay: 0, gw: 0, gh: 0, bearing_x: bx, bearing_y: by, advance: adv as u32 };
+                continue;
+            }
+            if cx + gw + GUT > ATLAS_W {
+                cx = GUT;
+                cy += shelf_h + GUT;
+                shelf_h = 0;
+            }
+            metas[i] = GlyphMeta {
+                ax: cx as u32, ay: cy as u32, gw: gw as u32, gh: gh as u32,
+                bearing_x: bx, bearing_y: by, advance: adv as u32,
+            };
+            cx += gw + GUT;
+            if gh > shelf_h { shelf_h = gh; }
+        }
+        let atlas_w = ATLAS_W;
+        let atlas_h = cy + shelf_h + GUT;
         let atlas_pitch = atlas_w * 4;
         let bytes = atlas_pitch * atlas_h;
 
@@ -72,37 +111,31 @@ impl GpuFont {
         let vaddr = sys_map_shm(shm_id);
         if vaddr == 0 { return None; }
 
-        // Zero the atlas (fully transparent), then stamp each glyph as OPAQUE WHITE where covered. We
-        // THRESHOLD the antialiasing coverage (cov > 50) to a hard on/off so glyph pixels are fully
-        // opaque (alpha 255). This is essential for the PLAIN textured PS: it RT-writes the SAMPLED alpha
-        // and the src-over blender uses it, so a coverage-in-alpha glyph is semi-transparent and takes on
-        // the background colour. Opaque glyphs are solid white on ANY background. (T2's colored PS will
-        // instead consume real coverage from alpha and multiply a per-quad colour.)
+        // Second pass: stamp each glyph's REAL coverage into the alpha channel, RGB = white. The kernel
+        // text PS reads this coverage as the output alpha and tints RGB to the per-quad luminance.
         let pixels = unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u32, atlas_w * atlas_h) };
-        for p in pixels.iter_mut() { *p = 0x0000_0000; } // fully transparent
+        for p in pixels.iter_mut() { *p = 0x0000_0000; } // transparent
 
         for i in 0..N_GLYPHS {
+            let m = metas[i];
+            if m.gw == 0 { continue; }
             let c = (FIRST + i as u8) as char;
-            let ox = (i % COLS) * cell_w;
-            let oy = (i / COLS) * cell_h;
             crate::font::with_glyph(c, px, |g| {
                 for row in 0..g.h {
-                    let py_cell = ascent - g.bearing_y + row as i32;
-                    if py_cell < 0 || py_cell as usize >= cell_h { continue; }
+                    let ay = m.ay as usize + row;
+                    if ay >= atlas_h { break; }
                     for col in 0..g.w {
-                        let px_cell = g.bearing_x + col as i32;
-                        if px_cell < 0 || px_cell as usize >= cell_w { continue; }
-                        if g.cov[row * g.w + col] > 50 {
-                            let ax = ox + px_cell as usize;
-                            let ay = oy + py_cell as usize;
-                            pixels[ay * atlas_w + ax] = 0xFFFF_FFFF; // opaque white
-                        }
+                        let cov = g.cov[row * g.w + col];
+                        if cov == 0 { continue; }
+                        let ax = m.ax as usize + col;
+                        if ax >= atlas_w { continue; }
+                        // A8 coverage in the top byte, white RGB.
+                        pixels[ay * atlas_w + ax] = ((cov as u32) << 24) | 0x00FF_FFFF;
                     }
                 }
             });
         }
 
-        // Map the atlas SHM into the GPU's GGTT at ATLAS_GVA so the kernel can bind it as a texture.
         sys_gpu_map_shm(shm_id, ATLAS_GVA);
 
         Some(GpuFont {
@@ -110,80 +143,78 @@ impl GpuFont {
             atlas_w: atlas_w as u32,
             atlas_h: atlas_h as u32,
             atlas_pitch: atlas_pitch as u32,
-            cell_w,
-            cell_h,
+            ascent,
+            line_h,
+            space_adv,
+            glyphs: metas,
             atlas_cpu: vaddr as *const u32,
             ready: true,
         })
     }
 
     pub fn is_ready(&self) -> bool { self.ready }
-    pub fn cell_w(&self) -> usize { self.cell_w }
-    pub fn cell_h(&self) -> usize { self.cell_h }
+    pub fn line_height(&self, scale: usize) -> usize { self.line_h * scale }
 
-    /// DIAGNOSTIC: CPU-blit the RAW atlas to `canvas` at (x, y), `scale`×, so we can visually inspect
-    /// the atlas contents independently of the GPU sample path. Each atlas texel is drawn opaque:
-    /// non-zero (a glyph pixel) → white, zero (empty) → dark grey, so the glyph grid is visible. If this
-    /// shows a clean grid of readable glyphs but the GPU-drawn text is garbage, the bug is in GPU
-    /// sampling/UVs/mapping — not the atlas. If THIS is also garbled, the atlas builder is the culprit.
-    pub fn debug_blit(&self, canvas: &mut crate::canvas::Canvas, x: usize, y: usize, scale: usize) {
-        let aw = self.atlas_w as usize;
-        let ah = self.atlas_h as usize;
-        let src = unsafe { core::slice::from_raw_parts(self.atlas_cpu, aw * ah) };
-        let cw = canvas.width;
-        let ch = canvas.height;
-        for ay in 0..ah {
-            for ax in 0..aw {
-                let col = if src[ay * aw + ax] != 0 { 0xFF_FFFFFFu32 } else { 0xFF_303030u32 };
-                for sy in 0..scale {
-                    let py = y + ay * scale + sy;
-                    if py >= ch { continue; }
-                    let base = py * cw;
-                    for sx in 0..scale {
-                        let px = x + ax * scale + sx;
-                        if px < cw { canvas.buffer[base + px] = col; }
-                    }
-                }
-            }
+    /// Pixel width of `text` at `scale` (sum of per-glyph advances; widest line for multi-line).
+    pub fn text_width(&self, text: &str, scale: usize) -> usize {
+        let mut w = 0usize;
+        let mut max = 0usize;
+        for ch in text.chars() {
+            if ch == '\n' { if w > max { max = w; } w = 0; continue; }
+            w += self.advance_of(ch) * scale;
         }
+        if w > max { max = w; }
+        max
     }
 
-    /// Advance width (px) of one glyph at `scale`. Cells are drawn at their natural size; advancing by
-    /// the same keeps the run clean (no overlap).
-    pub fn advance(&self, scale: usize) -> usize { self.cell_w * scale }
-    pub fn line_height(&self, scale: usize) -> usize { self.cell_h * scale }
+    /// Advance (px, scale 1) of char `ch` — from the metrics table, falling back to the space advance.
+    fn advance_of(&self, ch: char) -> usize {
+        let b = ch as u32;
+        if b < FIRST as u32 || b > LAST as u32 { return self.space_adv; }
+        let a = self.glyphs[(b as u8 - FIRST) as usize].advance as usize;
+        if a == 0 { self.space_adv } else { a }
+    }
 
-    /// Lay out `text` at pixel (x, y), `scale`× the atlas cell, producing one GlyphQuad per visible
-    /// glyph (whitespace is skipped — it only advances the pen). `color` is stored for the future
-    /// colored-text path; the coverage/white path ignores it. Handles '\n'.
+    /// Lay out `text` at pixel (x, y=line TOP), `scale`×, producing one GlyphQuad per VISIBLE glyph.
+    /// Each glyph is placed at its bearing relative to the baseline (`y + ascent`), with a tight dst
+    /// rect and its atlas UV sub-rect. `color` (0xAARRGGBB) is carried per glyph; the kernel text PS
+    /// tints coverage to that colour's luminance. Whitespace only advances the pen. Handles '\n'.
     pub fn layout_str(&self, x: i32, y: i32, text: &str, scale: usize, color: u32) -> Vec<GlyphQuad> {
         let mut out: Vec<GlyphQuad> = Vec::new();
-        let adv = (self.cell_w * scale) as i32;
-        let lh = (self.cell_h * scale) as i32;
-        let dst_w = (self.cell_w * scale) as u32;
-        let dst_h = (self.cell_h * scale) as u32;
+        let s = scale as i32;
         let aw = self.atlas_w as f32;
         let ah = self.atlas_h as f32;
-
+        let baseline = y + self.ascent * s;
         let mut cx = x;
-        let mut cy = y;
+        let mut cy_baseline = baseline;
         for ch in text.chars() {
-            if ch == '\n' { cx = x; cy += lh; continue; }
+            if ch == '\n' {
+                cx = x;
+                cy_baseline += (self.line_h * scale) as i32;
+                continue;
+            }
+            let adv = (self.advance_of(ch) * scale) as i32;
             let b = ch as u32;
-            if b < FIRST as u32 || b > LAST as u32 { cx += adv; continue; }
-            if ch == ' ' { cx += adv; continue; }
-            let i = (b as u8 - FIRST) as usize;
-            let ox = (i % COLS) * self.cell_w;
-            let oy = (i / COLS) * self.cell_h;
+            if ch == ' ' || b < FIRST as u32 || b > LAST as u32 {
+                cx += adv;
+                continue;
+            }
+            let m = self.glyphs[(b as u8 - FIRST) as usize];
+            if m.gw == 0 {
+                cx += adv;
+                continue;
+            }
+            let dx = cx + m.bearing_x * s;
+            let dy = cy_baseline - m.bearing_y * s;
             out.push(GlyphQuad {
-                dst_x: cx,
-                dst_y: cy,
-                dst_w,
-                dst_h,
-                u0: ox as f32 / aw,
-                v0: oy as f32 / ah,
-                u1: (ox + self.cell_w) as f32 / aw,
-                v1: (oy + self.cell_h) as f32 / ah,
+                dst_x: dx,
+                dst_y: dy,
+                dst_w: m.gw * scale as u32,
+                dst_h: m.gh * scale as u32,
+                u0: m.ax as f32 / aw,
+                v0: m.ay as f32 / ah,
+                u1: (m.ax + m.gw) as f32 / aw,
+                v1: (m.ay + m.gh) as f32 / ah,
                 color,
             });
             cx += adv;

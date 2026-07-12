@@ -111,6 +111,20 @@ pub const GVA_TEXT_TEX: u32 = 0x6300_0000;     // unused upload region (atlas is
 /// surface by the text pass — same "bind an existing GVA, no upload" trick window quads use.
 pub const GVA_TEXT_ATLAS: u32 = 0x6400_0000;
 
+/// U4/glcube coexistence fix: the DESKTOP COMPOSITOR's window-composite scene needs its OWN state
+/// buffers, for the SAME reason the text scene does. `StateBuffer::new` remaps the GGTT PTEs at its GVA
+/// to FRESH frames on every call, so if the compositor's `create_scene` reused the shared 0x19–0x1D
+/// slots it would clobber the mini-GL (glcube) context's cached surface/vertex/texture state — glcube
+/// would then render its cube against the compositor's surface state and produce a BLANK window
+/// (symptom: glcube alone shows a white window; a second window "fixes" it only by accident of timing).
+/// Placed high, clear of the compositor-state slots (0x19–0x1D), SSAA RT (0x4000_0000), GL window
+/// backbuffer (0x5000_0000), HW cursor (0x5100_0000) and the text context (0x6000–0x6400). The composite
+/// renders into the shared backbuffer (0x1400_0000); only its dynamic/surface/vertex/tex state is separate.
+pub const GVA_COMP_DYNAMIC: u32 = 0x7000_0000; // blend/cc/viewport + sampler for the composite scene
+pub const GVA_COMP_SURFACE: u32 = 0x7100_0000; // RT + per-window surface state + binding tables
+pub const GVA_COMP_VERTEX: u32 = 0x7200_0000;  // per-window quad verts + indices
+pub const GVA_COMP_TEX: u32 = 0x7300_0000;     // corner-mask upload region (window pixels bound by GVA)
+
 /// The RCS ring is one 4 KiB page = 1024 dwords, matching the BLT ring.
 pub const RCS_RING_DWORDS: u32 = 1024;
 
@@ -615,9 +629,17 @@ pub fn init_render_engine(mmio_base: u64) -> bool {
         // column-major mat4 storage + trig approximations before they feed the pipeline.
         math::self_test();
 
+        // Phase 5/8b: the boot GPU demo (spinning cube + pyramid, ~300 frames + a 2s hold ≈ 5.6s of
+        // motion) proved the mesh/scene pipeline during bring-up. It's now DISABLED by default because
+        // it added multiple seconds to every boot; the engine bring-up above (ring self-test, PIPE_
+        // CONTROL fence, kernel encode) is the meaningful gate. glcube exercises the same path on demand
+        // from userspace (and does its own gl_init + TLB invalidate), so nothing depends on this running
+        // at boot. Flip to `true` to re-enable the on-boot demo.
+        const BOOT_GPU_DEMO: bool = false;
+
         // Phase 5: draw a triangle into the backbuffer (GVA 0x1400_0000) and verify via
         // CPU pixel readback. Only if the fence path (Phase 2b) and kernels are ready.
-        if pc_ok && eng.kernels.is_some() {
+        if BOOT_GPU_DEMO && pc_ok && eng.kernels.is_some() {
             let bb_phys = {
                 let g = crate::drivers::gpu::intel::INTEL_GPU.lock();
                 g.as_ref().map(|d| d.backbuffer_phys).unwrap_or(0)

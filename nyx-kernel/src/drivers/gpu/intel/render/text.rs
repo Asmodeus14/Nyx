@@ -75,12 +75,20 @@ fn build_run(glyphs: &[GlyphQuad]) -> (Vec<Vertex>, Vec<u32>) {
         let y0 = g.dst_y as f32;
         let x1 = (g.dst_x + g.dst_w as i32) as f32;
         let y1 = (g.dst_y + g.dst_h as i32) as f32;
+        // T2: per-quad LUMINANCE in varying.z (attr-0 ch2 @ g5.0) — the text PS tints the sampled
+        // coverage to this gray level. Rec.601 luma of the glyph's 0xAARRGGBB colour, normalized 0..1.
+        // (varying.w stays 1.0.) A luminance atlas + this transport = AA grayscale text with NO extra
+        // vertex attribute / VS / SBE change (reuses the opacity-PS plumbing).
+        let r = ((g.color >> 16) & 0xFF) as f32;
+        let gg = ((g.color >> 8) & 0xFF) as f32;
+        let b = (g.color & 0xFF) as f32;
+        let lum = (0.299 * r + 0.587 * gg + 0.114 * b) / 255.0;
         let base = verts.len() as u32;
         // top-left, top-right, bottom-right, bottom-left (UV follows position)
-        verts.push(Vertex::new(Vec3::new(x0, y0, 0.0), Vec4::new(g.u0, g.v0, 0.0, 1.0)));
-        verts.push(Vertex::new(Vec3::new(x1, y0, 0.0), Vec4::new(g.u1, g.v0, 0.0, 1.0)));
-        verts.push(Vertex::new(Vec3::new(x1, y1, 0.0), Vec4::new(g.u1, g.v1, 0.0, 1.0)));
-        verts.push(Vertex::new(Vec3::new(x0, y1, 0.0), Vec4::new(g.u0, g.v1, 0.0, 1.0)));
+        verts.push(Vertex::new(Vec3::new(x0, y0, 0.0), Vec4::new(g.u0, g.v0, lum, 1.0)));
+        verts.push(Vertex::new(Vec3::new(x1, y0, 0.0), Vec4::new(g.u1, g.v0, lum, 1.0)));
+        verts.push(Vertex::new(Vec3::new(x1, y1, 0.0), Vec4::new(g.u1, g.v1, lum, 1.0)));
+        verts.push(Vertex::new(Vec3::new(x0, y1, 0.0), Vec4::new(g.u0, g.v1, lum, 1.0)));
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     (verts, indices)
@@ -123,10 +131,7 @@ pub fn draw_text(atlas_gva: u32, atlas_w: u32, atlas_h: u32, atlas_pitch: u32, g
         ctx.scene = Some(scene);
         ctx.atlas_gva = atlas_gva;
         ctx.atlas_bt_off = bt;
-        crate::serial_println!(
-            "[TEXT] atlas bound: gva={:#x} {}x{} pitch={} bt_off={:#x}",
-            atlas_gva, atlas_w, atlas_h, atlas_pitch, bt
-        );
+        // (Silenced: one-time "[TEXT] atlas bound …". The compositor already logs "U5 text atlas ready".)
     }
 
     let bt_off = ctx.atlas_bt_off;

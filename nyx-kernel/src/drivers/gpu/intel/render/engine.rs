@@ -235,13 +235,6 @@ impl RenderEngine {
             // SAMPLER_STATE (NEAREST/CLAMP) into dynamic state; 32B-aligned per the SSP field.
             let samp_gva = dyn_buf.write(&state::sampler_state_nearest_clamp(), 32)?;
             sampler_off = samp_gva - dyn_buf.gva;
-            crate::serial_println!(
-                "[STATE] tex_gva={:#x} tex_surf_off={:#x} bt2_off={:#x} sampler_off={:#x}",
-                tex_gva,
-                tex_surf_off,
-                rs.binding_table_off,
-                sampler_off
-            );
             tex_buf_opt = Some(tex_buf);
         }
 
@@ -320,6 +313,9 @@ pub struct Scene {
     /// U4 Boot 3: PS kernel that also multiplies a corner-mask alpha in (rounded corners). Used by
     /// window quads when `mask_surf_off != 0`; 0 falls back to `ps_opacity_off`.
     pub(super) ps_rounded_off: u32,
+    /// U5 T2: TEXT PS (atlas coverage → per-quad luminance). The text scene's glyph mesh uses this;
+    /// 0 falls back to `ps_off` (plain textured).
+    pub(super) ps_text_off: u32,
     /// U4 Boot 3: surface-state offset of the uploaded corner alpha-mask (BTI 2 for window quads).
     /// 0 = no mask uploaded yet → window quads use the 2-entry / opacity-only path.
     pub(super) mask_surf_off: u32,
@@ -363,12 +359,6 @@ impl Scene {
         let vbo_dwords = mesh.vertices.len() * VERTEX_DWORDS;
         let (vbo_cpu, vbo_gva) = self.vbo_buf.alloc(vbo_dwords, 64)?;
         let idx_gva = self.vbo_buf.write(&mesh.indices, 64)?;
-
-        crate::serial_println!(
-            "[SCENE] mesh {}: tex_gva={:#x} tex_surf_off={:#x} bt_off={:#x} vbo_gva={:#x} idx_gva={:#x} ({} verts, {} idx)",
-            self.meshes.len(), tex_gva, tex_surf_off, binding_table_off, vbo_gva, idx_gva,
-            mesh.vertices.len(), mesh.indices.len()
-        );
 
         self.meshes.push(SceneMesh {
             verts: mesh.vertices.clone(),
@@ -432,11 +422,6 @@ impl Scene {
         let (vbo_cpu, vbo_gva) = self.vbo_buf.alloc(vbo_dwords, 64)?;
         let idx_gva = self.vbo_buf.write(&quad.indices, 64)?;
 
-        crate::serial_println!(
-            "[COMPOSIT] window quad {}: win_gva={:#x} {}x{} pitch={} surf_off={:#x} bt_off={:#x}",
-            self.meshes.len(), win_gva, win_w, win_h, win_pitch, win_surf_off, binding_table_off
-        );
-
         self.meshes.push(SceneMesh {
             verts: quad.vertices.clone(),
             vbo_cpu,
@@ -467,17 +452,8 @@ impl Scene {
             state::TILEMODE_LINEAR);
         let mask_surf_gva = self.surf_buf.write(&ms, 64)?;
         self.mask_surf_off = mask_surf_gva - self.surf_buf.gva;
-        // Diagnostic: sample the mask alpha at the very bottom-left corner texel vs. the center. A
-        // working mask reads corner_a≈0 and center_a=255. If corner_a is also 255 the CPU carve is
-        // wrong (→ the shape bug is here, not the shader); if corner_a≈0 but windows still render
-        // square, the shader's mask multiply is the culprit.
-        let n = mask.width as usize;
-        let corner_a = mask.texels[(n - 1) * n + 0] >> 24;        // bottom-left texel
-        let center_a = mask.texels[(n / 2) * n + (n / 2)] >> 24;  // center texel
-        crate::serial_println!(
-            "[COMPOSIT] corner mask uploaded: {}x{} tex_gva={:#x} mask_surf_off={:#x} (BL_alpha={} center_alpha={})",
-            mask.width, mask.height, tex_gva, self.mask_surf_off, corner_a, center_a
-        );
+        // (Corner mask uploaded. Diagnostic alpha-sample log removed; re-add locally when debugging
+        // the rounded-corner mask shape.)
         Ok(())
     }
 
@@ -547,7 +523,9 @@ impl Scene {
             idx_gva,
             idx_count,
             binding_table_off,
-            ps_off: self.ps_off,
+            // U5 T2: the TEXT PS (coverage → per-quad luminance). Falls back to the plain textured PS
+            // if the text kernel wasn't placed (then glyphs draw white/opaque, still legible).
+            ps_off: if self.ps_text_off != 0 { self.ps_text_off } else { self.ps_off },
         });
         Ok(())
     }
@@ -605,12 +583,6 @@ impl Scene {
         let vbo_dwords = quad.vertices.len() * VERTEX_DWORDS;
         let (vbo_cpu, vbo_gva) = self.vbo_buf.alloc(vbo_dwords, 64)?;
         let idx_gva = self.vbo_buf.write(&quad.indices, 64)?;
-
-        crate::serial_println!(
-            "[SCENE] resolve quad: bb_surf_off={:#x} scene_surf_off={:#x} bt_off={:#x} vbo_gva={:#x} rsamp_off={:#x} rsfv_off={:#x} scene={}x{} bb={}x{}",
-            bb_surf_off, scene_surf_off, binding_table_off, vbo_gva,
-            self.resolve_sampler_off, self.resolve_sf_clip_off, scene_w, scene_h, width, height
-        );
 
         self.resolve = Some(SceneMesh {
             verts: quad.vertices.clone(),

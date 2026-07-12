@@ -1,4 +1,5 @@
 use alloc::string::String;
+use alloc::vec::Vec;
 use nyx_api::*;
 use crate::canvas::Canvas;
 
@@ -64,32 +65,26 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
     // 🚨 FIX: Track if we have a pending memory swap waiting for paint
     let mut pending_shm_swap: Option<u64> = None;
 
+    // R1: buffers we've resized away from, awaiting the compositor's MSG_SHM_RELEASED before we free
+    // them. Each entry is (shm_id, mapping_base_vaddr). We must NOT free a buffer while the compositor
+    // still maps it (use-after-free of RAM it may reuse), so we hold it here until the ACK arrives.
+    let mut pending_retire: Vec<(u64, u64)> = Vec::new();
+
     loop {
         let mut event_redraw = false;
 
-        if sys_ipc_recv(&mut msg, false) {
+        // U6: DRAIN the whole IPC queue each tick, coalescing resizes. A fast resize drag emits
+        // MSG_WINDOW_RESIZED far faster than this 16 ms loop, so processing one message per tick made
+        // the app trail the drag (allocating+painting through a stale backlog). Instead we consume every
+        // queued message now and keep only the LATEST resize size, then reallocate ONCE below — the app
+        // jumps straight to the current drag size in a single repaint.
+        let mut pending_resize: Option<(usize, usize)> = None;
+        while sys_ipc_recv(&mut msg, false) {
             match msg.msg_type {
                 MSG_WINDOW_CLOSE => sys_exit(0),
                 MSG_WINDOW_RESIZED => {
-                    width = msg.data1 as usize;
-                    height = msg.data2 as usize;
-
-                    total_size = core::mem::size_of::<WindowHeader>() + (width * height * 4);
-                    let new_shm_id = sys_create_shm(total_size);
-                    
-                    buffer_ptr = sys_map_shm(new_shm_id) as *mut u8;
-                    header = unsafe { &mut *(buffer_ptr as *mut WindowHeader) };
-                    
-                    header.magic = WIN_MAGIC;
-                    header.width = width as u32;
-                    header.height = height as u32;
-                    
-                    pixels_ptr = unsafe { buffer_ptr.add(core::mem::size_of::<WindowHeader>()) } as *mut u32;
-                    
-                    // 🚨 FIX: Do NOT notify the Compositor yet!
-                    // Save the ID and force the engine to paint the new buffer first.
-                    pending_shm_swap = Some(new_shm_id);
-                    needs_redraw = true; 
+                    // Coalesce: remember the newest size; don't allocate per message.
+                    pending_resize = Some((msg.data1 as usize, msg.data2 as usize));
                 },
                 MSG_MOUSE_EVENT => {
                     event_redraw |= app.on_mouse(msg.data1 as usize, msg.data2 as usize, true);
@@ -103,8 +98,43 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
                     // Compositor moved our scrollbar → apply the new offset (data1) to scroll state.
                     event_redraw |= app.on_scroll(msg.data1 as usize);
                 },
+                MSG_SHM_RELEASED => {
+                    // R1: the compositor released its mapping of an old resized-away buffer (data1 =
+                    // its shm id). It's now single-owner, so destroy it — frees the physical RAM back
+                    // to the kernel instead of leaking one buffer per resize step.
+                    let rid = msg.data1;
+                    if let Some(pos) = pending_retire.iter().position(|&(id, _)| id == rid) {
+                        let (_, base) = pending_retire.swap_remove(pos);
+                        sys_destroy_shm(rid, base);
+                    }
+                },
                 _ => {}
             }
+        }
+
+        // Apply the coalesced resize ONCE (allocate the new SHM at the final drag size). We still defer
+        // notifying the compositor until AFTER the buffer is painted (below) so it never samples a
+        // half-painted surface.
+        if let Some((w, h)) = pending_resize {
+            // R1: remember the OUTGOING buffer (id + its mapping base) so we can destroy it once the
+            // compositor ACKs that it has released it. Capture BEFORE we overwrite buffer_ptr/shm_id.
+            let old_id = shm_id;
+            let old_base = buffer_ptr as u64;
+
+            width = w;
+            height = h;
+            total_size = core::mem::size_of::<WindowHeader>() + (width * height * 4);
+            let new_shm_id = sys_create_shm(total_size);
+            buffer_ptr = sys_map_shm(new_shm_id) as *mut u8;
+            header = unsafe { &mut *(buffer_ptr as *mut WindowHeader) };
+            header.magic = WIN_MAGIC;
+            header.width = width as u32;
+            header.height = height as u32;
+            pixels_ptr = unsafe { buffer_ptr.add(core::mem::size_of::<WindowHeader>()) } as *mut u32;
+            shm_id = new_shm_id;                        // this is now the live buffer
+            pending_shm_swap = Some(new_shm_id);
+            pending_retire.push((old_id, old_base));    // retire the old one on the compositor's ACK
+            needs_redraw = true;
         }
 
         let update_redraw = app.update();
@@ -121,8 +151,8 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
             header.scroll_off = app.scroll_offset() as u32;
 
             // 2. NOW safely tell the Compositor the buffer is ready
-            if let Some(shm_id) = pending_shm_swap {
-                sys_ipc_send(COMPOSITOR_PID, MSG_WINDOW_UPDATE_SHM, shm_id, 0);
+            if let Some(swap_id) = pending_shm_swap {
+                sys_ipc_send(COMPOSITOR_PID, MSG_WINDOW_UPDATE_SHM, swap_id, 0);
                 pending_shm_swap = None;
             } else {
                 // If it wasn't a resize event, just flush a normal frame update

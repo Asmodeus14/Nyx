@@ -553,3 +553,48 @@ pub fn map_shm_block(id: u64, target_vaddr: u64) -> Result<u64, &'static str> {
     }
     Ok(target_vaddr)
 }
+
+/// R1: tear down the CURRENT address space's mapping of `size` bytes starting at `base_vaddr`, WITHOUT
+/// freeing the physical frames (they are shared — the owner frees them separately via destroy_shm_block).
+/// The compositor calls this on its OLD window mapping after it has swapped to the resized buffer, so it
+/// no longer references the old frames before the app frees them (prevents use-after-free of reused RAM).
+pub fn unmap_shm_range(base_vaddr: u64, size: usize) {
+    let num_pages = (size + 0xFFF) / 0x1000;
+    let mut active_mapper = unsafe { active_mapper() };
+    for i in 0..num_pages {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(base_vaddr + (i as u64 * 4096)));
+        unsafe {
+            if let Ok((_frame, flush)) = active_mapper.unmap(page) { flush.flush(); }
+        }
+    }
+}
+
+/// R1: destroy an SHM block — unmap the CALLER's mapping at `base_vaddr`, return every physical frame to
+/// the allocator free-list (reused by the next allocate_frame), and remove the block from the registry.
+/// Call ONLY when the block is single-owner: all OTHER mappings (e.g. the compositor's CPU mapping and its
+/// GGTT mapping) must already be torn down/repointed, or those stale mappings would dangle onto RAM that
+/// gets handed to another allocation. The resize handshake guarantees this (compositor releases + ACKs
+/// first; the app destroys only on the ACK). Returns false if the id isn't in the registry.
+pub fn destroy_shm_block(id: u64, base_vaddr: u64) -> bool {
+    // Remove the block from the registry first (swap_remove: order doesn't matter).
+    let block = {
+        let mut reg = SHM_REGISTRY.lock();
+        match reg.iter().position(|b| b.id == id) {
+            Some(pos) => reg.swap_remove(pos),
+            None => return false,
+        }
+    };
+    // Drop the caller's virtual mapping of the block.
+    unmap_shm_range(base_vaddr, block.size);
+    // Return the physical frames to the allocator's free-list.
+    {
+        let mut sys_lock = MEMORY_MANAGER.lock();
+        if let Some(sys) = sys_lock.as_mut() {
+            for &phys in block.frames.iter() {
+                sys.frame_allocator.deallocate_frame(PhysFrame::containing_address(phys));
+            }
+        }
+    }
+    // R1: the resize buffer was reclaimed here (per-free serial log silenced now that it's verified).
+    true
+}

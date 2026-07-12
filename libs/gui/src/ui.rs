@@ -36,6 +36,12 @@ pub enum CursorType {
     Arrow,
     IBeam,
     Hand,
+    // U7: resize cursors, one per edge orientation. The HW cursor path renders real double-arrow
+    // bitmaps for these; the SW fallback draws the plain arrow.
+    ResizeH,     // ↔  left / right edge
+    ResizeV,     // ↕  top / bottom edge
+    ResizeNWSE,  // ⤡  top-left / bottom-right corner
+    ResizeNESW,  // ⤢  top-right / bottom-left corner
 }
 
 const ARROW_BITMAP: [[u8; 11]; 16] = [
@@ -119,8 +125,18 @@ pub fn draw_cursor(buffer: &mut [u32], stride: usize, screen_h: usize, mx: usize
             let offset_x = mx.saturating_sub(4);
             for (row_idx, row) in HAND_BITMAP.iter().enumerate() {
                 for (col_idx, &pixel) in row.iter().enumerate() {
-                    if pixel == 1 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::TEXT_DARK); } 
+                    if pixel == 1 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::TEXT_DARK); }
                     else if pixel == 2 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::WHITE); }
+                }
+            }
+        }
+        _ => {
+            // U7 resize cursors: software fallback draws the plain arrow (the HW cursor path shows the
+            // real double-arrow shapes). Keeps the SW fallback functional without extra bitmaps.
+            for (row_idx, row) in ARROW_BITMAP.iter().enumerate() {
+                for (col_idx, &pixel) in row.iter().enumerate() {
+                    if pixel == 1 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::TEXT_DARK); }
+                    else if pixel == 2 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::WHITE); }
                 }
             }
         }
@@ -167,7 +183,7 @@ pub fn draw_window_rounded(buffer: &mut [u32], stride: usize, screen_h: usize, w
 ///                       the curve, so the BORDER follows the rounding instead of staying square.
 ///   d <  radius-0.5  → INSIDE: leave the window content/fill untouched.
 /// Constant pixel `radius` regardless of window size.
-fn round_rect_corners(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usize, radius: usize, bg: u32, border: u32) {
+fn round_rect_corners(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usize, radius: usize, bg: u32, border: u32, above: &[(i32, i32, i32, i32)]) {
     if w < 2 * radius || h < 2 * radius { return; }
     let r = radius as f32;
     let outer = (r + 0.5) * (r + 0.5); // squared thresholds — avoids sqrt (no libm in this crate)
@@ -185,10 +201,19 @@ fn round_rect_corners(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usiz
             } else {
                 continue; // inside the arc — keep the window content
             };
-            canvas.fill_rect(x + dx, y + dy, 1, 1, c);                     // top-left
-            canvas.fill_rect(x + w - 1 - dx, y + dy, 1, 1, c);             // top-right
-            canvas.fill_rect(x + dx, y + h - 1 - dy, 1, 1, c);             // bottom-left
-            canvas.fill_rect(x + w - 1 - dx, y + h - 1 - dy, 1, 1, c);     // bottom-right
+            // Four corners; skip any pixel covered by a window ABOVE (else carving to wallpaper would
+            // punch a hole in an upper window at this window's corner).
+            let pts = [
+                (x + dx, y + dy),                     // top-left
+                (x + w - 1 - dx, y + dy),             // top-right
+                (x + dx, y + h - 1 - dy),             // bottom-left
+                (x + w - 1 - dx, y + h - 1 - dy),     // bottom-right
+            ];
+            for (px, py) in pts {
+                if !Canvas::point_occluded(px as i32, py as i32, above) {
+                    canvas.fill_rect(px, py, 1, 1, c);
+                }
+            }
         }
     }
 }
@@ -198,7 +223,7 @@ fn round_rect_corners(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usiz
 /// backbuffer (GPU composite or CPU fallback) and AFTER `draw_window_chrome`/`draw_window_rounded` drew
 /// the straight frame — so it carves the real corners to the wallpaper and draws the connecting arc
 /// border. Size-independent (unlike the window-proportional GPU-mask experiment).
-pub fn round_window_corners(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, radius: usize) {
+pub fn round_window_corners(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, radius: usize, above: &[(i32, i32, i32, i32)]) {
     let mut canvas = Canvas::new(buffer, stride, screen_h);
     let total_h = if win.is_minimized { 30 } else { win.h + 30 };
     let border = apply_opacity(Color::WARM_BORDER, win.opacity);
@@ -206,7 +231,7 @@ pub fn round_window_corners(buffer: &mut [u32], stride: usize, screen_h: usize, 
     // the BOTTOM border at row y+total_h — one past the x..x+w-1 / y..y+total_h-1 content box. So the
     // rounded rect must be w+1 × total_h+1 to include (and curve) those right/bottom border lines;
     // otherwise they stay straight with square corners.
-    round_rect_corners(&mut canvas, win.x, win.y, win.w + 1, total_h + 1, radius, Color::WARM_BG, border);
+    round_rect_corners(&mut canvas, win.x, win.y, win.w + 1, total_h + 1, radius, Color::WARM_BG, border, above);
 }
 
 /// Newton-Raphson sqrt (2 iters off a bit-twiddle seed). No libm in this crate; adequate for the
@@ -259,14 +284,35 @@ pub fn draw_window_shadow(buffer: &mut [u32], stride: usize, screen_h: usize, wi
     let x0 = (rx - blur).max(0);
     let x1 = (rx + rw + blur).min(stride as i32);
 
+    // Window's ROUNDED outline (same radius as round_window_corners). The shadow must hug THIS, not the
+    // square bounding box: skipping the full square box left the shadow's inner edge square (a 90° notch
+    // at each corner) while the window corners are carved round → the shadow read as a square. Undo the
+    // shadow's downward shift to recover the window center (the window itself is not shifted).
+    let wcx = cx;
+    let wcy = cy - off_y as f32;
+    let ri = r as i32;
+
     let mut py = y0;
     while py < y1 {
         let mut px = x0;
+        // A row in the window's straight (non-corner) vertical span covers the full window width inside
+        // the rounded outline — skip that whole span in one jump (the original perf win preserved).
+        let straight_row = py >= wy0 + ri && py < wy1 - ri;
         while px < x1 {
-            // Skip the span the window covers on this row (jump straight past it).
+            // Inside the window's bounding box: decide skip by the ROUNDED outline.
             if px >= wx0 && px < wx1 && py >= wy0 && py < wy1 {
-                px = wx1;
-                continue;
+                if straight_row {
+                    px = wx1; // whole interior row is under the window — jump past it
+                    continue;
+                }
+                // Corner band: skip only pixels actually inside the rounded window. A carved corner
+                // (outside the arc but inside the square box) falls through and receives shadow, so the
+                // shadow curves around the rounded corner instead of forming a square notch.
+                let wqx = (px as f32 - wcx).abs() - (hx - r);
+                let wqy = (py as f32 - wcy).abs() - (hy - r);
+                let dwin = fsqrt(wqx.max(0.0) * wqx.max(0.0) + wqy.max(0.0) * wqy.max(0.0))
+                    + wqx.max(wqy).min(0.0) - r;
+                if dwin <= 0.0 { px += 1; continue; }
             }
             // Skip pixels covered by any window stacked ABOVE this one — a higher window must never be
             // darkened by a lower window's shadow (this is the correct painter order the pre-pass lacked).
@@ -333,34 +379,62 @@ pub fn draw_scrollbar(canvas: &mut Canvas, x: usize, y: usize, w: usize, track_h
     }
 }
 
-pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window) {
+/// Draw a window's title bar + border frame. `above` = the screen rects `(x0,y0,x1,y1)` of every window
+/// stacked ON TOP of this one; all chrome is occluded by them so a lower window's title/border never
+/// bleeds over an upper window (the compositor draws chrome in one CPU pass after GPU-compositing all
+/// content, so without occlusion the passes fight — the "below-window outline" z-order artifact).
+/// U7 boot 3 (focus & hover polish): `is_active` marks the focused (topmost) window — inactive windows
+/// get a dimmed title-bar surface, muted title text, and greyed traffic-light buttons (classic focus
+/// cue). `hover_btn` = the title-bar button under the pointer (0=close, 1=min, 2=max; -1 = none) and
+/// draws a soft highlight plate behind that button. Both are pure CPU chrome (GPU-safe).
+pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, above: &[(i32, i32, i32, i32)], is_active: bool, hover_btn: i32) {
     let mut canvas = Canvas::new(buffer, stride, screen_h);
-    let surface = apply_opacity(Color::WARM_SURFACE, win.opacity);
+    // Inactive windows use a slightly greyed surface so the focused window reads as "on top".
+    let base_surface = if is_active { Color::WARM_SURFACE } else { 0xFF_F1F1EE };
+    let surface = apply_opacity(base_surface, win.opacity);
     let border = apply_opacity(Color::WARM_BORDER, win.opacity);
     let total_h = if win.is_minimized { 30 } else { win.h + 30 };
 
     // Title bar strip (top 30px) — solid surface fill; the content below is GPU-drawn.
-    canvas.fill_rect(win.x, win.y, win.w, 30, surface);
+    canvas.fill_rect_occluded(win.x, win.y, win.w, 30, surface, above);
     // Frame borders around the whole window.
-    canvas.fill_rect(win.x, win.y, win.w, 1, border);
-    canvas.fill_rect(win.x, win.y + total_h, win.w, 1, border);
-    canvas.fill_rect(win.x, win.y, 1, total_h, border);
-    canvas.fill_rect(win.x + win.w, win.y, 1, total_h + 1, border);
+    canvas.fill_rect_occluded(win.x, win.y, win.w, 1, border, above);
+    canvas.fill_rect_occluded(win.x, win.y + total_h, win.w, 1, border, above);
+    canvas.fill_rect_occluded(win.x, win.y, 1, total_h, border, above);
+    canvas.fill_rect_occluded(win.x + win.w, win.y, 1, total_h + 1, border, above);
     // Separator under the title bar.
-    canvas.fill_rect(win.x, win.y + 30, win.w, 1, border);
+    canvas.fill_rect_occluded(win.x, win.y + 30, win.w, 1, border, above);
 
-    // Header controls (close / min / max) — same layout as draw_window_rounded.
+    // Header controls (close / min / max) — same layout as draw_window_rounded. When the window isn't
+    // focused the traffic lights grey out; the hovered button gets a soft highlight plate behind it.
     let icon_color = apply_opacity(0x60_000000, win.opacity);
-    canvas.fill_rect(win.x + 12, win.y + 10, 12, 12, apply_opacity(0xFF_FF5F56, win.opacity));
-    canvas.print_str(win.x + 14, win.y + 12, "x", icon_color, 1);
-    canvas.fill_rect(win.x + 28, win.y + 10, 12, 12, apply_opacity(0xFF_FFBD2E, win.opacity));
-    canvas.print_str(win.x + 30, win.y + 11, "-", icon_color, 1);
-    canvas.fill_rect(win.x + 44, win.y + 10, 12, 12, apply_opacity(0xFF_28C940, win.opacity));
-    canvas.print_str(win.x + 46, win.y + 12, "+", icon_color, 1);
+    let (c_close, c_min, c_max) = if is_active {
+        (0xFF_FF5F56u32, 0xFF_FFBD2Eu32, 0xFF_28C940u32)
+    } else {
+        (0xFF_CFCFCAu32, 0xFF_CFCFCAu32, 0xFF_CFCFCAu32)
+    };
+    let hover_plate = apply_opacity(0xFF_FCE9D8, win.opacity); // soft accent plate under a hovered button
+    let btns = [(win.x + 12, c_close), (win.x + 28, c_min), (win.x + 44, c_max)];
+    for (bi, &(bxx, col)) in btns.iter().enumerate() {
+        if hover_btn == bi as i32 {
+            canvas.fill_rect_occluded(bxx - 2, win.y + 8, 16, 16, hover_plate, above);
+        }
+        canvas.fill_rect_occluded(bxx, win.y + 10, 12, 12, apply_opacity(col, win.opacity), above);
+    }
+    // Glyphs/text can't be per-pixel occluded cheaply — skip each when its anchor is under an upper
+    // window (coarse, but the fills above are already clipped so this only prevents floating text).
+    let gy = win.y as i32 + 14;
+    if !Canvas::point_occluded(win.x as i32 + 14, gy, above) { canvas.print_str(win.x + 14, win.y + 12, "x", icon_color, 1); }
+    if !Canvas::point_occluded(win.x as i32 + 30, gy, above) { canvas.print_str(win.x + 30, win.y + 11, "-", icon_color, 1); }
+    if !Canvas::point_occluded(win.x as i32 + 46, gy, above) { canvas.print_str(win.x + 46, win.y + 12, "+", icon_color, 1); }
 
     let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
+    let title_col = if is_active { Color::TEXT_DARK } else { Color::TEXT_MUTED };
     let tw = crate::canvas::Canvas::text_width(title_str, 1);
-    canvas.print_str(win.x + (win.w / 2).saturating_sub(tw / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
+    let tx = win.x + (win.w / 2).saturating_sub(tw / 2);
+    if !Canvas::point_occluded(tx as i32, gy, above) {
+        canvas.print_str(tx, win.y + 12, title_str, apply_opacity(title_col, win.opacity), 1);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

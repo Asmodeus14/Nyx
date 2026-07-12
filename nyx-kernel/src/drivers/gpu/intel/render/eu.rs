@@ -54,6 +54,10 @@ pub struct KernelStore {
     /// when a corner mask is bound (BTI 2); samples the mask (sampler 1, bilinear) and folds its
     /// alpha into the window alpha. 0 until placed → add_window_quad falls back to ps_opacity_off.
     pub ps_rounded_off: u32,
+    /// U5 T2: TEXT PS — samples the font atlas (coverage in alpha) and tints it to a per-quad luminance
+    /// (attr-0 ch2). Used ONLY by the text scene's glyph mesh (`Scene::set_text_mesh`); every other path
+    /// keeps its own `ps_off`, so this adds zero regression surface. 0 until placed.
+    pub ps_text_off: u32,
 }
 
 impl KernelStore {
@@ -86,6 +90,7 @@ impl KernelStore {
             ps_offs: [0; 6],
             ps_opacity_off: 0,
             ps_rounded_off: 0,
+            ps_text_off: 0,
         })
     }
 
@@ -625,6 +630,37 @@ pub fn build_ps_tex_opacity_rounded() -> Vec<u8> {
     emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 16, rt_write_desc(4, 0)));
     k
 }
+
+/// U5 T2: TEXT pixel shader — antialiased GRAYSCALE (luminance) text. Samples the font ATLAS whose
+/// COVERAGE is in the alpha channel, then outputs (RGB = a per-quad LUMINANCE, A = sampled coverage) so
+/// the src-over blender draws `dst = coverage*lum + (1-coverage)*dst` — smooth text tinted to `lum`.
+///
+/// Why luminance (one channel) and not full RGB: all chrome text colours (TEXT_DARK, WHITE, TEXT_MUTED)
+/// are effectively gray (R≈G≈B), so a single value suffices — and it rides in attribute-0 CHANNEL 2
+/// (`varying.z`, plane setup @ g5.0), the EXACT proven transport `build_ps_tex_opacity` uses for opacity.
+/// That means NO vertex-format / VS / SBE change (the risky part) — only this one new PS kernel and three
+/// extra `pln`s. Full per-quad RGB (a 2nd vertex attribute) is a later upgrade if accent-coloured text is
+/// ever needed. Payload layout matches build_ps_tex: g0/g1 header, g2/g3 barycentric, g4/g5 attr-0 setup.
+///   U = pln(g4.0), V = pln(g4.4) -> g14/g15
+///   sample BTI 1, sampler 0 -> g16..g19  (atlas RGBA; COVERAGE in alpha g19)
+///   lum = pln(attr-0 ch2 @ g5.0); write it into g16, g17, g18 (R=G=B=lum), leaving g19 = coverage
+///   RT-write g16..g19 (RGB=lum, A=coverage), headerless, EOT.
+pub fn build_ps_text() -> Vec<u8> {
+    let mut k = Vec::new();
+    emit(&mut k, pln(EXEC_SIMD8, 14, 4, 0, 2));  // U <- attribute-0 channel 0 (g4.0)
+    emit(&mut k, pln(EXEC_SIMD8, 15, 4, 16, 2)); // V <- attribute-0 channel 1 (g4.4)
+    // Sample the atlas: BTI 1, sampler 0, SAMPLE(0), SIMD8(1), mlen 2, rlen 4 -> g16..g19.
+    // g19 = the glyph's antialiasing COVERAGE (alpha). g16..g18 (atlas RGB = white) are discarded.
+    emit(&mut k, send_msg(EXEC_SIMD8, SFID_SAMPLER, 16, 14, sampler_desc(1, 0, 0, 1, 2, 4)));
+    // Interpolate the per-quad luminance (attr-0 ch2 @ g5.0) into R, G, B (same value → grayscale).
+    // g19 (coverage) is left untouched as the output alpha.
+    emit(&mut k, pln(EXEC_SIMD8, 16, 5, 0, 2)); // R = lum
+    emit(&mut k, pln(EXEC_SIMD8, 17, 5, 0, 2)); // G = lum
+    emit(&mut k, pln(EXEC_SIMD8, 18, 5, 0, 2)); // B = lum
+    // RT-write RGB (lum) + A (coverage), headerless, EOT → src-over draws AA grayscale text.
+    emit(&mut k, send_eot(EXEC_SIMD8, SFID_RENDER_CACHE, 16, rt_write_desc(4, 0)));
+    k
+}
 /// hardware opcode 1 (mov) in [6:0] and SIMD8 (3) in [23:21] => 0x0060_0001. (The old
 /// reference used 0x0060_0002, i.e. opcode 2 = `sel` — it validated the bug. Fixed to
 /// the real mov opcode; see gen_opcodes.py pre_xe.)
@@ -651,10 +687,13 @@ pub unsafe fn build_and_dump_kernels(mmio_base: u64) -> Result<KernelStore, Rend
 
     let mut store = KernelStore::new(mmio_base, 1)?;
 
+    // NOTE: the per-kernel `store.dump(...)` hex-dumps (raw EU machine code over serial, for byte-diff
+    // against Mesa during Phase 3 bring-up) are intentionally silenced now that the kernels are verified —
+    // they spammed the boot log and exposed the shader bytecode. Re-enable a single dump locally if you
+    // ever need to re-validate an encoder change.
     let vs = build_vs();
     let vs_off = store.place(&vs)?;
     store.vs_off = vs_off;
-    store.dump("VS pass-through", vs_off, vs.len());
 
     // Phase 7 Boot C: a SINGLE textured pixel shader — interpolate the UV varying (pln, as
     // Boot B) and sample a checkerboard texture. build_ps_attr (Boot A flat) / build_ps_attr
@@ -663,25 +702,24 @@ pub unsafe fn build_and_dump_kernels(mmio_base: u64) -> Result<KernelStore, Rend
     let ps_off = store.place(&ps)?;
     store.ps_off = ps_off;
     store.ps_offs = [ps_off; 6]; // all faces share the one textured PS (back-compat)
-    store.dump("PS textured (sampler)", ps_off, ps.len());
 
     // U4 Boot 2: the per-window-opacity variant of the textured PS. Only window quads use it
     // (via Scene::add_window_quad); everything else keeps `ps_off` unchanged.
     let pso = build_ps_tex_opacity();
     let ps_opacity_off = store.place(&pso)?;
     store.ps_opacity_off = ps_opacity_off;
-    store.dump("PS textured+opacity", ps_opacity_off, pso.len());
 
     // U4 Boot 3: opacity + corner-mask multiply (rounded corners). Window quads use it when a corner
     // mask is bound at BTI 2; else they fall back to ps_opacity_off. Cube/glcube keep `ps_off`.
     let psr = build_ps_tex_opacity_rounded();
     let ps_rounded_off = store.place(&psr)?;
     store.ps_rounded_off = ps_rounded_off;
-    store.dump("PS textured+opacity+rounded", ps_rounded_off, psr.len());
 
-    crate::serial_println!(
-        "[EU] kernels placed: VS={:#x}, PS(attr)={:#x} (offsets from instruction base)",
-        vs_off, ps_off
-    );
+    // U5 T2: the TEXT PS (atlas coverage → per-quad luminance). Used only by the text scene's glyph
+    // mesh; cube/glcube/window quads keep their own PS unchanged.
+    let pst = build_ps_text();
+    let ps_text_off = store.place(&pst)?;
+    store.ps_text_off = ps_text_off;
+
     Ok(store)
 }

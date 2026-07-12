@@ -20,7 +20,7 @@
 - [Kernel ABI Reference](#kernel-abi-reference)
   - [System Call Interface](#system-call-interface)
   - [POSIX-Compatible Syscalls](#posix-compatible-syscalls)
-  - [Nyx Native Syscalls (500–534)](#nyx-native-syscalls-500534)
+  - [Nyx Native Syscalls (500–540)](#nyx-native-syscalls-500540)
   - [Interrupt Vector Table](#interrupt-vector-table)
   - [Calling Convention](#calling-convention)
 - [QCLang — Quantum Programming Language](#qclang--quantum-programming-language)
@@ -160,7 +160,11 @@ Build:  Rust nightly + LLD linker + ACPICA C bridge (bindgen)
 - **Intel Gen9.5 3D Engine (RCS)** — A from-scratch 3D renderer driving the Comet Lake integrated GPU's RENDER command streamer in legacy ring-buffer mode. It brings up the render engine (forcewake, MOCS, GGTT), submits the full Gen9 3D pipeline directly to the RCS ring (STATE_BASE_ADDRESS, URB, hand-encoded EU vertex/pixel shaders, SBE/WM barycentric interpolation, back-face culling, binding tables, samplers), and renders textured, perspective-correct, indexed triangle meshes. Features proven on bare metal: MVP-transformed spinning meshes, multi-mesh scenes under one shared state-base, procedural textures via the sampler, render-to-texture (offscreen Y-tiled render targets), and **SSAA antialiasing** (2×2 supersampling with a free hardware-bilinear box-downsample resolve). Exposed to userspace as a mini-GL API (syscalls 514–516/527); a userspace client renders into its **own compositor window** — the engine resolves into a per-context backbuffer that the kernel copies into the client's window surface, so 3D apps compose alongside 2D windows instead of taking over the scanout. Validated end-to-end by the `glcube` app (a spinning textured cube in a window). Tested on real hardware only — QEMU cannot emulate the render engine.
 - **GPU Fallback** — All GPU operations fall back gracefully to CPU-side software rendering if the Intel GPU driver is unavailable.
 - **Window Manager** — `window.rs` maintains a list of application windows with position, size, and z-order. `WINDOW_MANAGER` is a global spinlock-protected instance.
-- **Desktop Compositor** — the userspace `compositor` app is an event-driven window server: it composites client SHM window buffers, decorations, taskbar, and start menu, redrawing only when something is dirty. **GPU-accelerated present path (U4):** each window's SHM pixel buffer is GGTT-mapped and drawn by the Gen9.5 render engine as one textured orthographic quad (`sys_gpu_composite`, 536) — the CPU stops copying per-pixel window data — with a full software-composite fallback so the desktop is never black. On top of that path: **per-window opacity** (windows fade in on open, via a src-over blend with the opacity written into the quad's alpha), **live GPU resize** (content tracks the frame every drag frame), **constant-radius rounded corners** (a CPU carve on the true window outline), soft **drop shadows** (a rounded-box signed-distance falloff, painter-ordered so an upper window's shadow lands on the window below), and a **functional window scrollbar** drawn by the compositor and driven back to the app over the window header (`content_h`/`scroll_off` fields + `MSG_SCROLL`; drag-thumb / click-track, no new syscall). The taskbar shows a **live wall clock** (`HH:MM:SS`) sourced from the hardware RTC via `sys_get_rtc` (528), ticking once per second even on an idle desktop. A lightweight **U0 instrumentation overlay** (`FPS NN  Xms`) plus a per-second `[UI] frame …` serial log establish the baseline frame time / frame rate that the ongoing GPU UI-acceleration work (`UI-ACCELERATION-PLAN.md`) is measured against.
+- **Desktop Compositor** — the userspace `compositor` app is an event-driven window server: it composites client SHM window buffers, decorations, taskbar, and start menu, redrawing only when something is dirty. **GPU-accelerated present path (U4):** each window's SHM pixel buffer is GGTT-mapped and drawn by the Gen9.5 render engine as one textured orthographic quad (`sys_gpu_composite`, 536) — the CPU stops copying per-pixel window data — with a full software-composite fallback so the desktop is never black. On top of that path: **per-window opacity** (windows fade in on open, via a src-over blend with the opacity written into the quad's alpha), **live GPU resize** (content tracks the frame every drag frame), **constant-radius rounded corners** (a CPU carve on the true window outline), soft **drop shadows** (a rounded-box signed-distance falloff, painter-ordered so an upper window's shadow lands on the window below), and a **functional window scrollbar** drawn by the compositor and driven back to the app over the window header (`content_h`/`scroll_off` fields + `MSG_SCROLL`; drag-thumb / click-track, no new syscall).
+  - **Smoothness & correctness passes:** **damage tracking** (D1) — the compositor recomposites the stable quad set every frame but presents only the changed rectangle to scanout (`sys_swap_buffers_rect`, 538); **owned-scanout page-flip** (P1) — the display plane's surface-base register is pointed at a framebuffer the kernel owns and flipped there, rather than relying on the firmware's default scanout mapping; **SHM reclamation on resize** (R1) — a `sys_unmap_shm`/`sys_destroy_shm` (540/539) ACK handshake frees a window's resized-away buffer instead of leaking it.
+  - **Window controls (U7):** resize from **any edge or corner** with the hardware cursor swapping to the matching resize double-arrow shape; **taskbar window buttons** with **real minimize** (a minimized window hides fully and lives as a taskbar button that restores/focuses it); maximize/restore; and **focus & hover polish** (the focused window keeps full-colour title-bar controls while background windows dim their surface, title, and traffic-light buttons; title-bar and taskbar buttons highlight on hover).
+  - The taskbar shows a **live wall clock** (`HH:MM:SS`) sourced from the hardware RTC via `sys_get_rtc` (528), ticking once per second even on an idle desktop. A lightweight **U0 instrumentation overlay** (`FPS NN  Xms`) tracks the composite frame time / frame rate that the GPU UI-acceleration work (`UI-ACCELERATION-PLAN.md`) is measured against.
+- **Proportional TTF UI font** — the entire UI renders in **DejaVu Sans**, a real proportional antialiased typeface rasterized from an embedded TTF (`ttf-parser` outlines filled by `ab_glyph_rasterizer`), replacing the old fixed 9×16 bitmap font. The compositor's **chrome text** (title bars, taskbar, clock, FPS, start menu) is drawn by the GPU text path (`sys_gpu_draw_text`, 537) — glyph quads sampling a coverage atlas, tinted per-quad — with a CPU `print_str` fallback in the same font so text is never blank.
 - **Mouse Input** — PS/2 mouse driver with atomic state (`MOUSE_STATE`) tracking X/Y position and button state. The cursor is drawn by the **display controller's hardware cursor plane** (U1): the kernel arms the plane once and then only writes `CUR_POS` straight from the mouse IRQ, so pointer motion costs zero window redraws; a software-composited cursor remains as an automatic fallback. (No scroll wheel yet — the PS/2 driver reports X/Y and buttons only.)
 - **Pixel Format** — BGRA 32-bit (4 bytes per pixel), stride-aware layout sourced from the UEFI framebuffer info.
 
@@ -250,7 +254,7 @@ These syscalls follow Linux x86_64 numbering and semantics, allowing standard EL
 
 ---
 
-### Nyx Native Syscalls (500–534)
+### Nyx Native Syscalls (500–540)
 
 These syscalls are unique to Nyx OS and provide access to the kernel's quantum, graphics, AI, and system telemetry subsystems. They begin at number 500 to avoid conflicts with the Linux syscall table.
 
@@ -273,6 +277,11 @@ These syscalls are unique to Nyx OS and provide access to the kernel's quantum, 
 | `515` | `sys_gl_upload_mesh` | `desc*` | handle / `u64::MAX` | Upload a 3D mesh (interleaved position + varying vertices, `u32` indices, and a B8G8R8A8 texture) into the GL context. Data is copied into the kernel once. Returns the mesh handle (0-based index), or `u64::MAX` on error. Call before the first render. |
 | `516` | `sys_gl_render` | `mvps*, count` | `1`/`0` | Render one frame: transform and draw every uploaded mesh (one 16-float column-major MVP matrix each) into the supersampled render target, box-downsample to the private backbuffer (antialiased), and copy the result into the caller's window pixel buffer for the compositor to composite. On the first call the scene is finalized from the uploaded meshes. |
 | `527` | `sys_gl_reset` | — | `1` | Tear down the GL context (drop the scene and staged meshes) so it can be re-initialized and re-uploaded. |
+| `529` | `sys_cursor_init` | — | `1`/`0` | Bring up the display controller's **hardware cursor plane** (U1). Once armed, the kernel writes `CUR_POS` straight from the mouse IRQ, so pointer motion costs zero window redraws. Returns 1 if the plane came up. |
+| `535` | `sys_cursor_set_image` | `img*` (64×64 BGRA) | `1`/`0` | Upload a 64×64 ARGB cursor bitmap to the hardware cursor plane. Used to swap the pointer shape (arrow ↔ resize double-arrows) as the compositor's hit-test zone changes. |
+| `536` | `sys_gpu_composite` | `quads*, count` | `1`/`0` | Composite an array of window quads into the backbuffer with the Gen9.5 render engine — each quad is a GGTT-mapped SHM window drawn as one textured orthographic quad (with per-quad opacity + optional rounded-corner mask). Returns 0 on GPU failure so the caller can fall back to CPU compositing. |
+| `537` | `sys_gpu_draw_text` | `atlas_gva, atlas_w, atlas_h, atlas_pitch, glyphs*, count` | `1`/`0` | Draw a run of antialiased glyph quads (GPU text) sampling a coverage atlas, tinted per-quad to each label's colour. Used for the compositor's chrome text in the proportional UI font. |
+| `538` | `sys_swap_buffers_rect` | `x, y, w, h` | — | Present only a **damage rectangle** of the backbuffer to the owned scanout buffer (D1 damage tracking), instead of the whole framebuffer — the compositor's partial-frame present path. |
 
 #### VFS and Filesystem
 
@@ -310,6 +319,8 @@ These syscalls are unique to Nyx OS and provide access to the kernel's quantum, 
 | `531` | `sys_map_shm` | `shm_id` | `u64` | Map a previously created shared memory block into the calling process's address space. Returns the virtual address, aligned to a 2 MB boundary to prevent overlap with anonymous mmap. |
 | `532` | `sys_ipc_send` | `target_pid, msg_type, data1, data2` | `1` on success | Deliver an `IpcMessage` to the mailbox of the process identified by `target_pid`. If the target is blocked waiting for IPC (`wake_tsc == u64::MAX`), it is immediately woken. Thread-safe across SMP cores. |
 | `533` | `sys_ipc_recv` | `IpcMessage*, block` | `1` if message received | Receive one message from the calling process's mailbox. If `block == 1`, the task enters `Blocked` state and yields until a message arrives. If `block == 0`, returns 0 immediately if the mailbox is empty. |
+| `539` | `sys_destroy_shm` | `shm_id, base_vaddr` | `1`/`0` | Destroy a shared-memory block once it is single-owner: unmaps the caller's mapping and frees the backing physical frames. Used by the R1 resize-reclamation handshake so a resized-away window buffer is not leaked. |
+| `540` | `sys_unmap_shm` | `base_vaddr, size` | — | Release only the caller's mapping of an SHM range (unmap the pages) without freeing the physical frames — the owner still holds them. The compositor calls this on the old buffer after a resize, then ACKs the app to `sys_destroy_shm` it. |
 
 #### Network
 
@@ -542,7 +553,7 @@ Nyx/
 │           └── bin/qclang.rs   # CLI: compile, run, benchmark, info, update
 │
 ├── apps/                       # Userspace applications (ELF64, Ring 3)
-│   ├── compositor/             # Windowing compositor (GPU-composited windows, opacity, rounded corners, shadows, scrollbar, live RTC clock)
+│   ├── compositor/             # Windowing compositor (GPU-composited windows, opacity, rounded corners, shadows, scrollbar, damage tracking, page-flip, U7 window controls, GPU text)
 │   ├── terminal/               # Terminal emulator
 │   ├── explorer/               # File system explorer
 │   ├── sysmon/                 # System monitor (CPU, memory, tasks)
@@ -578,7 +589,7 @@ Nyx/
 
 ## Current Status
 
-**Pre-Alpha — as of March 2026**
+**Pre-Alpha — as of July 2026**
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -591,16 +602,20 @@ Nyx/
 | NVMe Driver | ✅ Functional | Block read/write, IO queues |
 | RTL8168 Ethernet | ✅ Functional | DHCP, TCP/UDP, DNS |
 | Intel GPU (2D BLT) | ✅ Functional | fill_rect, copy_rect, vsync, double buffer |
+| Intel Gen9.5 3D (RCS) | ✅ Functional | From-scratch mini-GL: textured meshes, SSAA, render-to-texture (bare metal only) |
+| Desktop Compositor (GPU) | ✅ Functional | GPU-composited windows, opacity, rounded corners, shadows, damage tracking, page-flip present |
+| Window Controls (U7) | ✅ Functional | Resize any edge, taskbar buttons, real minimize, maximize, focus/hover |
+| UI Font | ✅ Functional | Proportional antialiased DejaVu Sans (TTF); GPU chrome text |
 | SMP (Multi-core) | ✅ Functional | AP bootstrap, per-CPU scheduler |
-| Syscall ABI | ✅ Functional | 40+ POSIX + 30+ Nyx native syscalls |
+| Syscall ABI | ✅ Functional | 40+ POSIX + 40+ Nyx native syscalls |
 | ACPI / Thermal | ✅ Functional | Temperature, HWP, fan control |
 | xHCI USB | 🔧 Prototype | Controller init; device enumeration in progress |
 | AI Entity System | ✅ Functional | Genetic seed persistence, real-time NyxState |
-| Real Hardware Boot | 🔧 Partial | Boots on select x86_64 laptops |
+| Real Hardware Boot | 🔧 Partial | Boots on select x86_64 laptops (Comet Lake) |
 | DRM / Nouveau | 🔧 Early | Handshake WIP for NVIDIA GPU support |
 | Intel WiFi | 🔧 Prototype | Driver skeleton; association pending |
 | AHCI / SATA | 🔧 Prototype | Port enumeration; R/W in progress |
-| Userspace Apps | 🔧 Early stage | Compositor, terminal, sysmon, explorer |
+| Userspace Apps | 🔧 Early stage | Compositor, terminal, sysmon, explorer, settings, network, glcube |
 
 ---
 

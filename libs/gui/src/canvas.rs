@@ -79,6 +79,37 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Like `fill_rect`, but skips any pixel covered by one of the `above` rectangles
+    /// `(x0, y0, x1, y1)` (screen px, exclusive on x1/y1). Used to draw a window's chrome WITHOUT
+    /// painting over windows stacked on top of it — the compositor draws chrome in a single CPU pass
+    /// after the GPU composited all content, so without this a lower window's title bar / border bleeds
+    /// over an upper window wherever their edges cross (the "below-window outline" z-order artifact).
+    pub fn fill_rect_occluded(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32, above: &[(i32, i32, i32, i32)]) {
+        let a = (color >> 24) & 0xFF;
+        if a == 0 { return; }
+        for cy in 0..h {
+            let dst_y = y + cy;
+            if dst_y >= self.height { break; }
+            for cx in 0..w {
+                let dst_x = x + cx;
+                if dst_x >= self.width { break; }
+                let (pxi, pyi) = (dst_x as i32, dst_y as i32);
+                let mut occluded = false;
+                for &(ax0, ay0, ax1, ay1) in above {
+                    if pxi >= ax0 && pxi < ax1 && pyi >= ay0 && pyi < ay1 { occluded = true; break; }
+                }
+                if occluded { continue; }
+                let idx = dst_y * self.width + dst_x;
+                self.buffer[idx] = if a == 255 { color } else { alpha_blend(color, self.buffer[idx]) };
+            }
+        }
+    }
+
+    /// True if point `(px, py)` is inside any `above` rectangle — gates occluded text/glyph draws.
+    pub fn point_occluded(px: i32, py: i32, above: &[(i32, i32, i32, i32)]) -> bool {
+        above.iter().any(|&(ax0, ay0, ax1, ay1)| px >= ax0 && px < ax1 && py >= ay0 && py < ay1)
+    }
+
     pub fn composite_buffer(&mut self, x: usize, y: usize, src: &[u32], src_w: usize, src_h: usize, opacity: u8) {
         if opacity == 0 { return; }
         
