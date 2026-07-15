@@ -626,6 +626,27 @@ syscall_handler_asm:
     sysretq
 "#);
 
+/// Convert the RTC's packed wall-clock (see rtc::read_packed) into Unix epoch seconds.
+/// Packed layout: [7:0]=sec [15:8]=min [23:16]=hour [31:24]=day [39:32]=month [63:40]=year(full).
+/// Uses Howard Hinnant's days-from-civil algorithm (proleptic Gregorian, UTC — no timezone).
+fn rtc_packed_to_unix(p: u64) -> i64 {
+    let sec = (p & 0xFF) as i64;
+    let min = ((p >> 8) & 0xFF) as i64;
+    let hour = ((p >> 16) & 0xFF) as i64;
+    let day = ((p >> 24) & 0xFF) as i64;
+    let month = ((p >> 32) & 0xFF) as i64;
+    let year = ((p >> 40) & 0xFFFFFF) as i64;
+    if year == 0 || month == 0 || day == 0 { return 0; } // RTC not readable yet
+
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;                                   // [0, 399]
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;           // [0, 146096]
+    let days = era * 146097 + doe - 719468;                    // days since 1970-01-01
+    days * 86400 + hour * 3600 + min * 60 + sec
+}
+
 #[no_mangle]
 pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
     if !is_valid_user_ptr(frame.rcx as *const u8, 1) { frame.rcx = 0; }
@@ -1037,15 +1058,22 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 }
                 
                 // 5. Load the new ELF
-                if let Ok(entry_point) = crate::process::load_elf(&elf_data) {
+                if let Ok(loaded) = crate::process::load_elf_full(&elf_data) {
+                    let entry_point = loaded.entry;
                     let stack_base = 0x7FFF_0000_0000;
-                    let stack_pages = 32; 
+                    let stack_pages = 32;
                     if crate::memory::allocate_user_pages_at(stack_base, stack_pages).is_ok() {
-                        let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8; 
-                        
+                        let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8;
+
+                        // B2: build the SysV entry stack (argc/argv/envp/auxv) in the freshly loaded
+                        // address space so a std runtime can start. We're already on the task's CR3.
+                        let entry_rsp = unsafe {
+                            crate::process::build_initial_stack(stack_top, &path_str, &loaded)
+                        };
+
                         // Override the Syscall Return Frame!
                         frame.rcx = entry_point;    // Jump to the new App's _start
-                        frame.user_rsp = stack_top; // Give it the fresh stack
+                        frame.user_rsp = entry_rsp; // Give it the fresh SysV stack
                         
                         // 🚨 SECURITY FIX: Zero out ALL general purpose registers!
                         // This prevents the new app from inheriting garbage state from the old app.
@@ -1070,18 +1098,21 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = (-1i64) as u64; // File Not Found or Parse Error
         },
 
-        60 => { // SYS_EXIT
+        60 | 231 => { // SYS_EXIT / SYS_EXIT_GROUP (single-threaded teardown covers both here)
             // 0. DISABLE INTERRUPTS to prevent getting buried alive!
             x86_64::instructions::interrupts::disable();
 
             let exit_code = arg1 as i64;
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            
-            crate::serial_println!("[PID {}] Exited (Code: {})", task.pid, exit_code);
-            
+
+            let my_cr3 = task.cr3;
+            let my_pid = task.pid;
+            crate::serial_println!("[PID {}] Exited (Code: {})", my_pid, exit_code);
+            task.exit_code = exit_code; // B1: retained for the parent's wait4 before reaping.
+
             // 1. Safe FD Teardown using Arc Reference Counting
-            for i in 0..32 { 
+            for i in 0..32 {
                 if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
                     if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
                         let sock = sock_mtx.lock();
@@ -1100,16 +1131,44 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     }
                 }
                 // Safely drop our reference to the FD
-                task.fd_table[i] = None; 
+                task.fd_table[i] = None;
             }
 
-            // 2. Shred ONLY the user memory tables securely. 
-            // DO NOT swap CR3 to KERNEL_CR3, or the CPU will instantly Triple Fault when trying to use the stack!
-            crate::memory::clear_user_address_space(task.cr3);
+            // B-β.2a: threads share `cr3`. Count OTHER live tasks in this address space across all
+            // cores; if any exist, this is a *thread* exit — we must NOT shred the shared user memory
+            // (that would kill the siblings). Only the sole owner of the cr3 tears the memory down.
+            let mut siblings_alive = false;
+            unsafe {
+                let active = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
+                if let Some(cores) = &mut crate::percpu::PER_CPU {
+                    'scan: for i in 0..active {
+                        for t in cores[i].scheduler.tasks.iter() {
+                            if t.pid != my_pid
+                                && t.cr3 == my_cr3
+                                && t.state != crate::scheduler::TaskState::Empty
+                                && t.state != crate::scheduler::TaskState::Zombie {
+                                siblings_alive = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+            }
 
-            // 3. Mark as Zombie at the VERY END, once all locks are released
-            task.state = crate::scheduler::TaskState::Zombie;
-            
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            if siblings_alive {
+                // 2a. Thread exit: leave the shared address space intact. Self-reap this slot
+                // (Empty), so no wait4 is required for a joined worker. The kernel stack leaks,
+                // consistent with the existing process-exit path (which also never frees it).
+                task.state = crate::scheduler::TaskState::Empty;
+            } else {
+                // 2b. Sole owner: shred ONLY the user memory tables securely.
+                // DO NOT swap CR3 to KERNEL_CR3, or the CPU will instantly Triple Fault using the stack!
+                crate::memory::clear_user_address_space(my_cr3);
+                // 3. Mark as Zombie at the VERY END, once all locks are released, for the parent's wait4.
+                task.state = crate::scheduler::TaskState::Zombie;
+            }
+
             // 4. Re-enable interrupts and wait for the scheduler to context-switch away natively
             unsafe {
                 x86_64::instructions::interrupts::enable();
@@ -1136,10 +1195,229 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let buf_ptr = arg1 as *mut u8;
             let len = arg2 as usize;
             if is_valid_user_ptr(buf_ptr, len) {
-                unsafe { core::ptr::write_bytes(buf_ptr, 42, len); }
+                // B1: fill from a TSC/uptime-mixed xorshift instead of a constant, so std's
+                // HashMap RandomState (and any getrandom() user) gets non-repeating bytes. Not
+                // cryptographically strong, but adequate for hash-DoS resistance on this target.
+                let mut seed = {
+                    let tsc: u64;
+                    unsafe { core::arch::asm!("rdtsc", out("rax") tsc, out("rdx") _, options(nomem, nostack)); }
+                    tsc ^ crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                };
+                let mut i = 0;
+                while i < len {
+                    // xorshift64*
+                    seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27;
+                    let r = seed.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                    let n = core::cmp::min(8, len - i);
+                    unsafe { core::ptr::copy_nonoverlapping(r.to_le_bytes().as_ptr(), buf_ptr.add(i), n); }
+                    i += n;
+                }
                 frame.rax = len as u64;
             } else {
                 frame.rax = EFAULT as u64;
+            }
+        },
+
+        // ====================================================================
+        // std-port syscalls (B1): the Linux-numbered primitives std needs that
+        // were previously falling through to the `_ => EINVAL` arm below.
+        // ====================================================================
+        24 => { // SYS_SCHED_YIELD — give up the rest of this quantum.
+            unsafe { core::arch::asm!("int 0x41"); }
+            frame.rax = 0;
+        },
+
+        39 | 186 => { // SYS_GETPID / SYS_GETTID (threads carry their own pid here).
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            frame.rax = percpu.scheduler.tasks[curr_idx].pid;
+        },
+
+        228 => { // SYS_CLOCK_GETTIME(clockid, *timespec{tv_sec:i64, tv_nsec:i64})
+            let clockid = arg1 as i32;
+            let ts_ptr = arg2 as *mut i64;
+            if !is_valid_user_ptr(ts_ptr as *const u8, 16) { frame.rax = EFAULT as u64; return; }
+            let (sec, nsec) = match clockid {
+                0 => (rtc_packed_to_unix(crate::rtc::read_packed()), 0i64), // CLOCK_REALTIME
+                _ => { // CLOCK_MONOTONIC / BOOTTIME / everything else -> uptime
+                    let ms = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed);
+                    ((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64)
+                }
+            };
+            unsafe { *ts_ptr = sec; *ts_ptr.add(1) = nsec; }
+            frame.rax = 0;
+        },
+
+        35 | 230 => { // SYS_NANOSLEEP(*req,*rem) / SYS_CLOCK_NANOSLEEP(clockid,flags,*req,*rem)
+            let req_ptr = (if id == 35 { arg1 } else { arg3 }) as *const i64;
+            if !is_valid_user_ptr(req_ptr as *const u8, 16) { frame.rax = EFAULT as u64; return; }
+            let (sec, nsec) = unsafe { (*req_ptr, *req_ptr.add(1)) };
+            // Round up to whole milliseconds (the scheduler's tick granularity).
+            let ms = (sec.max(0) as u64) * 1000 + ((nsec.max(0) as u64) + 999_999) / 1_000_000;
+            if ms > 0 {
+                let wake_ms = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) + ms;
+                unsafe {
+                    x86_64::instructions::interrupts::enable();
+                    loop {
+                        let percpu = crate::percpu::current();
+                        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                        percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Blocked;
+                        percpu.scheduler.tasks[curr_idx].wake_tsc = wake_ms;
+                        core::arch::asm!("int 0x41");
+                        if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) >= wake_ms { break; }
+                        x86_64::instructions::hlt();
+                    }
+                    x86_64::instructions::interrupts::disable();
+                }
+            }
+            frame.rax = 0;
+        },
+
+        202 => { // SYS_FUTEX(uaddr, op, val, timeout, uaddr2, val3)
+            const FUTEX_WAIT: u32 = 0;
+            const FUTEX_WAKE: u32 = 1;
+            const FUTEX_PRIVATE_FLAG: u32 = 128;
+            const FUTEX_CLOCK_REALTIME: u32 = 256;
+            let uaddr = arg1;
+            let cmd = (arg2 as u32) & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+            let val = arg3 as u32;
+
+            if !is_valid_user_ptr(uaddr as *const u8, 4) { frame.rax = EFAULT as u64; return; }
+            let cr3 = {
+                let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                percpu.scheduler.tasks[curr_idx].cr3
+            };
+
+            match cmd {
+                FUTEX_WAIT => {
+                    // Optional relative timeout (timespec at arg4). None => wait indefinitely.
+                    let deadline = if arg4 != 0 && is_valid_user_ptr(arg4 as *const u8, 16) {
+                        let tp = arg4 as *const i64;
+                        let (s, n) = unsafe { (*tp, *tp.add(1)) };
+                        let ms = (s.max(0) as u64) * 1000 + ((n.max(0) as u64) + 999_999) / 1_000_000;
+                        Some(crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) + ms)
+                    } else { None };
+
+                    unsafe {
+                        x86_64::instructions::interrupts::enable();
+                        let mut ret = 0i64;
+                        loop {
+                            // Durable re-check: the waker stores a new value at *uaddr BEFORE waking.
+                            // Reading it each iteration means a lost FUTEX_WAKE cannot hang us forever.
+                            let cur = core::ptr::read_volatile(uaddr as *const u32);
+                            if cur != val { ret = 0; break; }                   // value changed -> woken
+                            let now = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed);
+                            if let Some(d) = deadline { if now >= d { ret = -110; break; } } // ETIMEDOUT
+
+                            // Block, but cap the sleep at 10 ms so a missed wake self-heals into a
+                            // re-poll of *uaddr (liveness insurance for this lock-free wake path).
+                            let repoll = now + 10;
+                            let cap = match deadline { Some(d) => core::cmp::min(d, repoll), None => repoll };
+                            let percpu = crate::percpu::current();
+                            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                            percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Blocked;
+                            percpu.scheduler.tasks[curr_idx].wake_tsc = cap;
+                            percpu.scheduler.tasks[curr_idx].futex_addr = uaddr;
+
+                            core::arch::asm!("int 0x41");
+
+                            let percpu = crate::percpu::current();
+                            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                            percpu.scheduler.tasks[curr_idx].futex_addr = 0;
+                        }
+                        x86_64::instructions::interrupts::disable();
+                        frame.rax = ret as u64;
+                    }
+                },
+                FUTEX_WAKE => {
+                    // Wake up to `val` waiters parked on this (cr3, uaddr). Scan every core's run queue.
+                    let mut woken = 0u32;
+                    let want = val;
+                    unsafe {
+                        let active = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
+                        if let Some(cores) = &mut crate::percpu::PER_CPU {
+                            'outer: for i in 0..active {
+                                for task in cores[i].scheduler.tasks.iter_mut() {
+                                    if woken >= want { break 'outer; }
+                                    if task.futex_addr == uaddr && task.cr3 == cr3
+                                        && task.state == crate::scheduler::TaskState::Blocked {
+                                        task.state = crate::scheduler::TaskState::Ready;
+                                        task.wake_tsc = 0;
+                                        task.futex_addr = 0;
+                                        woken += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    frame.rax = woken as u64;
+                },
+                _ => { frame.rax = EINVAL as u64; }
+            }
+        },
+
+        61 => { // SYS_WAIT4(pid, *wstatus, options, *rusage) — reap a Zombie child.
+            const WNOHANG: u64 = 1;
+            let want_pid = arg1 as i64;   // -1 = any child
+            let wstatus = arg2 as *mut i32;
+            let options = arg3;
+
+            let my_pid = {
+                let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                percpu.scheduler.tasks[curr_idx].pid
+            };
+
+            // Scan all cores for a matching Zombie child; capture + tombstone it (state=Empty).
+            let reap = |wpid: i64, parent: u64| -> Option<(u64, i64)> {
+                unsafe {
+                    let active = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
+                    if let Some(cores) = &mut crate::percpu::PER_CPU {
+                        for i in 0..active {
+                            for task in cores[i].scheduler.tasks.iter_mut() {
+                                if task.state == crate::scheduler::TaskState::Zombie
+                                    && task.parent_pid == Some(parent)
+                                    && (wpid == -1 || task.pid as i64 == wpid) {
+                                    let out = (task.pid, task.exit_code);
+                                    task.state = crate::scheduler::TaskState::Empty; // reaped tombstone
+                                    return Some(out);
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            };
+
+            if let Some((cpid, code)) = reap(want_pid, my_pid) {
+                if !wstatus.is_null() && is_valid_user_ptr(wstatus as *const u8, 4) {
+                    unsafe { *wstatus = ((code as i32) & 0xff) << 8; } // WEXITSTATUS encoding
+                }
+                frame.rax = cpid;
+            } else if options & WNOHANG != 0 {
+                frame.rax = 0; // nothing ready, caller asked not to block
+            } else {
+                // Block until a child becomes reapable (re-poll; no explicit exit-waker exists yet).
+                unsafe {
+                    x86_64::instructions::interrupts::enable();
+                    let mut result = 0u64;
+                    loop {
+                        if let Some((cpid, code)) = reap(want_pid, my_pid) {
+                            if !wstatus.is_null() && is_valid_user_ptr(wstatus as *const u8, 4) {
+                                *wstatus = ((code as i32) & 0xff) << 8;
+                            }
+                            result = cpid;
+                            break;
+                        }
+                        let now = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed);
+                        let percpu = crate::percpu::current();
+                        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                        percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Blocked;
+                        percpu.scheduler.tasks[curr_idx].wake_tsc = now + 20; // re-scan every 20 ms
+                        core::arch::asm!("int 0x41");
+                        x86_64::instructions::hlt();
+                    }
+                    x86_64::instructions::interrupts::disable();
+                    frame.rax = result;
+                }
             }
         },
         

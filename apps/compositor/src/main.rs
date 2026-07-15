@@ -503,7 +503,7 @@ impl CompositorState {
 
             let btn_w = 70; let btn_x = (self.screen_stride / 2) - 35; let btn_y = self.screen_h - 36 + 6;
             let net_x = self.screen_w.saturating_sub(50); let net_w = 30;
-            let menu_w = 180; let menu_h = 240;
+            let menu_w = 180; let menu_h = 320;
             let menu_x = (self.screen_stride / 2) - (menu_w / 2); let menu_y = self.screen_h - 36 - menu_h - 10;
 
             // U7: which taskbar window button (if any) is under the pointer — computed before the click
@@ -525,7 +525,9 @@ impl CompositorState {
                 else if rel_y < 120 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Explorer.nyx/run.bin\0"); sys_exit(1); } }
                 else if rel_y < 160 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Network.nyx/run.bin\0"); sys_exit(1); } }
                 else if rel_y < 200 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0"); sys_exit(1); } }
-                else { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/GlCube.nyx/run.bin\0"); sys_exit(1); } }
+                else if rel_y < 240 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/GlCube.nyx/run.bin\0"); sys_exit(1); } }
+                else if rel_y < 280 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/ImageViewer.nyx/run.bin\0"); sys_exit(1); } }
+                else { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/StdHello.nyx/run.bin\0"); sys_exit(1); } }
                 
                 self.start_menu_open = false; 
                 self.mark_full_redraw();
@@ -1054,7 +1056,7 @@ pub extern "C" fn _start() -> ! {
             // Draw Start Menu on top of windows (fills only; the entry TEXT is drawn in the batched
             // chrome-text pass below, GPU with CPU fallback).
             if state.start_menu_open {
-                let menu_w = 180; let menu_h = 240;
+                let menu_w = 180; let menu_h = 320;
                 let menu_x = (screen_stride / 2) - (menu_w / 2); let menu_y = screen_h - 36 - menu_h - 10;
 
                 canvas.fill_rect(menu_x, menu_y, menu_w, menu_h, 0xFF_111111);
@@ -1105,10 +1107,10 @@ pub extern "C" fn _start() -> ! {
                 glyphs.extend(font.layout_str((btn_x + 18) as i32, (bar_y + 8) as i32, "NYX", 1, Color::WHITE));
                 glyphs.extend(font.layout_str(net_x as i32, (bar_y + 10) as i32, "WIFI", 1, Color::TEXT_DARK));
                 if state.start_menu_open {
-                    let menu_w = 180; let menu_h = 240;
+                    let menu_w = 180; let menu_h = 320;
                     let menu_x = (screen_stride / 2) - (menu_w / 2);
                     let menu_y = screen_h - 36 - menu_h - 10;
-                    let items = ["> Terminal", "> Settings", "> Explorer", "> Network Suite", "> System Monitor", "> GL Cube (3D)"];
+                    let items = ["> Terminal", "> Settings", "> Explorer", "> Network Suite", "> System Monitor", "> GL Cube (3D)", "> Image Viewer", "> Std Hello"];
                     for (i, it) in items.iter().enumerate() {
                         glyphs.extend(font.layout_str((menu_x + 20) as i32, (menu_y + 12 + i * 40) as i32, it, 1, Color::WHITE));
                     }
@@ -1125,10 +1127,10 @@ pub extern "C" fn _start() -> ! {
                 canvas.print_str(btn_x + 18, bar_y + 8, "NYX", Color::WHITE, 1);
                 canvas.print_str(net_x, bar_y + 10, "WIFI", Color::TEXT_DARK, 1);
                 if state.start_menu_open {
-                    let menu_w = 180; let menu_h = 240;
+                    let menu_w = 180; let menu_h = 320;
                     let menu_x = (screen_stride / 2) - (menu_w / 2);
                     let menu_y = screen_h - 36 - menu_h - 10;
-                    let items = ["> Terminal", "> Settings", "> Explorer", "> Network Suite", "> System Monitor", "> GL Cube (3D)"];
+                    let items = ["> Terminal", "> Settings", "> Explorer", "> Network Suite", "> System Monitor", "> GL Cube (3D)", "> Image Viewer", "> Std Hello"];
                     for (i, it) in items.iter().enumerate() {
                         canvas.print_str(menu_x + 20, menu_y + 12 + i * 40, it, Color::WHITE, 1);
                     }

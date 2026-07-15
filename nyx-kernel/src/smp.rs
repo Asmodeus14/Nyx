@@ -92,6 +92,44 @@ pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
         core::ptr::write_volatile(svr_ptr, svr);
     }
     
+    // B-β.2c: give this core an IDLE TASK before it becomes a load-balancer target. The scheduler's
+    // save-step writes the interrupted context into tasks[core_task_idx]; without a resident task,
+    // the first task pushed here lands at index 0 and the first timer tick OVERWRITES its entry
+    // frame with this boot hlt-loop's RSP — the task then never runs (this is why cross-core
+    // spawn_thread hung: worker marked Running but executing the idle loop). With the idle task at
+    // index 0, the first save adopts this hlt loop AS the idle task — exactly what the BSP does in
+    // main.rs where its boot context becomes init's context. MUST happen before ACTIVE_CORES is
+    // incremented (that's what makes this core visible to the load balancer).
+    {
+        // new_idle_ap: reserved-range PID! Process::new() here consumed PIDs 1..N BEFORE the boot
+        // daemons were created, shifting init/compositor off their well-known numbers (apps hardcode
+        // COMPOSITOR_PID=4 for window IPC) — that regression made every app unable to open a window.
+        let mut idle_task = crate::process::Process::new_idle_ap().expect("AP idle task alloc failed");
+        idle_task.name = *b"kernel-idle\0\0\0\0\0";
+        // Crafted resume frame (mirrors main.rs). In practice the first timer save replaces
+        // saved_rsp with this boot context before it is ever restored, but build it anyway so the
+        // slot is valid even if scheduling order ever changes.
+        unsafe {
+            let iretq_ptr = idle_task.kernel_stack_top - 40;
+            let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+            iret_slice[0] = crate::process::nyx_idle_task as u64;
+            iret_slice[1] = 0x08; iret_slice[2] = 0x202;
+            iret_slice[3] = idle_task.kernel_stack_top; iret_slice[4] = 0x10;
+            let regs_ptr = iretq_ptr - 120;
+            core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
+            let fxsave_ptr = (regs_ptr - 512) & !0xF;
+            core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
+            *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+            let final_rsp = fxsave_ptr - 16;
+            let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+            bottom[0] = regs_ptr; bottom[1] = 0;
+            idle_task.saved_rsp = final_rsp;
+        }
+        let percpu = crate::percpu::current();
+        percpu.scheduler.tasks.push(idle_task);
+        percpu.scheduler.core_task_idx[logical_id % 32] = 0;
+    }
+
     crate::smp::AP_READY.store(true, core::sync::atomic::Ordering::SeqCst);
     crate::smp::ACTIVE_CORES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 

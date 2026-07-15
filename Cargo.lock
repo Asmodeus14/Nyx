@@ -1839,6 +1839,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-imageviewer"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "nyx-api",
+ "nyx-gui",
+]
+
+[[package]]
 name = "nyx-init"
 version = "0.1.0"
 dependencies = [

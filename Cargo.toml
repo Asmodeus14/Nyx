@@ -19,11 +19,16 @@ members = [
     "apps/network",
     "apps/sysmon",
     "apps/glcube",
+    "apps/imageviewer",
 
 ]
 
 # Force Cargo to ONLY build the kernel by default
 default-members = ["nyx-kernel"]
+
+# The std-port spike crate uses a different target + build-std=std; keep Cargo from pulling it
+# into the workspace (it must be built standalone against x86_64-unknown-nyx.json).
+exclude = ["tests/stdhello", "vendor"]
 
 resolver = "2"
 

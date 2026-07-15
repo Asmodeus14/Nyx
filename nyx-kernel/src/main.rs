@@ -322,12 +322,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let init_data = crate::vfs::VFS.read_file_alloc("/mnt/nvme/apps/Init.nyx/run.bin")
         .expect("VFS FATAL: Failed to load /mnt/nvme/apps/Init.nyx/run.bin from SSD!");
         
-    let entry_point = crate::process::load_elf(&init_data).expect("ELF Parse Fail");
-    
+    let loaded = crate::process::load_elf_full(&init_data).expect("ELF Parse Fail");
+    let entry_point = loaded.entry;
+
     let stack_base = 0x7FFF_0000_0000;
-    let stack_pages = 32; 
+    let stack_pages = 32;
     crate::memory::allocate_user_pages_at(stack_base, stack_pages).expect("Stack Map Fail");
-    let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8; 
+    let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8;
+
+    // B2: hand init a proper SysV entry stack (argc/argv/envp/auxv) so a std runtime can start.
+    let stack_top = unsafe {
+        crate::process::build_initial_stack(stack_top, "/mnt/nvme/apps/Init.nyx/run.bin", &loaded)
+    };
 
     interrupts::init_syscalls();
     unsafe { percpu.user_rsp = stack_top; } 

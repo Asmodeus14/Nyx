@@ -85,6 +85,13 @@ impl Scheduler {
             
             // FIX: ALWAYS save the stack pointer so we don't jump backward in time!
             current_process.saved_rsp = current_rsp;
+
+            // B-β.2a: save the FS base so per-thread TLS survives preemption. Threads of one
+            // process share cr3 but each has its own FS base (set via arch_prctl in userspace);
+            // without this, a context switch would leave the previous thread's FS loaded and
+            // corrupt thread-local access. 0 for the no_std apps that never set FS (harmless).
+            current_process.saved_fs_base =
+                x86_64::registers::model_specific::FsBase::read().as_u64();
             
             // If it was Running (normal preemption), mark it Ready so it can run again.
             // If it was Blocked (sys_sleep or IPC wait), we leave it Blocked!
@@ -148,6 +155,12 @@ impl Scheduler {
             if current_cr3 != next_cr3 {
                 core::arch::asm!("mov cr3, {}", in(reg) next_cr3, options(nostack, preserves_flags));
             }
+
+            // D. Restore this task's FS base for per-thread TLS (B-β.2a). Paired with the save in
+            // step 2. Writing 0 for tasks that never use FS is harmless (they never read fs:).
+            x86_64::registers::model_specific::FsBase::write(
+                x86_64::VirtAddr::new(next_process.saved_fs_base),
+            );
         }
 
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);

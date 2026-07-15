@@ -3,4 +3,5 @@
 # NyxOS Build Artifacts
 *.tar
 build_initrd/
-.claude
+.claudenyx_build_last.log
+tests/stdhello/target/

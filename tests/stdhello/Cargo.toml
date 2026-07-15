@@ -1,0 +1,14 @@
+[package]
+name = "stdhello"
+version = "0.1.0"
+edition = "2021"
+
+# B-alpha spike: the smallest possible `std` binary for target_os="nyx". Built with
+# -Z build-std=std,panic_abort against targets/x86_64-unknown-nyx.json to discover exactly
+# what the `nyx` PAL must provide. NOT part of the workspace (it uses a different target/std).
+[[bin]]
+name = "stdhello"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

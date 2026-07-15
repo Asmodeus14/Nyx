@@ -33,10 +33,18 @@ echo "[6/7] Building Network Suite (network)..."
 echo "[7/8] Building System Monitor (sysmon)..."
 (cd apps/sysmon && $BUILD_CMD)
 
-echo "[8/8] Building GL Cube validation app (glcube)..."
+echo "[8/9] Building GL Cube validation app (glcube)..."
 (cd apps/glcube && $BUILD_CMD)
 
-echo "[9/9] Generating App Tarball..."
+echo "[9/9] Building Image Viewer (imageviewer)..."
+(cd apps/imageviewer && $BUILD_CMD)
+
+# std-port smoke test (Workstream B): build a real `std` binary for target_os=nyx and bundle it so
+# it can be launched on-device (B-alpha runtime check). Non-fatal if the std toolchain isn't ready.
+echo "[9b] Building std hello (target_os=nyx)..."
+./Build-std.sh tests/stdhello stdhello || echo "  (std build skipped/failed — continuing)"
+
+echo "[10/10] Generating App Tarball..."
 rm -rf build_initrd
 
 # 1. Create the App Folders
@@ -48,6 +56,8 @@ mkdir -p build_initrd/apps/Explorer.nyx
 mkdir -p build_initrd/apps/Network.nyx
 mkdir -p build_initrd/apps/SystemMonitor.nyx
 mkdir -p build_initrd/apps/GlCube.nyx
+mkdir -p build_initrd/apps/ImageViewer.nyx
+mkdir -p build_initrd/apps/StdHello.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
@@ -59,6 +69,12 @@ cp target/x86_64-nyx/release/nyx-explorer build_initrd/apps/Explorer.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-network build_initrd/apps/Network.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-sysmon build_initrd/apps/SystemMonitor.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-glcube build_initrd/apps/GlCube.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-imageviewer build_initrd/apps/ImageViewer.nyx/run.bin
+# std-port smoke test binary (built for the x86_64-unknown-nyx std target; workspace-excluded, so
+# its output lives under tests/stdhello/target/, not the root target dir).
+cp tests/stdhello/target/x86_64-unknown-nyx/release/stdhello build_initrd/apps/StdHello.nyx/run.bin 2>/dev/null || true
+# Sample data file so the std binary can exercise std::fs::read on-device (B-alpha fs milestone).
+cp tests/stdhello/hello.txt build_initrd/apps/StdHello.nyx/hello.txt 2>/dev/null || true
 
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true
@@ -69,6 +85,12 @@ cp apps/explorer/*.json build_initrd/apps/Explorer.nyx/ 2>/dev/null || true
 cp apps/network/*.json build_initrd/apps/Network.nyx/ 2>/dev/null || true
 cp apps/sysmon/*.json build_initrd/apps/SystemMonitor.nyx/ 2>/dev/null || true
 cp apps/glcube/*.json build_initrd/apps/GlCube.nyx/ 2>/dev/null || true
+cp apps/imageviewer/*.json build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
+
+# 3b. Bundle the Image Viewer's sample image asset(s) so it has something to open on launch.
+# Only ship real image files — NOT the generator script (make_sample.py).
+cp apps/imageviewer/assets/*.bmp build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
+cp apps/imageviewer/assets/*.tga build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
 
 # 4. Package it into a lightweight tape archive
 cd build_initrd

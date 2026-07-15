@@ -1,0 +1,16 @@
+[package]
+name = "nyx-imageviewer"
+version = "0.1.0"
+edition = "2021"
+
+# Nyx Image Viewer — a no_std nyx-gui app. Loads an image file from the VFS,
+# decodes it to B8G8R8A8, and blits it (fit-to-window, nearest-neighbour) via
+# Canvas::composite_buffer. Depends ONLY on nyx-api + nyx-gui (+ the heap
+# allocator), like apps/explorer.
+[dependencies]
+nyx-api = { path = "../../libs/api" }
+nyx-gui = { path = "../../libs/gui" }
+linked_list_allocator = "0.10.5"
+
+[profile.release]
+panic = "abort"

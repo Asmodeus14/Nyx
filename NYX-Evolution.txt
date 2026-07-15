@@ -1,250 +1,193 @@
+
 ================================================================================
-Nyx OS — GPU / 3D Engine Evolution
-Intel Gen9.5 (Comet Lake, device 0x9BC4, GT2) — RENDER Command Streamer (RCS)
+Nyx OS — Userspace Platform Evolution (std, apps, qclang)
 ================================================================================
 
-This document tracks the bring-up of a full 3D rendering engine on the Intel
-integrated GPU, driving the RENDER command streamer (RCS) and the Gen9 3D
-pipeline in legacy ring-buffer mode (no execlists / GuC), culminating in a
-mini-GL API exposed to userspace over syscalls.
+This roadmap tracks Nyx growing from bare-metal no_std apps into a real userspace
+platform: a desktop Image Viewer, a genuine Rust `std` port (target_os = "nyx"),
+and the qclang quantum compiler running ON-DEVICE. The three efforts are staged
+so each ships value on its own; qclang-on-device is gated on the std port.
 
-Target: Intel Comet Lake iGPU, PCI device 0x9BC4 (GT2), mapped to
-GpuGeneration::Gen9. Tested on bare metal only (QEMU cannot emulate the render
-engine); every 3D milestone is verified over serial + on-panel photo.
+Dependency chain:
+  Workstream A (Image Viewer)  -> independent, no_std, ships first.
+  Workstream B (real std)      -> the keystone; a Linux-personality PAL.
+  Workstream C (qclang)        -> a std program; depends on B reaching milestone B-gamma.
+
+KEY DISCOVERY that makes the std port tractable: the kernel ALREADY speaks the
+Linux x86-64 syscall ABI and was deliberately pre-wired for std. Implemented in
+nyx-kernel/src/interrupts.rs (syscall_dispatcher): mmap(9, real page alloc),
+arch_prctl(158, ARCH_SET_FS for TLS), getrandom(318, commented "Required for Rust
+HashMaps"), set_tid_address(218), spawn_thread(58), fork(57), execve(59), exit(60),
+writev(20), pipe(22), dup2(33), sockets(41/42/44/45), signal stubs(13/14/131).
+The std port is mostly FILLING GAPS, not inventing an ABI.
 
 --------------------------------------------------------------------------------
 STATUS SUMMARY
 --------------------------------------------------------------------------------
 
+[DONE] A1  Image Viewer app skeleton (no_std nyx-gui app)
+[DONE] A2a BMP/TGA hand-rolled decoder + blit + fit-to-window scale
+[DONE] A3  Register Image Viewer (Start menu + Build.sh + workspace)
+[TODO] A2b PNG/JPEG decoder (no_std crate, default-features=false + libm)
+[DONE] B1  Kernel syscall gaps for std (futex, clocks, sleep, yield, wait4, ...)
+[DONE] B2  SysV process startup (argc/argv/envp/auxv stack image; PT_TLS parsed, block-install deferred to PAL)
+[WIP ] B3  The `nyx` std PAL (library/std/src/sys/pal/nyx) — B-alpha + B-beta FULLY HW-VERIFIED (println+fs read+Mutex/Condvar/RwLock/Once+Instant+sleep+native thread_local+REAL thread::spawn/join across cores); B-gamma (HashMap/fs write/process) + net PAL still TODO
+[DONE] B4  Toolchain / build-std integration (target json + apply.py inject; stdhello links+RUNS)
+[TODO] C1  Slim qclang to a portable lib (prune deps, no stderr on compile path)
+[TODO] C2  On-device qclang front-end app (qcstudio, a std target_os=nyx binary)
+[TODO] C3  Validation: on-device .ql -> .qasm byte-matches host qclang
 
-[TODO] Phase 6  Primitives, CPU/GPU transforms, depth  -> spinning cube
-[TODO] Phase 7  Textures & samplers                    -> textured cube
-[TODO] Phase 8  Engine API layer (Device/Buffer/Mesh/Camera)
-[TODO] Phase 9  Mini-GL + syscalls + userspace 3D demo
-
-Milestone reached: a fully GPU-rendered red triangle (real VS + PS EU kernels,
-full Gen9 3D pipeline) drawn into the backbuffer at GVA 0x1400_0000, verified by
-CPU pixel readback (PS_inv=665088, center=0xffff0000) AND presented to the panel.
-This is NOT a CPU blit — it is the execution units shading real rasterizer
-coverage.
-
---------------------------------------------------------------------------------
-GVA (GGTT) MEMORY MAP owned by the 3D engine
---------------------------------------------------------------------------------
-Chosen to avoid the BLT driver's existing allocations (ring 0x1000_0000,
-backbuffer 0x1400_0000, fence 0x1500_0000, windows 0x2000_0000+).
-
-  0x1600_0000  RCS ring buffer
-  0x1700_0000  Batch buffer(s)
-  0x1800_0000  Instruction base (shader kernels)
-  0x1900_0000  Dynamic state (viewport / CC / blend / sampler)
-  0x1A00_0000  Surface state + binding tables
-  0x1B00_0000  Vertex / index buffers
-  0x1C00_0000  Depth buffer
-  0x1D00_0000  Textures
-  0x1E00_0000  RCS fence / scratch
+Milestone ladder for B (each is a real boot test):
+  B-alpha  std hello-world: println! + std::fs read; serial "[PID n] Exited (Code: 0)".  [FULLY HW-VERIFIED: println+eprintln 2026-07-12; std::fs::read_to_string of bundled hello.txt round-tripped 2026-07-15, exit 0]
+  B-beta   thread::spawn + Mutex/Condvar + Instant::now() + thread::sleep.  [FULLY HW-VERIFIED 2026-07-15: sync/time on main thread, native fs:-TLS, then 2 spawned workers on separate cores + shared futex Mutex (2000 increments) + join + per-thread TLS isolation, exit 0]
+  B-gamma  HashMap + std::process spawn/wait + full fs read/write. (Unlocks C.)
 
 --------------------------------------------------------------------------------
-HARD-WON LESSONS (first-triangle bring-up) — avoid this whole bug class
+Workstream A: Image Viewer  (independent, no_std, low risk)
 --------------------------------------------------------------------------------
-The first triangle took THREE distinct root-cause bugs, all the same shape: a
-Gen9 field whose innocent-looking or "more complete" value is the trap. When a
-field is left 0 or set to the seemingly-safe option, cross-check Mesa's Gen9
-lowering (ELK, not brw — brw is Xe/Gen12+) and the local genxml before trusting
-it.
+Objective: open image files from the desktop and display them in a window.
 
-  Bug #1  EU hardware opcodes. mov=1 / send=49 (pre-Xe). We had mov=2 (=sel!) and
-          send=51 (=sends, split-send) — silently mis-encoded every instruction.
-          Symptom: VS_inv>0 but CL_inv=0, deadlock.
-
-  Bug #2  3DSTATE_RASTER Cull Mode. Value 0 = CULLMODE_BOTH (cull EVERY triangle),
-          NOT "none". CULLMODE_NONE = 1. An all-zero DW1 culls everything.
-          Symptom: CL_prims=1 but PS_inv=0, black screen.
-
-  Bug #3  PS Render-Target write must be HEADERLESS on Gen9. Setting header-present
-          and forwarding raw R0/R1 as the message header fed the render cache
-          garbage (PS payload is NOT in RT-write-header format) -> per-thread
-          garbage destination addresses -> wild, per-boot-varying GGTT page faults
-          while PS_inv>0. Mesa builds a header only for dual-source / multi-RT /
-          kill, and even then it is a constructed g0-derived header, never a raw
-          forward. The render cache derives each pixel's destination from the
-          fixed-function dispatch; the EOT pixel mask comes from the exec mask.
-
-Debug infrastructure that made this tractable:
-  - On-device command-stream decoder (render/decode.rs) prints the whole batch
-    as readable lines, so one screen photo captures the pipeline.
-  - Staged PIPE_CONTROL "progress" fences: the fence page holds the last stage
-    reached, so a hang is localized without a GPU debugger.
-  - Fault-address readback: GEN8_FAULT_TLB_DATA0/1 (0x4b10/0x4b14) decode the
-    exact faulting GPU virtual address; RING_FAULT_REG = 0x4094.
-  - Gen9 pipeline-statistics MMIO counters pinpoint where a draw dies:
-    IA_VERTICES 0x2310, VS_INVOCATION 0x2320, CL_INVOCATION 0x2338,
-    CL_PRIMITIVES 0x2340, PS_INVOCATION 0x2348. (IA_VERTICES needs a separate
-    3DSTATE_VF_STATISTICS enable to count — IA_verts=0 is a red herring.)
-  - MOCS table MUST be programmed on Gen9 (all entries LLC write-back) or render-
-    cache writes have undefined caching and never reach memory.
-
-
-================================================================================
-REMAINING PHASES
-================================================================================
-
---------------------------------------------------------------------------------
-Phase 6: 3D Primitives, Transforms, and Depth  ->  spinning depth-tested cube
---------------------------------------------------------------------------------
-Objective: go from one hardcoded NDC triangle to real indexed geometry with a
-model-view-projection transform and a working depth buffer.
-
-Reference: PRM vol07-3d_media_gpgpu.pdf; genxml 3DSTATE_INDEX_BUFFER,
-3DSTATE_DEPTH_BUFFER, 3DSTATE_WM_DEPTH_STENCIL, 3DSTATE_CLEAR_PARAMS.
+Reuses primitives that ALREADY exist:
+  - Canvas::composite_buffer  (blit a &[u32] B8G8R8A8 buffer)  libs/gui/src/canvas.rs:113
+  - ImageView widget                                           libs/gui/src/ui.rs:650
+  - NyxApp trait + nyx_gui::app::run event loop                libs/gui/src/app.rs:6
+Model app to copy: apps/explorer/src/main.rs.
 
 Actionable Steps:
 
-1. Index buffers.
-   - Implement 3DSTATE_INDEX_BUFFER (index format UINT16/UINT32, GGTT address at
-     0x1B00_0000 region) and switch 3DPRIMITIVE to RANDOM (indexed) access.
-   - Add a vertex-format abstraction so a mesh declares its attributes
-     (position, color, later normal/uv) and the code emits matching
-     3DSTATE_VERTEX_ELEMENTS / VERTEX_BUFFERS automatically.
+A1. App skeleton.
+    - New crate apps/imageviewer, package name `nyx-imageviewer`; deps nyx-api,
+      nyx-gui, linked_list_allocator (copy apps/explorer/Cargo.toml).
+    - #![no_std] #![no_main]; LockedHeap global allocator; _start with
+      #[unsafe(link_section=".text.entry")] + sys_alloc_pages heap init;
+      #[panic_handler] -> sys_exit. Implement NyxApp (title/draw/on_key/on_mouse).
+    - Load bytes with the nyx-api helpers sys_open/sys_read/sys_close
+      (libs/api/src/lib.rs:133-146). User files live under /mnt/nvme/...
 
-2. CPU-side math (new engine/math.rs).
-   - mat4 (multiply, identity), perspective (fovy/aspect/near/far), lookAt,
-     translate/rotate/scale, vec3/vec4.
-   - START by transforming vertices on the CPU: feed already-projected clip-space
-     verts to the existing pass-through VS. This isolates the math from the VS
-     kernel and reuses the proven Phase-5 pipeline unchanged.
+A2a. Hand-rolled decoders (zero deps).
+    - 24/32-bit uncompressed BMP (and TGA) -> Vec<u32> B8G8R8A8. Proves the whole
+      load -> decode -> blit -> present path.
+    - Nearest-neighbour scale to fit the window (composite_buffer does NOT scale).
+      Keep the decoded Vec<u32> owned by the app struct (ImageView borrows a raw ptr).
 
-3. Move the transform into the VS (push constants).
-   - Upload the MVP matrix via 3DSTATE_CONSTANT_VS (push-constant region already
-     reserved by PUSH_CONSTANT_ALLOC_VS) into the VS payload GRFs.
-   - Extend the VS kernel with multiply-add (mul/mad) ops to transform position
-     by the MVP. Validate the new EU encoding by byte-diff vs Mesa ELK as in
-     Phase 3. Keep the CPU-transform path as a fallback for A/B debugging.
+A2b. Real formats (no_std crate).
+    - Pull a decoder the SAME way libs/gui/Cargo.toml pulls ttf-parser /
+      ab_glyph_rasterizer: default-features = false + a libm feature, and add libm.
+      Candidates: zune-png / zune-jpeg (alloc-only) or hand-rolled inflate.
+    - Dispatch by extension/magic. Cap image dimensions to protect the heap; a
+      pathological file can blow the 1 MiB default heap (bump sys_alloc_pages).
 
-4. Real depth buffer.
-   - Allocate + GGTT-map a depth surface at 0x1C00_0000 (D32_FLOAT or D24_UNORM),
-     replace the SURFTYPE_NULL 3DSTATE_DEPTH_BUFFER with a real one, program
-     3DSTATE_CLEAR_PARAMS, and clear it each frame.
-   - Enable depth test LESS + depth write in 3DSTATE_WM_DEPTH_STENCIL. HiZ can
-     stay off initially.
+A3. Registration (exact edits).
+    - Workspace Cargo.toml `members`: add "apps/imageviewer".
+    - apps/compositor/src/main.rs Start menu: append "> Image Viewer" to BOTH item
+      arrays (~:1111, ~:1131); extend click dispatch (~:521-528) — turn the final
+      `else` (GlCube) into a bounded `else if rel_y < 240` and add a new arm doing
+      sys_fork()==0 -> sys_execve("/mnt/nvme/apps/ImageViewer.nyx/run.bin\0"); bump
+      menu_h 240 -> 280 in all three geometry spots (~:506, ~:1057, ~:1108/1128).
+    - Build.sh: add the build, the mkdir build_initrd/apps/ImageViewer.nyx, and the
+      cp target/x86_64-nyx/release/nyx-imageviewer .../run.bin. Bundle a sample image.
 
-5. Animation loop.
-   - Drive rotation from a frame counter / TSC; re-emit the MVP push constant per
-     frame; re-run the pipeline; present.
-
-Milestone: a spinning, depth-tested, per-vertex-colored cube on the monitor.
-Watch for: back-face occlusion correct (depth working), no z-fighting, cull mode
-now meaningfully BACK (test that CULLMODE_BACK culls the correct faces).
-
+Milestone A: Image Viewer opens from the Start menu and displays a bundled BMP,
+then PNG/JPEG, scaled to the window — verified by panel photo.
 
 --------------------------------------------------------------------------------
-Phase 7: Textures & Samplers  ->  textured cube
+Workstream B: Real userspace std (target_os = "nyx")   <- keystone / long pole
 --------------------------------------------------------------------------------
-Objective: sample a 2D texture in the pixel shader.
+Objective: genuine Rust `std` in userspace so real std crates (and qclang) build
+and run on Nyx.
 
-Reference: PRM vol02b (SURFACE_FORMAT), vol07 (sampler messages); genxml
-RENDER_SURFACE_STATE, SAMPLER_STATE, 3DSTATE_SAMPLER_STATE_POINTERS_PS.
+Strategy: a custom target + a `nyx` platform-abstraction layer (PAL) added to a
+patched rust-src, built with -Z build-std=std,panic_abort. Chosen over a rustc
+fork (too heavy to maintain) and over a musl-ABI shim (needs the same kernel work
+with less control). The kernel's Linux-numbered syscalls back the PAL directly.
 
-Actionable Steps:
+B1. Kernel syscall gaps (nyx-kernel/src/interrupts.rs, the `match id` dispatch).
+    Currently missing -> fall to the `_ => EINVAL` arm (:1867). Add:
+    - futex(202) — linchpin for std Mutex/Condvar/RwLock/thread park; needs a
+      wait-queue keyed by user address in the scheduler.
+    - clock_gettime(228) MONOTONIC+REALTIME (UPTIME_MS/TSC + RTC); nanosleep(35) /
+      clock_nanosleep(230) (Process already has a wake_tsc field).
+    - sched_yield(24) (yield path already exists via the 0x41 vector),
+      getpid(39)/gettid(186), wait4(61), exit_group(231) aliased to exit.
+    - Real exit codes + reaping: exit(60) currently only marks Zombie (:1073-1118);
+      store the code and let wait4 retrieve/reap it.
+    - Optionally replace getrandom's constant-42 fill (:1135) with a TSC/RTC PRNG.
 
-1. Texture upload.
-   - Allocate + GGTT-map texture storage at 0x1D00_0000; upload pixels; clflush.
-   - Start LINEAR (no tiling) to reuse the Phase-4/5 surface path; add Y-tiling
-     later for performance.
+B2. SysV process startup (nyx-kernel/src/process.rs load_elf + the execve arm).
+    Today the loader handles only PT_LOAD and hands _start a BARE stack (:1040-1048).
+    A real std/CRT needs:
+    - Initial stack image: [argc][argv..][NULL][envp..][NULL][auxv..][AT_NULL] + strings.
+    - auxv: AT_PAGESZ, AT_RANDOM(16), AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY, AT_HWCAP, AT_NULL.
+    - PT_TLS: record the template (image ptr, filesz, memsz, align); allocate + install
+      the initial thread's TLS block and set FS base (existing arch_prctl path) so
+      thread-locals resolve. Reject PT_INTERP (static only).
 
-2. Texture surface state.
-   - Build a second RENDER_SURFACE_STATE (sampled image, e.g. R8G8B8A8_UNORM),
-     place it as binding-table entry [1] (RT stays entry [0]).
+B3. The `nyx` std PAL (library/std/src/sys/pal/nyx in the patched rust-src).
+    Implement over nyx-api syscalls: alloc(mmap-backed), thread(spawn_thread/clone +
+    futex park/unpark), thread_local/TLS(FS base + PT_TLS), time(clock_gettime),
+    sync(futex Mutex/Condvar/RwLock), fs(open/read/write/close/seek/stat — EXTEND the
+    VFS for seek+stat+readdir; confirm write support), stdio(fd 0/1/2),
+    os/args/env(from auxv/argv/envp), process(fork/execve/wait4), net(smoltcp,
+    best-effort), random(getrandom), panic = abort.
 
-3. Sampler state.
-   - Build SAMPLER_STATE (min/mag filter, wrap modes), place in dynamic state,
-     point 3DSTATE_SAMPLER_STATE_POINTERS_PS at it.
+B4. Toolchain / build integration.
+    - New targets/x86_64-unknown-nyx.json: "os":"nyx", static reloc, disable-redzone,
+      same SSE feature set as x86_64-nyx.json, panic-strategy:"abort". [DONE]
+    - EMPIRICAL FINDING (spike tests/stdhello, build-std=std,panic_abort): core+alloc build
+      fine, but std FAILS because on nightly-2026-07-01 the `sys/*` subsystem modules use
+      `cfg_select!` with NO fallback arm (only `pal/mod.rs` has `_ => unsupported`). So os="nyx"
+      must add an explicit `nyx` (or `_`) arm to EACH of: sys/alloc/mod.rs, sys/io/error/mod.rs,
+      sys/thread_local/*, sys/random, sys/fs, sys/net, sys/process, sys/thread, sys/time,
+      sys/stdio, sys/pal/mod.rs. The compiler errors enumerate each subsystem's exact contract
+      (e.g. io::error needs errno/error_string/decode_error_kind/is_interrupted; random needs
+      fill_bytes). This is an error-driven grind: each build reveals the next required symbol.
+    - Mechanism: patch the ACTIVE rustup rust-src in place from an in-repo source of truth
+      (vendor/nyx-std/) via an idempotent apply script, then -Z build-std=std,panic_abort
+      -Z json-target-spec. Pin to nightly-2026-07-01 (rust-toolchain.toml). Reproducibility of
+      this patch step is the maintainability crux — wire it into Build.sh + CI.
+    - Provide a naked `_start` shim in the PAL that reads the B2 SysV stack (argc/argv/auxv at
+      RSP, RSP%16==8), installs TLS from PT_TLS via AT_PHDR + arch_prctl, then calls the Rust
+      lang-start. std's own entry can't be used directly (no crt0).
 
-4. Textured PS kernel.
-   - Add UV as a second vertex attribute; the SF interpolates it into the PS
-     payload (extend 3DSTATE_SBE attribute count + read offset).
-   - New PS variant: issue a sampler `send` (SFID sampler) with the UVs, receive
-     the RGBA result, then the headerless RT write. Byte-diff the new send vs
-     Mesa ELK sampler lowering.
-
-Milestone: a textured, spinning cube.
-
+Milestone B: the B-alpha -> B-beta -> B-gamma ladder above, each a real boot test.
 
 --------------------------------------------------------------------------------
-Phase 8: Engine API Layer
+Workstream C: qclang on-device   (depends on B-gamma)
 --------------------------------------------------------------------------------
-Objective: wrap the raw command emission behind a small, reusable engine so
-scenes are described in data, not hand-rolled batches.
+Objective: compile .ql -> OpenQASM entirely on Nyx.
 
-Actionable Steps:
+Findings: Compiler::compile(&str) -> Result<String, Vec<String>> ALREADY exists
+(tools/compiler/src/lib.rs:162); the whole lex -> parse -> semantics -> QIR ->
+codegen chain is in-memory, string-in/string-out, with NO process/net/threads on
+the compile path. The in-tree and standalone copies are byte-identical.
 
-1. engine/ module.
-   - Device (owns the RenderEngine + state allocators), Buffer, Texture,
-     Shader (selects a compiled kernel), Pipeline / render-state, CommandList.
-   - draw_indexed(mesh, material, mvp); present().
+C1. Slim the compiler to a portable lib.
+    - Build qclang_compiler as lib-only (drop both [[bin]]).
+    - Prune deps to the compile path: keep logos + thiserror; drop dead
+      serde/serde_json/regex/lazy_static/chrono and peripheral
+      clap/indicatif/colored/self_update; drop num-complex/rand unless the optional
+      simulator.rs is shipped (it needs entropy — leave out initially).
+    - Replace the two eprintln! diagnostics (lib.rs:118, lexer.rs:195) with returned
+      warnings so the core never touches stderr.
 
-2. Scene helpers.
-   - Mesh (vertex/index buffers + format), Camera (view/proj), Transform,
-     Material (shader + textures + render state).
+C2. On-device front-end app (a std target_os=nyx binary).
+    - New apps/qcstudio (or extend apps/terminal): read a .ql via std::fs, call
+      qclang_compiler::Compiler::compile, write .qasm via std::fs, render QASM +
+      diagnostics through nyx-gui. First real consumer of Workstream B.
+    - Register in Start menu + Build.sh like Workstream A; bundle a sample .ql.
 
-3. Present path.
-   - Currently proof-of-life copies the backbuffer to scanout then holds. Replace
-     with a proper present: either the existing BLT-to-scanout swap, or a true
-     display flip via PLANE_SURF register writes (the driver currently only reads
-     those regs — add the write path) for tear-free double buffering.
-   - Resolve backbuffer ownership vs the compositor: the engine should render into
-     its own surface and composite, not fight the window server for 0x1400_0000.
+C3. Validation.
+    - Compile a bundled sample.ql on-device and byte-compare the emitted .qasm
+      against the host qclang output for the same input.
 
-Milestone: a scene (multiple meshes, a camera) rendered from data through the
-engine API, presented without the Phase-5 "present + 5s hold" hack.
-
+Milestone C: .ql -> .qasm compiled and displayed entirely on Nyx.
 
 --------------------------------------------------------------------------------
-Phase 9: Mini-GL + Syscalls + Userspace Demo  (stated end goal)
+BUILD / TEST NOTES (this workstream)
 --------------------------------------------------------------------------------
-Objective: expose the engine to userspace as a small OpenGL-like API over
-syscalls, and prove it with a userspace 3D app.
-
-Reference: existing GPU syscall model in nyx-kernel/src/interrupts.rs
-(syscalls 501-513; sys_swap_buffers = 502). Add new syscalls at 514+.
-
-Actionable Steps:
-
-1. Syscall surface.
-   - Define syscalls: create/destroy buffer, create/destroy texture, create
-     shader/program, bind, set uniform (MVP etc.), draw(_indexed), clear, present.
-   - Marshal handles (not raw kernel pointers) across the boundary; validate all
-     userspace-supplied sizes/offsets in the kernel (no GGTT address escapes).
-
-2. Mini-GL library (userspace).
-   - Thin libGL-like wrapper over the syscalls: glGenBuffers/glBufferData,
-     glGenTextures/glTexImage2D, glUseProgram, glUniformMatrix4fv, glDrawElements,
-     glClear, glSwapBuffers.
-
-3. Userspace demo app.
-   - Patterned on apps/compositor: open the device, upload a cube, spin it,
-     present each frame — entirely from userspace through the mini-GL API.
-
-Milestone: a userspace process rendering an animated 3D scene through mini-GL
-syscalls.
-
-Stretch (only if multi-app 3D is required):
-   - Per-process GPU contexts need PPGTT (only GGTT exists today) and most likely
-     execlists. A single-context mini-GL runs fine on GGTT; scope PPGTT/execlists
-     only when two apps must render concurrently.
-
-
-================================================================================
-BUILD / TEST NOTES
-================================================================================
-- No Rust toolchain on the Windows host. Build in WSL Ubuntu:
-    wsl.exe -- bash -lc 'cd /mnt/c/CODE/Nyx && cargo build --package nyx-kernel \
-      --release --target x86_64-unknown-none -Z build-std=core,alloc \
-      -Z build-std-features=compiler-builtins-mem'
-  Full image: ./Build.sh
-- The Git Bash tool has /tmp and git but NO /mnt/c; only WSL sees /mnt/c.
-- Mesa Gen9 encoding reference is ELK (src/intel/compiler/elk/), not brw.
-  genxml (command/state field offsets) is local at
-  C:\CODE\Nyx-Firmwares\Intel_Docs\mesa-gen9.xml.
-- No serial capture on the test laptop: read kernel logs in the userspace sysmon
-  boot-log viewer, and photograph the panel for visual milestones.
+- Image Viewer (A) is a GPU path -> bare-metal only on the Comet Lake test laptop
+  (no QEMU), same as the 3D engine. Verify by panel photo.
+- std + qclang (B/C) are CPU-only (no GPU), so QEMU is worth trying for fast
+  iteration on the SysV/TLS/PAL bring-up; fall back to bare metal if it misbehaves.
+- Build everything in WSL Ubuntu (no Rust on the Windows host):
+    wsl.exe -- bash -lc 'cd /mnt/c/CODE/Nyx && ./Build.sh'
