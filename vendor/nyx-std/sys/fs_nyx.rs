@@ -17,8 +17,13 @@ use crate::sys::unsupported;
 
 // --- Nyx syscalls (Linux-compatible numbers; see nyx-kernel/src/interrupts.rs). ---
 const SYS_READ: usize = 0;
+const SYS_WRITE: usize = 1;
 const SYS_OPEN: usize = 2;
 const SYS_CLOSE: usize = 3;
+
+// open(2) flags honored by the kernel (arg3). Linux values.
+const O_CREAT: usize = 0x40;
+const O_TRUNC: usize = 0x200;
 
 #[inline]
 unsafe fn sys3(n: usize, a1: usize, a2: usize, a3: usize) -> isize {
@@ -48,6 +53,9 @@ pub struct DirEntry(!);
 pub struct OpenOptions {
     read: bool,
     write: bool,
+    append: bool,
+    truncate: bool,
+    create: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -203,7 +211,7 @@ impl DirEntry {
 
 impl OpenOptions {
     pub fn new() -> OpenOptions {
-        OpenOptions { read: false, write: false }
+        OpenOptions { read: false, write: false, append: false, truncate: false, create: false }
     }
 
     pub fn read(&mut self, read: bool) {
@@ -212,19 +220,37 @@ impl OpenOptions {
     pub fn write(&mut self, write: bool) {
         self.write = write;
     }
-    pub fn append(&mut self, _append: bool) {}
-    pub fn truncate(&mut self, _truncate: bool) {}
-    pub fn create(&mut self, _create: bool) {}
-    pub fn create_new(&mut self, _create_new: bool) {}
+    pub fn append(&mut self, append: bool) {
+        self.append = append;
+    }
+    pub fn truncate(&mut self, truncate: bool) {
+        self.truncate = truncate;
+    }
+    pub fn create(&mut self, create: bool) {
+        self.create = create;
+    }
+    pub fn create_new(&mut self, create_new: bool) {
+        // No O_EXCL kernel-side yet; treat as plain create (best effort).
+        if create_new {
+            self.create = true;
+        }
+    }
 }
 
 impl File {
-    pub fn open(path: &Path, _opts: &OpenOptions) -> io::Result<File> {
-        // The kernel expects a raw (ptr,len) UTF-8 path slice — no NUL, no flags.
+    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
+        // The kernel expects a raw (ptr,len) UTF-8 path slice — no NUL. Flags travel in arg3.
         let s = path.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
         })?;
-        let ret = unsafe { sys3(SYS_OPEN, s.as_ptr() as usize, s.len(), 0) };
+        let mut flags = 0usize;
+        if opts.create {
+            flags |= O_CREAT;
+        }
+        if opts.truncate {
+            flags |= O_TRUNC;
+        }
+        let ret = unsafe { sys3(SYS_OPEN, s.as_ptr() as usize, s.len(), flags) };
         if ret < 0 {
             // Kernel returns EBADF(-9)/EINVAL(-22)/EFAULT(-14) as negative errnos.
             Err(io::Error::from_raw_os_error((-ret) as i32))
@@ -302,12 +328,30 @@ impl File {
         Ok(())
     }
 
-    pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
-        unsupported()
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        // write(1) routes fd>=3 through the VFS OpenFile (write-through at the fd offset).
+        let ret = unsafe { sys3(SYS_WRITE, self.fd as usize, buf.as_ptr() as usize, buf.len()) };
+        if ret < 0 {
+            Err(io::Error::from_raw_os_error((-ret) as i32))
+        } else if ret == 0 && !buf.is_empty() {
+            // The VFS bridge returns 0 on driver failure; surface it rather than looping forever
+            // in write_all.
+            Err(io::Error::new(io::ErrorKind::WriteZero, "kernel VFS wrote 0 bytes"))
+        } else {
+            Ok(ret as usize)
+        }
     }
 
-    pub fn write_vectored(&self, _bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        unsupported()
+    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let mut total = 0;
+        for b in bufs {
+            let n = self.write(b)?;
+            total += n;
+            if n < b.len() {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     pub fn is_write_vectored(&self) -> bool {

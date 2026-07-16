@@ -199,24 +199,33 @@ pub fn allocate_user_pages_at(start_vaddr: u64, num_pages: usize) -> Result<u64,
 
     for i in 0..num_pages {
         let page = start_page + i as u64;
-        
+
         unsafe {
             let frame = system.frame_allocator.allocate_frame().ok_or("Out of physical memory!")?;
-            
+
             match active_mapper.map_to(page, frame, flags, &mut system.frame_allocator) {
-                Ok(mapper) => mapper.flush(),
+                Ok(mapper) => {
+                    mapper.flush();
+                    // Zero only FRESH frames. (Reused pages must keep their contents — see below.)
+                    core::ptr::write_bytes(page.start_address().as_mut_ptr::<u8>(), 0, 4096);
+                }
                 Err(MapToError::PageAlreadyMapped(_)) => {
-                    let (_phys, flush) = active_mapper.unmap(page).unwrap();
-                    flush.flush();
-                    active_mapper.map_to(page, frame, flags, &mut system.frame_allocator).unwrap().flush();
+                    // B-γ FIX: KEEP the existing mapping. ELF segments legitimately share a page
+                    // (e.g. stdhello: .rodata ends at 0x...c148 and PT_TLS/.tdata STARTS there —
+                    // both LOADs cover page 0x...c000). The old behavior unmapped the page and
+                    // installed a fresh ZEROED frame, destroying the tail of the previous segment:
+                    // that wiped the last bytes of .rodata — where core::fmt's DECIMAL_PAIRS digit
+                    // table lives — so EVERY runtime-formatted integer became garbage bytes
+                    // (in-memory format! corruption + "tofu" in the boot log, varying per build).
+                    // Just release the unused frame and leave the page intact; the caller copies
+                    // its segment bytes on top.
+                    system.frame_allocator.deallocate_frame(frame);
                 },
                 Err(_) => {
                     system.frame_allocator.deallocate_frame(frame);
                     return Err("Failed to map user page");
                 }
             }
-            
-            core::ptr::write_bytes(page.start_address().as_mut_ptr::<u8>(), 0, 4096);
         }
     }
     Ok(start_vaddr)
@@ -341,10 +350,10 @@ pub fn clone_kernel_page_table(new_pml4_phys: PhysAddr) {
     }
 }
 
-pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
+pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) -> Result<(), &'static str> {
     unsafe {
         let mut lock = crate::memory::MEMORY_MANAGER.lock();
-        let system = lock.as_mut().expect("Memory System not initialized");
+        let system = lock.as_mut().ok_or("Memory System not initialized")?;
         let offset = PHYS_MEM_OFFSET;
         let phys_mask = 0x000FFFFF_FFFFF000;
         let flags_mask = 0xFFF;
@@ -356,7 +365,9 @@ pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
             let pml4_entry = *parent_pml4.add(i4);
             if pml4_entry & 1 == 0 { continue; }
 
-            let new_pml3 = system.frame_allocator.allocate_frame().expect("OOM: PML3");
+            // A userspace fork() must never be able to panic the whole kernel: on allocation
+            // failure, bail out with Err so the caller can return -ENOMEM to the process.
+            let new_pml3 = system.frame_allocator.allocate_frame().ok_or("OOM: PML3")?;
             let child_pml3_ptr = (new_pml3.start_address().as_u64() + offset) as *mut u64;
             core::ptr::write_bytes(child_pml3_ptr as *mut u8, 0, 4096);
             *child_pml4.add(i4) = new_pml3.start_address().as_u64() | (pml4_entry & flags_mask);
@@ -366,7 +377,7 @@ pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
                 let pml3_entry = *parent_pml3_ptr.add(i3);
                 if pml3_entry & 1 == 0 { continue; }
 
-                let new_pml2 = system.frame_allocator.allocate_frame().expect("OOM: PML2");
+                let new_pml2 = system.frame_allocator.allocate_frame().ok_or("OOM: PML2")?;
                 let child_pml2_ptr = (new_pml2.start_address().as_u64() + offset) as *mut u64;
                 core::ptr::write_bytes(child_pml2_ptr as *mut u8, 0, 4096);
                 *child_pml3_ptr.add(i3) = new_pml2.start_address().as_u64() | (pml3_entry & flags_mask);
@@ -381,7 +392,7 @@ pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
                         continue;
                     }
 
-                    let new_pt = system.frame_allocator.allocate_frame().expect("OOM: PT");
+                    let new_pt = system.frame_allocator.allocate_frame().ok_or("OOM: PT")?;
                     let child_pt_ptr = (new_pt.start_address().as_u64() + offset) as *mut u64;
                     core::ptr::write_bytes(child_pt_ptr as *mut u8, 0, 4096);
                     *child_pml2_ptr.add(i2) = new_pt.start_address().as_u64() | (pml2_entry & flags_mask);
@@ -414,6 +425,7 @@ pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) {
             }
         }
     }
+    Ok(())
 }
 
 pub fn clear_user_address_space(cr3_phys: PhysAddr) {

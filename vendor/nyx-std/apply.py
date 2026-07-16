@@ -171,6 +171,51 @@ def main():
         return insert_arm_after_cfg_select(os.path.join(B, "thread", "mod.rs"), arm, MARK)
     do("thread/mod.rs", thread)
 
+    # --- B-γ.3: process. Command spawn/wait over fork(57)+execve(59)+wait4(61). Path-only spawn
+    #     (kernel execve carries no argv/env); stdio inherited; kill unsupported (no signals). ---
+    def process():
+        copy("sys/process_nyx.rs", os.path.join(B, "process", "nyx.rs"))
+        arm = f'    target_os = "nyx" => {{ {MARK}\n        mod nyx;\n        use nyx as imp;\n    }}\n'
+        return insert_arm_after_cfg_select(os.path.join(B, "process", "mod.rs"), arm, MARK)
+    do("process/mod.rs", process)
+
+    # --- B-γ.3: sys::exit. `std::process::exit` (and returning from `main`) calls
+    #     `crate::sys::exit::exit(code)`. nyx has no arm in that cfg_select, so it fell through to
+    #     `_ => crate::intrinsics::abort()` (a `ud2` invalid opcode) — every std process that reached
+    #     exit died on #UD instead of terminating. Add a nyx arm that does exit_group(231) inline
+    #     (self-contained asm; no dependency on pal re-exports). Anchored on the motor exit arm, which
+    #     is unique to the `exit()` fn's cfg_select (the file's SECOND cfg_select, so the generic
+    #     insert_arm_after_cfg_select — which targets the first — can't be used here). ---
+    def sys_exit():
+        path = os.path.join(B, "exit.rs")
+        if not os.path.isfile(path):
+            return "skip"
+        text = open(path, encoding="utf-8").read()
+        if MARK in text:
+            return "already"
+        anchor = 'target_os = "motor" => {\n            moto_rt::process::exit(code)\n        }\n'
+        i = text.find(anchor)
+        if i < 0:
+            return "anchor-not-found"
+        j = i + len(anchor)
+        nyx_arm = (
+            f'        target_os = "nyx" => {{ {MARK}\n'
+            '            // Nyx: terminate via exit_group(231). Never returns.\n'
+            '            unsafe {\n'
+            '                core::arch::asm!(\n'
+            '                    "syscall",\n'
+            '                    in("rax") 231usize,\n'
+            '                    in("rdi") code as usize,\n'
+            '                    options(noreturn, nostack),\n'
+            '                );\n'
+            '            }\n'
+            '        }\n'
+        )
+        new = text[:j] + nyx_arm + text[j:]
+        open(path, "w", encoding="utf-8").write(new)
+        return "patched"
+    do("exit.rs (nyx exit_group arm)", sys_exit)
+
     # --- io/error: reuse the existing `generic` module (errno/error_string/…) for nyx. ---
     do("io/error/mod.rs (reuse generic)",
        lambda: add_os_to_arm(os.path.join(B, "io", "error", "mod.rs"), "generic", 'target_os = "nyx"'))

@@ -76,6 +76,7 @@ lazy_static! {
         }
         idt.page_fault.set_handler_fn(pf_handler);
         idt.general_protection_fault.set_handler_fn(gpf_handler);
+        idt.invalid_opcode.set_handler_fn(ud_handler);
         
         unsafe {
             idt[0x40].set_handler_addr(VirtAddr::new(timer_interrupt_stub as *const () as u64));
@@ -116,8 +117,69 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
 }
 
 extern "x86-interrupt" fn gpf_handler(stack_frame: InterruptStackFrame, error_code: u64) {
-    if (stack_frame.code_segment & 3) == 3 { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
+    let was_user = (stack_frame.code_segment & 3) == 3;
+    if was_user { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
+    if was_user {
+        // A userspace #GP must kill only the offending process, NOT panic the whole kernel.
+        crate::serial_println!("\n[GPF] User Process Terminated. err={:#x} IP={:#x}",
+            error_code, stack_frame.instruction_pointer.as_u64());
+        terminate_current_user_process();
+    }
     panic!("EXCEPTION: GPF Error: {} ({:#x})\nIP: {:#x}", error_code, error_code, stack_frame.instruction_pointer.as_u64());
+}
+
+// #UD (invalid opcode, vector 6). Rust's `core::intrinsics::abort()` and failed `debug_assert`s lower
+// to `ud2`; without this handler a userspace abort escalated to a triple fault and froze the whole
+// machine (dead mouse, blank screen). A userspace #UD now kills only that process.
+extern "x86-interrupt" fn ud_handler(stack_frame: InterruptStackFrame) {
+    let was_user = (stack_frame.code_segment & 3) == 3;
+    if was_user { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
+    if was_user {
+        crate::serial_println!("\n[#UD] User Process Terminated (invalid opcode / abort). IP={:#x}",
+            stack_frame.instruction_pointer.as_u64());
+        terminate_current_user_process();
+    }
+    panic!("EXCEPTION: INVALID OPCODE (#UD)\nIP: {:#x}\nCS: {:#x}",
+        stack_frame.instruction_pointer.as_u64(), stack_frame.code_segment);
+}
+
+/// Tear down the currently-running user process (close FDs, shred its address space, mark Zombie) and
+/// hlt-loop until the scheduler switches away. Shared by the page-fault, #GP, and #UD handlers so a
+/// crashing userspace program never takes the kernel down with it. Assumes swapgs already ran (we're
+/// on the kernel GS). Never returns.
+fn terminate_current_user_process() -> ! {
+    if GsBase::read().as_u64() != 0 {
+        let percpu = crate::percpu::current();
+        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+        if curr_idx < percpu.scheduler.tasks.len() {
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            for i in 0..32 {
+                if let Some(crate::scheduler::FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
+                    if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
+                        let sock = sock_mtx.lock();
+                        if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
+                            match sock.kind {
+                                crate::scheduler::SocketKind::Tcp(handle) => {
+                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                    socket.abort();
+                                    sockets.remove(handle);
+                                },
+                                crate::scheduler::SocketKind::Udp(handle) => { sockets.remove(handle); }
+                            }
+                        }
+                    }
+                }
+                task.fd_table[i] = None;
+            }
+            crate::memory::clear_user_address_space(task.cr3);
+            task.state = crate::scheduler::TaskState::Zombie;
+        }
+    }
+    crate::apic::end_of_interrupt();
+    unsafe {
+        x86_64::instructions::interrupts::enable();
+        loop { core::arch::asm!("hlt") }
+    }
 }
 
 extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
@@ -184,42 +246,7 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
 
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
         crate::serial_println!("\n[SEGFAULT] User Process Terminated. Invalid Memory Access at: {:#x}", cr2);
-        if GsBase::read().as_u64() != 0 {
-            let percpu = crate::percpu::current();
-            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-            if curr_idx < percpu.scheduler.tasks.len() {
-                let task = &mut percpu.scheduler.tasks[curr_idx];
-                
-                for i in 0..32 { 
-                    if let Some(crate::scheduler::FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
-                        if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
-                            let sock = sock_mtx.lock();
-                            if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
-                                match sock.kind {
-                                    crate::scheduler::SocketKind::Tcp(handle) => {
-                                        let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                                        socket.abort();
-                                        sockets.remove(handle);
-                                    },
-                                    crate::scheduler::SocketKind::Udp(handle) => { sockets.remove(handle); }
-                                }
-                            }
-                        }
-                    }
-                    task.fd_table[i] = None; 
-                }
-
-                crate::memory::clear_user_address_space(task.cr3);
-                task.state = crate::scheduler::TaskState::Zombie;
-            }
-        }
-        
-        crate::apic::end_of_interrupt();
-        
-        unsafe { 
-            x86_64::instructions::interrupts::enable();
-            loop { core::arch::asm!("hlt") } 
-        }
+        terminate_current_user_process();
     } else {
         if !was_user && (stack_frame.code_segment & 3) == 3 { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
         panic!("KERNEL PAGE FAULT\nAddr: {:#x}\nError: {:?}\nIP: {:#x}\nCS: {:#x}\nCR3: {:#x}", 
@@ -665,14 +692,28 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
     match id {
         0 => { frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64; },
         1 => { frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64; },
-        2 => { 
+        2 => {
             let buf_ptr = arg1 as *const u8;
             let len = arg2 as usize;
-            
+
             if !is_valid_user_ptr(buf_ptr, len) { frame.rax = EFAULT as u64; return; }
-            
+
             let path_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
             if let Ok(path) = core::str::from_utf8(path_slice) {
+                // B-γ.2: honor Linux-style open flags in arg3 (previously ignored). Nyx's open takes
+                // (ptr, len, flags) — the path stays a (ptr,len) slice, not a C string.
+                const O_CREAT: u64 = 0x40;
+                const O_TRUNC: u64 = 0x200;
+                let flags = arg3;
+                if flags & O_TRUNC != 0 {
+                    // Truncate-to-zero: recreate the file. delete_file is a no-op if absent.
+                    crate::vfs::VFS.delete_file(path);
+                    crate::vfs::VFS.create_file(path);
+                } else if flags & O_CREAT != 0 {
+                    // Create if missing; harmless if it already exists (driver returns AlreadyExists).
+                    crate::vfs::VFS.create_file(path);
+                }
+
                 if let Some(vnode) = crate::vfs::VFS.open_path(path) {
                     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                     if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
@@ -863,16 +904,27 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         57 => { // SYS_FORK
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ENOSYS as u64; return; }
-            
-            let mut child = crate::process::Process::new().expect("Failed to create child process");
-            
+
+            // A userspace fork() must NEVER be able to panic the whole kernel. Allocate the child
+            // process fallibly and return -ENOMEM on failure instead of .expect()-halting the CPU.
+            let mut child = match crate::process::Process::new() {
+                Ok(c) => c,
+                Err(_) => { frame.rax = (-12i64) as u64; return; } // -ENOMEM
+            };
+
             {
                 let parent = &percpu.scheduler.tasks[curr_idx];
                 child.parent_pid = Some(parent.pid);
-                child.mmap_bump = parent.mmap_bump; 
-                
-                // 1. Share memory frames (CoW implementation)
-                crate::memory::clone_user_address_space(parent.cr3, child.cr3);
+                child.mmap_bump = parent.mmap_bump;
+
+                // 1. Share memory frames (CoW implementation). Fallible: on OOM mid-walk, tear the
+                // half-built child address space back down and fail the fork gracefully.
+                if crate::memory::clone_user_address_space(parent.cr3, child.cr3).is_err() {
+                    crate::serial_println!("[57] fork FAILED: clone_user_address_space OOM");
+                    crate::memory::clear_user_address_space(child.cr3);
+                    frame.rax = (-12i64) as u64; // -ENOMEM
+                    return;
+                }
 
                 // 🚨 CoW FIX: Flush the Parent's TLB!
                 // Since we just marked the parent's active pages as Read-Only, we MUST 
@@ -940,7 +992,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             
             // 4. The parent process receives the child's actual PID!
             frame.rax = child.pid;
-            
+
             percpu.scheduler.tasks.push(child);
         },
         58 => { // SYS_SPAWN_THREAD
@@ -1043,10 +1095,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if let Some(elf_data) = crate::vfs::VFS.read_file_alloc(&path_str) {
                 let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                 let task = &mut percpu.scheduler.tasks[curr_idx];
-                
+
                 // 3. Shred the old memory
                 crate::memory::clear_user_address_space(task.cr3);
-                
+
                 // 🚨 THE FIX: Reset the bump allocator to a VALID canonical address! 🚨
                 // 0x1000_0000_0000 is safely inside the lower user half.
                 task.mmap_bump = 0x1000_0000_0000;

@@ -1,0 +1,14 @@
+[package]
+name = "stdchild"
+version = "0.1.0"
+edition = "2021"
+
+# B-gamma.3 child binary: the smallest possible std program spawned BY stdhello via
+# std::process::Command (fork+execve+wait4). Prints one line and exits 42 so the parent
+# can verify the wait4 status decode. Built the same way as stdhello (Build-std.sh).
+[[bin]]
+name = "stdchild"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

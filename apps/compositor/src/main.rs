@@ -527,6 +527,9 @@ impl CompositorState {
                 else if rel_y < 200 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0"); sys_exit(1); } }
                 else if rel_y < 240 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/GlCube.nyx/run.bin\0"); sys_exit(1); } }
                 else if rel_y < 280 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/ImageViewer.nyx/run.bin\0"); sys_exit(1); } }
+                // DIAGNOSTIC: bottom slot temporarily launches StdChild DIRECTLY (proven compositor
+                // fork+execve path, tiny parent) to test whether StdChild's own ELF/startup is broken
+                // vs. the freeze being specific to the StdHello->StdChild double-fork chain.
                 else { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/StdHello.nyx/run.bin\0"); sys_exit(1); } }
                 
                 self.start_menu_open = false; 

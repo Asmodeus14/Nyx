@@ -43,6 +43,9 @@ echo "[9/9] Building Image Viewer (imageviewer)..."
 # it can be launched on-device (B-alpha runtime check). Non-fatal if the std toolchain isn't ready.
 echo "[9b] Building std hello (target_os=nyx)..."
 ./Build-std.sh tests/stdhello stdhello || echo "  (std build skipped/failed — continuing)"
+# B-gamma.3 child binary: spawned by stdhello via std::process::Command to prove fork+execve+wait4.
+echo "[9c] Building std child (target_os=nyx)..."
+./Build-std.sh tests/stdchild stdchild || echo "  (std child build skipped/failed — continuing)"
 
 echo "[10/10] Generating App Tarball..."
 rm -rf build_initrd
@@ -58,6 +61,7 @@ mkdir -p build_initrd/apps/SystemMonitor.nyx
 mkdir -p build_initrd/apps/GlCube.nyx
 mkdir -p build_initrd/apps/ImageViewer.nyx
 mkdir -p build_initrd/apps/StdHello.nyx
+mkdir -p build_initrd/apps/StdChild.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
@@ -75,6 +79,8 @@ cp target/x86_64-nyx/release/nyx-imageviewer build_initrd/apps/ImageViewer.nyx/r
 cp tests/stdhello/target/x86_64-unknown-nyx/release/stdhello build_initrd/apps/StdHello.nyx/run.bin 2>/dev/null || true
 # Sample data file so the std binary can exercise std::fs::read on-device (B-alpha fs milestone).
 cp tests/stdhello/hello.txt build_initrd/apps/StdHello.nyx/hello.txt 2>/dev/null || true
+# B-gamma.3 child binary — spawned by stdhello via std::process::Command (fork/execve/wait4 test).
+cp tests/stdchild/target/x86_64-unknown-nyx/release/stdchild build_initrd/apps/StdChild.nyx/run.bin 2>/dev/null || true
 
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true

@@ -275,7 +275,23 @@ impl OpenFile {
         0 // EOF or Error
     }
 
-    pub fn write(&self, _buf: &[u8]) -> usize { 0 }
+    // B-γ.2: real write-through at the fd's current offset (mirrors read). The ext4 driver
+    // (lwext4) is R/W; only this bridge was a stub. Advances the shared offset so sequential
+    // write() calls append correctly.
+    pub fn write(&self, buf: &[u8]) -> usize {
+        let mut off = self.offset.lock();
+
+        if let Some((mount_point, rel_path)) = VFS.resolve_mount(&self.path) {
+            let mut mounts = VFS.mounts.lock();
+            if let Some(driver) = mounts.get_mut(&mount_point) {
+                if let Ok(bytes_written) = driver.write_file(&rel_path, *off, buf) {
+                    *off += bytes_written;
+                    return bytes_written;
+                }
+            }
+        }
+        0
+    }
 
     pub fn mmap(&self, _offset: usize, _size: usize) -> Result<u64, i64> {
         Err(-12) // ENOMEM
