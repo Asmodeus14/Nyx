@@ -7,7 +7,8 @@ pub mod qir;
 pub mod codegen;
 pub mod semantics;
 pub mod error;
-pub mod simulator; // <--- Added: Simulator Module
+#[cfg(feature = "sim")]
+pub mod simulator; // Statevector simulator (feature = "sim"; host `run` command).
 
 use lexer::tokenize;
 use parser::Parser;
@@ -17,18 +18,19 @@ use qir::analysis::QirAnalyzer;
 use semantics::SemanticAnalyzer;
 use codegen::QASMGenerator;
 use qir::QirModule;
-use std::time::SystemTime;
 
 pub const VERSION: &str = "0.6.0";
 
-// Dynamic build info (requires chrono in Cargo.toml)
+// Dynamic build info (requires chrono; host CLI banner only).
+#[cfg(feature = "cli")]
 pub fn build_timestamp() -> String {
-    let now = SystemTime::now();
+    let now = std::time::SystemTime::now();
     let dt = chrono::DateTime::<chrono::Utc>::from(now);
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-// Fetches hash from build.rs
+// Fetches hash from build.rs (host CLI banner only).
+#[cfg(feature = "cli")]
 pub fn git_commit_hash() -> String {
     env!("GIT_HASH").to_string()
 }
@@ -114,6 +116,8 @@ impl Compiler {
         let mut semantic_analyzer = SemanticAnalyzer::new();
         match semantic_analyzer.analyze_program(&program) {
             Ok(_) => {
+                // Host CLI surfaces warnings on stderr; on-device compile path stays silent.
+                #[cfg(feature = "cli")]
                 for warning in semantic_analyzer.get_warnings() {
                     eprintln!("Warning: {}", warning);
                 }

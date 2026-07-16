@@ -10,31 +10,45 @@ readme = "README.md"
 keywords = ["quantum", "compiler", "programming-language", "qasm"]
 categories = ["science", "development-tools"]
 
+[lib]
+name = "qclang_compiler"
+path = "src/lib.rs"
+
 [[bin]]
 name = "qclang"
 path = "src/bin/qclang.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "qclang-test"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
+# --- Core pipeline (portable: lexer -> parser -> semantics -> qir -> codegen) ---
+# These are the ONLY deps the on-device compiler (target_os = "nyx") links.
 logos = "0.13"
 thiserror = "1.0"
-clap = { version = "4.4", features = ["derive", "cargo"] }
-indicatif = "0.17"
-colored = "2.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-self_update = { version = "0.41", features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zip-deflate"] }
 
-num-complex = "0.4"   # Complex number support
-rand = "0.8"          # Random number generation
+# --- Statevector simulator (feature = "sim") ---
+num-complex = { version = "0.4", optional = true }   # Complex number support
+rand = { version = "0.8", optional = true }           # Measurement sampling
 
+# --- Host CLI only (feature = "cli") ---
+clap = { version = "4.4", features = ["derive", "cargo"], optional = true }
+indicatif = { version = "0.17", optional = true }
+colored = { version = "2.0", optional = true }
+self_update = { version = "0.41", features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zip-deflate"], optional = true }
+chrono = { version = "0.4", optional = true }         # build_timestamp() banner
 
-chrono = "0.4"
-lazy_static = "1.4"
-regex = "1.9"
+[features]
+# Default = full host toolchain (unchanged behavior for `cargo build` in tools/compiler).
+default = ["cli"]
+# Statevector simulator (run command). Pulls num-complex + rand.
+sim = ["dep:num-complex", "dep:rand"]
+# Host CLI binary: argument parsing, colored output, progress bars, self-update,
+# build-info banner. Implies the simulator (the `run` subcommand needs it).
+cli = ["dep:clap", "dep:colored", "dep:indicatif", "dep:self_update", "dep:chrono", "sim"]
 
 [profile.release]
 lto = true

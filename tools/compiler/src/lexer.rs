@@ -191,9 +191,14 @@ pub fn tokenize(source: &str) -> Vec<(Token, usize, usize)> {
                 let error_line = lines_up_to_error.len();
                 let line_start = source[..span.start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
                 let error_column = span.start - line_start + 1;
-                
-                eprintln!("Lexer error at line {} column {}: unexpected character '{}'", 
+
+                // Host CLI diagnostic only; the portable core (target_os = "nyx") never touches
+                // stderr. The bad token is skipped either way — the parser surfaces the error.
+                #[cfg(feature = "cli")]
+                eprintln!("Lexer error at line {} column {}: unexpected character '{}'",
                          error_line, error_column, slice);
+                #[cfg(not(feature = "cli"))]
+                let _ = (error_line, error_column, slice);
             }
         }
     }

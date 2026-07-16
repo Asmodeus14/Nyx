@@ -46,6 +46,9 @@ echo "[9b] Building std hello (target_os=nyx)..."
 # B-gamma.3 child binary: spawned by stdhello via std::process::Command to prove fork+execve+wait4.
 echo "[9c] Building std child (target_os=nyx)..."
 ./Build-std.sh tests/stdchild stdchild || echo "  (std child build skipped/failed — continuing)"
+# Workstream C (C2): on-device qclang front-end (std target_os=nyx; links the portable compiler core).
+echo "[9d] Building qcstudio (target_os=nyx)..."
+./Build-std.sh apps/qcstudio qcstudio || echo "  (qcstudio build skipped/failed — continuing)"
 
 echo "[10/10] Generating App Tarball..."
 rm -rf build_initrd
@@ -62,6 +65,7 @@ mkdir -p build_initrd/apps/GlCube.nyx
 mkdir -p build_initrd/apps/ImageViewer.nyx
 mkdir -p build_initrd/apps/StdHello.nyx
 mkdir -p build_initrd/apps/StdChild.nyx
+mkdir -p build_initrd/apps/QcStudio.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
@@ -81,6 +85,12 @@ cp tests/stdhello/target/x86_64-unknown-nyx/release/stdhello build_initrd/apps/S
 cp tests/stdhello/hello.txt build_initrd/apps/StdHello.nyx/hello.txt 2>/dev/null || true
 # B-gamma.3 child binary — spawned by stdhello via std::process::Command (fork/execve/wait4 test).
 cp tests/stdchild/target/x86_64-unknown-nyx/release/stdchild build_initrd/apps/StdChild.nyx/run.bin 2>/dev/null || true
+# Workstream C (C2): qcstudio on-device compiler front-end (std target_os=nyx), plus the sample .ql
+# it compiles to .qasm on-device (C3 byte-compares that output against host qclang).
+cp apps/qcstudio/target/x86_64-unknown-nyx/release/qcstudio build_initrd/apps/QcStudio.nyx/run.bin 2>/dev/null || true
+cp apps/qcstudio/samples/sample.ql build_initrd/apps/QcStudio.nyx/sample.ql 2>/dev/null || true
+# C3 reference: host qclang's QASM for sample.ql; qcstudio byte-compares its on-device output to it.
+cp apps/qcstudio/samples/expected.qasm build_initrd/apps/QcStudio.nyx/expected.qasm 2>/dev/null || true
 
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true

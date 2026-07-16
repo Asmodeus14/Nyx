@@ -28,7 +28,7 @@ default-members = ["nyx-kernel"]
 
 # The std-port spike crate uses a different target + build-std=std; keep Cargo from pulling it
 # into the workspace (it must be built standalone against x86_64-unknown-nyx.json).
-exclude = ["tests/stdhello", "tests/stdchild", "vendor"]
+exclude = ["tests/stdhello", "tests/stdchild", "apps/qcstudio", "vendor"]
 
 resolver = "2"
 

@@ -220,6 +220,31 @@ def main():
     do("io/error/mod.rs (reuse generic)",
        lambda: add_os_to_arm(os.path.join(B, "io", "error", "mod.rs"), "generic", 'target_os = "nyx"'))
 
+    # --- C2: std/build.rs allowlist. std's build.rs emits `cfg(restricted_std)` for any target NOT
+    #     in its known-platform list; that cfg makes std (and EVERY downstream crate that touches it,
+    #     e.g. logos/thiserror) require `#![feature(restricted_std)]`. Our own crates opt in, but
+    #     registry deps can't — and `-Zcrate-attr` can't be scoped to skip core/compiler_builtins.
+    #     Fix at the source: add nyx beside motor in the allowlist so std is treated as a fully
+    #     supported platform and never sets restricted_std. build.rs is two dirs up from src/sys. ---
+    def build_allowlist():
+        path = os.path.join(B, "..", "..", "build.rs")
+        if not os.path.isfile(path):
+            return "skip"
+        text = open(path, encoding="utf-8").read()
+        if 'target_os == "nyx"' in text:
+            return "already"
+        anchor = '|| target_os == "motor"\n'
+        i = text.find(anchor)
+        if i < 0:
+            return "anchor-not-found"
+        j = i + len(anchor)
+        line_start = text.rfind("\n", 0, i) + 1
+        indent = text[line_start:i]
+        new = text[:j] + f'{indent}|| target_os == "nyx"\n' + text[j:]
+        open(path, "w", encoding="utf-8").write(new)
+        return "patched"
+    do("build.rs (nyx in restricted_std allowlist)", build_allowlist)
+
     # --- thread_local (B-β.2b): nyx now has NATIVE fs:-relative TLS (target_thread_local = true in
     #     the target json + a variant-II block installed by pal::tls before main). So nyx must NOT be
     #     in the `no_threads` arm — remove it so cfg_select falls through to the `target_thread_local`

@@ -1,0 +1,27 @@
+[package]
+name = "qcstudio"
+version = "0.1.0"
+edition = "2021"
+
+# Workstream C (C2): the first real consumer of the Nyx std port. A `target_os = "nyx"`
+# std binary that reads a .ql source via std::fs, runs it through the PORTABLE qclang core
+# (qclang_compiler with default-features off => only logos + thiserror, no clap/self_update/
+# chrono/colored/indicatif/sim), writes the emitted OpenQASM back via std::fs, and echoes the
+# QASM + any diagnostics to the boot log. Headless first (unblocks C3 byte-match validation);
+# a nyx-gui window can layer on later.
+#
+# Built standalone against targets/x86_64-unknown-nyx.json via Build-std.sh — NOT a workspace
+# member (it uses the std target + build-std=std, like tests/stdhello).
+[[bin]]
+name = "qcstudio"
+path = "src/main.rs"
+
+[dependencies]
+# Portable compiler core only. default-features = false drops the "cli" feature (and with it
+# clap, colored, indicatif, self_update, chrono) AND "sim" (num-complex, rand) — leaving just
+# logos + thiserror, the two crates the lexer/parser/error path need. These must compile for
+# target_os = "nyx" under build-std; that's the C2 unknown this app proves out.
+qclang_compiler = { path = "../../tools/compiler", default-features = false }
+
+[profile.release]
+panic = "abort"

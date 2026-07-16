@@ -2148,14 +2148,10 @@ dependencies = [
  "clap",
  "colored",
  "indicatif",
- "lazy_static",
  "logos",
  "num-complex",
  "rand",
- "regex",
  "self_update",
- "serde",
- "serde_json",
  "thiserror 1.0.69",
 ]
 

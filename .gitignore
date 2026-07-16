@@ -1,8 +1,9 @@
-# Rust build outputs
+# Rust build outputs — root workspace AND the standalone std crates
+# (tests/*, apps/qcstudio) that build-std into their own local target/ dirs.
 /target/
+**/target/
 # NyxOS Build Artifacts
 *.tar
 build_initrd/
 .claude/
 nyx_build_last.log
-tests/stdhello/target/
