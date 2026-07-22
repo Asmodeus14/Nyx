@@ -23,28 +23,39 @@ pub enum FsError {
     PermissionDenied,
 }
 
+// F: filesystem capacity snapshot (total/free bytes + block size), from a driver that can report it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatFs {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub block_size: u32,
+}
+
 /// Any storage driver (NVMe, AHCI, TAR RAMFS) must implement this trait.
 pub trait FileSystem: Send + Sync {
     /// Reads up to buf.len() bytes from the file at the given offset.
     fn read_file(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError>;
-    
+
     /// Writes buf.len() bytes to the file at the given offset.
     fn write_file(&mut self, path: &str, offset: usize, buf: &[u8]) -> Result<usize, FsError>;
-    
+
     /// Gets the total size of the file in bytes.
     fn get_file_size(&self, path: &str) -> Result<usize, FsError>;
-    
+
     // Default implementations gracefully fail for read-only systems (like TarFs)
     fn create_file(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
     fn create_dir(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
     fn list_dir(&self, _path: &str) -> Result<Vec<String>, FsError> { Err(FsError::Unsupported) }
-    
+
     // 🔥 MILESTONE 1.3: Delete File Added
     fn delete_file(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
-    
+
     // 🔥 MILESTONE 1.7: Sync/Flush to commit Journal to physical disk
     fn sync(&mut self) -> Result<(), FsError> { Ok(()) }
-    
+
+    // F: total/free capacity of this filesystem. Default None for drivers that can't report it.
+    fn statfs(&self) -> Option<StatFs> { None }
+
     // --- WAL (Write-Ahead Logging) Hooks ---
     fn begin_transaction(&mut self) -> u64 { 0 }
     fn commit_transaction(&mut self, _tx_id: u64) -> bool { true }
@@ -164,6 +175,23 @@ impl VirtualFileSystem {
         } else {
             None
         }
+    }
+
+    // F: public size lookup (the trait's get_file_size was only reachable internally before). Returns
+    // None if the path doesn't resolve to a mount or the driver can't stat it (e.g. it's a directory).
+    pub fn file_size(&self, path: &str) -> Option<usize> {
+        let (mount_point, relative_path) = self.resolve_mount(path)?;
+        let mounts = self.mounts.lock();
+        let driver = mounts.get(&mount_point)?;
+        driver.get_file_size(&relative_path).ok()
+    }
+
+    // F: capacity of the filesystem backing `path` (total/free bytes). None if the mount can't report.
+    pub fn statfs(&self, path: &str) -> Option<StatFs> {
+        let (mount_point, _relative_path) = self.resolve_mount(path)?;
+        let mounts = self.mounts.lock();
+        let driver = mounts.get(&mount_point)?;
+        driver.statfs()
     }
     
     pub fn list_dir(&self, path: &str) -> Vec<String> {

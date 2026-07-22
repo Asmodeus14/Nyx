@@ -3,11 +3,20 @@ name = "nyx-terminal"
 version = "0.1.0"
 edition = "2021"
 
+# Workstream D (D3): the terminal is now a `target_os = "nyx"` std binary (built standalone via
+# Build-std.sh, like apps/qcstudio and apps/stdgui — NOT a workspace member, since it uses the std
+# target + build-std=std). std owns the heap/entry/panic, so linked_list_allocator is gone; nyx-gui
+# and nyx-api link in unchanged. D4 adds a `nyx_toolchains` dep for the compiler-registry commands.
 [dependencies]
-
-linked_list_allocator = "0.10.5"
 nyx-api = { path = "../../libs/api" }
 nyx-gui = { path = "../../libs/gui" }
+# D4: the pluggable compiler registry. Plain std + qclang_compiler (default-features=false → logos +
+# thiserror), all proven to build for target_os=nyx. This is what makes `compile`/`toolchains` work.
+nyx-toolchains = { path = "../../libs/toolchains" }
+
+[[bin]]
+name = "nyx-terminal"
+path = "src/main.rs"
 
 [profile.release]
 panic = "abort"

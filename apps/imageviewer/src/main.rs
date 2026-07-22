@@ -20,6 +20,11 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // later exec us with a real path once argv exists (Workstream B).
 const DEFAULT_IMAGE: &str = "/mnt/nvme/apps/ImageViewer.nyx/sample.bmp";
 
+// Bundled samples the viewer cycles through on click (no argv yet, so this is how
+// PNG/JPEG get exercised on-device). Only the ones that actually exist are kept.
+const SAMPLE_DIR: &str = "/mnt/nvme/apps/ImageViewer.nyx/";
+const SAMPLE_NAMES: [&str; 3] = ["sample.png", "sample.jpg", "sample.bmp"];
+
 // Guard rails: the default app heap is 4 MiB (see `_start`). A decoded image costs w*h*4 bytes,
 // so cap dimensions well under that to avoid OOM on a hostile/huge file. 2048*2048*4 = 16 MiB
 // would blow the heap; 1024*1024*4 = 4 MiB is the ceiling we allow a source image to occupy.
@@ -28,6 +33,16 @@ const MAX_PIXELS: usize = 1024 * 1024;
 // ============================================================================
 // File loading (nyx-api helpers: sys_open=2 / sys_read=0 / sys_close=3)
 // ============================================================================
+fn file_exists(path: &str) -> bool {
+    let fd = sys_open(path);
+    if fd >= 0 {
+        sys_close(fd);
+        true
+    } else {
+        false
+    }
+}
+
 fn read_file_bytes(path: &str) -> Vec<u8> {
     let fd = sys_open(path);
     if fd < 0 {
@@ -68,12 +83,13 @@ fn decode(bytes: &[u8]) -> Result<Image, &'static str> {
     if bytes.len() >= 2 && &bytes[0..2] == b"BM" {
         return decode_bmp(bytes);
     }
-    // PNG magic \x89PNG\r\n\x1a\n and JPEG SOI 0xFFD8 are handled in A2b.
+    // PNG magic \x89PNG\r\n\x1a\n (hand-written parser + miniz_oxide inflate) and
+    // JPEG SOI 0xFFD8 (zune-jpeg) — Workstream A2b.
     if bytes.len() >= 8 && &bytes[0..4] == &[0x89, b'P', b'N', b'G'] {
-        return Err("PNG not yet supported (see Workstream A2b)");
+        return decode_png(bytes);
     }
     if bytes.len() >= 2 && &bytes[0..2] == &[0xFF, 0xD8] {
-        return Err("JPEG not yet supported (see Workstream A2b)");
+        return decode_jpeg(bytes);
     }
     // TGA has no magic; try it last as a best-effort fallback.
     decode_tga(bytes)
@@ -187,6 +203,181 @@ fn decode_tga(b: &[u8]) -> Result<Image, &'static str> {
     Ok(Image { pixels: px, w, h })
 }
 
+// ----------------------------------------------------------------------------
+// PNG: hand-written chunk parser + unfilter, DEFLATE via miniz_oxide (no_std,
+// with-alloc). Scope: 8-bit depth, non-interlaced; color types 0/2/3/4/6.
+// ----------------------------------------------------------------------------
+fn decode_png(b: &[u8]) -> Result<Image, &'static str> {
+    const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if b.len() < 8 || !b.starts_with(&SIG) {
+        return Err("bad PNG signature");
+    }
+
+    let mut pos = 8usize;
+    let (mut width, mut height) = (0usize, 0usize);
+    let (mut bit_depth, mut color_type, mut interlace) = (0u8, 0u8, 0u8);
+    let mut seen_ihdr = false;
+    let mut idat: Vec<u8> = Vec::new();
+    let mut palette: Vec<(u8, u8, u8)> = Vec::new();
+    let mut trns: Vec<u8> = Vec::new(); // per-palette-index alpha (color type 3)
+
+    while pos + 8 <= b.len() {
+        let len = u32::from_be_bytes([b[pos], b[pos + 1], b[pos + 2], b[pos + 3]]) as usize;
+        let ctype = [b[pos + 4], b[pos + 5], b[pos + 6], b[pos + 7]];
+        let dstart = pos + 8;
+        if dstart + len + 4 > b.len() {
+            return Err("PNG chunk truncated");
+        }
+        let data = &b[dstart..dstart + len];
+        match &ctype {
+            b"IHDR" => {
+                if len < 13 {
+                    return Err("PNG bad IHDR");
+                }
+                width = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                height = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                bit_depth = data[8];
+                color_type = data[9];
+                // data[10] compression method (0), data[11] filter method (0)
+                interlace = data[12];
+                seen_ihdr = true;
+            }
+            b"PLTE" => {
+                for i in 0..len / 3 {
+                    palette.push((data[i * 3], data[i * 3 + 1], data[i * 3 + 2]));
+                }
+            }
+            b"tRNS" => trns.extend_from_slice(data),
+            b"IDAT" => idat.extend_from_slice(data),
+            b"IEND" => break,
+            _ => {}
+        }
+        pos = dstart + len + 4; // advance past data + 4-byte CRC (unchecked)
+    }
+
+    if !seen_ihdr {
+        return Err("PNG missing IHDR");
+    }
+    if bit_depth != 8 {
+        return Err("PNG: only 8-bit depth supported");
+    }
+    if interlace != 0 {
+        return Err("PNG: interlaced (Adam7) unsupported");
+    }
+    if width == 0 || height == 0 {
+        return Err("PNG: zero dimensions");
+    }
+    if width.checked_mul(height).map_or(true, |p| p > MAX_PIXELS) {
+        return Err("PNG image too large");
+    }
+
+    let channels: usize = match color_type {
+        0 => 1, // grayscale
+        2 => 3, // truecolor RGB
+        3 => 1, // palette index
+        4 => 2, // grayscale + alpha
+        6 => 4, // truecolor RGBA
+        _ => return Err("PNG: unsupported color type"),
+    };
+    let bpp = channels; // bytes per pixel at 8-bit depth
+    let stride = width * bpp;
+
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat)
+        .map_err(|_| "PNG: inflate failed")?;
+    if raw.len() < height * (1 + stride) {
+        return Err("PNG: short inflate output");
+    }
+
+    // Reverse the per-scanline filters into a contiguous height*stride buffer.
+    let mut img = vec![0u8; height * stride];
+    for y in 0..height {
+        let filter = raw[y * (1 + stride)];
+        let sbase = y * (1 + stride) + 1;
+        for x in 0..stride {
+            let a = if x >= bpp { img[y * stride + x - bpp] as i32 } else { 0 };
+            let up = if y > 0 { img[(y - 1) * stride + x] as i32 } else { 0 };
+            let ul = if x >= bpp && y > 0 { img[(y - 1) * stride + x - bpp] as i32 } else { 0 };
+            let v = raw[sbase + x] as i32;
+            let recon = match filter {
+                0 => v,
+                1 => v + a,
+                2 => v + up,
+                3 => v + (a + up) / 2,
+                4 => v + paeth(a, up, ul),
+                _ => return Err("PNG: bad filter type"),
+            } & 0xFF;
+            img[y * stride + x] = recon as u8;
+        }
+    }
+
+    // Expand each pixel to packed B8G8R8A8.
+    let mut px = vec![0u32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let i = y * stride + x * bpp;
+            let (r, g, bl, a) = match color_type {
+                0 => (img[i], img[i], img[i], 255),
+                2 => (img[i], img[i + 1], img[i + 2], 255),
+                3 => {
+                    let idx = img[i] as usize;
+                    let (r, g, bl) = *palette.get(idx).unwrap_or(&(0, 0, 0));
+                    (r, g, bl, *trns.get(idx).unwrap_or(&255))
+                }
+                4 => (img[i], img[i], img[i], img[i + 1]),
+                6 => (img[i], img[i + 1], img[i + 2], img[i + 3]),
+                _ => unreachable!(),
+            };
+            px[y * width + x] = pack(r, g, bl, a);
+        }
+    }
+    Ok(Image { pixels: px, w: width, h: height })
+}
+
+/// PNG Paeth predictor (a=left, b=above, c=upper-left).
+#[inline]
+fn paeth(a: i32, b: i32, c: i32) -> i32 {
+    let p = a + b - c;
+    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+    if pa <= pb && pa <= pc {
+        a
+    } else if pb <= pc {
+        b
+    } else {
+        c
+    }
+}
+
+// ----------------------------------------------------------------------------
+// JPEG: baseline/progressive via zune-jpeg (no_std, scalar path). Ask for RGB
+// output and pack to B8G8R8A8.
+// ----------------------------------------------------------------------------
+fn decode_jpeg(bytes: &[u8]) -> Result<Image, &'static str> {
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(bytes, options);
+    dec.decode_headers().map_err(|_| "JPEG: bad headers")?;
+    let (w, h) = dec.dimensions().ok_or("JPEG: no dimensions")?;
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 {
+        return Err("JPEG: zero dimensions");
+    }
+    if w.checked_mul(h).map_or(true, |p| p > MAX_PIXELS) {
+        return Err("JPEG image too large");
+    }
+
+    let rgb = dec.decode().map_err(|_| "JPEG decode failed")?;
+    if rgb.len() < w * h * 3 {
+        return Err("JPEG: short pixel buffer");
+    }
+    let mut px = vec![0u32; w * h];
+    for i in 0..w * h {
+        px[i] = pack(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2], 255);
+    }
+    Ok(Image { pixels: px, w, h })
+}
+
 // ============================================================================
 // Nearest-neighbour scale into a dst_w x dst_h buffer (composite_buffer does
 // not scale, so we resize here to fit the window while preserving aspect).
@@ -236,33 +427,71 @@ struct ImageViewerApp {
     scaled: Vec<u32>,
     scaled_w: usize,
     scaled_h: usize,
+    // Bundled samples that exist, cycled on click; `cur` indexes the one shown.
+    candidates: Vec<String>,
+    cur: usize,
 }
 
 const FOOTER_H: usize = 28;
 
 impl ImageViewerApp {
     fn new() -> Self {
-        let path = String::from(DEFAULT_IMAGE);
-        let bytes = read_file_bytes(&path);
-        let (image, status) = if bytes.is_empty() {
-            (None, alloc::format!("Could not open {}", path))
-        } else {
-            match decode(&bytes) {
-                Ok(img) => {
-                    let s = alloc::format!("{}  —  {} x {}", short_name(&path), img.w, img.h);
-                    (Some(img), s)
-                }
-                Err(e) => (None, alloc::format!("{}: {}", short_name(&path), e)),
+        let mut candidates: Vec<String> = Vec::new();
+        for name in SAMPLE_NAMES.iter() {
+            let p = alloc::format!("{}{}", SAMPLE_DIR, name);
+            if file_exists(&p) {
+                candidates.push(p);
             }
-        };
-        Self {
-            path,
-            image,
-            status,
+        }
+        if candidates.is_empty() {
+            candidates.push(String::from(DEFAULT_IMAGE));
+        }
+        let mut app = Self {
+            path: String::new(),
+            image: None,
+            status: String::new(),
             scaled: Vec::new(),
             scaled_w: 0,
             scaled_h: 0,
+            candidates,
+            cur: 0,
+        };
+        app.load_index(0);
+        app
+    }
+
+    // Load + decode candidate `i` (wrapping), resetting the scaled-frame cache.
+    fn load_index(&mut self, i: usize) {
+        if self.candidates.is_empty() {
+            return;
         }
+        let i = i % self.candidates.len();
+        self.cur = i;
+        let path = self.candidates[i].clone();
+        let bytes = read_file_bytes(&path);
+        let (image, status) = if bytes.is_empty() {
+            (None, alloc::format!("Could not open {}   (click to cycle)", path))
+        } else {
+            match decode(&bytes) {
+                Ok(img) => {
+                    // w/h are Copy — read them before `img` moves into the tuple.
+                    let s = alloc::format!(
+                        "{}  —  {} x {}   (click to cycle)",
+                        short_name(&path),
+                        img.w,
+                        img.h
+                    );
+                    (Some(img), s)
+                }
+                Err(e) => (None, alloc::format!("{}: {}   (click to cycle)", short_name(&path), e)),
+            }
+        };
+        self.path = path;
+        self.image = image;
+        self.status = status;
+        self.scaled.clear();
+        self.scaled_w = 0;
+        self.scaled_h = 0;
     }
 
     // Ensure `self.scaled` holds the image fit into (avail_w, avail_h). Returns the drawn dims.
@@ -324,6 +553,14 @@ impl NyxApp for ImageViewerApp {
         canvas.fill_rect(0, height - FOOTER_H, width, 1, Color::WARM_BORDER);
         canvas.print_str(12, height - FOOTER_H + 7, &self.status, Color::TEXT_DARK, 1);
     }
+
+    // Any click advances to the next bundled sample (BMP → PNG → JPG → TGA → …),
+    // the only way to reach PNG/JPEG until the launcher can pass a file argv.
+    fn on_mouse(&mut self, _mx: usize, _my: usize, _clicked: bool) -> bool {
+        let n = self.candidates.len().max(1);
+        self.load_index((self.cur + 1) % n);
+        true
+    }
 }
 
 // ============================================================================
@@ -332,13 +569,15 @@ impl NyxApp for ImageViewerApp {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
-    // 1024 pages * 4 KiB = 4 MiB heap — enough for a 1024x1024 decoded image plus a scaled copy.
-    let heap_start = sys_alloc_pages(1024);
+    // 4096 pages * 4 KiB = 16 MiB heap. A PNG/JPEG decode holds several full-frame
+    // buffers at once: the decoder's own output (up to ~4 MiB), our packed u32 copy
+    // (4 MiB for 1024x1024), plus the scaled-to-window copy — 4 MiB was too tight.
+    let heap_start = sys_alloc_pages(4096);
     if heap_start == 0 {
         sys_exit(1);
     }
     unsafe {
-        ALLOCATOR.lock().init(heap_start as *mut u8, 1024 * 4096);
+        ALLOCATOR.lock().init(heap_start as *mut u8, 4096 * 4096);
     }
 
     nyx_gui::app::run(ImageViewerApp::new());

@@ -1,0 +1,18 @@
+[package]
+name = "notepad"
+version = "0.1.0"
+edition = "2021"
+
+# A proper text editor: write multi-line text and save it to /mnt/nvme via std::fs. A `target_os =
+# "nyx"` std binary (same skeleton as apps/stdgui) so std::fs::write/read_to_string are available —
+# built standalone via Build-std.sh, NOT a workspace member. nyx-gui/nyx-api link in unchanged.
+[[bin]]
+name = "notepad"
+path = "src/main.rs"
+
+[dependencies]
+nyx-api = { path = "../../libs/api" }
+nyx-gui = { path = "../../libs/gui" }
+
+[profile.release]
+panic = "abort"

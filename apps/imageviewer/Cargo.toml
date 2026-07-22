@@ -12,5 +12,17 @@ nyx-api = { path = "../../libs/api" }
 nyx-gui = { path = "../../libs/gui" }
 linked_list_allocator = "0.10.5"
 
+# A2b image decoders. Both must be no_std + alloc (this app builds with
+# -Z build-std=core,alloc for the bare x86_64-nyx target, so default `std`
+# features are disabled).
+#   miniz_oxide: zlib/DEFLATE inflate for PNG IDAT (hand-written PNG parser on top).
+#                `with-alloc` gives inflate::decompress_to_vec_zlib without std.
+#   zune-jpeg:   baseline/progressive JPEG; default-features=false drops the std
+#                feature + the runtime-SIMD path (needs is_x86_feature_detected!),
+#                leaving the portable scalar IDCT.
+miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+zune-jpeg = { version = "0.4", default-features = false }
+zune-core = { version = "0.4", default-features = false }
+
 [profile.release]
 panic = "abort"

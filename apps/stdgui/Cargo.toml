@@ -1,0 +1,29 @@
+[package]
+name = "stdgui"
+version = "0.1.0"
+edition = "2021"
+
+# Workstream D (D2): the std-GUI foundation spike. Proves a `target_os = "nyx"` std binary can
+# link the EXISTING no_std GUI stack UNCHANGED and open a real window — the make-or-break step for
+# porting the terminal (D3) to std so it can host the compiler registry (D4).
+#
+# The two no_std libraries below link into this std binary with ZERO changes: std is a superset of
+# core+alloc, and neither lib declares a _start / #[global_allocator] / #[panic_handler] (those live
+# only in each no_std *binary*, and here std owns all three). The real unknown this app de-risks is
+# whether nyx-gui's font pipeline — ttf-parser + ab_glyph_rasterizer + libm, pulled transitively —
+# compiles for target_os=nyx under build-std. The build.rs restricted_std allowlist patch (C2) is
+# what lets those downstream crates build for nyx at all.
+#
+# Built standalone against targets/x86_64-unknown-nyx.json via Build-std.sh — NOT a workspace
+# member (it uses the std target + build-std=std, like tests/stdhello and apps/qcstudio).
+[[bin]]
+name = "stdgui"
+path = "src/main.rs"
+
+[dependencies]
+# The exact same crates every no_std GUI app uses — imported here into a std binary unmodified.
+nyx-api = { path = "../../libs/api" }
+nyx-gui = { path = "../../libs/gui" }
+
+[profile.release]
+panic = "abort"

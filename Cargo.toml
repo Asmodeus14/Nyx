@@ -9,11 +9,13 @@ members = [
     # Libraries
     "libs/api",
     "libs/gui",
+    "libs/toolchains",
     
     # Applications
     "apps/init",
     "apps/compositor",
-    "apps/terminal",
+    # apps/terminal is now a std target_os=nyx binary (D3) — built standalone via Build-std.sh, so it
+    # lives in `exclude` below, not here.
     "apps/settings",
     "apps/explorer",
     "apps/network",
@@ -28,7 +30,7 @@ default-members = ["nyx-kernel"]
 
 # The std-port spike crate uses a different target + build-std=std; keep Cargo from pulling it
 # into the workspace (it must be built standalone against x86_64-unknown-nyx.json).
-exclude = ["tests/stdhello", "tests/stdchild", "apps/qcstudio", "vendor"]
+exclude = ["tests/stdhello", "tests/stdchild", "apps/qcstudio", "apps/stdgui", "apps/terminal", "apps/notepad", "vendor"]
 
 resolver = "2"
 

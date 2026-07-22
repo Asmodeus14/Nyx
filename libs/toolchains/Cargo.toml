@@ -1,0 +1,15 @@
+[package]
+name = "nyx-toolchains"
+version = "0.1.0"
+edition = "2021"
+description = "Pluggable on-device compiler/interpreter registry for Nyx (dispatch a source file to a language backend)"
+
+[lib]
+name = "nyx_toolchains"
+path = "src/lib.rs"
+
+[dependencies]
+# Backend #1: the portable qclang core (logos + thiserror only; no host CLI/sim deps). Every
+# language backend is added the same way — a thin module implementing the Toolchain trait over
+# whatever crate does the real work. Adding a compiler is a one-entry change in Registry::with_defaults.
+qclang_compiler = { path = "../../tools/compiler", default-features = false }

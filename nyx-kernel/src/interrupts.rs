@@ -1807,6 +1807,38 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 frame.rax = 0;
             }
         }
+        // 541: sys_file_size(path_ptr, path_len) -> i64 bytes, or -1 if missing / not a plain file.
+        541 => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let path_slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+            frame.rax = if let Ok(path) = core::str::from_utf8(path_slice) {
+                match crate::vfs::VFS.file_size(path) {
+                    Some(sz) => sz as u64,
+                    None => (-1i64) as u64,
+                }
+            } else {
+                (-1i64) as u64
+            };
+        }
+
+        // 542: sys_statfs(out_ptr) -> 0 ok / -1. Writes {u64 total, u64 free, u32 block_size} of the
+        // /mnt/nvme ext4 mount into user memory at out_ptr (offsets 0/8/16, matching nyx_api::StatFs).
+        542 => {
+            let out_ptr = arg1 as *mut u8;
+            match crate::vfs::VFS.statfs("/mnt/nvme") {
+                Some(sf) => {
+                    unsafe {
+                        core::ptr::write_unaligned(out_ptr as *mut u64, sf.total_bytes);
+                        core::ptr::write_unaligned(out_ptr.add(8) as *mut u64, sf.free_bytes);
+                        core::ptr::write_unaligned(out_ptr.add(16) as *mut u32, sf.block_size);
+                    }
+                    frame.rax = 0;
+                }
+                None => frame.rax = (-1i64) as u64,
+            }
+        }
+
         513 => { // sys_wait_vsync — returns 1 if the vblank was observed, 0 on timeout / no GPU.
             let mut seen = 0u64;
             unsafe {

@@ -83,6 +83,24 @@ pub struct SystemInfo {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// KEYBOARD: navigation/editing keys delivered as Private-Use-Area chars
+// ─────────────────────────────────────────────────────────────────────────
+// The kernel (nyx-kernel/src/shell.rs) has no Unicode for arrows/Home/End/Delete/PageUp/Down, so it
+// encodes them as these PUA chars and pushes them through the normal key path → NyxApp::on_key(char).
+// These values MUST stay in sync with the match in shell.rs::handle_key.
+pub mod keys {
+    pub const LEFT: char = '\u{E010}';
+    pub const RIGHT: char = '\u{E011}';
+    pub const UP: char = '\u{E012}';
+    pub const DOWN: char = '\u{E013}';
+    pub const HOME: char = '\u{E014}';
+    pub const END: char = '\u{E015}';
+    pub const DELETE: char = '\u{E016}';
+    pub const PAGE_UP: char = '\u{E017}';
+    pub const PAGE_DOWN: char = '\u{E018}';
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // LINUX X86_64 SYSCALL ID CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────
 pub const SYS_READ: u64 = 0;
@@ -477,6 +495,29 @@ pub fn sys_fs_count(path: &str) -> usize {
 
 pub fn sys_fs_get_name(path: &str, idx: usize, buf: &mut [u8]) -> usize {
     syscall(511, idx as u64, buf.as_mut_ptr() as u64, path.as_ptr() as u64, path.len() as u64, 0, 0) as usize
+}
+
+/// F: size of a file in bytes, or -1 if it doesn't exist / is a directory. Backed by the kernel's
+/// existing get_file_size (ext4 fsize) surfaced via syscall 541.
+pub fn sys_file_size(path: &str) -> i64 {
+    syscall(541, path.as_ptr() as u64, path.len() as u64, 0, 0, 0, 0) as i64
+}
+
+/// F: filesystem capacity for the nvme mount. Field offsets are fixed (repr(C)) so the kernel can
+/// write total@0, free@8, block_size@16 directly into this struct via syscall 542.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatFs {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub block_size: u32,
+}
+
+/// F: query total/free bytes of the /mnt/nvme ext4 filesystem. `None` if the kernel couldn't stat it.
+pub fn sys_statfs() -> Option<StatFs> {
+    let mut sf = StatFs::default();
+    let rc = syscall(542, (&mut sf as *mut StatFs) as u64, 0, 0, 0, 0, 0) as i64;
+    if rc == 0 { Some(sf) } else { None }
 }
 
 pub fn sys_alloc_pages(pages: usize) -> u64 {

@@ -1,4 +1,4 @@
-use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
+use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
 use spin::Mutex;
 use alloc::collections::vec_deque::VecDeque;
 use lazy_static::lazy_static;
@@ -22,7 +22,29 @@ pub fn handle_key(scancode: u8) {
                     // Push to queue for Syscalls
                     KEY_QUEUE.lock().push_back(character);
                 },
-                DecodedKey::RawKey(_) => {},
+                // The pc_keyboard crate decodes navigation/editing keys (arrows, Home/End, Delete,
+                // PageUp/Down) as RawKey, which carry no Unicode. We used to drop them, so userspace
+                // apps could never see them. Instead, encode each as a Unicode Private-Use-Area char
+                // and push it through the SAME char queue — so it flows through pop_key(506) →
+                // MSG_KEY_EVENT → NyxApp::on_key(char) untouched, no protocol change. Apps decode
+                // these via nyx_api::keys::* (libs/api/src/lib.rs), whose values MUST match these.
+                DecodedKey::RawKey(code) => {
+                    let mapped = match code {
+                        KeyCode::ArrowLeft  => Some('\u{E010}'),
+                        KeyCode::ArrowRight => Some('\u{E011}'),
+                        KeyCode::ArrowUp    => Some('\u{E012}'),
+                        KeyCode::ArrowDown  => Some('\u{E013}'),
+                        KeyCode::Home       => Some('\u{E014}'),
+                        KeyCode::End        => Some('\u{E015}'),
+                        KeyCode::Delete     => Some('\u{E016}'),
+                        KeyCode::PageUp     => Some('\u{E017}'),
+                        KeyCode::PageDown   => Some('\u{E018}'),
+                        _ => None,
+                    };
+                    if let Some(c) = mapped {
+                        KEY_QUEUE.lock().push_back(c);
+                    }
+                },
             }
         }
     }

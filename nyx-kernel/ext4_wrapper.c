@@ -157,3 +157,18 @@ int nyx_fs_sync(const char* path) {
     }
     return 0;
 }
+
+// ==========================================
+// FILESYSTEM CAPACITY (statfs)
+// ==========================================
+// Reports total/free bytes of the mounted ext4 partition. lwext4 already computes this in
+// ext4_mount_point_stats; we just surface it. The mount point is "/mnt/" (see nyx_fs_mount above).
+// Returns 0 on success, -1 on failure.
+int nyx_fs_statfs(uint64_t* total_bytes, uint64_t* free_bytes, uint32_t* block_size) {
+    struct ext4_mount_stats s;
+    if (ext4_mount_point_stats("/mnt/", &s) != EOK) return -1;
+    *total_bytes = (uint64_t)s.blocks_count * (uint64_t)s.block_size;
+    *free_bytes  = (uint64_t)s.free_blocks_count * (uint64_t)s.block_size;
+    *block_size  = s.block_size;
+    return 0;
+}

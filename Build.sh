@@ -18,8 +18,8 @@ echo "[1/7] Building Init Orchestrator (init)..."
 echo "[2/7] Building Window Server (compositor)..."
 (cd apps/compositor && $BUILD_CMD)
 
-echo "[3/7] Building Terminal App (terminal)..."
-(cd apps/terminal && $BUILD_CMD)
+# [3] Terminal is now a std target_os=nyx binary (D3) — built via Build-std.sh below (step [9f]),
+# not the no_std $BUILD_CMD path.
 
 echo "[4/7] Building Settings App (settings)..."
 (cd apps/settings && $BUILD_CMD)
@@ -49,6 +49,18 @@ echo "[9c] Building std child (target_os=nyx)..."
 # Workstream C (C2): on-device qclang front-end (std target_os=nyx; links the portable compiler core).
 echo "[9d] Building qcstudio (target_os=nyx)..."
 ./Build-std.sh apps/qcstudio qcstudio || echo "  (qcstudio build skipped/failed — continuing)"
+# Workstream D (D2): std-GUI foundation spike — a std target_os=nyx binary that links the no_std
+# nyx-gui/nyx-api UNCHANGED and opens a window (proves the font pipeline builds for nyx under build-std).
+echo "[9e] Building stdgui (target_os=nyx)..."
+./Build-std.sh apps/stdgui stdgui || echo "  (stdgui build skipped/failed — continuing)"
+# Workstream D (D3): the terminal, ported to a std target_os=nyx binary (hosts the compiler registry
+# in D4). Built via build-std like the other std apps; must SUCCEED (it's the primary shell), so no
+# `|| echo`-swallow here — a failure should abort the build rather than silently ship a stale terminal.
+echo "[9f] Building terminal (std target_os=nyx)..."
+./Build-std.sh apps/terminal nyx-terminal
+# Notepad: std target_os=nyx text editor that saves to /mnt/nvme.
+echo "[9g] Building notepad (std target_os=nyx)..."
+./Build-std.sh apps/notepad notepad || echo "  (notepad build skipped/failed — continuing)"
 
 echo "[10/10] Generating App Tarball..."
 rm -rf build_initrd
@@ -66,12 +78,19 @@ mkdir -p build_initrd/apps/ImageViewer.nyx
 mkdir -p build_initrd/apps/StdHello.nyx
 mkdir -p build_initrd/apps/StdChild.nyx
 mkdir -p build_initrd/apps/QcStudio.nyx
+mkdir -p build_initrd/apps/StdGui.nyx
+mkdir -p build_initrd/apps/Notepad.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
 cp target/x86_64-nyx/release/nyx-init build_initrd/apps/Init.nyx/run.bin
 cp target/x86_64-nyx/release/compositor build_initrd/apps/WindowServer.nyx/run.bin
-cp target/x86_64-nyx/release/nyx-terminal build_initrd/apps/Terminal.nyx/run.bin
+# D3: terminal is a std binary now — its output lives under apps/terminal/target/ (workspace-excluded),
+# not the root target dir.
+cp apps/terminal/target/x86_64-unknown-nyx/release/nyx-terminal build_initrd/apps/Terminal.nyx/run.bin
+# D4: a bundled sample so `compile` (no args) works out of the box — the registry dispatches it to the
+# qclang backend by its .ql extension and emits OpenQASM next to it.
+cp apps/qcstudio/samples/sample.ql build_initrd/apps/Terminal.nyx/sample.ql 2>/dev/null || true
 cp target/x86_64-nyx/release/nyx-settings build_initrd/apps/Settings.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-explorer build_initrd/apps/Explorer.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-network build_initrd/apps/Network.nyx/run.bin
@@ -91,6 +110,10 @@ cp apps/qcstudio/target/x86_64-unknown-nyx/release/qcstudio build_initrd/apps/Qc
 cp apps/qcstudio/samples/sample.ql build_initrd/apps/QcStudio.nyx/sample.ql 2>/dev/null || true
 # C3 reference: host qclang's QASM for sample.ql; qcstudio byte-compares its on-device output to it.
 cp apps/qcstudio/samples/expected.qasm build_initrd/apps/QcStudio.nyx/expected.qasm 2>/dev/null || true
+# Workstream D (D2): std-GUI foundation spike binary (std target_os=nyx; links no_std nyx-gui unchanged).
+cp apps/stdgui/target/x86_64-unknown-nyx/release/stdgui build_initrd/apps/StdGui.nyx/run.bin 2>/dev/null || true
+# Notepad: std target_os=nyx text editor (saves to /mnt/nvme via std::fs).
+cp apps/notepad/target/x86_64-unknown-nyx/release/notepad build_initrd/apps/Notepad.nyx/run.bin 2>/dev/null || true
 
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true
@@ -107,6 +130,9 @@ cp apps/imageviewer/*.json build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || tru
 # Only ship real image files — NOT the generator script (make_sample.py).
 cp apps/imageviewer/assets/*.bmp build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
 cp apps/imageviewer/assets/*.tga build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
+# A2b: PNG + JPEG samples so the viewer's click-to-cycle can exercise both decoders on-device.
+cp apps/imageviewer/assets/*.png build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
+cp apps/imageviewer/assets/*.jpg build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
 
 # 4. Package it into a lightweight tape archive
 cd build_initrd

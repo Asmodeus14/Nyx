@@ -56,6 +56,7 @@ extern "C" {
     fn nyx_fs_read_file(path: *const u8, offset: u32, buf: *mut u8, len: u32) -> i32;
     fn nyx_fs_write_file(path: *const u8, offset: u32, buf: *const u8, len: u32) -> i32;
     fn nyx_fs_get_size(path: *const u8) -> i32;
+    fn nyx_fs_statfs(total_bytes: *mut u64, free_bytes: *mut u64, block_size: *mut u32) -> i32;
     
     fn nyx_fs_create_file(path: *const u8) -> i32; 
     fn nyx_fs_create_dir(path: *const u8) -> i32; 
@@ -209,5 +210,18 @@ impl crate::vfs::FileSystem for NvmeLwExt4Fs {
     fn sync(&mut self) -> Result<(), FsError> {
         let c_path = alloc::format!("/mnt/\0").into_bytes();
         if unsafe { nyx_fs_sync(c_path.as_ptr()) == 1 } { Ok(()) } else { Err(FsError::IoError) }
+    }
+
+    // F: total/free capacity of the ext4 partition (lwext4 ext4_mount_point_stats via the C wrapper).
+    fn statfs(&self) -> Option<crate::vfs::StatFs> {
+        let mut total: u64 = 0;
+        let mut free: u64 = 0;
+        let mut bsize: u32 = 0;
+        let rc = unsafe { nyx_fs_statfs(&mut total, &mut free, &mut bsize) };
+        if rc == 0 {
+            Some(crate::vfs::StatFs { total_bytes: total, free_bytes: free, block_size: bsize })
+        } else {
+            None
+        }
     }
 }
