@@ -11,6 +11,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 pub static NET_DRIVER: Mutex<Option<crate::drivers::net::rtl8168::Rtl8168Driver>> = Mutex::new(None);
+// WiFi (Intel AX201 CNVi) — owns the driver instance parallel to NET_DRIVER. Not yet plugged
+// into poll_network(); becomes a second smoltcp Device at Phase 7.
+pub static WIFI_DRIVER: Mutex<Option<crate::drivers::net::iwlwifi::IntelWifiDriver>> = Mutex::new(None);
 pub static NET_IFACE: Mutex<Option<Interface>> = Mutex::new(None);
 pub static GLOBAL_SOCKETS: Mutex<Option<SocketSet<'static>>> = Mutex::new(None);
 pub static DHCP_HANDLE: Mutex<Option<SocketHandle>> = Mutex::new(None);

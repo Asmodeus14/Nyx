@@ -69,6 +69,102 @@ impl PciDriver {
 }
 
 // ==========================================
+// 1b. INTEL AX201 CNVi Wi-Fi BIND (shared by both enumeration paths)
+// ==========================================
+
+/// Raw 32-bit PCI config write via legacy CF8/CFC (no offset masking — matches the RTL8168
+/// path's idiom so behaviour is identical to the proven wired-NIC bind).
+fn write_cfg_raw(bus: u8, device: u8, func: u8, offset: u8, value: u32) {
+    let address = 0x80000000 | ((bus as u32) << 16) | ((device as u32) << 11)
+        | ((func as u32) << 8) | (offset as u32);
+    unsafe {
+        Port::<u32>::new(0xCF8).write(address);
+        Port::<u32>::new(0xCFC).write(value);
+    }
+}
+
+/// Best-effort MSI (cap 0x05) programming, mirroring the RTL8168 walk. Intel gen2 Wi-Fi usually
+/// exposes MSI-X only; if no MSI cap is found this logs and defers IRQ wiring to Phase 3. Harmless
+/// for Phases 1-2, which keep CSR_INT_MASK=0 (all interrupts masked).
+fn setup_wifi_msi(dev: &PciDevice, vector: u8) {
+    let mut cap_ptr = (PciDriver::read_config(dev.bus, dev.device, dev.func, 0x34) & 0xFF) as u8;
+    while cap_ptr != 0 {
+        let cap = PciDriver::read_config(dev.bus, dev.device, dev.func, cap_ptr);
+        let cap_id = (cap & 0xFF) as u8;
+        if cap_id == 0x05 {
+            let msg_ctrl = PciDriver::read_config(dev.bus, dev.device, dev.func, cap_ptr + 2);
+            let is_64bit = (msg_ctrl & (1 << 7)) != 0;
+
+            let bsp_apic_id = unsafe { crate::percpu::PER_CPU.as_ref().unwrap()[0].apic_id } as u32;
+            let msi_addr_low = 0xFEE0_0000 | (bsp_apic_id << 12);
+            write_cfg_raw(dev.bus, dev.device, dev.func, cap_ptr + 4, msi_addr_low);
+            if is_64bit {
+                write_cfg_raw(dev.bus, dev.device, dev.func, cap_ptr + 8, 0);
+            }
+            let data_off = if is_64bit { cap_ptr + 12 } else { cap_ptr + 8 };
+            write_cfg_raw(dev.bus, dev.device, dev.func, data_off, vector as u32);
+
+            let mut msg_ctrl_new = PciDriver::read_config(dev.bus, dev.device, dev.func, cap_ptr + 2);
+            msg_ctrl_new |= 1; // MSI enable
+            write_cfg_raw(dev.bus, dev.device, dev.func, cap_ptr + 2, msg_ctrl_new);
+
+            let mut cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04);
+            cmd |= 1 << 10; // INTx disable
+            write_cfg_raw(dev.bus, dev.device, dev.func, 0x04, cmd);
+
+            crate::serial_println!("[WIFI] MSI vector {:#x} programmed (cap@{:#x}, 64bit={}).",
+                vector, cap_ptr, is_64bit);
+            return;
+        }
+        cap_ptr = ((cap >> 8) & 0xFF) as u8;
+    }
+    crate::serial_println!("[WIFI] No MSI (cap 0x05) found — likely MSI-X only; IRQ wiring deferred to Phase 3.");
+}
+
+/// Bind the Intel AX201 CNVi Wi-Fi card: enable bus-master, map BAR0, run Phase-1 bring-up
+/// (identity read of HW_REV) and Phase-2 DMA transport allocation, then stash the driver.
+/// Guarded so it never double-binds and never blocks the rest of boot on failure.
+pub fn bind_intel_wifi(dev: &PciDevice) {
+    if crate::drivers::net::WIFI_DRIVER.lock().is_some() {
+        return; // already bound by the other enumeration path
+    }
+    crate::serial_println!("[PCI] Binding Intel AX201 CNVi Wi-Fi ({:#06x}:{:#06x})...",
+        dev.vendor_id, dev.device_id);
+
+    // Enable memory space + bus master (full-dword read/OR/write, as the RTL8168 path does).
+    let cmd = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x04) | 0x06;
+    write_cfg_raw(dev.bus, dev.device, dev.func, 0x04, cmd);
+
+    // BAR0 — 64-bit MMIO.
+    let bar0 = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x10);
+    let bar1 = PciDriver::read_config(dev.bus, dev.device, dev.func, 0x14);
+    let mut mmio_phys = (bar0 & 0xFFFF_FFF0) as u64;
+    if (bar0 & 0b100) != 0 { mmio_phys |= (bar1 as u64) << 32; }
+    if mmio_phys == 0 {
+        crate::serial_println!("[WIFI] BAR0 is zero — cannot bind Wi-Fi.");
+        return;
+    }
+    crate::serial_println!("[WIFI] BAR0 MMIO phys: {:#x}", mmio_phys);
+
+    let mut wifi = crate::drivers::net::iwlwifi::IntelWifiDriver::new(*dev, mmio_phys);
+    let alive = wifi.initialize();   // Phase 1: prepare-card, reset, read HW_REV
+    setup_wifi_msi(dev, 0x31);       // best-effort IRQ prep (deferred to P3 if MSI-X only)
+    if alive {
+        wifi.setup_transport();      // Phase 2: DMA rings + context-info block (no firmware)
+        if wifi.parse_firmware() {   // Phase 3a: parse the TLV .ucode → section map (no hardware)
+            if wifi.build_context_info() { // Phase 3b: copy fw to DMA + assemble context-info
+                wifi.start_firmware();     // Phase 3c: APM init + CSR_CTXT_INFO_BA kick + wait ALIVE
+            }
+        }
+    } else {
+        crate::serial_println!("[WIFI] Card not responding — skipping Phase-2/3 setup.");
+    }
+
+    *crate::drivers::net::WIFI_DRIVER.lock() = Some(wifi);
+    crate::serial_println!("[PCI] Wi-Fi driver stored.");
+}
+
+// ==========================================
 // 2. MODERN PCIe (MCFG) STRUCTURES
 // ==========================================
 #[repr(C, packed)]
@@ -125,7 +221,8 @@ fn enumerate_pci_legacy() {
                 crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id);
                 
                 if dev.vendor_id == 0x8086 && dev.device_id == 0x06f0 {
-                    crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
+                    crate::serial_println!("[PCI] Found Intel AX201 CNVi.");
+                    bind_intel_wifi(&dev);
                 }
                 
                 if dev.vendor_id == 0x10ec && matches!(dev.device_id, 0x8168 | 0x8125 | 0x8169 | 0x8136 | 0x8167) {
@@ -290,7 +387,14 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                                 crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", vendor_id, device_id);
                                   
                                 if vendor_id == 0x8086 && device_id == 0x06f0 {
-                                    crate::serial_println!("[PCI] Found Intel AX201 CNVi (Quarantined).");
+                                    crate::serial_println!("[PCI] Found Intel AX201 CNVi.");
+                                    let wifi_dev = PciDevice {
+                                        bus, device, func,
+                                        vendor_id, device_id,
+                                        class_id: class_code,
+                                        subclass_id: subclass,
+                                    };
+                                    bind_intel_wifi(&wifi_dev);
                                 }
                                 
                                 if vendor_id == 0x10ec && matches!(device_id, 0x8168 | 0x8125 | 0x8169 | 0x8136 | 0x8167) {
