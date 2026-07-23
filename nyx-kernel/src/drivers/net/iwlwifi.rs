@@ -66,6 +66,35 @@ const HBUS_TARG_PRPH_RDAT:    usize = 0x450;
 // (Linux iwl_trans_pcie_read_mem). Used to pull the fw error table out of device SRAM.
 const HBUS_TARG_MEM_RADDR:    usize = 0x40C;
 const HBUS_TARG_MEM_RDAT:     usize = 0x41C;
+// gen2 RX free-RBD doorbell (shadow write-index trigger, DIRECT MMIO — iwl_write32, not PRPH). For
+// context-info devices the FW configures RFH itself during boot; the host just rings this AFTER the
+// fw is alive to publish the posted free RBDs so the fw can DMA notifications. Pre-BZ restock path.
+const RFH_Q0_FRBDCB_WIDX_TRG: usize = 0x1C80;
+
+// --- P4b: gen2 host-command TX path (Linux iwl_pcie_gen2_enqueue_hcmd + iwl_txq_inc_wr_ptr) ---
+// The command queue is pre-configured by the fw from the context-info hcmd_cfg; post-ALIVE the host
+// builds an iwl_tfh_tfd in the ring, puts the command bytes (wide header + payload) in a slot, and
+// rings the TX write-ptr doorbell. NO byte-count table for the command queue (that's data-TX only).
+const HBUS_TARG_WRPTR: usize = 0x460;   // TX doorbell: value = write_ptr | (queue_id << 16)
+const IWL_FIRST_TB_SIZE: usize = 20;    // TB0 must be a dedicated <=20B buffer (hw requirement)
+const TFH_TFD_SIZE: usize = 256;        // sizeof(iwl_tfh_tfd): num_tbs(2) + 25*tb(10) + pad(4)
+const CMD_QUEUE_ID: u32 = 0;            // gen2/DQA command queue is queue 0
+// Real MAC from CSR (mac_addr_from_csr=0x380 for QuZ/9000-gen2). Try STRAP first, then OTP.
+const CSR_MAC_ADDR0_OTP:   usize = 0x380;
+const CSR_MAC_ADDR1_OTP:   usize = 0x384;
+const CSR_MAC_ADDR0_STRAP: usize = 0x388;
+const CSR_MAC_ADDR1_STRAP: usize = 0x38C;
+// Host command groups/ids for the post-ALIVE unified-fw init handshake (Linux
+// iwl_run_unified_mvm_ucode). NOTE: REGULATORY_AND_NVM_GROUP is 0x0C — 0x0B is PROT_OFFLOAD_GROUP.
+const SYSTEM_GROUP:          u8  = 0x02;
+const REGULATORY_NVM_GROUP:  u8  = 0x0C;
+const INIT_EXTENDED_CFG_CMD: u8  = 0x03; // SYSTEM_GROUP: "NVM-access commands follow"
+const INIT_COMPLETE_NOTIF:   u8  = 0x04; // legacy group (arrives with group_id=0x00)
+const NVM_ACCESS_COMPLETE:   u8  = 0x00; // REGULATORY_NVM_GROUP: finish NVM phase → fw finalizes init
+const NVM_GET_INFO:          u8  = 0x02; // REGULATORY_NVM_GROUP: query NVM (version/channels/chains)
+const IWL_INIT_NVM_FLAG:     u32 = 0x0000_0002; // init_flags = BIT(IWL_INIT_NVM=1)
+// PHY_CONFIGURATION_CMD is intentionally omitted: iwl_send_phy_cfg_cmd() returns early (no command)
+// for unified ucode without SISO-diversity — so NVM_ACCESS_COMPLETE is what triggers INIT_COMPLETE.
 
 // Firmware boot-status / program-counter PRPH registers (for diagnosing an early SW_ERR).
 const SB_CPU_1_STATUS:      u32 = 0x00A0_1E30; // LMAC secure-boot status
@@ -194,6 +223,14 @@ pub struct IntelWifiDriver {
     // --- Phase 3b: firmware in DMA + status write-back ---
     fw_dma: Vec<DmaRegion>,        // one DMA block per fw section (same order as fw_sections)
     rb_stts: Option<DmaRegion>,    // RX status write-back (device writes closed index here)
+
+    // --- Phase 4b: host-command TX + RX consumption ---
+    first_tb_bufs: Option<DmaRegion>, // per-slot 20-byte "first TB" (TB0) buffers
+    cmd_write_ptr: u32,               // command-queue producer index
+    rx_read_ptr: u32,                 // used-BD entries consumed so far
+    mac_addr: [u8; 6],
+    alive_umac_err: u32,              // UMAC error-table SRAM ptr (from the ALIVE ntf, runtime)
+    alive_lmac_err: u32,              // LMAC error-table SRAM ptr (from the ALIVE ntf, runtime)
 }
 
 impl IntelWifiDriver {
@@ -222,6 +259,12 @@ impl IntelWifiDriver {
             lmac_error_addr: 0,
             fw_dma: Vec::new(),
             rb_stts: None,
+            first_tb_bufs: None,
+            cmd_write_ptr: 0,
+            rx_read_ptr: 0,
+            mac_addr: [0; 6],
+            alive_umac_err: 0,
+            alive_lmac_err: 0,
         }
     }
 
@@ -415,8 +458,11 @@ impl IntelWifiDriver {
                 Some(buf) => {
                     if let Some(free) = self.rx_free {
                         unsafe {
+                            // gen2/22000 free-RBD = (buffer_dma | VID). VID is 1-based and the fw
+                            // echoes it back in the used-BD ring so we can map a completion to its
+                            // buffer. Buffers are 4 KiB-aligned so the low 12 bits are free for it.
                             let slot = (free.virt as *mut u64).add(i);
-                            write_volatile(slot, buf.phys);
+                            write_volatile(slot, buf.phys | (i as u64 + 1));
                         }
                     }
                     self.rx_buffers.push(buf);
@@ -426,12 +472,15 @@ impl IntelWifiDriver {
         }
         crate::serial_println!("[WIFI]   rx_buffers   count={} (16 x 4KiB)", self.rx_buffers.len());
 
-        // Host-command TX queue: one TFD ring page + one backing-bytes page.
-        self.tx_cmd_ring = self.alloc_dma(1);
-        self.tx_cmd_buf = self.alloc_dma(1);
-        ok &= self.tx_cmd_ring.is_some() && self.tx_cmd_buf.is_some();
+        // Host-command TX queue (gen2). TFD ring = 32 × sizeof(iwl_tfh_tfd)=256 = 8 KiB (2 pg);
+        // command backing = 32 × 256B slots = 8 KiB (2 pg); first-TB buffers = 32 × 64B (1 pg).
+        self.tx_cmd_ring = self.alloc_dma(2);
+        self.tx_cmd_buf = self.alloc_dma(2);
+        self.first_tb_bufs = self.alloc_dma(1);
+        ok &= self.tx_cmd_ring.is_some() && self.tx_cmd_buf.is_some() && self.first_tb_bufs.is_some();
         log_region("tx_cmd_ring", &self.tx_cmd_ring);
         log_region("tx_cmd_buf", &self.tx_cmd_buf);
+        log_region("first_tb", &self.first_tb_bufs);
 
         if ok {
             crate::serial_println!("[WIFI] Phase 2 OK: transport skeleton allocated (no firmware loaded).");
@@ -827,6 +876,274 @@ impl IntelWifiDriver {
         );
     }
 
+    /// P4: read + parse the firmware's ALIVE notification out of the RX ring. gen2/22000 RX
+    /// completion: rb_stts.closed_rb_num (le16 @0) = how many RBs the fw has filled; used_bd[i]
+    /// (le32) low-12 bits = the 1-based VID we encoded into the free-RBD, indexing our RX buffers.
+    /// The buffer holds an iwl_rx_packet: len_n_flags@0, cmd@4, group@5, seq@6, data@8. The ALIVE
+    /// notification is cmd=0x1/group=0; its payload is iwl_alive_ntf (status@0=0xCAFE ok, lmac[2]
+    /// @4 [48 B each], umac @100). Returns true iff a valid status==0xCAFE ALIVE ntf was parsed.
+    /// Wait up to `timeout_ms` for the next RX completion, consume it, and return its buffer virt
+    /// address (the start of the iwl_rx_packet). gen2/22000: rb_stts.closed_rb_num (le16@0, 12-bit)
+    /// is the fw's running fill count; used_bd[slot] (le32) low-12 bits = the 1-based VID we posted.
+    /// Advances rx_read_ptr by one. Returns None on timeout.
+    unsafe fn poll_next_rx(&mut self, timeout_ms: u32) -> Option<u64> {
+        let (rb_stts, used) = match (self.rb_stts, self.rx_used) {
+            (Some(r), Some(u)) => (r, u),
+            _ => return None,
+        };
+        for _ in 0..timeout_ms {
+            let closed = (read_volatile(rb_stts.virt as *const u16) & 0x0FFF) as u32;
+            if closed != self.rx_read_ptr {
+                let slot = (self.rx_read_ptr & 0x1FF) as usize; // 512-entry used ring
+                let ub = read_volatile((used.virt as *const u32).add(slot));
+                let vid = (ub & 0x0FFF) as usize;
+                self.rx_read_ptr = self.rx_read_ptr.wrapping_add(1);
+                let buf = if vid >= 1 && vid <= self.rx_buffers.len() {
+                    self.rx_buffers[vid - 1]
+                } else if !self.rx_buffers.is_empty() {
+                    crate::serial_println!("[WIFI] rx: VID {} out of range — using buffer[0].", vid);
+                    self.rx_buffers[0]
+                } else {
+                    return None;
+                };
+                return Some(buf.virt);
+            }
+            self.delay_ms(1);
+        }
+        None
+    }
+
+    /// P4: consume + parse the firmware's ALIVE notification from the RX ring. cmd=0x1/group=0;
+    /// payload iwl_alive_ntf: status le16@0 (0xCAFE=ok), lmac_data[0]@4 (48B), umac_data@100,
+    /// sku_id@116 (3×le32 — nonzero ⇒ PNVM required; zero ⇒ skipped). Returns true iff status ok.
+    unsafe fn read_alive_notification(&mut self) -> bool {
+        let v = match self.poll_next_rx(300) {
+            Some(v) => v,
+            None => {
+                crate::serial_println!("[WIFI] P4: fw delivered no RX (closed_rb_num stayed 0).");
+                return false;
+            }
+        };
+        let p = v as *const u8;
+
+        let mut hx = [0u8; 32];
+        for k in 0..32 { hx[k] = read_volatile(p.add(k)); }
+        crate::serial_println!("[WIFI] P4: alive rxb head: {:02x?}", &hx[..]);
+
+        let cmd = read_volatile(p.add(4));
+        let group = read_volatile(p.add(5));
+        if !(cmd == 0x01 && group == 0x00) {
+            crate::serial_println!("[WIFI] P4: first RX is not the ALIVE ntf (cmd={:#04x} grp={:#04x}).",
+                cmd, group);
+            return false;
+        }
+
+        // iwl_alive_ntf payload begins at data (packet offset 8).
+        let a = p.add(8);
+        let rd16 = |off: usize| read_volatile(a.add(off) as *const u16);
+        let rd32 = |off: usize| read_volatile(a.add(off) as *const u32);
+        let status = rd16(0);
+        let lmac_major = rd32(4);   // lmac_data[0].ucode_major @ payload+4
+        let lmac_minor = rd32(8);
+        let lmac_err   = rd32(20);  // lmac_data[0].dbg_ptrs.error_event_table_ptr @ payload+4+16
+        let umac_major = rd32(100); // umac_data.umac_major @ payload+100
+        let umac_minor = rd32(104);
+        let umac_err   = rd32(108); // umac_data.dbg_ptrs.error_info_addr @ payload+108
+        // Stash the runtime error-table pointers so a post-alive assert can be decoded.
+        self.alive_umac_err = umac_err;
+        self.alive_lmac_err = lmac_err;
+        let (sku0, sku1, sku2) = (rd32(116), rd32(120), rd32(124)); // iwl_sku_id @payload+116
+        crate::serial_println!("[WIFI] P4: *** ALIVE ntf *** status={:#06x} ({})",
+            status, if status == 0xCAFE { "OK" } else { "NOT-OK" });
+        crate::serial_println!("[WIFI] P4:   LMAC ucode {}.{} err_table={:#010x}",
+            lmac_major, lmac_minor, lmac_err);
+        crate::serial_println!("[WIFI] P4:   UMAC ucode {}.{} err_info={:#010x}",
+            umac_major, umac_minor, umac_err);
+        crate::serial_println!("[WIFI] P4:   sku_id=[{:#010x},{:#010x},{:#010x}] -> PNVM {}",
+            sku0, sku1, sku2,
+            if (sku0 | sku1 | sku2) == 0 { "SKIPPED (zero sku)" } else { "REQUIRED" });
+        status == 0xCAFE
+    }
+
+    /// Gen2 host-command enqueue (Linux iwl_pcie_gen2_enqueue_hcmd, simplified for one-at-a-time
+    /// synchronous use). Builds the command bytes (8-byte iwl_cmd_header_wide + payload) in a cmd-buf
+    /// slot, copies the first ≤20 bytes into a dedicated first-TB buffer (hw requires TB0 there),
+    /// assembles the iwl_tfh_tfd (TB0 + optional TB1 for the rest), advances the producer index and
+    /// rings HBUS_TARG_WRPTR. No byte-count table (command queue doesn't use one). Does NOT wait.
+    unsafe fn send_host_cmd(&mut self, group: u8, cmd: u8, payload: &[u8]) -> bool {
+        let (ring, buf, ftb) = match (self.tx_cmd_ring, self.tx_cmd_buf, self.first_tb_bufs) {
+            (Some(r), Some(b), Some(f)) => (r, b, f),
+            _ => { crate::serial_println!("[WIFI] cmd: TX rings missing."); return false; }
+        };
+        let wptr = self.cmd_write_ptr;
+        let idx = (wptr & 0x1F) as usize;   // 32-entry command queue
+        let slot = 256usize;                // per-command backing-slot stride
+        let total = 8 + payload.len();
+        if total > slot {
+            crate::serial_println!("[WIFI] cmd: command too large ({} B).", total);
+            return false;
+        }
+
+        // --- Command bytes (iwl_cmd_header_wide + payload) in the cmd-buf slot. ---
+        let cb = (buf.virt + (idx * slot) as u64) as *mut u8;
+        core::ptr::write_bytes(cb, 0, slot);
+        write_volatile(cb.add(0), cmd);       // hdr_wide.cmd
+        write_volatile(cb.add(1), group);     // hdr_wide.group_id
+        let seq: u16 = (((CMD_QUEUE_ID as u16) & 0x1F) << 8) | (wptr as u16 & 0xFF); // QUEUE|INDEX
+        write_volatile(cb.add(2) as *mut u16, seq);                 // hdr_wide.sequence
+        write_volatile(cb.add(4) as *mut u16, payload.len() as u16); // hdr_wide.length (payload)
+        // reserved@6, version@7 stay 0
+        for (i, &b) in payload.iter().enumerate() { write_volatile(cb.add(8 + i), b); }
+
+        // --- TB0: the first ≤20 bytes into the dedicated first-TB buffer. ---
+        let tb0 = core::cmp::min(total, IWL_FIRST_TB_SIZE);
+        let ftb_v = (ftb.virt + (idx * 64) as u64) as *mut u8;
+        core::ptr::copy_nonoverlapping(cb, ftb_v, tb0);
+        let ftb_p = ftb.phys + (idx * 64) as u64;
+
+        // --- Build the TFD (iwl_tfh_tfd): num_tbs le16@0, then tbs[] {tb_len le16, addr le64}. ---
+        let tfd = (ring.virt + (idx * TFH_TFD_SIZE) as u64) as *mut u8;
+        core::ptr::write_bytes(tfd, 0, TFH_TFD_SIZE);
+        let mut ntb = 0usize;
+        // TB0 -> first-TB buffer.
+        {
+            let t = tfd.add(2 + ntb * 10);
+            write_volatile(t as *mut u16, tb0 as u16);
+            let ab = ftb_p.to_le_bytes();
+            for k in 0..8 { write_volatile(t.add(2 + k), ab[k]); }
+            ntb += 1;
+        }
+        // TB1 -> the remainder of the command (if any) directly out of the cmd-buf slot.
+        if total > tb0 {
+            let rest_phys = buf.phys + (idx * slot) as u64 + tb0 as u64;
+            let t = tfd.add(2 + ntb * 10);
+            write_volatile(t as *mut u16, (total - tb0) as u16);
+            let ab = rest_phys.to_le_bytes();
+            for k in 0..8 { write_volatile(t.add(2 + k), ab[k]); }
+            ntb += 1;
+        }
+        write_volatile(tfd as *mut u16, ntb as u16); // num_tbs
+
+        // --- Advance producer index + ring the doorbell (write_ptr | qid<<16). ---
+        self.cmd_write_ptr = wptr.wrapping_add(1) & 0xFFFF;
+        let door = self.cmd_write_ptr | (CMD_QUEUE_ID << 16);
+        self.write32(HBUS_TARG_WRPTR, door);
+        crate::serial_println!(
+            "[WIFI] cmd: grp={:#04x} cmd={:#04x} len={} seq={:#06x} idx={} tbs={} door={:#x}",
+            group, cmd, payload.len(), seq, idx, ntb, door);
+        true
+    }
+
+    /// Read the base HW MAC address from CSR (unified-fw devices don't return it in NVM_GET_INFO).
+    /// STRAP registers first; fall back to OTP if STRAP is empty/multicast. Byte order per Linux
+    /// iwl_flip_hw_address: mac = [a0>>24, a0>>16, a0>>8, a0, a1>>8, a1].
+    unsafe fn read_mac_from_csr(&mut self) {
+        let flip = |a: u32, b: u32| [
+            (a >> 24) as u8, (a >> 16) as u8, (a >> 8) as u8, a as u8,
+            (b >> 8) as u8, b as u8,
+        ];
+        let mut mac = flip(self.read32(CSR_MAC_ADDR0_STRAP), self.read32(CSR_MAC_ADDR1_STRAP));
+        let mut src = "strap";
+        if mac.iter().all(|&x| x == 0) || (mac[0] & 0x01) != 0 {
+            mac = flip(self.read32(CSR_MAC_ADDR0_OTP), self.read32(CSR_MAC_ADDR1_OTP));
+            src = "otp";
+        }
+        self.mac_addr = mac;
+        crate::serial_println!("[WIFI] P4: MAC ({}) = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            src, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    /// P4b: post-ALIVE bring-up. Read the real MAC from CSR, then exercise the host-command TX path
+    /// by sending NVM_GET_INFO and consuming its response (proves TX end-to-end + yields NVM info).
+    /// Consume RX packets until one with (group_id, cmd) matches, logging each. Returns its buffer
+    /// virt on match; None on timeout or a firmware SW_ERR (checked between packets).
+    unsafe fn wait_for_rx(&mut self, want_grp: u8, want_cmd: u8, per_pkt_ms: u32) -> Option<u64> {
+        for _ in 0..64 {
+            match self.poll_next_rx(per_pkt_ms) {
+                Some(v) => {
+                    let c = read_volatile((v as *const u8).add(4));
+                    let g = read_volatile((v as *const u8).add(5));
+                    crate::serial_println!("[WIFI] P4b: rx cmd={:#04x} grp={:#04x}", c, g);
+                    if c == want_cmd && g == want_grp { return Some(v); }
+                }
+                None => {
+                    if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 {
+                        crate::serial_println!("[WIFI] P4b: SW_ERR while waiting for cmd={:#04x} grp={:#04x}",
+                            want_cmd, want_grp);
+                    } else {
+                        crate::serial_println!("[WIFI] P4b: timeout waiting for cmd={:#04x} grp={:#04x}",
+                            want_cmd, want_grp);
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Dump interrupt state + the firmware error tables (called when the fw asserts / goes silent).
+    unsafe fn report_fw_error(&self) {
+        crate::serial_println!("[WIFI] P4b: CSR_INT={:#010x} FH_INT={:#010x}",
+            self.read32(CSR_INT), self.read32(CSR_FH_INT_STATUS));
+        self.dump_fw_error_table("UMAC", self.alive_umac_err);
+        self.dump_fw_error_table("LMAC", self.alive_lmac_err);
+    }
+
+    /// P4b: post-ALIVE unified-fw init handshake, then NVM_GET_INFO.
+    ///   1. INIT_EXTENDED_CFG_CMD (init_flags = BIT(IWL_INIT_NVM))  — "NVM-access commands follow"
+    ///   2. NVM_ACCESS_COMPLETE                                     — finish NVM phase
+    ///   3. wait INIT_COMPLETE_NOTIF (cmd 0x04, group 0x00)         — fw init done
+    ///   4. NVM_GET_INFO -> parse (version/channels/chains). PHY_CONFIGURATION_CMD is skipped
+    ///      (unified fw). MAC came from CSR already.
+    unsafe fn bring_up_after_alive(&mut self) {
+        self.read_mac_from_csr();
+
+        crate::serial_println!("[WIFI] P4b: init handshake (INIT_EXTENDED_CFG + NVM_ACCESS_COMPLETE)...");
+        self.send_host_cmd(SYSTEM_GROUP, INIT_EXTENDED_CFG_CMD, &IWL_INIT_NVM_FLAG.to_le_bytes());
+        self.send_host_cmd(REGULATORY_NVM_GROUP, NVM_ACCESS_COMPLETE, &[0u8; 4]);
+
+        if self.wait_for_rx(0x00, INIT_COMPLETE_NOTIF, 300).is_none() {
+            crate::serial_println!("[WIFI] P4b: no INIT_COMPLETE — init handshake failed.");
+            self.report_fw_error();
+            return;
+        }
+        crate::serial_println!("[WIFI] P4b: *** INIT_COMPLETE_NOTIF *** — firmware init complete.");
+
+        crate::serial_println!("[WIFI] P4b: sending NVM_GET_INFO...");
+        self.send_host_cmd(REGULATORY_NVM_GROUP, NVM_GET_INFO, &[0u8; 4]);
+        match self.wait_for_rx(REGULATORY_NVM_GROUP, NVM_GET_INFO, 300) {
+            Some(v) => self.parse_nvm_info(v),
+            None => {
+                crate::serial_println!("[WIFI] P4b: no NVM_GET_INFO response.");
+                self.report_fw_error();
+            }
+        }
+    }
+
+    /// Parse iwl_nvm_get_info_rsp: general{flags@0, nvm_version le16@4, board@6, n_hw_addrs@7},
+    /// mac_sku{flags@8}, phy_sku{tx_chains@12, rx_chains@16}, regulatory{lar@20, n_channels@24}.
+    unsafe fn parse_nvm_info(&self, v: u64) {
+        let p = (v as *const u8).add(8); // payload after the 8-byte iwl_rx_packet header
+        let rd16 = |o: usize| read_volatile(p.add(o) as *const u16);
+        let rd32 = |o: usize| read_volatile(p.add(o) as *const u32);
+        let flags = rd32(0);
+        let nvm_ver = rd16(4);
+        let board = read_volatile(p.add(6));
+        let n_hw = read_volatile(p.add(7));
+        let sku_flags = rd32(8);
+        let tx_chains = rd32(12);
+        let rx_chains = rd32(16);
+        let lar = rd32(20);
+        let n_ch = rd32(24);
+        crate::serial_println!(
+            "[WIFI] P4b: *** NVM_GET_INFO rsp *** flags={:#x} nvm_ver={:#06x} board={} n_hw_addrs={}",
+            flags, nvm_ver, board, n_hw);
+        crate::serial_println!(
+            "[WIFI] P4b:   sku_flags={:#010x} tx_chains={:#x} rx_chains={:#x} lar={} n_channels={}",
+            sku_flags, tx_chains, rx_chains, lar, n_ch);
+        crate::serial_println!("[WIFI] P4b: host-command TX path VERIFIED (fw answered the NVM query).");
+    }
+
     pub fn start_firmware(&mut self) -> bool {
         let ci = match self.ctxt_info { Some(c) => c, None => {
             crate::serial_println!("[WIFI] P3c: no context-info — aborting.");
@@ -962,7 +1279,23 @@ impl IntelWifiDriver {
             }
 
             match outcome {
-                1 => { crate::serial_println!("[WIFI] P3c: firmware appears ALIVE. Next: parse ALIVE + NVM (P4)."); true }
+                1 => {
+                    crate::serial_println!("[WIFI] P3c: firmware initialized (alive-class int). Reading ALIVE ntf (P4)...");
+                    // RESTOCK (gen2 context-info, at alive): the fw configured RFH during init but its
+                    // free-RBD write pointer is still 0, so it sees no buffers to deliver into. Ring the
+                    // free-RBD doorbell to publish our posted RBDs (write_actual = round_down(count,8)).
+                    let widx = (self.rx_buffers.len() & !7) as u32;
+                    self.write32(RFH_Q0_FRBDCB_WIDX_TRG, widx);
+                    crate::serial_println!("[WIFI] P4: rang free-RBD doorbell WIDX_TRG <= {}.", widx);
+                    // poll_next_rx waits for the fw to DMA the ALIVE notification into the RX ring.
+                    if self.read_alive_notification() {
+                        crate::serial_println!("[WIFI] P4: firmware ALIVE confirmed.");
+                        self.bring_up_after_alive(); // P4b: MAC + NVM_GET_INFO via host command
+                    } else {
+                        crate::serial_println!("[WIFI] P4: fw initialized but ALIVE ntf not parsed (see rxb dump).");
+                    }
+                    true
+                }
                 2 => {
                     crate::serial_println!("[WIFI] P3c: firmware signalled an error during boot.");
                     self.dump_boot_status();
