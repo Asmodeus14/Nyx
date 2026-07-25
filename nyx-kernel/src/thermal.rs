@@ -141,20 +141,132 @@ unsafe fn force_hardware_cooling(throttle: bool) {
     }
 }
 
+/// One task's cumulative CPU-tick count, sampled from the scheduler.
+#[derive(Clone, Copy)]
+struct CpuSample { pid: u64, ticks: u64, name: [u8; 16], idle: bool }
+
+const CPU_TRACK: usize = 48;
+
+/// Snapshot every task's cumulative tick count. Fixed array, no allocation — this runs in the
+/// governor, which has to stay dependable exactly when the machine is already in trouble.
+fn sample_tasks(out: &mut [CpuSample; CPU_TRACK]) -> usize {
+    let mut n = 0;
+    unsafe {
+        if let Some(cores) = &crate::percpu::PER_CPU {
+            for core in cores.iter() {
+                for t in core.scheduler.tasks.iter() {
+                    if n >= CPU_TRACK { return n; }
+                    out[n] = CpuSample { pid: t.pid, ticks: t.cpu_ticks, name: t.name, idle: t.is_idle };
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Log who actually burned the CPU over the last governor cycle.
+///
+/// "Something is pegging the CPU and cooking the laptop" is not a debuggable statement, and the trip
+/// below halts the machine before anyone can look. The scheduler already counts one tick per task per
+/// timer interrupt, so the delta across one cycle IS that task's CPU share for the second.
+///
+/// The IDLE task is reported first and deliberately: it is the single most informative number here.
+/// A desktop sitting untouched should be almost entirely idle; if idle is near zero while nothing is
+/// on screen, the kernel's own poll path is the suspect rather than any application.
+fn report_cpu_share(prev: &[CpuSample; CPU_TRACK], prev_n: usize,
+                    cur: &[CpuSample; CPU_TRACK], cur_n: usize, temp: u8) {
+    let mut deltas = [(0u64, 0u64, [0u8; 16], false); CPU_TRACK];
+    let mut n = 0;
+    let mut total = 0u64;
+    for c in cur.iter().take(cur_n) {
+        let was = prev.iter().take(prev_n).find(|p| p.pid == c.pid).map(|p| p.ticks).unwrap_or(0);
+        let d = c.ticks.saturating_sub(was);
+        total += d;
+        if d > 0 {
+            deltas[n] = (d, c.pid, c.name, c.idle);
+            n += 1;
+        }
+    }
+    // Selection sort by descending delta — n is tiny and this avoids pulling in a sort.
+    for i in 0..n {
+        let mut best = i;
+        for j in i + 1..n { if deltas[j].0 > deltas[best].0 { best = j; } }
+        deltas.swap(i, best);
+    }
+
+    // ★ SUM every idle task, don't take the first one. This box has FOUR idle tasks — one per core
+    // (pid 2 plus the 0xFFFF_0000+ SMP ones) — so counting only the first reported 87% busy on a
+    // machine that was actually ~2.5% busy, and sent me hunting a CPU hog that did not exist.
+    let idle: u64 = deltas.iter().take(n).filter(|d| d.3).map(|d| d.0).sum();
+    let busy = total.saturating_sub(idle);
+    let pct = if total == 0 { 0 } else { busy * 100 / total };
+    crate::serial_println!("[Thermal] {}C | cpu {}% busy ({} of {} ticks), idle {}",
+        temp, pct, busy, total, idle);
+    for d in deltas.iter().take(n).take(4) {
+        if d.3 { continue; }
+        let nm = core::str::from_utf8(&d.2).unwrap_or("?");
+        let nm = nm.trim_end_matches('\0');
+        if nm.is_empty() {
+            crate::serial_println!("[Thermal]   pid {} — {} ticks", d.1, d.0);
+        } else {
+            crate::serial_println!("[Thermal]   {} (pid {}) — {} ticks", nm, d.1, d.0);
+        }
+    }
+}
+
 pub extern "C" fn nyx_task_manager_daemon() {
     crate::serial_println!("[Thermal] NyxOS Mobile Thermal Governor Online.");
     identify_silicon();
     let mut is_throttled = false;
+    let blank = CpuSample { pid: 0, ticks: 0, name: [0; 16], idle: false };
+    let mut prev = [blank; CPU_TRACK];
+    let mut prev_n = 0usize;
+    let mut cycle = 0u32;
     kernel_sleep_ms(1000);
 
     loop {
         let temp = get_intel_silicon_temp();
-        if temp >= 95 { 
-            crate::serial_println!("[Thermal] CRITICAL THERMAL TRIP! Halting system!");
-            crate::acpi::poweroff(); 
+
+        // Park the GPU once it has been idle a while. This lives here because it needs a periodic
+        // tick that keeps running when the compositor has stopped issuing GPU work entirely — which
+        // is precisely the situation that overheats the machine. try_lock, never lock: this task is
+        // preemptible (IF=1) and INTEL_GPU is taken from syscalls with IF=0, so blocking here would
+        // be the preemption-boundary deadlock documented in drivers/net/mod.rs. Missing a park
+        // attempt costs nothing — the next tick is a second away.
+        unsafe {
+            if let Some(mut g) = crate::drivers::gpu::intel::INTEL_GPU.try_lock() {
+                if let Some(gpu) = g.as_mut() { gpu.maybe_park_gpu(); }
+            }
+        }
+
+        // CPU accounting every cycle; PRINTED once a minute when cool, every cycle once we're warm
+        // enough to care. Silence while healthy keeps the boot log readable, but the moment the
+        // machine starts heating we get a per-second record of who is responsible — which survives
+        // the trip below, unlike anything a userspace monitor could show.
+        let mut cur = [blank; CPU_TRACK];
+        let cur_n = sample_tasks(&mut cur);
+        cycle = cycle.wrapping_add(1);
+        if temp >= 70 || cycle % 60 == 0 {
+            report_cpu_share(&prev, prev_n, &cur, cur_n, temp);
+        }
+        prev = cur;
+        prev_n = cur_n;
+
+        if temp >= 95 {
+            crate::serial_println!("[Thermal] CRITICAL THERMAL TRIP at {}C — attempting power off.", temp);
+            crate::acpi::poweroff();
+            // ★ If we get here, acpi::poweroff() did NOT power the machine down (it needs PM1a/PM1b
+            // + SLP_TYP from the DSDT and returns silently when it can't). The loop below is an
+            // interrupts-off halt, which IS the safe thing to do at 95C — but it is indistinguishable
+            // from a crash unless we say so first. This line is the difference between "the box froze
+            // and nothing was in the log" and a diagnosis.
+            crate::serial_println!(
+                "[Thermal] poweroff returned — firmware did not shut down. Parking the CPU in cli;hlt \
+                 to stop generating heat. THIS IS AN INTENTIONAL EMERGENCY HALT, NOT A HANG.");
             loop { unsafe { core::arch::asm!("cli; hlt"); } }
         }
-        
+
         // --------------------------------------------------------
         // THE FIX: Always assert maximum cooling while hot to 
         // fight the Embedded Controller / BIOS resets!

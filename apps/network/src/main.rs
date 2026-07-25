@@ -52,6 +52,7 @@ impl NetworkSuite {
 // 2. COMPONENT FRAMEWORK IMPLEMENTATION
 // ─────────────────────────────────────────────────────────────────────────
 impl NyxApp for NetworkSuite {
+    fn icon_path(&self) -> &str { "/mnt/nvme/apps/Network.nyx/icon.png" }
     fn title(&self) -> &str { "Nyx Network Suite" }
     fn initial_width(&self) -> usize { 700 }
     fn initial_height(&self) -> usize { 480 }

@@ -9,6 +9,7 @@ members = [
     # Libraries
     "libs/api",
     "libs/gui",
+    "libs/image",
     "libs/toolchains",
     
     # Applications
@@ -22,6 +23,8 @@ members = [
     "apps/sysmon",
     "apps/glcube",
     "apps/imageviewer",
+    "apps/wifi",
+    "apps/wifiagent",
 
 ]
 

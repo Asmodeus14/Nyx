@@ -39,6 +39,15 @@ echo "[8/9] Building GL Cube validation app (glcube)..."
 echo "[9/9] Building Image Viewer (imageviewer)..."
 (cd apps/imageviewer && $BUILD_CMD)
 
+# P8: the Wi-Fi network picker — the only way to choose a network now that the driver has no
+# built-in SSID, so a failure here means a machine that can't get online. Not swallowed.
+echo "[9a] Building Wi-Fi picker (wifi)..."
+(cd apps/wifi && $BUILD_CMD)
+
+# Headless auto-reconnect agent, spawned by init at boot from the saved-network file.
+echo "[9a2] Building Wi-Fi auto-connect agent (wifiagent)..."
+(cd apps/wifiagent && $BUILD_CMD)
+
 # std-port smoke test (Workstream B): build a real `std` binary for target_os=nyx and bundle it so
 # it can be launched on-device (B-alpha runtime check). Non-fatal if the std toolchain isn't ready.
 echo "[9b] Building std hello (target_os=nyx)..."
@@ -80,6 +89,8 @@ mkdir -p build_initrd/apps/StdChild.nyx
 mkdir -p build_initrd/apps/QcStudio.nyx
 mkdir -p build_initrd/apps/StdGui.nyx
 mkdir -p build_initrd/apps/Notepad.nyx
+mkdir -p build_initrd/apps/Wifi.nyx
+mkdir -p build_initrd/apps/WifiAgent.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
@@ -97,6 +108,8 @@ cp target/x86_64-nyx/release/nyx-network build_initrd/apps/Network.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-sysmon build_initrd/apps/SystemMonitor.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-glcube build_initrd/apps/GlCube.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-imageviewer build_initrd/apps/ImageViewer.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-wifi build_initrd/apps/Wifi.nyx/run.bin
+cp target/x86_64-nyx/release/nyx-wifiagent build_initrd/apps/WifiAgent.nyx/run.bin
 # std-port smoke test binary (built for the x86_64-unknown-nyx std target; workspace-excluded, so
 # its output lives under tests/stdhello/target/, not the root target dir).
 cp tests/stdhello/target/x86_64-unknown-nyx/release/stdhello build_initrd/apps/StdHello.nyx/run.bin 2>/dev/null || true
@@ -125,6 +138,7 @@ cp apps/network/*.json build_initrd/apps/Network.nyx/ 2>/dev/null || true
 cp apps/sysmon/*.json build_initrd/apps/SystemMonitor.nyx/ 2>/dev/null || true
 cp apps/glcube/*.json build_initrd/apps/GlCube.nyx/ 2>/dev/null || true
 cp apps/imageviewer/*.json build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
+cp apps/wifi/*.json build_initrd/apps/Wifi.nyx/ 2>/dev/null || true
 
 # 3b. Bundle the Image Viewer's sample image asset(s) so it has something to open on launch.
 # Only ship real image files — NOT the generator script (make_sample.py).
@@ -133,6 +147,25 @@ cp apps/imageviewer/assets/*.tga build_initrd/apps/ImageViewer.nyx/ 2>/dev/null 
 # A2b: PNG + JPEG samples so the viewer's click-to-cycle can exercise both decoders on-device.
 cp apps/imageviewer/assets/*.png build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
 cp apps/imageviewer/assets/*.jpg build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
+
+# 3c. Each app carries its OWN icon inside its .nyx bundle as icon.png — the compositor decodes it
+# (via libs/image) for the start menu, and apps declare the same path in their window header so the
+# taskbar button matches. Committed artwork; regenerate with `python3 tools/make_icons.py`.
+install_icon() { cp "assets/icons/$1.png" "build_initrd/apps/$2.nyx/icon.png" 2>/dev/null || true; }
+install_icon terminal    Terminal
+install_icon settings    Settings
+install_icon explorer    Explorer
+install_icon network     Network
+install_icon sysmon      SystemMonitor
+install_icon glcube      GlCube
+install_icon imageviewer ImageViewer
+install_icon stdhello    StdHello
+install_icon qcstudio    QcStudio
+install_icon stdgui      StdGui
+install_icon notepad     Notepad
+install_icon wifi        Wifi
+# The shell's own mark, in the compositor's bundle.
+install_icon nyx         WindowServer
 
 # 4. Package it into a lightweight tape archive
 cd build_initrd

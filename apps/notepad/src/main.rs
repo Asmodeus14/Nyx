@@ -245,6 +245,7 @@ impl Notepad {
 }
 
 impl NyxApp for Notepad {
+    fn icon_path(&self) -> &str { "/mnt/nvme/apps/Notepad.nyx/icon.png" }
     fn title(&self) -> &str {
         "Nyx Notepad"
     }

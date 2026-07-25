@@ -17,12 +17,17 @@ pub struct WindowHeader {
     pub content_h: u32,
     pub scroll_off: u32,
     pub title: [u8; 64],
+    /// Absolute path to this app's icon PNG, NUL-padded. Apps live in `.nyx` bundles and ship their
+    /// own artwork, so this is normally `/mnt/nvme/apps/<Name>.nyx/icon.png`. The compositor decodes
+    /// it once and uses it for the window's taskbar button. Empty = no icon; the button falls back
+    /// to the window's initial letter, so an app that never sets this still gets a usable button.
+    pub icon: [u8; 96],
     // U4: pad the header so the pixel data that follows (`shm + size_of::<WindowHeader>()`) is
     // PAGE-ALIGNED. The GPU compositor binds that pixel region as a sampled texture, and every proven
     // texture surface in the render engine uses a 4KB-aligned base — this makes window surfaces match,
     // with zero alignment risk. All apps compute the pixel offset via size_of, so this is transparent.
-    // Fixed part is now 96 bytes (8×u32 + 64 title), so pad to keep the total exactly 4096.
-    pub _pad: [u8; 4096 - 96],
+    // Fixed part is now 192 bytes (8×u32 + 64 title + 96 icon), so pad to keep the total exactly 4096.
+    pub _pad: [u8; 4096 - 192],
 }
 
 // U4 invariant: the header MUST stay exactly one page so the pixel data after it is 4KB-aligned for
@@ -75,11 +80,22 @@ pub struct TaskInfo {
 #[repr(C)]
 pub struct SystemInfo {
     pub current_temp: u8,
-    pub active_cooling: u8, 
-    pub cpu_fan_rpm: u32,  
+    pub active_cooling: u8,
+    pub cpu_fan_rpm: u32,
     pub gpu_fan_rpm: u32,
     pub task_count: u64,
     pub tasks: [TaskInfo; 64],
+    /// SMBIOS manufacturer + product ("Dell Inc. Latitude 5410"), NUL-padded, empty when the
+    /// firmware reported no identity. See `machine_name()`.
+    pub machine: [u8; 80],
+}
+
+impl SystemInfo {
+    /// The SMBIOS machine name, or "" when unknown.
+    pub fn machine_name(&self) -> &str {
+        let end = self.machine.iter().position(|&b| b == 0).unwrap_or(self.machine.len());
+        core::str::from_utf8(&self.machine[..end]).unwrap_or("")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -98,6 +114,9 @@ pub mod keys {
     pub const DELETE: char = '\u{E016}';
     pub const PAGE_UP: char = '\u{E017}';
     pub const PAGE_DOWN: char = '\u{E018}';
+    /// Either Windows/Super key. The compositor consumes this to toggle the start menu, so apps
+    /// never see it — it's listed here so nothing else claims the codepoint.
+    pub const SUPER: char = '\u{E019}';
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -158,6 +177,15 @@ pub fn sys_write(fd: i64, buf: &[u8]) -> i64 {
 
 pub fn sys_open(path: &str) -> i64 {
     syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, 0, 0, 0, 0) as i64
+}
+
+pub const O_CREAT: u64 = 0x40;
+pub const O_TRUNC: u64 = 0x200;
+
+/// `open` with Linux-style flags — `O_CREAT` to create, `O_TRUNC` to overwrite. Plain `sys_open`
+/// passes 0, so it can only open a file that already exists.
+pub fn sys_open_flags(path: &str, flags: u64) -> i64 {
+    syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags, 0, 0, 0) as i64
 }
 
 pub fn sys_close(fd: i64) -> i64 {
@@ -518,6 +546,173 @@ pub fn sys_statfs() -> Option<StatFs> {
     let mut sf = StatFs::default();
     let rc = syscall(542, (&mut sf as *mut StatFs) as u64, 0, 0, 0, 0, 0) as i64;
     if rc == 0 { Some(sf) } else { None }
+}
+
+// ─────────────────────────── P8: WiFi ───────────────────────────
+// The kernel driver holds the radio; these four calls are the whole userspace surface. Layouts are
+// repr(C) and the kernel writes the bytes directly, so field order here IS the ABI.
+
+/// One network from the last scan. `flags`: bit0 = privacy (needs a passphrase), bit1 = RSN present
+/// (WPA2/WPA3 — the only secured flavour our supplicant speaks), bit2 = this is the current network.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WifiNetwork {
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    pub channel: u8,
+    pub band: u8,       // 1 = 2.4 GHz, 0 = 5 GHz
+    pub flags: u8,
+    pub bssid: [u8; 6],
+    pub _pad: [u8; 2],
+}
+
+impl Default for WifiNetwork {
+    fn default() -> Self {
+        Self { ssid: [0; 32], ssid_len: 0, channel: 0, band: 0, flags: 0, bssid: [0; 6], _pad: [0; 2] }
+    }
+}
+
+impl WifiNetwork {
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.ssid[..self.ssid_len as usize]).unwrap_or("?")
+    }
+    pub fn is_secure(&self) -> bool { self.flags & 0x01 != 0 }
+    /// True when the AP is secured with something we can't join (WEP / WPA1: privacy but no RSN IE).
+    pub fn is_unsupported_security(&self) -> bool { self.is_secure() && self.flags & 0x02 == 0 }
+    pub fn is_current(&self) -> bool { self.flags & 0x04 != 0 }
+}
+
+/// Link state — mirrors the kernel's `LinkState`. Values are part of the ABI.
+pub const WIFI_IDLE: u32 = 0;
+pub const WIFI_CONNECTING: u32 = 1;
+pub const WIFI_CONNECTED: u32 = 2;
+pub const WIFI_AUTH_FAILED: u32 = 3;
+pub const WIFI_NO_LEASE: u32 = 4;
+pub const WIFI_HW_FAILED: u32 = 5;
+/// The radio is administratively off (`sys_wifi_set_radio(false)`). Not a driver state — the kernel
+/// substitutes it into the published status, so every reader sees it without asking separately.
+pub const WIFI_RADIO_OFF: u32 = 6;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WifiStatus {
+    pub state: u32,
+    pub ip: [u8; 4],
+    pub mask: [u8; 4],
+    pub router: [u8; 4],
+    pub dns: [u8; 4],
+    pub ssid_len: u8,
+    pub ssid: [u8; 32],
+}
+
+impl Default for WifiStatus {
+    fn default() -> Self {
+        Self { state: 0, ip: [0; 4], mask: [0; 4], router: [0; 4], dns: [0; 4], ssid_len: 0, ssid: [0; 32] }
+    }
+}
+
+impl WifiStatus {
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.ssid[..self.ssid_len as usize]).unwrap_or("")
+    }
+}
+
+/// Re-run a passive sweep of every channel and return how many networks are visible. BLOCKS for
+/// several seconds (the radio dwells on each channel), and is refused while associated.
+pub fn sys_wifi_scan() -> usize {
+    syscall(543, 0, 0, 0, 0, 0, 0) as usize
+}
+
+/// Fill `out` from the last scan; returns how many entries were written.
+pub fn sys_wifi_list(out: &mut [WifiNetwork]) -> usize {
+    syscall(544, out.as_mut_ptr() as u64, out.len() as u64, 0, 0, 0, 0) as usize
+}
+
+/// Join `ssid`. BLOCKS for the association, WPA2 4-way handshake and DHCP exchange — expect ~5-15 s
+/// with no chance to repaint, so paint a "Connecting…" frame BEFORE calling. Returns a WIFI_* state.
+pub fn sys_wifi_connect(ssid: &str, psk: &str) -> u32 {
+    syscall(545, ssid.as_ptr() as u64, ssid.len() as u64,
+                 psk.as_ptr() as u64, psk.len() as u64, 0, 0) as u32
+}
+
+/// Where the remembered network lives: `ssid\npassphrase\n`, plain text. Written by the Wi-Fi
+/// picker after a successful join, read by the boot agent. Note it is NOT encrypted — anything that
+/// can read the filesystem can read the passphrase.
+pub const WIFI_CONF_PATH: &str = "/mnt/nvme/wifi.conf";
+
+/// Remember `ssid`/`psk` so the boot agent can reconnect without asking. Overwrites any previous
+/// entry (one network is remembered, like a phone's "last used").
+pub fn wifi_save_network(ssid: &str, psk: &str) -> bool {
+    let fd = sys_open_flags(WIFI_CONF_PATH, O_CREAT | O_TRUNC);
+    if fd < 0 { return false; }
+    let mut buf = [0u8; 160];
+    let mut n = 0usize;
+    for &b in ssid.as_bytes() { if n < buf.len() { buf[n] = b; n += 1; } }
+    if n < buf.len() { buf[n] = b'\n'; n += 1; }
+    for &b in psk.as_bytes() { if n < buf.len() { buf[n] = b; n += 1; } }
+    if n < buf.len() { buf[n] = b'\n'; n += 1; }
+    let ok = sys_write(fd, &buf[..n]) == n as i64;
+    sys_close(fd);
+    ok
+}
+
+/// Blank the remembered network. (There is no unlink syscall, so this truncates the file to zero —
+/// `wifi_load_network` then reports nothing saved.)
+pub fn wifi_forget_network() -> bool {
+    let fd = sys_open_flags(WIFI_CONF_PATH, O_CREAT | O_TRUNC);
+    if fd < 0 { return false; }
+    sys_close(fd);
+    true
+}
+
+/// Read the remembered network into `buf`. Returns `(ssid_len, psk_len)`: the SSID occupies
+/// `buf[..ssid_len]` and the passphrase `buf[ssid_len..ssid_len + psk_len]`. `None` if nothing is
+/// saved or the file is malformed. (Split-buffer rather than `&str` pairs so this stays usable from
+/// no_std callers without alloc.)
+pub fn wifi_load_network(buf: &mut [u8; 160]) -> Option<(usize, usize)> {
+    let fd = sys_open(WIFI_CONF_PATH);
+    if fd < 0 { return None; }
+    let mut raw = [0u8; 160];
+    let n = sys_read(fd, &mut raw);
+    sys_close(fd);
+    if n <= 0 { return None; }
+    let raw = &raw[..n as usize];
+
+    let nl = raw.iter().position(|&b| b == b'\n')?;
+    let ssid = &raw[..nl];
+    let rest = &raw[nl + 1..];
+    let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+    let psk = &rest[..end];
+    if ssid.is_empty() { return None; }
+
+    buf[..ssid.len()].copy_from_slice(ssid);
+    buf[ssid.len()..ssid.len() + psk.len()].copy_from_slice(psk);
+    Some((ssid.len(), psk.len()))
+}
+
+/// Leave the current network. The radio becomes idle and scannable again. Takes a moment (the
+/// driver deauthenticates and removes the firmware contexts) but nothing like a connect.
+pub fn sys_wifi_disconnect() {
+    syscall(547, 0, 0, 0, 0, 0, 0);
+}
+
+/// Turn the Wi-Fi radio on or off, returning the link state afterwards.
+///
+/// Off is a soft-kill: it leaves the network, drops the interface, and makes scans and joins no-ops
+/// until it is turned back on — but the firmware stays loaded, so switching back on is instant.
+/// Turning it on does NOT rejoin anything; it only makes joining possible again.
+///
+/// BLOCKS on the way off (the teardown talks to the firmware). Returns the state unchanged if
+/// another Wi-Fi operation is already running, so compare the result against what you asked for.
+pub fn sys_wifi_set_radio(on: bool) -> u32 {
+    syscall(548, on as u64, 0, 0, 0, 0, 0) as u32
+}
+
+/// Current link state + lease. `None` if the machine has no WiFi adapter.
+pub fn sys_wifi_status() -> Option<WifiStatus> {
+    let mut st = WifiStatus::default();
+    let rc = syscall(546, (&mut st as *mut WifiStatus) as u64, 0, 0, 0, 0, 0) as i64;
+    if rc == 0 { Some(st) } else { None }
 }
 
 pub fn sys_alloc_pages(pages: usize) -> u64 {

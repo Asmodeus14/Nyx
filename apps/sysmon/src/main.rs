@@ -55,6 +55,7 @@ impl SysMonApp {
 }
 
 impl NyxApp for SysMonApp {
+    fn icon_path(&self) -> &str { "/mnt/nvme/apps/SystemMonitor.nyx/icon.png" }
     fn title(&self) -> &str { "Nyx System Monitor" }
     fn initial_width(&self) -> usize { 700 }
     fn initial_height(&self) -> usize { 480 }
@@ -156,13 +157,31 @@ impl NyxApp for SysMonApp {
                 
                 let temp_color = if self.sys_info.current_temp >= 80 { 0xFF_E74C3C } else { Color::ACCENT_GREEN };
                 canvas.print_str(cx, 70, &alloc::format!("Silicon Temp: {} C", self.sys_info.current_temp), temp_color, 1);
-                canvas.print_str(cx, 90, &alloc::format!("CPU Fan Speed: {} RPM", self.sys_info.cpu_fan_rpm), Color::TEXT_DARK, 1);
-                canvas.print_str(cx, 110, &alloc::format!("GPU Fan Speed: {} RPM", self.sys_info.gpu_fan_rpm), Color::TEXT_DARK, 1);
+                // u32::MAX is the kernel's "no supported way to read this tachometer" sentinel. Show
+                // that as unreadable rather than as a speed — printing "0 RPM" for an unmeasured fan
+                // looks exactly like a dead fan, which sent a thermal investigation down a blind
+                // alley once already.
+                let fan_text = |rpm: u32| -> alloc::string::String {
+                    if rpm == u32::MAX { "not readable (no vendor driver)".into() }
+                    else { alloc::format!("{} RPM", rpm) }
+                };
+                canvas.print_str(cx, 90, &alloc::format!("CPU Fan: {}", fan_text(self.sys_info.cpu_fan_rpm)), Color::TEXT_DARK, 1);
+                canvas.print_str(cx, 110, &alloc::format!("GPU Fan: {}", fan_text(self.sys_info.gpu_fan_rpm)), Color::TEXT_DARK, 1);
 
-                canvas.fill_rect(cx, 140, cw, 1, Color::WARM_BORDER);
-                canvas.print_str(cx, 155, &alloc::format!("Total Kernel Tasks: {}", self.sys_info.task_count), Color::TEXT_DARK, 1);
-                
-                let mut ty = 185;
+                // Which machine has no fan driver? Fan tachometers are vendor-private, so the SMBIOS
+                // identity is the thing that says whether "not readable" is fixable.
+                let machine = self.sys_info.machine_name();
+                let machine_line = if machine.is_empty() {
+                    alloc::string::String::from("System: not reported by firmware (no SMBIOS)")
+                } else {
+                    alloc::format!("System: {}", machine)
+                };
+                canvas.print_str(cx, 130, &machine_line, Color::TEXT_MUTED, 1);
+
+                canvas.fill_rect(cx, 156, cw, 1, Color::WARM_BORDER);
+                canvas.print_str(cx, 168, &alloc::format!("Total Kernel Tasks: {}", self.sys_info.task_count), Color::TEXT_DARK, 1);
+
+                let mut ty = 196;
                 let limit = core::cmp::min(self.sys_info.task_count as usize, 10);
                 for i in 0..limit {
                     let t = &self.sys_info.tasks[i];

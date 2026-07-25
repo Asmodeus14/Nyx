@@ -1,0 +1,9 @@
+[package]
+name = "nyx-wifi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nyx-api = { path = "../../libs/api" }
+nyx-gui = { path = "../../libs/gui" }
+linked_list_allocator = "0.10.5"

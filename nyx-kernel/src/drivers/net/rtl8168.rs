@@ -155,9 +155,9 @@ impl Rtl8168Driver {
 
         let phy_status = self.read8(0x6C);
         if (phy_status & 0x02) != 0 {
-            crate::serial_println!("[RTL8168] ✅ HARDWARE REPORTS PHYSICAL LINK IS UP!");
+            crate::serial_println!("[RTL8168]  HARDWARE REPORTS PHYSICAL LINK IS UP!");
         } else {
-            crate::serial_println!("[RTL8168] ❌ HARDWARE REPORTS PHYSICAL LINK IS DOWN!");
+            crate::serial_println!("[RTL8168]  HARDWARE REPORTS PHYSICAL LINK IS DOWN!");
         }
         
         let isr_status = self.read16(0x3E);
@@ -173,7 +173,7 @@ impl Device for Rtl8168Driver {
     type TxToken<'a> = RtkTxToken<'a> where Self: 'a;
 
     fn receive<'a>(&'a mut self, _timestamp: Instant) -> Option<(Self::RxToken<'a>, Self::TxToken<'a>)> {
-        // 🔥 MILESTONE 2.2: Interrupt Ack removed from here, now handled centrally in poll_network!
+        //  MILESTONE 2.2: Interrupt Ack removed from here, now handled centrally in poll_network!
 
         fence(Ordering::Acquire);
 
@@ -183,7 +183,7 @@ impl Device for Rtl8168Driver {
         if (status & (1 << 31)) == 0 {
             let length = ((status & 0x3FFF) as usize).saturating_sub(4); 
             
-            // 🔥 MILESTONE 2.4: Instantly pop a pre-allocated buffer! 
+            //  MILESTONE 2.4: Instantly pop a pre-allocated buffer! 
             // If the pool runs dry during a massive burst/DDoS, dynamically allocate a new box to survive.
             let mut pool_buf = crate::drivers::net::RX_BUFFER_POOL.lock().pop().unwrap_or_else(|| Box::new([0; 2048]));
             
@@ -230,7 +230,7 @@ impl Device for Rtl8168Driver {
     }
 }
 
-// 🔥 MILESTONE 2.4: A Zero-Allocation Auto-Recycling Token
+//  MILESTONE 2.4: A Zero-Allocation Auto-Recycling Token
 pub struct RtkRxToken {
     buf: Option<Box<[u8; 2048]>>,
     len: usize,
@@ -243,7 +243,7 @@ impl smoltcp::phy::RxToken for RtkRxToken {
         #[cfg(feature = "net_trace")]
         if self.len >= 14 {
             let eth_type = (buffer[12] as u16) << 8 | (buffer[13] as u16);
-            if eth_type == 0x0806 { crate::serial_println!("[smoltcp] 🚨 Received ARP Request!"); }
+            if eth_type == 0x0806 { crate::serial_println!("[smoltcp]  Received ARP Request!"); }
         }
         
         // Let the OS process the packet

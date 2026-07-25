@@ -337,6 +337,13 @@ pub extern "C" fn _start() -> ! {
         let title = b"GL Cube (3D)";
         let n = title.len().min(64);
         header.title[..n].copy_from_slice(&title[..n]);
+        // This app builds its window header by hand rather than going through nyx_gui::app::run, so
+        // it has to declare its taskbar icon itself. Must be set explicitly: an unwritten field would
+        // leave whatever the SHM page happened to hold.
+        header.icon.fill(0);
+        let icon = b"/mnt/nvme/apps/GlCube.nyx/icon.png";
+        let m = icon.len().min(96);
+        header.icon[..m].copy_from_slice(&icon[..m]);
     }
 
     // Register the window and wait for the compositor's ack.

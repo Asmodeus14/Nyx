@@ -58,6 +58,7 @@ impl StdGuiApp {
 }
 
 impl NyxApp for StdGuiApp {
+    fn icon_path(&self) -> &str { "/mnt/nvme/apps/StdGui.nyx/icon.png" }
     fn title(&self) -> &str {
         "Std GUI Spike (D2)"
     }

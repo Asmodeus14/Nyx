@@ -51,10 +51,14 @@ pub struct TaskInfo {
 pub struct SystemInfo {
     pub current_temp: u8,
     pub active_cooling: u8, // 1 = On, 0 = Off
-    pub cpu_fan_rpm: u32,  
+    pub cpu_fan_rpm: u32,
     pub gpu_fan_rpm: u32,
     pub task_count: u64,
     pub tasks: [TaskInfo; 64],
+    /// SMBIOS manufacturer + product, NUL-padded. Shown next to the fan readout: when the fans read
+    /// as unknown, the reason is "we have no driver for THIS machine", and naming the machine is what
+    /// turns that from a shrug into something actionable.
+    pub machine: [u8; 80],
 }
 
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
@@ -1102,6 +1106,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 // 🚨 THE FIX: Reset the bump allocator to a VALID canonical address! 🚨
                 // 0x1000_0000_0000 is safely inside the lower user half.
                 task.mmap_bump = 0x1000_0000_0000;
+
                 
                 // 4. Flush the CPU TLB
                 unsafe {
@@ -1135,9 +1140,16 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                         frame.r12 = 0; frame.r13 = 0; frame.r14 = 0; frame.r15 = 0;
                         frame.rbx = 0;
 
-                        // 6. Safely update the task name for the System Monitor
+                        // 6. Name the task for the System Monitor and the thermal CPU-share report.
+                        // Use the last path component, not the raw path: 16 bytes of
+                        // "/mnt/nvme/apps/WindowServer.nyx/run.bin" truncates to "/mnt/nvme/apps/W",
+                        // so every app showed up under an identical, useless name.
+                        let leaf = path_str.rsplit('/')
+                            .find(|s| !s.is_empty() && *s != "run.bin")
+                            .unwrap_or(&path_str);
+                        let leaf = leaf.strip_suffix(".nyx").unwrap_or(leaf);
                         let mut name_arr = [0u8; 16];
-                        let bytes = path_str.as_bytes();
+                        let bytes = leaf.as_bytes();
                         let copy_len = core::cmp::min(16, bytes.len());
                         name_arr[..copy_len].copy_from_slice(&bytes[..copy_len]);
                         task.name = name_arr;
@@ -1586,6 +1598,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                  if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
                      gpu.submit_fence();
                      gpu.wait_for_idle();
+                     // NOTE: deliberately does NOT park here. Parking at every frame's sync point
+                     // cost a forcewake wake + RC6 exit on the next submission and made the desktop
+                     // sluggish. The GT is parked by the thermal governor once it has been idle for
+                     // GPU_PARK_IDLE_MS — see `maybe_park_gpu`.
                  }
              }
         },
@@ -1839,6 +1855,177 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         }
 
+        // ---------------------------------------------------------------------
+        // P8: WiFi — the syscalls behind the desktop's network picker. The driver has no built-in
+        // SSID any more; userspace chooses the network and supplies the passphrase.
+        //
+        // Lock discipline: every arm below takes WIFI_DRIVER and MUST drop it before calling
+        // anything in drivers::net that re-acquires it (init_wifi_iface does) — hence the explicit
+        // scopes rather than one long `if let`.
+        //
+        // ★ P8c INTERRUPT DISCIPLINE — see the long comment at the top of drivers/net/mod.rs.
+        // SYSCALL clears IF, so these arms start with interrupts OFF. The three that touch the
+        // driver run for SECONDS, and leaving IF off for that long does two bad things:
+        //   1. it deadlocks against the idle task's poll_wifi, which holds the very same spin locks
+        //      with interrupts on and so can be preempted mid-hold — the spinner then waits on a
+        //      task that only the timer it has masked could resume; and
+        //   2. even absent that, it starves the thermal governor, which is an ordinary kernel task
+        //      driven by the timer. No scheduler means no fan control and no HWP throttle, so the
+        //      package just keeps climbing.
+        // Both symptoms — a wedged machine with a core pinned at 100%, running hot — trace back to
+        // this. So the long arms re-enable IF for their duration (the sys_sleep_ms arm sets the
+        // precedent) and serialise on wifi_try_begin() instead of on the mutex, while the cheap
+        // polled arms (544/546) never touch the driver at all and read the published snapshot.
+        // ---------------------------------------------------------------------
+
+        // 543: sys_wifi_scan() -> number of visible networks (re-runs a passive sweep; blocks ~7 s).
+        543 => {
+            let mut n = 0usize;
+            // A scan with the radio switched off would retune and light up the antenna — precisely
+            // what "off" is supposed to stop. The picker greys the button out; this is the backstop.
+            if crate::drivers::net::wifi_radio_on() && crate::drivers::net::wifi_try_begin() {
+                unsafe { x86_64::instructions::interrupts::enable(); }
+                if let Some(w) = crate::drivers::net::WIFI_DRIVER.lock().as_mut() {
+                    n = unsafe { w.rescan() };
+                    crate::drivers::net::publish_wifi_snapshot(w);
+                }
+                unsafe { x86_64::instructions::interrupts::disable(); }
+                crate::drivers::net::wifi_end();
+            } else {
+                // Another long operation owns the radio; report what we last saw rather than
+                // blocking behind it.
+                n = crate::drivers::net::WIFI_SNAPSHOT.lock().nets.len();
+            }
+            frame.rax = n as u64;
+        }
+
+        // 544: sys_wifi_list(out_ptr, max_entries) -> entries written. Each entry is 44 bytes:
+        // ssid[32], ssid_len u8, channel u8, band u8, flags u8 (bit0 secure, bit1 rsn, bit2 current),
+        // bssid[6], pad[2]. Matches nyx_api::WifiNetwork.
+        544 => {
+            let out = arg1 as *mut u8;
+            let max = arg2 as usize;
+            let mut written = 0usize;
+            // Snapshot only — never WIFI_DRIVER. The picker calls this on a timer, and a blocking
+            // acquire here is one of the two ways the machine used to wedge.
+            if is_valid_user_ptr(out as *const u8, max.saturating_mul(44)) {
+                let snap = crate::drivers::net::WIFI_SNAPSHOT.lock();
+                for e in snap.nets.iter().take(max) {
+                    unsafe { core::ptr::copy_nonoverlapping(e.as_ptr(), out.add(written * 44), 44) };
+                    written += 1;
+                }
+            }
+            frame.rax = written as u64;
+        }
+
+        // 545: sys_wifi_connect(ssid_ptr, ssid_len, psk_ptr, psk_len) -> LinkState (see nyx_api).
+        // Blocks for the full association + 4-way handshake + DHCP exchange (several seconds).
+        545 => {
+            // Validate only non-empty buffers: an open network legitimately passes a zero-length
+            // passphrase, and is_valid_user_ptr rejects (null, 0) — which would refuse the join for
+            // entirely the wrong reason.
+            let ssid_ok = arg2 == 0 || is_valid_user_ptr(arg1 as *const u8, arg2 as usize);
+            let psk_ok  = arg4 == 0 || is_valid_user_ptr(arg3 as *const u8, arg4 as usize);
+            if ssid_ok && psk_ok
+                && crate::drivers::net::wifi_radio_on()
+                && crate::drivers::net::wifi_try_begin()
+            {
+                let ssid = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
+                let psk  = unsafe { core::slice::from_raw_parts(arg3 as *const u8, arg4 as usize) };
+                // ~10 s of association, 4-way handshake and DHCP. Interrupts stay ON throughout, so
+                // the desktop keeps redrawing and the thermal governor keeps running while we join.
+                unsafe { x86_64::instructions::interrupts::enable(); }
+                // Drop any existing interface FIRST: a switch invalidates the old lease, and leaving
+                // the stale one in place would have smoltcp polling a device that is mid-retune.
+                crate::drivers::net::teardown_wifi_iface();
+                let mut ok = false;
+                {
+                    let mut lock = crate::drivers::net::WIFI_DRIVER.lock();
+                    if let Some(w) = lock.as_mut() {
+                        ok = unsafe { w.try_connect(ssid, psk) };
+                    }
+                } // driver lock released here — init_wifi_iface takes it again
+                if ok { crate::drivers::net::init_wifi_iface(); }
+                if let Some(w) = crate::drivers::net::WIFI_DRIVER.lock().as_ref() {
+                    crate::drivers::net::publish_wifi_snapshot(w);
+                }
+                unsafe { x86_64::instructions::interrupts::disable(); }
+                crate::drivers::net::wifi_end();
+            }
+            frame.rax = crate::drivers::net::wifi_cached_state() as u64;
+        }
+
+        // 546: sys_wifi_status(out_ptr) -> 0 ok / -1 no adapter. Writes 40 bytes:
+        // state u32, ip[4], mask[4], router[4], dns[4], ssid_len u8, ssid[32] → see nyx_api::WifiStatus.
+        546 => {
+            // The tray polls this every second. Snapshot only — see 544.
+            let out = arg1 as *mut u8;
+            let snap = crate::drivers::net::WIFI_SNAPSHOT.lock();
+            if snap.present && is_valid_user_ptr(out as *const u8, snap.status.len()) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(snap.status.as_ptr(), out, snap.status.len())
+                };
+                frame.rax = 0;
+            } else {
+                frame.rax = (-1i64) as u64;
+            }
+        }
+
+        // 547: sys_wifi_disconnect() -> 0. Leaves the network and frees the radio to scan/retune.
+        547 => {
+            if crate::drivers::net::wifi_try_begin() {
+                // Teardown walks the firmware through a chain of REMOVE commands, each of which
+                // waits on a response — seconds in the worst case, so interrupts stay on.
+                unsafe { x86_64::instructions::interrupts::enable(); }
+                crate::drivers::net::teardown_wifi_iface();
+                if let Some(w) = crate::drivers::net::WIFI_DRIVER.lock().as_mut() {
+                    unsafe { w.disconnect() };
+                    crate::drivers::net::publish_wifi_snapshot(w);
+                }
+                unsafe { x86_64::instructions::interrupts::disable(); }
+                crate::drivers::net::wifi_end();
+            }
+            frame.rax = 0;
+        }
+
+        // 548: sys_wifi_set_radio(on) -> LinkState after the change (WIFI_RADIO_OFF when off).
+        //
+        // Turning it off leaves the network and drops the interface; turning it on only re-arms the
+        // radio, it does not rejoin — reconnecting is the saved-network agent's job, and joining
+        // something the user didn't ask for the instant they flick a switch is the wrong default.
+        548 => {
+            let want_on = arg1 != 0;
+            // Refuse while another long operation owns the radio, exactly like 543/545/547: a join in
+            // flight would otherwise have the link ripped out from under it halfway through the
+            // handshake. The picker sees the state come back unchanged and can say so.
+            if want_on != crate::drivers::net::wifi_radio_on()
+                && crate::drivers::net::wifi_try_begin()
+            {
+                // Teardown talks to the firmware and waits on each response — seconds in the worst
+                // case, so interrupts stay on for the same reason 547 enables them.
+                unsafe { x86_64::instructions::interrupts::enable(); }
+                if want_on {
+                    crate::drivers::net::set_wifi_radio_off(false);
+                } else {
+                    // Latch BEFORE tearing down. publish_wifi_snapshot reads this flag, and anything
+                    // that races in behind us must already see the radio as down — otherwise the
+                    // teardown's own publish would report a plain "not connected" and the switch
+                    // would appear to have flipped back on by itself.
+                    crate::drivers::net::set_wifi_radio_off(true);
+                    crate::drivers::net::teardown_wifi_iface();
+                    if let Some(w) = crate::drivers::net::WIFI_DRIVER.lock().as_mut() {
+                        unsafe { w.disconnect() };
+                    }
+                }
+                if let Some(w) = crate::drivers::net::WIFI_DRIVER.lock().as_ref() {
+                    crate::drivers::net::publish_wifi_snapshot(w);
+                }
+                unsafe { x86_64::instructions::interrupts::disable(); }
+                crate::drivers::net::wifi_end();
+            }
+            frame.rax = crate::drivers::net::wifi_cached_state() as u64;
+        }
+
         513 => { // sys_wait_vsync — returns 1 if the vblank was observed, 0 on timeout / no GPU.
             let mut seen = 0u64;
             unsafe {
@@ -2021,9 +2208,20 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 (*info_ptr).active_cooling = if temp >= 75 { 1 } else { 0 };
                 
                 // 2. Hardware Fan Telemetry (SMM)
-                (*info_ptr).cpu_fan_rpm = crate::laptop_fans::get_dell_fan_rpm(0);
-                (*info_ptr).gpu_fan_rpm = crate::laptop_fans::get_dell_fan_rpm(1);
-                
+                // FAN_RPM_UNKNOWN when we have no way to read the tachometer. Reporting 0 here was
+                // worse than reporting nothing: 0 RPM is a plausible-looking measurement, so it read
+                // as "the fans are dead" during a thermal investigation when in fact we simply were
+                // not measuring. Don't let a UI state a number it doesn't have.
+                (*info_ptr).cpu_fan_rpm = crate::laptop_fans::fan_rpm(0);
+                (*info_ptr).gpu_fan_rpm = crate::laptop_fans::fan_rpm(1);
+
+                // Name the machine next to that, so "fans not readable" says which machine we have
+                // no driver for rather than leaving it a mystery.
+                let mut machine = [0u8; 80];
+                crate::smbios::machine_string(&mut machine);
+                (*info_ptr).machine = machine;
+
+
                 // 3. Task Scheduler Telemetry
                 let mut count = 0;
                 if let Some(cores) = &crate::percpu::PER_CPU {

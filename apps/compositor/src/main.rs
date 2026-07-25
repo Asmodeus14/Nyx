@@ -12,7 +12,7 @@ use alloc::vec;
 
 use nyx_api::*;
 use nyx_gui::canvas::{Canvas, Color};
-use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_window_chrome, round_window_corners, draw_window_shadow, draw_scrollbar, SCROLLBAR_W, draw_cursor, Window, CursorType};
+use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_window_chrome, round_window_corners, draw_window_shadow, draw_scrollbar, SCROLLBAR_W, draw_cursor, ctl_btn_hit, Window, CursorType};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -20,6 +20,135 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 /// Whole-hour offset applied to the raw hardware RTC before display. 0 = show the RTC verbatim
 /// (the machine's CMOS holds local time). Bump this if the panel clock is off by whole hours.
 const TZ_OFFSET_HOURS: i32 = 0;
+
+// ─────────────────────────────── Launcher ───────────────────────────────
+
+/// One start-menu entry. Label, icon PNG, and the binary to exec — both paths inside the app's own
+/// `.nyx` bundle, so an app ships its artwork alongside its code instead of relying on a central
+/// icon directory the app knows nothing about.
+struct MenuEntry {
+    label: &'static str,
+    icon: &'static str,
+    exec: &'static str,
+}
+
+/// The launcher, as ONE table. This used to be three parallel lists — a labels array for the GPU
+/// text pass, an identical one for the CPU fallback, and a chain of `else if rel_y < N` for the
+/// clicks — so adding an app meant editing three places and a wrong threshold silently launched the
+/// neighbouring entry. Now the renderer and the hit-test both iterate this.
+const MENU: [MenuEntry; 12] = [
+    MenuEntry { label: "Terminal",       icon: "/mnt/nvme/apps/Terminal.nyx/icon.png", exec: "/mnt/nvme/apps/Terminal.nyx/run.bin\0" },
+    MenuEntry { label: "Settings",       icon: "/mnt/nvme/apps/Settings.nyx/icon.png", exec: "/mnt/nvme/apps/Settings.nyx/run.bin\0" },
+    MenuEntry { label: "Explorer",       icon: "/mnt/nvme/apps/Explorer.nyx/icon.png", exec: "/mnt/nvme/apps/Explorer.nyx/run.bin\0" },
+    MenuEntry { label: "Network Suite",  icon: "/mnt/nvme/apps/Network.nyx/icon.png", exec: "/mnt/nvme/apps/Network.nyx/run.bin\0" },
+    MenuEntry { label: "System Monitor", icon: "/mnt/nvme/apps/SystemMonitor.nyx/icon.png", exec: "/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0" },
+    MenuEntry { label: "GL Cube (3D)",   icon: "/mnt/nvme/apps/GlCube.nyx/icon.png", exec: "/mnt/nvme/apps/GlCube.nyx/run.bin\0" },
+    MenuEntry { label: "Image Viewer",   icon: "/mnt/nvme/apps/ImageViewer.nyx/icon.png", exec: "/mnt/nvme/apps/ImageViewer.nyx/run.bin\0" },
+    MenuEntry { label: "Std Hello",      icon: "/mnt/nvme/apps/StdHello.nyx/icon.png", exec: "/mnt/nvme/apps/StdHello.nyx/run.bin\0" },
+    MenuEntry { label: "QC Studio",      icon: "/mnt/nvme/apps/QcStudio.nyx/icon.png", exec: "/mnt/nvme/apps/QcStudio.nyx/run.bin\0" },
+    MenuEntry { label: "Std GUI",        icon: "/mnt/nvme/apps/StdGui.nyx/icon.png", exec: "/mnt/nvme/apps/StdGui.nyx/run.bin\0" },
+    MenuEntry { label: "Notepad",        icon: "/mnt/nvme/apps/Notepad.nyx/icon.png", exec: "/mnt/nvme/apps/Notepad.nyx/run.bin\0" },
+    MenuEntry { label: "Wi-Fi",          icon: "/mnt/nvme/apps/Wifi.nyx/icon.png", exec: "/mnt/nvme/apps/Wifi.nyx/run.bin\0" },
+];
+
+/// The shell's own mark, in the compositor's bundle like every other app's icon.
+const NYX_LOGO: &str = "/mnt/nvme/apps/WindowServer.nyx/icon.png";
+
+// Start menu: a TILE GRID, not a list. One row per app made a 244x536 column — a pillar taller than
+// it was wide, which got worse with every app added. A 3-wide grid keeps the panel close to square
+// and leaves room for the search field.
+const MENU_COLS: usize = 3;
+const MENU_ROWS: usize = 4;          // 3x4 = 12 slots, i.e. the whole launcher with no scrolling
+const MENU_TILE_W: usize = 124;
+const MENU_TILE_H: usize = 88;
+const MENU_PAD: usize = 14;
+const MENU_W: usize = MENU_PAD * 2 + MENU_COLS * MENU_TILE_W;
+const MENU_HEADER_H: usize = 52;
+const MENU_SEARCH_H: usize = 30;
+const MENU_SEARCH_GAP: usize = 10;
+/// Top of the tile grid, relative to the panel: header, then the search field with a gap either side.
+const MENU_GRID_Y: usize = MENU_HEADER_H + MENU_SEARCH_GAP + MENU_SEARCH_H + MENU_SEARCH_GAP;
+const MENU_PAD_B: usize = 14;
+const MENU_ICON: usize = 40;   // size icons are pre-scaled to for the menu tiles
+const LOGO_BTN: usize = 20;    // and for the start button
+const TB_ICON: usize = 22;     // and for taskbar window buttons
+const MENU_SEARCH_MAX: usize = 24;
+
+const BAR_H: usize = 36;
+const START_BTN_W: usize = 96;
+const START_BTN_H: usize = 26;
+
+/// The panel is a FIXED size — it does not reflow as the search narrows the results. A panel that
+/// resized per keystroke would jump under the pointer and leave stale pixels behind every shrink.
+fn menu_h() -> usize { MENU_GRID_Y + MENU_ROWS * MENU_TILE_H + MENU_PAD_B }
+
+/// Case-insensitive substring match, used to filter the launcher by the search box. Labels and query
+/// are both ASCII, so this compares bytes.
+fn label_matches(label: &str, q: &[u8]) -> bool {
+    if q.is_empty() { return true; }
+    let l = label.as_bytes();
+    if q.len() > l.len() { return false; }
+    'outer: for start in 0..=(l.len() - q.len()) {
+        for i in 0..q.len() {
+            if !l[start + i].eq_ignore_ascii_case(&q[i]) { continue 'outer; }
+        }
+        return true;
+    }
+    false
+}
+
+/// Longest prefix of `s` that fits in `max_w` pixels. Tile labels are centred, and under the
+/// proportional font a long one ("System Monitor") would otherwise bleed into the neighbouring tile.
+/// Labels are ASCII, so byte slicing can't split a char.
+fn fit_label(s: &str, max_w: usize) -> &str {
+    if Canvas::text_width(s, 1) <= max_w { return s; }
+    let mut end = s.len();
+    while end > 1 && Canvas::text_width(&s[..end], 1) > max_w { end -= 1; }
+    &s[..end]
+}
+
+/// Read a whole file from the VFS. Icons are a few hundred bytes each, so one growing read is fine.
+fn read_file(path: &str) -> Option<Vec<u8>> {
+    let fd = sys_open(path);
+    if fd < 0 { return None; }
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = sys_read(fd, &mut chunk);
+        if n <= 0 { break; }
+        out.extend_from_slice(&chunk[..n as usize]);
+        if (n as usize) < chunk.len() { break; }
+    }
+    sys_close(fd);
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Decode an icon PNG and pre-scale it to `size`. None if the file is missing or undecodable — every
+/// draw site treats that as "no icon" and falls back to text, so a half-installed bundle degrades
+/// instead of leaving a blank square.
+fn load_icon(path: &str, size: usize) -> Option<Vec<u32>> {
+    let bytes = read_file(path)?;
+    let img = nyx_image::decode(&bytes).ok()?;
+    Some(Canvas::scale_rgba(&img.pixels, img.w, img.h, size, size))
+}
+
+/// Filled rectangle with rounded corners, for the chrome. Small radii only — the corner test is a
+/// plain distance check per pixel, with no antialiasing (chrome sits on flat fills, so the hard
+/// edge is invisible at r<=8 and it keeps this off the per-frame cost).
+fn fill_round_rect(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usize, r: usize, color: u32) {
+    if w == 0 || h == 0 { return; }
+    for row in 0..h {
+        let dy = if row < r { r - row } else if row >= h - r { row + 1 - (h - r) } else { 0 };
+        let inset = if dy == 0 { 0 } else {
+            // Largest k with k^2 + dy^2 <= r^2 → how far this row's corner is cut in.
+            let mut k = r;
+            while k > 0 && k * k + dy * dy > r * r { k -= 1; }
+            r - k
+        };
+        if inset * 2 >= w { continue; }
+        canvas.fill_rect(x + inset, y + row, w - inset * 2, 1, color);
+    }
+}
 
 /// Append a zero-padded 2-digit number to `buf` at `pos`, returning the new position.
 fn push_2d(buf: &mut [u8], pos: usize, v: u8) -> usize {
@@ -95,9 +224,14 @@ fn upload_arrow_cursor() {
 /// Grab band (px) just inside a window's border where a drag starts a resize.
 const RESIZE_BAND: usize = 8;
 
-/// U7: taskbar window-button dimensions.
-const TB_BTN_W: usize = 140;
-const TB_BTN_H: usize = 24;
+/// Taskbar window buttons. Icon-only now: a title-width button meant the bar was a row of text
+/// labels, and a minimized window "became" its name rather than its icon. Square keeps the group
+/// compact and lets far more windows fit before the cap in `tb_button_count` bites.
+const TB_BTN_W: usize = 36;
+const TB_BTN_H: usize = 28;
+const TB_GAP: usize = 6;
+/// Width reserved for the two-line clock block (time over date).
+const CLOCK_W: usize = 84;
 
 /// Edge bitmask for point (mx,my) relative to window `win`: L=1 R=2 T=4 B=8 (corners = combos), 0 =
 /// not on a resize edge. The band is the inner `RESIZE_BAND` px of the FULL window rect (title + content).
@@ -185,20 +319,44 @@ fn upload_cursor(t: CursorType) {
     sys_cursor_set_image(&img);
 }
 
-/// Draw the bottom taskbar strip (opaque white bar + top border, Start button, live RTC wall clock,
-/// NYX label, WIFI). Self-contained and fully opaque, so it can be repainted on its own without any
-/// under-pixels — the damage-tracked idle path relies on that to refresh only the clock once per second
-/// without recompositing the whole desktop. Called by both the full recomposite and the partial path.
+/// Draw the bottom taskbar strip: the opaque bar and its top border, nothing else. The Start button,
+/// window buttons, clock and tray are drawn by the main pass, which has the compositor state (icon
+/// bitmaps, link status, hover) this function doesn't.
 fn render_taskbar(canvas: &mut Canvas, screen_stride: usize, screen_h: usize) {
-    let bar_h = 36;
-    let start_y = screen_h - bar_h;
-    canvas.fill_rect(0, start_y, screen_stride, bar_h, 0xFF_FFFFFF); // Opaque white taskbar
+    let start_y = screen_h - BAR_H;
+    canvas.fill_rect(0, start_y, screen_stride, BAR_H, 0xFF_FFFFFF); // Opaque white taskbar
     canvas.fill_rect(0, start_y, screen_stride, 1, 0xFF_D1D1D1);     // Border
+}
 
-    let btn_x = (screen_stride / 2) - 35;
-    canvas.fill_rect(btn_x, start_y + 6, 70, 24, Color::ACCENT_PRIMARY);
-    // Taskbar TEXT (clock / NYX / WIFI) is drawn by the frame's batched GPU-text pass (chrome_items),
-    // with a CPU print_str fallback — see the main loop.
+/// Signal strength to show for a link state, as (lit bars, colour). We have no RSSI from the driver,
+/// so the bars encode CONNECTION state rather than signal quality — three lit means associated with
+/// a lease, not "excellent reception".
+fn wifi_indicator(state: u32) -> (usize, u32) {
+    match state {
+        WIFI_CONNECTED => (3, Color::ACCENT_GREEN),
+        WIFI_CONNECTING => (2, Color::ACCENT_PRIMARY),
+        WIFI_AUTH_FAILED | WIFI_NO_LEASE | WIFI_HW_FAILED => (1, 0xFF_C0392B),
+        _ => (0, Color::TEXT_MUTED),
+    }
+}
+
+/// Tray Wi-Fi glyph: three rising bars, greyed as a track with the lit ones overdrawn in the state
+/// colour. `x,y` is the top-left of a 22x18 box.
+fn draw_wifi_glyph(canvas: &mut Canvas, x: usize, y: usize, state: u32) {
+    let (lit, color) = wifi_indicator(state);
+    let base = y + 16;
+    for i in 0..3 {
+        let h = 6 + i * 5;
+        let bx = x + i * 7;
+        canvas.fill_rect(bx, base - h, 5, h, 0xFF_DCDCD6);
+        if i < lit {
+            canvas.fill_rect(bx, base - h, 5, h, color);
+        }
+    }
+    // Not-connected reads as "off" rather than "weak": strike the track through.
+    if lit == 0 {
+        canvas.fill_rect(x, base - 4, 19, 2, Color::TEXT_MUTED);
+    }
 }
 
 
@@ -206,13 +364,16 @@ pub struct WindowClient {
     pub win: Window,
     pub owner_pid: u64,
     pub shm_id: u64,
-    pub buffer: *const u32, 
+    pub buffer: *const u32,
     pub buf_w: usize,
     pub buf_h: usize,
     pub gpu_gva: u32,
+    /// The app's icon at taskbar size, decoded once when the window was created.
+    pub icon: Option<Vec<u32>>,
 }
 
 fn get_str_len(buf: &[u8; 64]) -> usize { buf.iter().position(|&c| c == 0).unwrap_or(64) }
+fn get_icon_len(buf: &[u8; 96]) -> usize { buf.iter().position(|&c| c == 0).unwrap_or(96) }
 
 /// Boot B: read a client's reported scroll state from its (already-mapped) WindowHeader. The pixel
 /// buffer starts at `header + size_of::<WindowHeader>()`, so the header sits just before `buffer`.
@@ -284,6 +445,20 @@ pub struct CompositorState {
     pub fps_window_frames: usize,// frames counted so far in the current window
     pub fps_logs: usize,         // number of [UI] baseline lines emitted (capped, then silent)
     pub vsync_timeouts: u64,     // U6: presents where sys_wait_vsync timed out (mis-paced panel)
+
+    // Desktop chrome artwork, decoded once at startup. Parallel to MENU; None = that icon failed to
+    // load and the entry renders label-only.
+    pub icons: Vec<Option<Vec<u32>>>,
+    pub logo: Option<Vec<u32>>,        // nyx mark, LOGO_BTN px, for the Start button
+    pub logo_big: Option<Vec<u32>>,    // same mark at MENU_ICON px, for the menu header
+    /// Last-known Wi-Fi link state for the tray glyph, refreshed on the 1 Hz clock tick (a syscall
+    /// per frame would be pointless — the link changes on human timescales).
+    pub wifi_state: u32,
+
+    /// Start-menu search box. A fixed buffer rather than a String: it is bounded by construction and
+    /// keeps the compositor's per-keystroke path allocation-free.
+    pub search: [u8; MENU_SEARCH_MAX],
+    pub search_len: usize,
 }
 
 impl CompositorState {
@@ -302,11 +477,59 @@ impl CompositorState {
             start_menu_open: false,
             screen_w: w, screen_h: h, screen_stride: stride,
             hw_cursor: false,
+            icons: Vec::new(), logo: None, logo_big: None,
+            wifi_state: WIFI_IDLE,
             last_clock_sec: 0,
             frame_count: 0, last_frame_ms: 0,
             fps: 0, fps_window_start: 0, fps_window_frames: 0, fps_logs: 0,
             vsync_timeouts: 0,
+            search: [0; MENU_SEARCH_MAX], search_len: 0,
         }
+    }
+
+    /// Indices into MENU that match the search box, in table order. Empty query = everything.
+    fn menu_filtered(&self) -> Vec<usize> {
+        let q = &self.search[..self.search_len];
+        MENU.iter()
+            .enumerate()
+            .filter(|(_, e)| label_matches(e.label, q))
+            .map(|(i, _)| i)
+            .take(MENU_COLS * MENU_ROWS)
+            .collect()
+    }
+
+    /// Rect of the `slot`-th visible tile (slot = position in the FILTERED list, not the MENU index).
+    /// ★ One source of truth for the grid, shared by the renderer, the hover highlight and the click
+    /// hit-test — the flat list already taught us what happens when those drift apart.
+    fn menu_tile_rect(&self, slot: usize) -> (usize, usize, usize, usize) {
+        let (mx, my, _, _) = self.start_menu_rect();
+        (mx + MENU_PAD + (slot % MENU_COLS) * MENU_TILE_W,
+         my + MENU_GRID_Y + (slot / MENU_COLS) * MENU_TILE_H,
+         MENU_TILE_W, MENU_TILE_H)
+    }
+
+    /// Which visible slot the pointer is over, bounded by how many tiles are actually drawn.
+    fn menu_slot_at(&self, mx: usize, my: usize) -> Option<usize> {
+        for slot in 0..self.menu_filtered().len() {
+            let (tx, ty, tw, th) = self.menu_tile_rect(slot);
+            if mx >= tx && mx < tx + tw && my >= ty && my < ty + th { return Some(slot); }
+        }
+        None
+    }
+
+    /// The search field's rect inside the panel.
+    fn menu_search_rect(&self) -> (usize, usize, usize, usize) {
+        let (mx, my, mw, _) = self.start_menu_rect();
+        (mx + MENU_PAD, my + MENU_HEADER_H + MENU_SEARCH_GAP,
+         mw - MENU_PAD * 2, MENU_SEARCH_H)
+    }
+
+    /// Open/close the launcher. Always clears the query — a stale filter from last time would show a
+    /// menu that looks half-empty for no visible reason.
+    fn set_start_menu(&mut self, open: bool) {
+        self.start_menu_open = open;
+        self.search_len = 0;
+        self.mark_full_redraw();
     }
 
     pub fn mark_dirty(&mut self, x: usize, y: usize, w: usize, h: usize) {
@@ -315,6 +538,41 @@ impl CompositorState {
         self.dirty_max_x = self.dirty_max_x.max(x + w).min(self.screen_stride);
         self.dirty_max_y = self.dirty_max_y.max(y + h).min(self.screen_h);
         self.needs_redraw = true;
+    }
+
+    // ── Chrome geometry. Single source of truth for both the renderer and the hit-tests; these used
+    // to be recomputed inline in each, which is how the WIFI button ended up with a hit box that no
+    // longer matched its label. ──
+
+    /// Start button: x, y, w, h. Leftmost item of the centred taskbar group, so it shifts as windows
+    /// open and close — the group stays centred rather than the button.
+    pub fn start_button_rect(&self) -> (usize, usize, usize, usize) {
+        (
+            self.tb_group_x(),
+            self.screen_h - BAR_H + (BAR_H - START_BTN_H) / 2,
+            START_BTN_W,
+            START_BTN_H,
+        )
+    }
+
+    /// Clock block: x, y, w, h — two stacked lines (time over date) on the right, where every desktop
+    /// puts it. Anchored to the VISIBLE width, not the stride: on a panel that pads its scanline the
+    /// two differ, and a stride-relative x lands outside the GPU text viewport.
+    pub fn clock_rect(&self) -> (usize, usize, usize, usize) {
+        (self.screen_w.saturating_sub(CLOCK_W + 16), self.screen_h - BAR_H + 4, CLOCK_W, BAR_H - 8)
+    }
+
+    /// Tray Wi-Fi indicator: x, y, w, h. Sits just left of the clock.
+    pub fn tray_wifi_rect(&self) -> (usize, usize, usize, usize) {
+        let (cx, _, _, _) = self.clock_rect();
+        (cx.saturating_sub(34), self.screen_h - BAR_H + 9, 22, 18)
+    }
+
+    /// Start menu: x, y, w, h.
+    pub fn start_menu_rect(&self) -> (usize, usize, usize, usize) {
+        let mh = menu_h();
+        let mx = (self.screen_w / 2) - (MENU_W / 2);
+        (mx, self.screen_h.saturating_sub(BAR_H + mh + 8), MENU_W, mh)
     }
 
     pub fn mark_full_redraw(&mut self) {
@@ -339,18 +597,36 @@ impl CompositorState {
         self.mark_dirty(fx, fy, fw, fh);
     }
 
-    /// U7: layout of taskbar window buttons — `(client_idx, button_x)` for each existing window,
-    /// left-aligned from x=10, stopping before the centre Start button. Shared by the render pass and
-    /// the click hit-test so they can never drift out of sync.
+    /// How many windows currently get a taskbar button, capped so the group can never run into the
+    /// clock on the right.
+    fn tb_button_count(&self) -> usize {
+        let live = self.clients.iter().filter(|c| c.win.exists).count();
+        // Half the screen, minus the Start button, is the widest the group may be.
+        let budget = (self.screen_w / 2).saturating_sub(START_BTN_W + TB_GAP) / (TB_BTN_W + TB_GAP);
+        live.min(budget)
+    }
+
+    /// Total width of the Start button + window buttons, drawn as one centred group.
+    fn tb_group_width(&self) -> usize {
+        let n = self.tb_button_count();
+        START_BTN_W + if n == 0 { 0 } else { TB_GAP + n * (TB_BTN_W + TB_GAP) - TB_GAP }
+    }
+
+    fn tb_group_x(&self) -> usize {
+        (self.screen_w / 2).saturating_sub(self.tb_group_width() / 2)
+    }
+
+    /// Layout of taskbar window buttons — `(client_idx, button_x)`, running rightward from the Start
+    /// button as one centred group. Shared by the render pass and the click hit-test so they can never
+    /// drift out of sync.
     fn taskbar_buttons(&self) -> Vec<(usize, usize)> {
-        let area_end = (self.screen_stride / 2).saturating_sub(45);
-        let mut bx = 10usize;
+        let start = self.tb_group_x() + START_BTN_W + TB_GAP;
+        let cap = self.tb_button_count();
         let mut out = Vec::new();
         for (i, client) in self.clients.iter().enumerate() {
             if !client.win.exists { continue; }
-            if bx + TB_BTN_W > area_end { break; }
-            out.push((i, bx));
-            bx += TB_BTN_W + 4;
+            if out.len() >= cap { break; }
+            out.push((i, start + out.len() * (TB_BTN_W + TB_GAP)));
         }
         out
     }
@@ -362,17 +638,13 @@ impl CompositorState {
 
     /// U7 boot 3: which title-bar button (close=0/min=1/max=2) of which window sits under the pointer,
     /// top-down. Stops at the topmost window the pointer is over (a lower window's buttons can't be
-    /// hovered through an upper one) — mirrors the click hit-test / cursor logic. Button rects match the
-    /// click handler: close x+12..+24, min x+28..+40, max x+44..+56, all y+10..+22.
+    /// hovered through an upper one) — mirrors the click hit-test / cursor logic. Rects come from
+    /// `nyx_gui::ui::ctl_btn_hit`, which is also what draws them, so hover can't drift from the plates.
     fn title_btn_at(&self, mx: usize, my: usize) -> Option<(usize, u8)> {
         for (idx, client) in self.clients.iter().enumerate().rev() {
             let w = &client.win;
             if !w.exists || w.is_minimized { continue; }
-            if my >= w.y + 10 && my <= w.y + 22 {
-                if mx >= w.x + 12 && mx <= w.x + 24 { return Some((idx, 0)); }
-                if mx >= w.x + 28 && mx <= w.x + 40 { return Some((idx, 1)); }
-                if mx >= w.x + 44 && mx <= w.x + 56 { return Some((idx, 2)); }
-            }
+            if let Some(b) = ctl_btn_hit(w.x, w.y, mx, my) { return Some((idx, b)); }
             // Over this (topmost hit) window but not on a button → nothing hovered; stop descending.
             if mx >= w.x && mx <= w.x + w.w && my >= w.y && my <= w.y + w.h + 30 { return None; }
         }
@@ -414,6 +686,17 @@ impl CompositorState {
                         let gpu_gva = 0x2000_0000 + (self.next_win_id * 0x0100_0000) as u32;
                         sys_gpu_map_shm(shm_id, gpu_gva);
 
+                        // Decode the app's own icon once, at window-creation time. The app declares
+                        // the path (it knows its bundle; we only know its pid), and an empty or
+                        // unreadable one just leaves None — the button then shows its initial.
+                        let icon = {
+                            let n = get_icon_len(&header.icon);
+                            if n == 0 { None } else {
+                                core::str::from_utf8(&header.icon[..n]).ok()
+                                    .and_then(|p| load_icon(p, TB_ICON))
+                            }
+                        };
+
                         self.clients.push(WindowClient {
                             win: Window { 
                                 id: self.next_win_id, x, y, w, h, 
@@ -424,7 +707,7 @@ impl CompositorState {
                             },
                             owner_pid: msg.sender_pid, shm_id, buffer: unsafe { vaddr.add(core::mem::size_of::<WindowHeader>()) } as *const u32,
                             buf_w: w, buf_h: h,
-                            gpu_gva,
+                            gpu_gva, icon,
                         });
                         self.next_win_id += 1;
                         self.mark_full_redraw();
@@ -478,7 +761,36 @@ impl CompositorState {
 
     pub fn process_input(&mut self) {
         if let Some(key) = sys_read_key() {
-            if let Some(top_client) = self.clients.iter().rev().find(|c| c.win.exists && !c.win.is_minimized) {
+            if key == nyx_api::keys::SUPER {
+                // The Super/Windows key belongs to the shell, not the focused app — swallow it.
+                let open = !self.start_menu_open;
+                self.set_start_menu(open);
+            } else if self.start_menu_open {
+                // While the launcher is open it OWNS the keyboard — that is what makes the search box
+                // work at all, since the compositor otherwise forwards every key to the focused app.
+                match key {
+                    '\x1b' => self.set_start_menu(false),               // Esc dismisses
+                    '\x08' => {                                        // Backspace
+                        self.search_len = self.search_len.saturating_sub(1);
+                        self.mark_full_redraw();
+                    }
+                    '\n' | '\r' => {                                   // Enter launches the top hit
+                        let first = self.menu_filtered().first().copied();
+                        if let Some(i) = first {
+                            if sys_fork() == 0 { sys_execve(MENU[i].exec); sys_exit(1); }
+                        }
+                        self.set_start_menu(false);
+                    }
+                    c if (c as u32) >= 0x20 && (c as u32) < 0x7F => {
+                        if self.search_len < MENU_SEARCH_MAX {
+                            self.search[self.search_len] = c as u8;
+                            self.search_len += 1;
+                            self.mark_full_redraw();
+                        }
+                    }
+                    _ => {}                                            // arrows/PUA: ignored for now
+                }
+            } else if let Some(top_client) = self.clients.iter().rev().find(|c| c.win.exists && !c.win.is_minimized) {
                 sys_ipc_send(top_client.owner_pid, MSG_KEY_EVENT, key as u64, 0);
             }
         }
@@ -501,16 +813,16 @@ impl CompositorState {
         if self.left_click && !self.prev_left {
             let mut clicked_idx: Option<usize> = None;
 
-            let btn_w = 70; let btn_x = (self.screen_stride / 2) - 35; let btn_y = self.screen_h - 36 + 6;
-            let net_x = self.screen_w.saturating_sub(50); let net_w = 30;
-            let menu_w = 180; let menu_h = 440;
-            let menu_x = (self.screen_stride / 2) - (menu_w / 2); let menu_y = self.screen_h - 36 - menu_h - 10;
+            let (btn_x, btn_y, btn_w, _btn_h) = self.start_button_rect();
+            let (net_x, net_y, net_w, net_h) = self.tray_wifi_rect();
+            let (menu_x, menu_y, menu_w, menu_h) = self.start_menu_rect();
+            let tb_btn_y = self.screen_h - BAR_H + 6;
 
             // U7: which taskbar window button (if any) is under the pointer — computed before the click
             // chain so no borrow of self is held while we later mutate.
             let tb_btn_hit = {
                 let mut h: Option<usize> = None;
-                if self.my >= btn_y && self.my < btn_y + TB_BTN_H {
+                if self.my >= tb_btn_y && self.my < tb_btn_y + TB_BTN_H {
                     for (ci, bx) in self.taskbar_buttons() {
                         if self.mx >= bx && self.mx < bx + TB_BTN_W { h = Some(ci); break; }
                     }
@@ -518,29 +830,30 @@ impl CompositorState {
                 h
             };
 
-            if self.start_menu_open && self.mx >= menu_x && self.mx <= menu_x + menu_w && self.my >= menu_y && self.my <= menu_y + menu_h {
-                let rel_y = self.my - menu_y;
-                if rel_y < 40 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Terminal.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 80 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Settings.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 120 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Explorer.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 160 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Network.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 200 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 240 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/GlCube.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 280 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/ImageViewer.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 320 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/StdHello.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 360 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/QcStudio.nyx/run.bin\0"); sys_exit(1); } }
-                else if rel_y < 400 { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/StdGui.nyx/run.bin\0"); sys_exit(1); } }
-                else { if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Notepad.nyx/run.bin\0"); sys_exit(1); } }
-                
-                self.start_menu_open = false; 
-                self.mark_full_redraw();
-            } 
-            else if self.mx >= btn_x && self.mx <= btn_x + btn_w && self.my >= btn_y && self.my <= btn_y + 24 {
-                self.start_menu_open = !self.start_menu_open; 
-                self.mark_full_redraw();
+            if self.start_menu_open && self.mx >= menu_x && self.mx < menu_x + menu_w
+                && self.my >= menu_y && self.my < menu_y + menu_h {
+                // A click on a tile launches it; anywhere else in the panel (header, search field,
+                // empty grid) just dismisses. Clicking the search box keeps the menu open, since
+                // that's plainly an intent to type rather than to leave.
+                let (sx, sy, sw, sh) = self.menu_search_rect();
+                let in_search = self.mx >= sx && self.mx < sx + sw && self.my >= sy && self.my < sy + sh;
+                if let Some(slot) = self.menu_slot_at(self.mx, self.my) {
+                    if let Some(&i) = self.menu_filtered().get(slot) {
+                        if sys_fork() == 0 { sys_execve(MENU[i].exec); sys_exit(1); }
+                    }
+                    self.set_start_menu(false);
+                } else if !in_search {
+                    self.set_start_menu(false);
+                }
             }
-            else if self.mx >= net_x && self.mx <= net_x + net_w && self.my >= btn_y && self.my <= btn_y + 24 {
-                if sys_fork() == 0 { sys_execve("/bin/nyx-network\0"); sys_exit(1); }
+            else if self.mx >= btn_x && self.mx < btn_x + btn_w && self.my >= btn_y && self.my < btn_y + START_BTN_H {
+                let open = !self.start_menu_open;
+                self.set_start_menu(open);
+            }
+            else if self.mx >= net_x && self.mx < net_x + net_w && self.my >= net_y && self.my < net_y + net_h {
+                // The tray Wi-Fi glyph opens the network picker. (This used to exec /bin/nyx-network,
+                // a path that has never existed on an installed system — the button did nothing.)
+                if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Wifi.nyx/run.bin\0"); sys_exit(1); }
                 self.start_menu_open = false;
                 self.mark_full_redraw();
             }
@@ -580,14 +893,17 @@ impl CompositorState {
                         clicked_idx = Some(idx); break;
                     }
 
-                    if self.mx >= win_x + 12 && self.mx <= win_x + 24 && self.my >= win_y + 10 && self.my <= win_y + 22 {
+                    // Control hit-tests come from nyx_gui::ui so they track the drawn plates exactly.
+                    let ctl = ctl_btn_hit(win_x, win_y, self.mx, self.my);
+
+                    if ctl == Some(0) {
                         client.win.exists = false;
                         sys_ipc_send(client.owner_pid, MSG_WINDOW_CLOSE, 0, 0);
                         self.mark_win_footprint(win_x, win_y, win_w, win_h);
                         clicked_idx = Some(idx); break;
                     }
 
-                    if self.mx >= win_x + 28 && self.mx <= win_x + 40 && self.my >= win_y + 10 && self.my <= win_y + 22 {
+                    if ctl == Some(1) {
                         // U7: minimize hides the window fully (it lives as a taskbar button). Full redraw
                         // — both the window's old area AND the taskbar (new button) change.
                         client.win.is_minimized = true;
@@ -595,7 +911,7 @@ impl CompositorState {
                         clicked_idx = Some(idx); break;
                     }
 
-                    if self.mx >= win_x + 44 && self.mx <= win_x + 56 && self.my >= win_y + 10 && self.my <= win_y + 22 {
+                    if ctl == Some(2) {
                         if client.win.is_maximized {
                             client.win.x = client.win.saved_x; client.win.y = client.win.saved_y;
                             client.win.w = client.win.saved_w; client.win.h = client.win.saved_h;
@@ -774,7 +1090,15 @@ impl CompositorState {
         let new_tb_btn = self.tb_btn_at(self.mx, self.my);
         if new_tb_btn != self.hover_tb_btn {
             self.hover_tb_btn = new_tb_btn;
-            self.mark_dirty(0, self.screen_h.saturating_sub(36), self.screen_stride, 36);
+            self.mark_dirty(0, self.screen_h.saturating_sub(BAR_H), self.screen_stride, BAR_H);
+        }
+
+        // Start-menu row highlight. Same reasoning as the buttons above: under the HW cursor a bare
+        // pointer move dirties nothing, so without this the highlight would only appear on the next
+        // 1 Hz clock tick. Only costs anything while the menu is actually open.
+        if self.start_menu_open && (self.mx != self.prev_mx || self.my != self.prev_my) {
+            let (mx0, my0, mw, mh) = self.start_menu_rect();
+            self.mark_dirty(mx0, my0, mw, mh);
         }
     }
 
@@ -819,6 +1143,27 @@ pub extern "C" fn _start() -> ! {
     // U5 Boot T1: build the GPU font atlas ONCE (rasterize printable ASCII → a mapped B8G8R8A8 atlas
     // surface) so the compositor can draw a proof banner via the GPU text path (sys_gpu_draw_text).
     // None → keep everything CPU-drawn (no banner); the desktop is unaffected either way.
+    // Decode the desktop's icon set once. Missing files are not fatal — each entry falls back to a
+    // label-only row, so a stale install still boots to a usable menu.
+    let mut loaded = 0usize;
+    for e in MENU.iter() {
+        let ic = load_icon(e.icon, MENU_ICON);
+        if ic.is_some() { loaded += 1; }
+        state.icons.push(ic);
+    }
+    state.logo = load_icon(NYX_LOGO, LOGO_BTN);
+    state.logo_big = load_icon(NYX_LOGO, MENU_ICON);
+    {
+        let mut m = [0u8; 64];
+        let mut mp = 0usize;
+        for &b in b"[COMPOSITOR] icons loaded: " { m[mp] = b; mp += 1; }
+        mp = push_num(&mut m, mp, loaded);
+        m[mp] = b'/'; mp += 1;
+        mp = push_num(&mut m, mp, MENU.len());
+        m[mp] = b'\n'; mp += 1;
+        if let Ok(s) = core::str::from_utf8(&m[..mp]) { sys_print(s); }
+    }
+
     let gpu_font = nyx_gui::gpu_text::GpuFont::prepare();
     if let Some(f) = &gpu_font {
         // Log the atlas dims (sanity-check from serial).
@@ -858,6 +1203,9 @@ pub extern "C" fn _start() -> ! {
         let now_sec = now / 1000;
         if now_sec != state.last_clock_sec {
             state.last_clock_sec = now_sec;
+            // Refresh the tray Wi-Fi state on the same tick. Once a second is the right cadence: the
+            // link changes on human timescales, and the frame is being recomposited anyway.
+            state.wifi_state = sys_wifi_status().map(|s| s.state).unwrap_or(WIFI_IDLE);
             state.needs_redraw = true;
         }
 
@@ -1033,37 +1381,118 @@ pub extern "C" fn _start() -> ! {
             // accented; minimized windows are dimmed. Drawn CPU (fill + title) on the taskbar strip;
             // the layout matches taskbar_buttons() so clicks map correctly.
             {
-                let bar_y = screen_h - 36;
+                let bar_y = screen_h - BAR_H;
+                let btn_y = bar_y + (BAR_H - TB_BTN_H) / 2;
                 let active = state.active_window();
                 for (ci, bx) in state.taskbar_buttons() {
-                    let win = &state.clients[ci].win;
+                    let client = &state.clients[ci];
+                    let win = &client.win;
                     let is_active = Some(ci) == active;
                     let is_hovered = state.hover_tb_btn == Some(ci);
-                    // U7 boot 3: active button accented; a hovered (non-active) button gets a soft accent
-                    // highlight; minimized dimmed; otherwise the resting light shade.
-                    let bg = if is_active { Color::ACCENT_PRIMARY }
-                             else if is_hovered { 0xFF_FCE9D8 }
-                             else if win.is_minimized { 0xFF_E8E8E8 }
-                             else { 0xFF_F3F3F3 };
-                    canvas.fill_rect(bx, bar_y + 6, TB_BTN_W, TB_BTN_H, bg);
-                    let tcol = if is_active { Color::WHITE } else { Color::TEXT_DARK };
-                    let title = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
-                    // Truncate to fit the button (leave 8px padding each side).
-                    let max_px = TB_BTN_W.saturating_sub(16);
-                    let mut end = title.len();
-                    while end > 0 && Canvas::text_width(&title[..end], 1) > max_px { end -= 1; }
-                    canvas.print_str(bx + 8, bar_y + 10, &title[..end], tcol, 1);
+                    // Active button accented; a hovered (non-active) one gets a soft accent tint;
+                    // minimized dimmed; otherwise it sits flush with the bar.
+                    let bg = if is_active { 0xFF_FDEBD8 }
+                             else if is_hovered { 0xFF_F2F2EF }
+                             else { 0xFF_FFFFFF };
+                    fill_round_rect(&mut canvas, bx, btn_y, TB_BTN_W, TB_BTN_H, 6, bg);
+
+                    match &client.icon {
+                        Some(icon) => {
+                            // Minimized windows are dimmed by compositing the icon over the button at
+                            // reduced opacity — it still reads as "this app", just parked.
+                            let op = if win.is_minimized { 130u8 } else { 255u8 };
+                            if op == 255 {
+                                canvas.blit_rgba(bx + (TB_BTN_W - TB_ICON) / 2,
+                                                 btn_y + (TB_BTN_H - TB_ICON) / 2,
+                                                 icon, TB_ICON, TB_ICON, None);
+                            } else {
+                                let faded: Vec<u32> = icon.iter()
+                                    .map(|p| ((((p >> 24) & 0xFF) * op as u32 / 255) << 24) | (p & 0x00FF_FFFF))
+                                    .collect();
+                                canvas.blit_rgba(bx + (TB_BTN_W - TB_ICON) / 2,
+                                                 btn_y + (TB_BTN_H - TB_ICON) / 2,
+                                                 &faded, TB_ICON, TB_ICON, None);
+                            }
+                        }
+                        None => {
+                            // No declared icon: fall back to the app's initial, so the button is
+                            // still identifiable rather than an empty square.
+                            let title = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("A");
+                            let ch = title.chars().next().unwrap_or('A');
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            let tw = Canvas::text_width(s, 1);
+                            let tcol = if win.is_minimized { Color::TEXT_MUTED } else { Color::TEXT_DARK };
+                            canvas.print_str(bx + (TB_BTN_W.saturating_sub(tw)) / 2, btn_y + 6, s, tcol, 1);
+                        }
+                    }
+
+                    // Running/active underline — the only cue left once the label is gone.
+                    if is_active {
+                        canvas.fill_rect(bx + 8, btn_y + TB_BTN_H - 2, TB_BTN_W - 16, 2, Color::ACCENT_PRIMARY);
+                    } else if !win.is_minimized {
+                        canvas.fill_rect(bx + 13, btn_y + TB_BTN_H - 2, TB_BTN_W - 26, 2, 0xFF_C8C8C2);
+                    }
                 }
             }
 
-            // Draw Start Menu on top of windows (fills only; the entry TEXT is drawn in the batched
-            // chrome-text pass below, GPU with CPU fallback).
-            if state.start_menu_open {
-                let menu_w = 180; let menu_h = 440;
-                let menu_x = (screen_stride / 2) - (menu_w / 2); let menu_y = screen_h - 36 - menu_h - 10;
+            // Start button: a rounded accent plate carrying the Nyx mark. Pressed-looking while the
+            // menu is open, so the button reflects the menu's state rather than being inert.
+            {
+                let (bx, by, bw, bh) = state.start_button_rect();
+                let bg = if state.start_menu_open { Color::ACCENT_HOVER } else { Color::ACCENT_PRIMARY };
+                fill_round_rect(&mut canvas, bx, by, bw, bh, 6, bg);
+                if let Some(logo) = &state.logo {
+                    canvas.blit_rgba(bx + 8, by + (bh - LOGO_BTN) / 2, logo, LOGO_BTN, LOGO_BTN, None);
+                }
+                // The "NYX" wordmark itself is drawn in the batched chrome-text pass below.
+            }
 
-                canvas.fill_rect(menu_x, menu_y, menu_w, menu_h, 0xFF_111111);
+            // Tray: live Wi-Fi state. Code-drawn rather than an icon asset because it has to say
+            // WHICH state the link is in, and a PNG would need four of them.
+            {
+                let (nx, ny, _, _) = state.tray_wifi_rect();
+                draw_wifi_glyph(&mut canvas, nx, ny, state.wifi_state);
+            }
+
+            // Start menu: dark panel, accent header carrying the Nyx mark, then one row per MENU
+            // entry with its icon. Entry TEXT is drawn in the batched chrome-text pass below.
+            if state.start_menu_open {
+                let (menu_x, menu_y, menu_w, menu_h) = state.start_menu_rect();
+
+                fill_round_rect(&mut canvas, menu_x, menu_y, menu_w, menu_h, 10, 0xFF_111111);
+                canvas.fill_rect(menu_x, menu_y, menu_w, MENU_HEADER_H, 0xFF_1B1B1B);
                 canvas.fill_rect(menu_x, menu_y, menu_w, 2, Color::NYX_ORANGE);
+                if let Some(logo) = &state.logo_big {
+                    // The header mark stays small; MENU_ICON is the (larger) tile size now.
+                    canvas.blit_rgba(menu_x + MENU_PAD, menu_y + (MENU_HEADER_H - 26) / 2,
+                                     logo, 26, 26, None);
+                }
+
+                // Search field. Text (query or placeholder) is drawn in the batched pass below.
+                let (sx, sy, sw, sh) = state.menu_search_rect();
+                fill_round_rect(&mut canvas, sx, sy, sw, sh, 6, 0xFF_1E1E1E);
+                // A small magnifier, code-drawn: a ring plus a diagonal tail.
+                let (cx, cy) = (sx + 15, sy + sh / 2 - 1);
+                for d in 0..12 {
+                    let a = [(0i32, -5i32), (3, -4), (5, -1), (4, 3), (0, 5), (-3, 4), (-5, 1), (-4, -3),
+                             (2, -5), (5, 2), (-2, 5), (-5, -2)][d];
+                    canvas.fill_rect((cx as i32 + a.0) as usize, (cy as i32 + a.1) as usize, 1, 1, 0xFF_888888);
+                }
+                canvas.fill_rect(cx + 4, cy + 4, 4, 1, 0xFF_888888);
+                canvas.fill_rect(cx + 5, cy + 5, 4, 1, 0xFF_888888);
+
+                // Tiles: icon over a centred label, hover plate behind. Labels go in the text pass.
+                let hovered = state.menu_slot_at(state.mx, state.my);
+                for (slot, &i) in state.menu_filtered().iter().enumerate() {
+                    let (tx, ty, tw, th) = state.menu_tile_rect(slot);
+                    if hovered == Some(slot) {
+                        fill_round_rect(&mut canvas, tx + 3, ty + 3, tw - 6, th - 6, 8, 0xFF_2A2A2A);
+                    }
+                    if let Some(Some(icon)) = state.icons.get(i) {
+                        canvas.blit_rgba(tx + (tw - MENU_ICON) / 2, ty + 14, icon, MENU_ICON, MENU_ICON, None);
+                    }
+                }
             }
 
             // U0 baseline overlay: FPS + last frame's composite time (top-left, unobtrusive).
@@ -1077,7 +1506,7 @@ pub extern "C" fn _start() -> ! {
             ov[op] = b'm'; op += 1; ov[op] = b's'; op += 1;
             let ov_str = core::str::from_utf8(&ov[..op]).unwrap_or("FPS ?");
 
-            // Taskbar clock string (HH:MM:SS from the hardware RTC).
+            // Taskbar clock: HH:MM:SS over "DD Mon YYYY", both from the hardware RTC.
             let rtc = sys_get_rtc();
             let mut disp_hour = rtc.hour as i32 + TZ_OFFSET_HOURS;
             disp_hour = ((disp_hour % 24) + 24) % 24;
@@ -1089,34 +1518,80 @@ pub extern "C" fn _start() -> ! {
             cp = push_2d(&mut clk, cp, rtc.sec);
             let clk_str = core::str::from_utf8(&clk[..cp]).unwrap_or("--:--:--");
 
-            let bar_y = screen_h - 36;
-            let btn_x = (screen_stride / 2) - 35;
-            // Right-anchor WIFI by the VISIBLE width, not the stride. The GPU text pass scissors to the
-            // visible width (ortho_screen(width) + DRAWING_RECTANGLE), so a stride-relative x (when the
-            // panel pads its scanline, stride > width) falls outside the viewport and the label vanishes.
-            let net_x = screen_w.saturating_sub(50);
+            const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            let mut dbuf = [0u8; 16];
+            let mut dp = push_2d(&mut dbuf, 0, rtc.day);
+            dbuf[dp] = b' '; dp += 1;
+            let mon = MONTHS[((rtc.month as usize).saturating_sub(1)).min(11)];
+            for &b in mon.as_bytes() { dbuf[dp] = b; dp += 1; }
+            dbuf[dp] = b' '; dp += 1;
+            dp = push_num(&mut dbuf, dp, rtc.year as usize);
+            let date_str = core::str::from_utf8(&dbuf[..dp]).unwrap_or("");
 
-            // U5 T2: CHROME TEXT on the GPU. Batch every fixed-opacity chrome label (taskbar clock/NYX/
-            // WIFI, FPS overlay, and the start-menu entries when open) into ONE textured glyph run drawn
-            // over the CPU-drawn chrome (same 0x1400_0000 backbuffer), tinted per-quad to each label's
-            // colour via the text PS. On any failure we CPU-draw the identical text as a fallback, so the
-            // chrome is never blank. Window TITLES stay CPU-drawn — they fade with per-window opacity,
-            // which the luminance-only text path can't express (and they already render in the F1 font).
+            let (sb_x, sb_y, _, sb_h) = state.start_button_rect();
+            // The wordmark sits right of the logo inside the Start button.
+            let nyx_x = sb_x + 8 + LOGO_BTN + 8;
+            let nyx_y = sb_y + (sb_h / 2) - 8;
+            let (menu_x, menu_y, _, _) = state.start_menu_rect();
+            let header_x = menu_x + MENU_PAD + 26 + 12;   // right of the 26px header mark
+
+            // Start-menu text, laid out once and drawn by whichever path is available below. Built
+            // here so the GPU batch and the CPU fallback can't disagree about where anything sits.
+            // Tuple: (x, y, text, colour).
+            let mut menu_text: Vec<(usize, usize, &str, u32)> = Vec::new();
+            if state.start_menu_open {
+                menu_text.push((header_x, menu_y + 17, "NyxOS", Color::WHITE));
+
+                let (sx, sy, sw, sh) = state.menu_search_rect();
+                let ty = sy + sh / 2 - 8;
+                if state.search_len == 0 {
+                    menu_text.push((sx + 30, ty, "Search apps", Color::TEXT_MUTED));
+                } else {
+                    // The query is ASCII by construction (only 0x20..0x7F is accepted), so this is
+                    // always valid UTF-8; the unwrap_or keeps a bad byte from panicking the shell.
+                    let q = core::str::from_utf8(&state.search[..state.search_len]).unwrap_or("");
+                    menu_text.push((sx + 30, ty, fit_label(q, sw.saturating_sub(38)), Color::WHITE));
+                }
+
+                let hits = state.menu_filtered();
+                if hits.is_empty() {
+                    let msg = "No matching apps";
+                    let (gx, gy, _, _) = state.menu_tile_rect(0);
+                    let w = Canvas::text_width(msg, 1);
+                    menu_text.push((gx + (MENU_COLS * MENU_TILE_W).saturating_sub(w) / 2,
+                                    gy + 24, msg, Color::TEXT_MUTED));
+                }
+                for (slot, &i) in hits.iter().enumerate() {
+                    let (tx, ty, tw, th) = state.menu_tile_rect(slot);
+                    let label = fit_label(MENU[i].label, tw - 8);
+                    let lw = Canvas::text_width(label, 1);
+                    menu_text.push((tx + tw.saturating_sub(lw) / 2, ty + th - 26, label, Color::WHITE));
+                }
+            }
+
+            // Clock: both lines RIGHT-aligned inside the block, so the date's varying width (one- vs
+            // two-digit day) doesn't make the time jitter horizontally each day.
+            let (ck_x, ck_y, ck_w, _) = state.clock_rect();
+            let time_x = ck_x + ck_w.saturating_sub(Canvas::text_width(clk_str, 1));
+            let date_x = ck_x + ck_w.saturating_sub(Canvas::text_width(date_str, 1));
+            let date_y = ck_y + 15;
+
+            // U5 T2: CHROME TEXT on the GPU. Batch every fixed-opacity chrome label (taskbar clock,
+            // the NYX wordmark, FPS overlay, and the start-menu entries when open) into ONE textured
+            // glyph run drawn over the CPU-drawn chrome (same 0x1400_0000 backbuffer), tinted per-quad
+            // to each label's colour via the text PS. On any failure we CPU-draw the identical text as
+            // a fallback, so the chrome is never blank. Window TITLES stay CPU-drawn — they fade with
+            // per-window opacity, which the luminance-only text path can't express.
             let mut chrome_drawn = false;
             if let Some(font) = &gpu_font {
                 let mut glyphs: Vec<GlyphQuad> = Vec::new();
                 glyphs.extend(font.layout_str(4, 2, ov_str, 1, Color::TEXT_MUTED));
-                glyphs.extend(font.layout_str(20, (bar_y + 12) as i32, clk_str, 1, Color::TEXT_DARK));
-                glyphs.extend(font.layout_str((btn_x + 18) as i32, (bar_y + 8) as i32, "NYX", 1, Color::WHITE));
-                glyphs.extend(font.layout_str(net_x as i32, (bar_y + 10) as i32, "WIFI", 1, Color::TEXT_DARK));
-                if state.start_menu_open {
-                    let menu_w = 180; let menu_h = 440;
-                    let menu_x = (screen_stride / 2) - (menu_w / 2);
-                    let menu_y = screen_h - 36 - menu_h - 10;
-                    let items = ["> Terminal", "> Settings", "> Explorer", "> Network Suite", "> System Monitor", "> GL Cube (3D)", "> Image Viewer", "> Std Hello", "> QC Studio", "> Std GUI", "> Notepad"];
-                    for (i, it) in items.iter().enumerate() {
-                        glyphs.extend(font.layout_str((menu_x + 20) as i32, (menu_y + 12 + i * 40) as i32, it, 1, Color::WHITE));
-                    }
+                glyphs.extend(font.layout_str(time_x as i32, ck_y as i32, clk_str, 1, Color::TEXT_DARK));
+                glyphs.extend(font.layout_str(date_x as i32, date_y as i32, date_str, 1, Color::TEXT_MUTED));
+                glyphs.extend(font.layout_str(nyx_x as i32, nyx_y as i32, "NYX", 1, Color::WHITE));
+                for &(tx, ty, text, col) in menu_text.iter() {
+                    glyphs.extend(font.layout_str(tx as i32, ty as i32, text, 1, col));
                 }
                 if sys_gpu_draw_text(font.atlas_gva, font.atlas_w, font.atlas_h, font.atlas_pitch, &glyphs) {
                     sys_gpu_sync();
@@ -1126,17 +1601,11 @@ pub extern "C" fn _start() -> ! {
             if !chrome_drawn {
                 // CPU fallback — identical layout/colours (never leave chrome blank).
                 canvas.print_str(4, 2, ov_str, Color::TEXT_MUTED, 1);
-                canvas.print_str(20, bar_y + 12, clk_str, Color::TEXT_DARK, 1);
-                canvas.print_str(btn_x + 18, bar_y + 8, "NYX", Color::WHITE, 1);
-                canvas.print_str(net_x, bar_y + 10, "WIFI", Color::TEXT_DARK, 1);
-                if state.start_menu_open {
-                    let menu_w = 180; let menu_h = 440;
-                    let menu_x = (screen_stride / 2) - (menu_w / 2);
-                    let menu_y = screen_h - 36 - menu_h - 10;
-                    let items = ["> Terminal", "> Settings", "> Explorer", "> Network Suite", "> System Monitor", "> GL Cube (3D)", "> Image Viewer", "> Std Hello", "> QC Studio", "> Std GUI", "> Notepad"];
-                    for (i, it) in items.iter().enumerate() {
-                        canvas.print_str(menu_x + 20, menu_y + 12 + i * 40, it, Color::WHITE, 1);
-                    }
+                canvas.print_str(time_x, ck_y, clk_str, Color::TEXT_DARK, 1);
+                canvas.print_str(date_x, date_y, date_str, Color::TEXT_MUTED, 1);
+                canvas.print_str(nyx_x, nyx_y, "NYX", Color::WHITE, 1);
+                for &(tx, ty, text, col) in menu_text.iter() {
+                    canvas.print_str(tx, ty, text, col, 1);
                 }
             }
 

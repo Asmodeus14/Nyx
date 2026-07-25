@@ -39,6 +39,9 @@ pub fn handle_key(scancode: u8) {
                         KeyCode::Delete     => Some('\u{E016}'),
                         KeyCode::PageUp     => Some('\u{E017}'),
                         KeyCode::PageDown   => Some('\u{E018}'),
+                        // Either Windows/Super key. Also Unicode-less; the compositor swallows this
+                        // one to toggle the start menu rather than forwarding it to the focused app.
+                        KeyCode::LWin | KeyCode::RWin => Some('\u{E019}'),
                         _ => None,
                     };
                     if let Some(c) = mapped {

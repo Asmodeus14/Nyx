@@ -157,15 +157,16 @@ pub fn draw_window_rounded(buffer: &mut [u32], stride: usize, screen_h: usize, w
     // Header Controls (Now with symbols!)
     let icon_color = apply_opacity(0x60_000000, win.opacity); // Dark semi-transparent text
 
-    canvas.fill_rect(win.x + 12, win.y + 10, 12, 12, apply_opacity(0xFF_FF5F56, win.opacity)); // Close
-    canvas.print_str(win.x + 14, win.y + 12, "x", icon_color, 1);
+    // Geometry and glyph centring shared with draw_window_chrome — see `ctl_btn_rect`.
+    for (i, (col, glyph)) in [(0xFF_FF5F56u32, 'x'), (0xFF_FFBD2E, '-'), (0xFF_28C940, '+')]
+        .into_iter().enumerate()
+    {
+        let (bx, by, bw, bh) = ctl_btn_rect(win.x, win.y, i);
+        canvas.fill_rect(bx, by, bw, bh, apply_opacity(col, win.opacity));
+        canvas.draw_char_centered(bx, by, bw, bh, glyph, icon_color, 1);
+    }
 
-    canvas.fill_rect(win.x + 28, win.y + 10, 12, 12, apply_opacity(0xFF_FFBD2E, win.opacity)); // Min
-    canvas.print_str(win.x + 30, win.y + 11, "-", icon_color, 1);
 
-    canvas.fill_rect(win.x + 44, win.y + 10, 12, 12, apply_opacity(0xFF_28C940, win.opacity)); // Max
-    canvas.print_str(win.x + 46, win.y + 12, "+", icon_color, 1);
-    
     let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
     let tw = crate::canvas::Canvas::text_width(title_str, 1);
     canvas.print_str(win.x + (win.w / 2).saturating_sub(tw / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
@@ -387,6 +388,36 @@ pub fn draw_scrollbar(canvas: &mut Canvas, x: usize, y: usize, w: usize, track_h
 /// get a dimmed title-bar surface, muted title text, and greyed traffic-light buttons (classic focus
 /// cue). `hover_btn` = the title-bar button under the pointer (0=close, 1=min, 2=max; -1 = none) and
 /// draws a soft highlight plate behind that button. Both are pure CPU chrome (GPU-safe).
+/// Title-bar control plates: 0 = close, 1 = minimise, 2 = maximise.
+///
+/// ★ ONE source of truth. `draw_window_chrome`, `draw_window_rounded` and the compositor's hover and
+/// click hit-tests all derive from this. They used to be five hand-copied literal rects, which is how
+/// the drawn plates and the clickable regions drifted apart in the first place.
+///
+/// `CTL_Y` centres a plate vertically in the 30px title bar: (30 - CTL_D) / 2 = 9.
+pub const CTL_D: usize = 12;
+pub const CTL_Y: usize = 9;
+pub const CTL_X: [usize; 3] = [12, 28, 44];
+
+/// Rect of control `idx` for a window whose top-left is `(win_x, win_y)`.
+pub fn ctl_btn_rect(win_x: usize, win_y: usize, idx: usize) -> (usize, usize, usize, usize) {
+    (win_x + CTL_X[idx.min(2)], win_y + CTL_Y, CTL_D, CTL_D)
+}
+
+/// Which control `(mx, my)` falls on, with 2px of slop so 12px plates stay comfortable to hit.
+pub fn ctl_btn_hit(win_x: usize, win_y: usize, mx: usize, my: usize) -> Option<u8> {
+    if my < (win_y + CTL_Y).saturating_sub(2) || my >= win_y + CTL_Y + CTL_D + 2 {
+        return None;
+    }
+    for i in 0..3 {
+        let bx = win_x + CTL_X[i];
+        if mx >= bx.saturating_sub(2) && mx < bx + CTL_D + 2 {
+            return Some(i as u8);
+        }
+    }
+    None
+}
+
 pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, above: &[(i32, i32, i32, i32)], is_active: bool, hover_btn: i32) {
     let mut canvas = Canvas::new(buffer, stride, screen_h);
     // Inactive windows use a slightly greyed surface so the focused window reads as "on top".
@@ -414,19 +445,20 @@ pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, wi
         (0xFF_CFCFCAu32, 0xFF_CFCFCAu32, 0xFF_CFCFCAu32)
     };
     let hover_plate = apply_opacity(0xFF_FCE9D8, win.opacity); // soft accent plate under a hovered button
-    let btns = [(win.x + 12, c_close), (win.x + 28, c_min), (win.x + 44, c_max)];
-    for (bi, &(bxx, col)) in btns.iter().enumerate() {
+    let btns = [(c_close, 'x'), (c_min, '-'), (c_max, '+')];
+    for (bi, &(col, glyph)) in btns.iter().enumerate() {
+        let (bx, by, bw, bh) = ctl_btn_rect(win.x, win.y, bi);
         if hover_btn == bi as i32 {
-            canvas.fill_rect_occluded(bxx - 2, win.y + 8, 16, 16, hover_plate, above);
+            canvas.fill_rect_occluded(bx - 2, by - 2, bw + 4, bh + 4, hover_plate, above);
         }
-        canvas.fill_rect_occluded(bxx, win.y + 10, 12, 12, apply_opacity(col, win.opacity), above);
+        canvas.fill_rect_occluded(bx, by, bw, bh, apply_opacity(col, win.opacity), above);
+        // Glyphs can't be per-pixel occluded cheaply — skip each when its centre is under an upper
+        // window (coarse, but the fills above are already clipped so this only stops floating glyphs).
+        if !Canvas::point_occluded((bx + bw / 2) as i32, (by + bh / 2) as i32, above) {
+            canvas.draw_char_centered(bx, by, bw, bh, glyph, icon_color, 1);
+        }
     }
-    // Glyphs/text can't be per-pixel occluded cheaply — skip each when its anchor is under an upper
-    // window (coarse, but the fills above are already clipped so this only prevents floating text).
     let gy = win.y as i32 + 14;
-    if !Canvas::point_occluded(win.x as i32 + 14, gy, above) { canvas.print_str(win.x + 14, win.y + 12, "x", icon_color, 1); }
-    if !Canvas::point_occluded(win.x as i32 + 30, gy, above) { canvas.print_str(win.x + 30, win.y + 11, "-", icon_color, 1); }
-    if !Canvas::point_occluded(win.x as i32 + 46, gy, above) { canvas.print_str(win.x + 46, win.y + 12, "+", icon_color, 1); }
 
     let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
     let title_col = if is_active { Color::TEXT_DARK } else { Color::TEXT_MUTED };

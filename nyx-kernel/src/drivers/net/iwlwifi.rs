@@ -79,6 +79,10 @@ const RFH_Q0_FRBDCB_WIDX_TRG: usize = 0x1C80;
 const HBUS_TARG_WRPTR: usize = 0x460;   // TX doorbell: value = write_ptr | (queue_id << 16)
 const IWL_FIRST_TB_SIZE: usize = 20;    // TB0 must be a dedicated <=20B buffer (hw requirement)
 const TFH_TFD_SIZE: usize = 256;        // sizeof(iwl_tfh_tfd): num_tbs(2) + 25*tb(10) + pad(4)
+// dev_cmd staging buffers for the data queue. A slot holds cmd_header(4) + tx_cmd_v9(20) + the
+// whole 802.11 frame, so it must exceed a full-MTU packet (~1556 B) — not just a mgmt frame.
+const TX_SLOT_SIZE: u64 = 2048;
+const TX_SLOTS: usize = 16;             // power of two; indexed by TFD index & (TX_SLOTS-1)
 const CMD_QUEUE_ID: u32 = 0;            // gen2/DQA command queue is queue 0
 // Real MAC from CSR (mac_addr_from_csr=0x380 for QuZ/9000-gen2). Try STRAP first, then OTP.
 const CSR_MAC_ADDR0_OTP:   usize = 0x380;
@@ -103,11 +107,13 @@ const FW_CTXT_ACTION_ADD: u8 = 1;   // enum iwl_ctxt_action: INVALID=0, ADD=1, M
 const MAC_CONF_GROUP:     u8 = 0x03; // used by the P6 MAC_CONFIG/LINK_CONFIG/STA_CONFIG commands
 const DATA_PATH_GROUP:    u8 = 0x05; // SCD_QUEUE_CONFIG_CMD=0x17, etc.
 const IWL_MGMT_TID:       u8 = 15;   // management-frame TID for the AP station's TX queue
-const TARGET_SSID: &[u8] = b"dipti";
-// P6c will derive a PMK per candidate and keep whichever makes the EAPOL MIC verify (the only
-// definitive test of the passphrase). Exact case is unknown, so we try both.
-#[allow(dead_code)]
-const TARGET_PSK_CANDIDATES: &[&[u8]] = &[b"dipti1978", b"Dipti1978"];
+// NOTE: there is deliberately no TXPATH_FLUSH here. Draining the station's queues before teardown is
+// what iwlwifi does (iwl_mld_flush_sta_txqs, LONG_GROUP cmd 0x1e), and it looked like the obvious fix
+// for the SCD_QUEUE(remove) assert — but this firmware does not implement it. Sending it asserted
+// with error_id=0x20000038 (BAD_COMMAND) and data1=0x1e, i.e. the fw naming the command id it did not
+// recognise. Don't re-add it without checking that data1 first.
+// P8: the SSID/passphrase used to live here as constants. They now come from userspace via
+// sys_wifi_connect, so the driver has no built-in network.
 // PHY_CONFIGURATION_CMD is intentionally omitted: iwl_send_phy_cfg_cmd() returns early (no command)
 // for unified ucode without SISO-diversity — so NVM_ACCESS_COMPLETE is what triggers INIT_COMPLETE.
 
@@ -222,6 +228,21 @@ pub struct ScanResult {
     pub channel: u8,
     pub band: u8,        // PHY_BAND_24=1 (2.4GHz), PHY_BAND_5=0 (5GHz)
     pub beacon_int: u16, // beacon interval in TU (from the beacon fixed body)
+    pub secure: bool,    // Privacy bit set in the beacon capability field (needs a passphrase)
+    pub rsn: bool,       // an RSN IE (tag 48) is present → WPA2/WPA3, which is what our supplicant does
+}
+
+/// Where the link is in the connect state machine. Reported to userspace by `sys_wifi_status` so the
+/// picker can show "Connecting…" / "Connected" / an error without guessing from the IP.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum LinkState {
+    Idle = 0,
+    Connecting = 1,
+    Connected = 2,
+    AuthFailed = 3,   // association or the 4-way handshake did not complete (usually a wrong passphrase)
+    NoLease = 4,      // associated and encrypted, but DHCP never answered
+    HwFailed = 5,     // the firmware rejected a step of the topology bring-up
 }
 
 // ===================== WPA2 crypto primitives (P6c 4-way handshake) =====================
@@ -318,6 +339,131 @@ fn sha1_prf(key: &[u8], label: &[u8], data: &[u8], out_len: usize) -> alloc::vec
     out
 }
 
+/// AES forward S-box (FIPS-197). The inverse box is derived from it at runtime.
+const AES_SBOX: [u8; 256] = [
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+];
+
+/// GF(2^8) multiply (AES field, poly 0x11b).
+fn gmul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        if b & 1 != 0 { p ^= a; }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 { a ^= 0x1b; }
+        b >>= 1;
+    }
+    p
+}
+
+/// AES-128 key expansion: 11 round keys of 16 B.
+fn aes128_expand_key(key: &[u8; 16]) -> [[u8; 16]; 11] {
+    let mut rk = [[0u8; 16]; 11];
+    rk[0] = *key;
+    let mut rcon = 1u8;
+    for r in 1..11 {
+        let prev = rk[r - 1];
+        // RotWord + SubWord + Rcon on the last column.
+        let mut t = [prev[13], prev[14], prev[15], prev[12]];
+        for b in t.iter_mut() { *b = AES_SBOX[*b as usize]; }
+        t[0] ^= rcon;
+        rcon = gmul(rcon, 2);
+        for c in 0..4 {
+            for i in 0..4 {
+                let p = if c == 0 { t[i] } else { rk[r][(c - 1) * 4 + i] };
+                rk[r][c * 4 + i] = prev[c * 4 + i] ^ p;
+            }
+        }
+    }
+    rk
+}
+
+/// AES-128 single-block decryption (inverse cipher, FIPS-197), in place.
+fn aes128_decrypt_block(rk: &[[u8; 16]; 11], inv_sbox: &[u8; 256], b: &mut [u8; 16]) {
+    for i in 0..16 { b[i] ^= rk[10][i]; }
+    for round in (0..10).rev() {
+        // InvShiftRows: row r (byte index r of each 4-byte column) rotates right by r.
+        let s = *b;
+        for c in 0..4 {
+            for r in 0..4 {
+                b[((c + r) % 4) * 4 + r] = s[c * 4 + r];
+            }
+        }
+        // InvSubBytes
+        for x in b.iter_mut() { *x = inv_sbox[*x as usize]; }
+        // AddRoundKey
+        for i in 0..16 { b[i] ^= rk[round][i]; }
+        // InvMixColumns (skipped on the final round, which is round 0 here)
+        if round != 0 {
+            for c in 0..4 {
+                let (a0, a1, a2, a3) = (b[c * 4], b[c * 4 + 1], b[c * 4 + 2], b[c * 4 + 3]);
+                b[c * 4]     = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
+                b[c * 4 + 1] = gmul(a0, 9)  ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
+                b[c * 4 + 2] = gmul(a0, 13) ^ gmul(a1, 9)  ^ gmul(a2, 14) ^ gmul(a3, 11);
+                b[c * 4 + 3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9)  ^ gmul(a3, 14);
+            }
+        }
+    }
+}
+
+/// AES Key Unwrap (RFC 3394) — undoes the wrapping the AP applies to EAPOL-Key key data with the
+/// KEK. Input is 8n+8 bytes; output is 8n bytes. Returns None if the A6A6.. integrity check fails.
+fn aes_key_unwrap(kek: &[u8; 16], ct: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    if ct.len() < 16 || ct.len() % 8 != 0 { return None; }
+    let n = ct.len() / 8 - 1;
+    let rk = aes128_expand_key(kek);
+    let mut inv_sbox = [0u8; 256];
+    for i in 0..256 { inv_sbox[AES_SBOX[i] as usize] = i as u8; }
+
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&ct[..8]);
+    let mut r = alloc::vec::Vec::with_capacity(n);
+    for i in 0..n { let mut b = [0u8; 8]; b.copy_from_slice(&ct[8 * (i + 1)..8 * (i + 2)]); r.push(b); }
+
+    for j in (0..6u64).rev() {
+        for i in (1..=n).rev() {
+            let t = (n as u64) * j + i as u64;
+            let mut blk = [0u8; 16];
+            blk[..8].copy_from_slice(&a);
+            for k in 0..8 { blk[k] ^= (t >> (56 - 8 * k)) as u8; }   // A ^ t (big-endian)
+            blk[8..].copy_from_slice(&r[i - 1]);
+            aes128_decrypt_block(&rk, &inv_sbox, &mut blk);
+            a.copy_from_slice(&blk[..8]);
+            r[i - 1].copy_from_slice(&blk[8..]);
+        }
+    }
+    if a != [0xa6; 8] { return None; }
+    let mut out = alloc::vec::Vec::with_capacity(n * 8);
+    for b in &r { out.extend_from_slice(b); }
+    Some(out)
+}
+
+/// Internet checksum (RFC 1071) over a byte slice, returned host-order for a big-endian field.
+fn ip_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i + 1 < data.len() { sum += ((data[i] as u32) << 8) | data[i + 1] as u32; i += 2; }
+    if i < data.len() { sum += (data[i] as u32) << 8; }
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16); }
+    !(sum as u16)
+}
+
 /// Self-test the crypto against known vectors (RFC 3174/2202 + our offline-computed PMK). Logs pass/fail.
 fn wpa_crypto_selftest() {
     let s = sha1(b"abc");
@@ -326,8 +472,18 @@ fn wpa_crypto_selftest() {
     let hmac_ok = m[..4] == [0xb6, 0x17, 0x31, 0x86];
     let pmk = pbkdf2_sha1(b"dipti1978", b"dipti", 4096, 32);
     let pmk_ok = pmk[..4] == [0x73, 0x04, 0x56, 0x57];
-    crate::serial_println!("[WIFI] P6c: crypto self-test — sha1={} hmac={} pbkdf2/PMK={}",
-        sha_ok, hmac_ok, pmk_ok);
+    // RFC 3394 §4.1 test vector — proves AES-128 decrypt + key unwrap (used to recover the GTK).
+    let kek: [u8; 16] = [0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                         0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f];
+    let ct: [u8; 24] = [0x1f,0xa6,0x8b,0x0a,0x81,0x12,0xb4,0x47,
+                        0xae,0xf3,0x4b,0xd8,0xfb,0x5a,0x7b,0x82,
+                        0x9d,0x3e,0x86,0x23,0x71,0xd2,0xcf,0xe5];
+    let kw_ok = aes_key_unwrap(&kek, &ct).map_or(false, |p| {
+        p == [0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
+              0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff]
+    });
+    crate::serial_println!("[WIFI] P6c: crypto self-test — sha1={} hmac={} pbkdf2/PMK={} aes-unwrap={}",
+        sha_ok, hmac_ok, pmk_ok, kw_ok);
 }
 
 pub struct IntelWifiDriver {
@@ -364,7 +520,7 @@ pub struct IntelWifiDriver {
     rx_read_ptr: u32,                 // used-BD entries consumed so far
     free_write_ptr: u32,              // free-RBD producer index (for restocking during a scan)
     last_rx_vid: usize,               // vid of the just-consumed buffer, reposted on the next poll
-    mac_addr: [u8; 6],
+    pub mac_addr: [u8; 6],
     alive_umac_err: u32,              // UMAC error-table SRAM ptr (from the ALIVE ntf, runtime)
     alive_lmac_err: u32,              // LMAC error-table SRAM ptr (from the ALIVE ntf, runtime)
 
@@ -388,7 +544,35 @@ pub struct IntelWifiDriver {
     eapol_anonce: [u8; 32],           // AP's nonce (from EAPOL msg 1/4)
     eapol_replay: [u8; 8],            // key replay counter (echo the AP's)
     eapol_kck: [u8; 16],              // PTK key-confirmation key (for EAPOL MICs)
+    eapol_kek: [u8; 16],              // PTK key-encryption key (unwraps msg 3/4 key data)
     eapol_tk: [u8; 16],               // PTK temporal key (the CCMP pairwise key)
+    eapol_keydata: Vec<u8>,           // msg 3/4 key data (AES-key-wrapped; carries the GTK)
+
+    // --- Phase 6d: DHCP ---
+    dhcp_xid: [u8; 4],                // transaction id (same across DISCOVER/REQUEST)
+    dhcp_ip: [u8; 4],                 // offered/leased IP
+    dhcp_server: [u8; 4],             // DHCP server identifier (option 54)
+    pub dhcp_mask: [u8; 4],           // subnet mask (option 1)
+    pub dhcp_router: [u8; 4],         // default gateway (option 3)
+    pub dhcp_dns: [u8; 4],            // first DNS server (option 6)
+    pub dhcp_done: bool,              // true once we hold a lease
+
+    // --- Phase 7: smoltcp Device ---
+    ap_bssid: [u8; 6],                // the AP we're associated with (RA for every TX)
+    rx_desc_size: usize,              // bytes of iwl_rx_mpdu_desc before the 802.11 header
+    rx_diag: u32,                     // how many data frames we've dumped for diagnosis
+    rx_seen: u32,                     // MPDUs seen by the Device path
+    rx_passed: u32,                   // MPDUs converted to Ethernet frames
+    tx_count: u32,                    // Ethernet frames handed to the firmware
+
+    // --- Phase 8: userspace-driven connect ---
+    link_state: LinkState,            // where the connect state machine is (reported to userspace)
+    cur_ssid: [u8; 32],               // SSID we last attempted / are associated with
+    cur_ssid_len: u8,
+    topology_up: bool,                // the fw context topology has been built (its ADD actions are spent)
+    topology_bssid: [u8; 6],          // which BSS that topology is tuned to
+    keys_installed: bool,             // PTK/GTK sit in the fw key slots (must be removed on teardown)
+    fw_dead: bool,                    // the fw asserted; nothing will work again until a reboot
 }
 
 impl IntelWifiDriver {
@@ -439,7 +623,29 @@ impl IntelWifiDriver {
             eapol_anonce: [0; 32],
             eapol_replay: [0; 8],
             eapol_kck: [0; 16],
+            eapol_kek: [0; 16],
             eapol_tk: [0; 16],
+            eapol_keydata: Vec::new(),
+            dhcp_xid: [0; 4],
+            dhcp_ip: [0; 4],
+            dhcp_server: [0; 4],
+            dhcp_mask: [255, 255, 255, 0],
+            dhcp_router: [0; 4],
+            dhcp_dns: [0; 4],
+            dhcp_done: false,
+            ap_bssid: [0; 6],
+            rx_desc_size: 0,
+            rx_diag: 0,
+            rx_seen: 0,
+            rx_passed: 0,
+            tx_count: 0,
+            link_state: LinkState::Idle,
+            cur_ssid: [0; 32],
+            cur_ssid_len: 0,
+            topology_up: false,
+            topology_bssid: [0; 6],
+            keys_installed: false,
+            fw_dead: false,
         }
     }
 
@@ -1102,7 +1308,10 @@ impl IntelWifiDriver {
             self.repost_rx_buffer(self.last_rx_vid);
             self.last_rx_vid = 0;
         }
-        for _ in 0..timeout_ms {
+        // Check first, then sleep — so timeout_ms = 0 means a single non-blocking probe (the
+        // smoltcp Device polls this on every receive() and must never stall).
+        let mut left = timeout_ms;
+        loop {
             let closed = (read_volatile(rb_stts.virt as *const u16) & 0x0FFF) as u32;
             if closed != self.rx_read_ptr {
                 let slot = (self.rx_read_ptr & 0x1FF) as usize; // 512-entry used ring
@@ -1120,9 +1329,10 @@ impl IntelWifiDriver {
                 };
                 return Some(buf.virt);
             }
+            if left == 0 { return None; }
+            left -= 1;
             self.delay_ms(1);
         }
-        None
     }
 
     /// Repost a consumed RX buffer back onto the free-RBD ring (gen2: entry = phys | vid) and ring
@@ -1309,7 +1519,7 @@ impl IntelWifiDriver {
                     }
                 }
                 None => {
-                    if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 {
+                    if self.take_sw_err() {
                         crate::serial_println!("[WIFI] P4b: SW_ERR while waiting for cmd={:#04x} grp={:#04x}",
                             want_cmd, want_grp);
                         return None;
@@ -1364,12 +1574,37 @@ impl IntelWifiDriver {
         self.start_scan_bringup(); // P5
     }
 
+    /// ★ Read AND CONSUME the firmware-assert cause. Returns true if the fw asserted since the last
+    /// call.
+    ///
+    /// `CSR_INT` is write-1-to-clear, and after boot **nothing ever acks it**: the radio runs with
+    /// `CSR_INT_MASK = 0` and there is no WiFi ISR, so the only writes are in the reset path. A
+    /// SW_ERR bit set once therefore stays set for the rest of the session, and every later
+    /// `read32(CSR_INT) & INT_BIT_SW_ERR` check — in this function's callers, in `wait_for_rx`,
+    /// in the scan and the TX paths — reports that ancient error as if it were the result of the
+    /// command just sent. One assert anywhere would poison every command for the rest of the boot.
+    ///
+    /// That is what made a network SWITCH report "adapter is in a failed state — reboot required":
+    /// `teardown_topology` aborts on the first command that "asserts", and with a stale bit latched
+    /// that was its very first command, having actually done nothing wrong.
+    unsafe fn take_sw_err(&mut self) -> bool {
+        if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 {
+            self.write32(CSR_INT, INT_BIT_SW_ERR); // W1C: consume just this cause, leave RX bits
+            true
+        } else {
+            false
+        }
+    }
+
     /// Send a fire-and-forget config command, then check for a fw BAD_COMMAND/assert. Returns true
     /// if the fw did NOT assert within a short window. `label` is for logging.
     unsafe fn send_cfg_checked(&mut self, label: &str, group: u8, cmd: u8, payload: &[u8]) -> bool {
+        // Consume anything left over from an earlier command, so what we read below can only have
+        // been caused by THIS one.
+        self.take_sw_err();
         self.send_host_cmd(group, cmd, payload);
         self.delay_ms(10);
-        if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 {
+        if self.take_sw_err() {
             crate::serial_println!("[WIFI] P5: SW_ERR after {} — decoding:", label);
             self.report_fw_error();
             false
@@ -1403,14 +1638,115 @@ impl IntelWifiDriver {
         if self.send_cfg_checked("SCAN_CFG", 0x01, 0x0c, &cfg) {
             crate::serial_println!("[WIFI] P5b: SCAN_CFG done.");
             self.start_scan();
-            self.connect(TARGET_SSID);
+            // P8: boot stops here. Which network to join — and with which passphrase — is a user
+            // decision now, so the radio just parks with a fresh scan list and waits for the WiFi
+            // picker to call sys_wifi_connect. (Previously this auto-joined a hardcoded SSID/PSK.)
+            self.link_state = LinkState::Idle;
+            crate::serial_println!(
+                "[WIFI] P8: {} network(s) available — waiting for a connect request from userspace.",
+                self.scan_results.len());
         }
+    }
+
+    // ===================== Phase 8: the userspace-facing driver API =====================
+    // Everything below is what the `sys_wifi_*` syscalls call. These are the ONLY entry points
+    // userspace has, so each one is responsible for leaving the driver in a coherent state.
+
+    /// Re-run a full passive sweep and return how many unique networks are now visible. Refused
+    /// while associated: the scan retunes the radio away from the AP channel for seconds at a time,
+    /// which would drop the link we're actively using.
+    pub unsafe fn rescan(&mut self) -> usize {
+        // Refresh doubles as the manual recovery button: if the fw is down, reload it and sweep.
+        if self.fw_dead && !self.restart_firmware() { return self.scan_results.len(); }
+        if self.link_state == LinkState::Connected {
+            crate::serial_println!("[WIFI] P8: rescan refused — already associated (would drop the link).");
+            return self.scan_results.len();
+        }
+        self.start_scan();
+        self.scan_results.len()
+    }
+
+    /// Copy the current scan list out in a stable order: strongest-security first is meaningless
+    /// without RSSI, so we simply preserve discovery order and let the picker sort by name.
+    pub fn networks(&self) -> &[ScanResult] { &self.scan_results }
+
+    /// `(state, ip, ssid)` for the status line.
+    pub fn status(&self) -> (LinkState, [u8; 4], &[u8]) {
+        (self.link_state, self.dhcp_ip, &self.cur_ssid[..self.cur_ssid_len as usize])
+    }
+
+    /// Join `ssid` using `psk`. Blocking: the whole topology bring-up, association, 4-way handshake
+    /// and DHCP exchange run here, which takes several seconds. Returns true once we hold a lease.
+    pub unsafe fn try_connect(&mut self, ssid: &[u8], psk: &[u8]) -> bool {
+        // A previous fault doesn't have to be terminal any more — try to reload the firmware first.
+        if self.fw_dead && !self.restart_firmware() {
+            crate::serial_println!("[WIFI] P8: adapter is in a failed state and would not restart.");
+            self.link_state = LinkState::HwFailed;
+            return false;
+        }
+        let same = ssid == &self.cur_ssid[..self.cur_ssid_len as usize];
+        if self.link_state == LinkState::Connected {
+            if same {
+                crate::serial_println!("[WIFI] P8: already on this network — nothing to do.");
+                return true;
+            }
+            // Switching: drop the current association cleanly first, so the teardown below runs
+            // against a live link rather than being interleaved with a half-built new one.
+            crate::serial_println!("[WIFI] P8: leaving the current network to switch.");
+            self.disconnect();
+            if self.fw_dead {
+                // The teardown asserted AND the firmware would not come back. Carrying on would
+                // build a topology on top of a fw that is no longer listening and report a bogus
+                // result. (A teardown that asserted but restarted cleanly falls through: a fresh
+                // firmware has no contexts, which is precisely what the teardown was for.)
+                crate::serial_println!("[WIFI] P8: switch aborted — the fw is down and did not restart.");
+                self.link_state = LinkState::HwFailed;
+                return false;
+            }
+        }
+        // A previous attempt that got all the way to an encrypted link but no lease needs nothing
+        // re-done except DHCP — re-running the handshake would try to install keys that are already
+        // in the fw's key slots. `same` is load-bearing: without it, asking for a DIFFERENT network
+        // after a NoLease failure silently re-ran DHCP on the OLD one and reported success.
+        if same && self.link_state == LinkState::NoLease && self.topology_bssid == self.ap_bssid {
+            crate::serial_println!("[WIFI] P8: link is already encrypted — retrying DHCP only.");
+            self.link_state = LinkState::Connecting;
+            let bssid = self.ap_bssid;
+            self.send_dhcp_discover(&bssid);
+            self.link_state = if self.dhcp_done { LinkState::Connected } else { LinkState::NoLease };
+            return self.link_state == LinkState::Connected;
+        }
+
+        let n = core::cmp::min(ssid.len(), 32);
+        self.cur_ssid = [0; 32];
+        self.cur_ssid[..n].copy_from_slice(&ssid[..n]);
+        self.cur_ssid_len = n as u8;
+
+        // Fresh attempt: clear the handshake/lease state so a stale ANonce or a half-filled key-data
+        // blob from a failed try can't leak into this one.
+        self.eapol_keydata.clear();
+        self.eapol_anonce = [0; 32];
+        self.dhcp_done = false;
+        self.dhcp_ip = [0; 4];
+
+        // A firmware restart clears the scan list (those entries were vouched for by a fw that has
+        // since died), and connect() resolves the SSID out of it — so without this, every recovery
+        // path would fail with "target SSID not found" despite a perfectly healthy adapter.
+        if self.scan_results.is_empty() {
+            crate::serial_println!("[WIFI] P8: no scan results — sweeping before the join.");
+            self.start_scan();
+        }
+
+        self.link_state = LinkState::Connecting;
+        self.connect(ssid, psk);
+        self.link_state == LinkState::Connected
     }
 
     /// P6a: begin associating with `ssid` (found in the last scan). Kernel-first: builds the fw
     /// context topology so the radio is tuned and a station slot exists. Order (iwlwifi):
     /// PHY_CONTEXT (tune to the AP channel) → MAC_CONTEXT → BINDING → ADD_STA. Crypto (P6c) later.
-    unsafe fn connect(&mut self, ssid: &[u8]) {
+    unsafe fn connect(&mut self, ssid: &[u8], psk: &[u8]) {
+        self.link_state = LinkState::HwFailed;   // every early return below is a bring-up failure
         let target = match self.find_network(ssid) {
             Some(t) => t,
             None => {
@@ -1424,82 +1760,27 @@ impl IntelWifiDriver {
             target.bssid[0], target.bssid[1], target.bssid[2], target.bssid[3], target.bssid[4],
             target.bssid[5], target.channel, target.band);
 
-        // --- P6a.1: PHY_CONTEXT_CMD (grp0 cmd0x08, MLD 32-byte layout) ---
-        crate::serial_println!("[WIFI] P6a: MLD firmware — using MAC_CONF_GROUP context commands.");
-        if !self.send_phy_context(target.channel, target.band) {
-            crate::serial_println!("[WIFI] P6a: PHY_CONTEXT rejected — stopping.");
-            return;
-        }
-        crate::serial_println!("[WIFI] P6a: PHY_CONTEXT accepted.");
-
-        // --- P6a.1b: RLC_CONFIG_CMD — configure the RX chains (our fw has RLC v2, so this is where
-        // rx_chain_info goes, not PHY_CONTEXT). Fedora sends this right after PHY_CONTEXT; without it
-        // the radio has no RX chains and receives nothing. ---
-        if !self.send_rlc_config() {
-            crate::serial_println!("[WIFI] P6a: RLC_CONFIG rejected — stopping.");
-            return;
-        }
-        crate::serial_println!("[WIFI] P6a: RLC_CONFIG accepted (RX chains configured).");
-
-        // --- P6a.2: MAC_CONFIG_CMD (grp0x03 cmd0x08) — create our BSS-station interface ---
-        if !self.send_mac_config() {
-            crate::serial_println!("[WIFI] P6a: MAC_CONFIG rejected — stopping.");
-            return;
-        }
-        crate::serial_println!("[WIFI] P6a: MAC_CONFIG accepted.");
-
-        // --- P6a.3: LINK_CONFIG_CMD ADD (grp0x03 cmd0x09) — create the link (unbound/inactive) ---
-        if !self.send_link_config_add() {
-            crate::serial_println!("[WIFI] P6a: LINK_CONFIG(add) rejected — stopping.");
-            return;
-        }
-        crate::serial_println!("[WIFI] P6a: LINK_CONFIG(add) accepted.");
-
-        // --- P6a.4: activate the link in TWO steps, exactly like mvm assign_vif_chanctx:
-        // (1) MODIFY with mask=0, active=0 → binds phy_id while INACTIVE (phy_id/addr are only
-        // applied until the link is active); (2) MODIFY mask=ACTIVE|RATES_INFO, active=1 → activate.
-        // Doing both in one command (phy_id + active=1 together) makes the fw ignore the phy binding
-        // and activate a phy-less link → assert 0x2010330f.
-        let bi = if target.beacon_int == 0 { 100 } else { target.beacon_int };
-        if !self.send_link_modify(0x00, 0, bi, "LINK_BINDPHY") {
-            crate::serial_println!("[WIFI] P6a: LINK bind-phy rejected — stopping.");
-            return;
-        }
-        crate::serial_println!("[WIFI] P6a: LINK phy bound (inactive).");
-        // ACTIVE|RATES_INFO|BEACON_TIMING (BIT0|BIT1|BIT4=0x13): include BEACON_TIMING so the fw
-        // actually applies bi/dtim — session protection (CONF_ASSOC) schedules relative to the AP's
-        // beacons and needs a non-zero beacon interval in the link.
-        if !self.send_link_modify(0x13, 1, bi, "LINK_ACTIVATE") {
-            crate::serial_println!("[WIFI] P6a: LINK activate rejected — stopping.");
-            return;
-        }
-        crate::serial_println!("[WIFI] P6a: LINK activated (bound to phy, active=1).");
         let bssid = target.bssid;
 
-        // Device power (POWER_TABLE_CMD, CAM = no power-save) — init the power/time subsystem.
-        if self.send_device_power() {
-            crate::serial_println!("[WIFI] P6b: DEVICE_POWER (CAM) accepted.");
-        }
-
-        // --- STA_CONFIG_CMD — add the AP as a peer station ---
-        if !self.send_sta_config(&bssid) {
-            crate::serial_println!("[WIFI] P6a: STA_CONFIG rejected — stopping.");
-            return;
-        }
-        crate::serial_println!("[WIFI] P6a: STA_CONFIG accepted.");
-
-        // --- TLC_MNG_CONFIG_CMD — rate-scaling table for the AP station. Fedora sends this before
-        // the auth; without a rate table the fw can't TX to the station and asserts (class 0x47). ---
-        if self.send_tlc_config() {
-            crate::serial_println!("[WIFI] P6b: TLC_CONFIG accepted (rate table set).");
+        // P8: the fw topology (PHY context, MAC, link, station, TX queue) is built with ADD actions,
+        // which are one-shot — replaying them over live contexts makes the firmware assert. So a
+        // retry on the SAME AP (the wrong-passphrase case) reuses what's already there and re-runs
+        // only the 802.11 exchange; targeting a different BSS tears the old contexts down first,
+        // which is what makes their ADDs spendable again.
+        if self.topology_up && self.topology_bssid == bssid {
+            crate::serial_println!("[WIFI] P8: reusing the existing fw topology (retry on the same AP).");
         } else {
-            crate::serial_println!("[WIFI] P6b: TLC_CONFIG rejected (continuing).");
-        }
-
-        // --- allocate a TX queue for the AP station ---
-        if !self.send_scd_queue_config() {
-            crate::serial_println!("[WIFI] P6b: TX queue allocation failed — stopping.");
-            return;
+            if self.topology_up {
+                crate::serial_println!("[WIFI] P8: switching networks — tearing down the old topology.");
+                if !self.teardown_topology() {
+                    return;   // fw asserted; teardown_aborted set HwFailed
+                }
+            }
+            if !self.build_topology(&target) {
+                return;   // link_state is already HwFailed
+            }
+            self.topology_up = true;
+            self.topology_bssid = bssid;
         }
 
         // --- session protection LAST, right before the auth, so the ~900 ms on-medium window is
@@ -1516,60 +1797,390 @@ impl IntelWifiDriver {
         }
 
         // --- TX the auth frame, then (on success) the association request ---
+        // Past this point the hardware is healthy, so a failure is an 802.11/credential problem, not
+        // a bring-up one. watch_eapol/DHCP refine the state further.
+        self.link_state = LinkState::AuthFailed;
+        self.ap_bssid = bssid;          // every later data TX uses this as the RA
         if self.send_auth(&bssid) {
             crate::serial_println!("[WIFI] P6b: authenticated — sending association request.");
             if self.send_assoc(&bssid, ssid) {
                 crate::serial_println!("[WIFI] P6c: associated — waiting for WPA2 4-way handshake.");
-                self.watch_eapol(&bssid, ssid);
+                self.watch_eapol(&bssid, ssid, psk);
             }
         }
     }
 
-    /// P6c: after association the AP starts the WPA2 4-way handshake by sending EAPOL-Key msg 1/4 (a
-    /// data frame, LLC/SNAP ethertype 0x888e, carrying the AP's ANonce). Watch for it and dump the
-    /// key_info + ANonce — the seed for deriving the PTK.
-    unsafe fn watch_eapol(&mut self, bssid: &[u8; 6], ssid: &[u8]) {
-        wpa_crypto_selftest();
-        // 1) wait for EAPOL-Key msg 1/4 (extracts ANonce + replay counter into self fields).
-        let mut got1 = false;
-        let mut budget_ms: i32 = 1500;
-        while budget_ms > 0 && !got1 {
-            match self.poll_next_rx(100) {
-                Some(v) => {
-                    let cmd = read_volatile((v as *const u8).add(4));
-                    let grp = read_volatile((v as *const u8).add(5));
-                    if cmd == 0xC1 && grp == 0x00 && self.scan_eapol(v) == Some(1) { got1 = true; }
-                }
-                None => budget_ms -= 100,
+    /// Undo `build_topology`, in the reverse order it was built, so every ADD action becomes
+    /// spendable again. Mirrors the mld teardown path (cancel session protection → remove keys →
+    /// remove the queue → remove the station → deactivate/remove the link → remove MAC → remove PHY).
+    ///
+    /// Returns false if the firmware ASSERTED partway through. `send_cfg_checked` only reports false
+    /// on SW_ERR, which means the fw is down — every command after that point is shouting at a corpse,
+    /// so we stop and say so rather than logging a reassuring "torn down" and leaving the caller to
+    /// rebuild on dead hardware.
+    unsafe fn teardown_topology(&mut self) -> bool {
+        let bssid = self.topology_bssid;
+
+        // Tell the AP we're leaving, while the TX queue still exists. Without this it keeps our
+        // association alive and may ignore a fresh auth for a while.
+        if self.tx_data_ring.is_some() && bssid != [0; 6] {
+            let mut f = [0u8; 26];
+            f[0] = 0xC0; f[1] = 0x00;                  // frame control: mgmt / deauthentication
+            f[4..10].copy_from_slice(&bssid);          // Address1 (DA) = AP
+            f[10..16].copy_from_slice(&self.mac_addr); // Address2 (SA) = us
+            f[16..22].copy_from_slice(&bssid);         // Address3 (BSSID) = AP
+            f[24] = 0x03;                              // reason 3 = station is leaving
+            crate::serial_println!("[WIFI] P8: TX deauth (reason 3, leaving).");
+            self.tx_data_frame(&f, 24, 0x6);           // mgmt → send in the clear
+            self.delay_ms(20);
+        }
+
+        // Give the deauth (and anything queued behind it) time to actually leave the air before we
+        // start dismantling what it depends on. This is the poor man's TX flush: the real one
+        // (TXPATH_FLUSH) is unimplemented on this firmware — see the note by IWL_MGMT_TID.
+        self.delay_ms(30);
+
+        // Cancel the session-protection window before touching the link. iwlwifi does this on
+        // disassociation; leaving a live window bound to a link we're about to remove is the kind of
+        // dangling reference the fw asserts on.
+        {
+            let mut c = [0u8; 24];
+            c[4..8].copy_from_slice(&3u32.to_le_bytes());   // action = REMOVE
+            // id_and_color@0 = 0 (vif id), conf_id@8 = 0 (ASSOC) — the window we opened at assoc.
+            if !self.send_cfg_checked("SESSION_PROT(cancel)", MAC_CONF_GROUP, 0x05, &c) {
+                return self.teardown_aborted("SESSION_PROT(cancel)");
             }
         }
-        if !got1 { crate::serial_println!("[WIFI] P6c: no EAPOL-Key msg 1/4 (yet)."); return; }
 
-        // 2) send msg 2/4 (candidate passphrase 0) + 3) watch for msg 3/4 (proves PTK/MIC correct).
-        self.send_eapol_msg2(bssid, ssid, TARGET_PSK_CANDIDATES[0]);
-        let mut budget_ms: i32 = 1500;
-        while budget_ms > 0 {
+        // Keys next: their slots belong to the station we're about to remove.
+        if self.keys_installed {
+            for (label, key_id, flags) in [("SEC_KEY(PTK) remove", 0u32, 0x02u32),
+                                           ("SEC_KEY(GTK) remove", 1u32, 0x42u32)] {
+                let mut c = [0u8; 80];
+                c[0..4].copy_from_slice(&3u32.to_le_bytes());   // action = REMOVE
+                c[4..8].copy_from_slice(&1u32.to_le_bytes());   // sta_mask = BIT(sta_id 0)
+                c[8..12].copy_from_slice(&key_id.to_le_bytes());
+                c[12..16].copy_from_slice(&flags.to_le_bytes());
+                if !self.send_cfg_checked(label, DATA_PATH_GROUP, 0x18, &c) {
+                    return self.teardown_aborted(label);
+                }
+            }
+            self.keys_installed = false;
+        }
+
+        // TX queue: SCD_QUEUE_CONFIG operation@0 = IWL_SCD_QUEUE_REMOVE(1), then remove{sta_mask@4,
+        // tid@8 as le32} — the remove arm of the union is narrower than the add arm.
+        if self.tx_data_ring.is_some() {
+            let mut c = [0u8; 36];
+            c[0..4].copy_from_slice(&1u32.to_le_bytes());              // operation = REMOVE
+            c[4..8].copy_from_slice(&1u32.to_le_bytes());              // remove.sta_mask
+            c[8..12].copy_from_slice(&(IWL_MGMT_TID as u32).to_le_bytes()); // remove.tid
+            if !self.send_cfg_checked("SCD_QUEUE(remove)", DATA_PATH_GROUP, 0x17, &c) {
+                return self.teardown_aborted("SCD_QUEUE(remove)");
+            }
+        }
+
+        // STA_REMOVE_CMD (MAC_CONF_GROUP 0x0C) — struct iwl_remove_sta_cmd { __le32 sta_id }. The
+        // station is removed by its own command, not by an action field on STA_CONFIG_CMD.
+        let mut c = [0u8; 4];
+        c[0..4].copy_from_slice(&0u32.to_le_bytes());   // sta_id = 0
+        if !self.send_cfg_checked("STA_REMOVE", MAC_CONF_GROUP, 0x0c, &c) {
+            return self.teardown_aborted("STA_REMOVE");
+        }
+
+        // Deactivate the link before removing it (the fw rejects removing an active link).
+        if !self.send_link_modify(0x01, 0, 100, "LINK_DEACTIVATE") {
+            return self.teardown_aborted("LINK_DEACTIVATE");
+        }
+        let mut c = [0u8; 208];
+        c[0..4].copy_from_slice(&3u32.to_le_bytes());   // action = REMOVE, link_id@4 = 0, mac_id@8 = 0
+        // phy_id = FW_CTXT_ID_INVALID, matching iwl_mld_remove_link — a remove that still names a
+        // live phy context is asking the fw to unbind something it is about to be told to forget.
+        c[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        c[16..22].copy_from_slice(&self.mac_addr);      // local_link_addr
+        if !self.send_cfg_checked("LINK_CONFIG(remove)", MAC_CONF_GROUP, 0x09, &c) {
+            return self.teardown_aborted("LINK_CONFIG(remove)");
+        }
+
+        // MAC context: id_and_color@0 = 0, action@4 = REMOVE. Same v3/v4 length rule as the ADD.
+        let ver = self.cmd_version(MAC_CONF_GROUP, 0x08);
+        let mut c = [0u8; 56];
+        c[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let len = if ver >= 4 { 56 } else { 52 };
+        if !self.send_cfg_checked("MAC_CONFIG(remove)", MAC_CONF_GROUP, 0x08, &c[..len]) {
+            return self.teardown_aborted("MAC_CONFIG(remove)");
+        }
+
+        // PHY context last — it's what everything above was bound to.
+        let mut c = [0u8; 32];
+        c[4..8].copy_from_slice(&3u32.to_le_bytes());   // id_and_color@0 = 0, action = REMOVE
+        if !self.send_cfg_checked("PHY_CONTEXT(remove)", 0x01, 0x08, &c) {
+            return self.teardown_aborted("PHY_CONTEXT(remove)");
+        }
+
+        // The DMA rings stay allocated and are REUSED by the next send_scd_queue_config — there is
+        // no dma free, so reallocating per switch would leak ~56 KiB each time.
+        self.topology_up = false;
+        self.topology_bssid = [0; 6];
+        self.ap_bssid = [0; 6];
+        self.tx_data_wptr = 0;
+        self.dhcp_done = false;
+        self.dhcp_ip = [0; 4];
+        self.dhcp_router = [0; 4];
+        self.dhcp_dns = [0; 4];
+        self.eapol_keydata.clear();
+        self.eapol_anonce = [0; 32];
+        crate::serial_println!("[WIFI] P8: topology torn down — radio is free to retune.");
+        true
+    }
+
+    /// The firmware asserted during teardown. Record which command it died on (that name, plus the
+    /// error_id the caller already dumped, is the whole diagnostic) and then try to bring the
+    /// firmware back rather than writing the adapter off until the next reboot.
+    ///
+    /// Returns false either way — the *teardown* did fail. Callers must check `fw_dead` to find out
+    /// whether the adapter recovered; if it did, the restart has left every context torn down, which
+    /// is exactly the state a successful teardown would have produced.
+    unsafe fn teardown_aborted(&mut self, step: &str) -> bool {
+        crate::serial_println!("[WIFI] P8: *** firmware asserted during teardown at {}. ***", step);
+        self.fw_dead = true;
+        self.topology_up = false;      // nothing usable is left standing
+        self.keys_installed = false;
+        self.link_state = LinkState::HwFailed;
+        self.restart_firmware();
+        false
+    }
+
+    /// Reload the firmware from scratch after an assert, without a machine reboot.
+    ///
+    /// A teardown assert used to be terminal ("adapter needs a reboot"), which is a miserable answer
+    /// to "I switched networks". It doesn't have to be: `start_firmware()` begins with prepare_card +
+    /// SW reset and re-kicks CSR_CTXT_INFO_BA, so it is a complete cold start of the device. Every
+    /// buffer it needs — the context-info block, the fw section DMA, the RX ring and its buffers, the
+    /// command queue — was allocated once at boot and survives the reset untouched. All that is
+    /// genuinely per-session is the ring bookkeeping, which the device restarts from zero.
+    ///
+    /// This also makes the fw restart a strictly more robust "leave the network" primitive than
+    /// teardown_topology: a fresh firmware has every context gone and every one-shot ADD action
+    /// spendable again. Teardown stays the fast path (~100 ms vs ~2 s + a rescan); this is the net.
+    unsafe fn restart_firmware(&mut self) -> bool {
+        crate::serial_println!("[WIFI] P8: restarting the firmware to recover the adapter...");
+
+        // Ring bookkeeping. The device comes back with its producer/consumer indices at zero, so
+        // ours must be too, or we read the RX ring at a stale offset and never see the ALIVE ntf.
+        self.cmd_write_ptr = 0;
+        self.rx_read_ptr = 0;
+        self.free_write_ptr = 0;
+        self.last_rx_vid = 0;
+        // ★ rb_stts holds the fw's RX write pointer from the *previous* session. start_firmware polls
+        // it as an "the device delivered something" signal, so a non-zero leftover would satisfy that
+        // poll instantly — we'd declare ALIVE before the fw had booted and then parse garbage.
+        if let Some(r) = self.rb_stts { core::ptr::write_bytes(r.virt as *mut u8, 0, r.pages * 4096); }
+        // Stale TFDs in the command queue would be re-executed by the restarted fw.
+        if let Some(r) = self.tx_cmd_ring { core::ptr::write_bytes(r.virt as *mut u8, 0, r.pages * 4096); }
+
+        // Session state: nothing from the dead firmware is meaningful any more.
+        self.topology_up = false;
+        self.topology_bssid = [0; 6];
+        self.keys_installed = false;
+        self.ap_bssid = [0; 6];
+        self.tx_queue_id = 0;
+        self.tx_data_wptr = 0;
+        self.rx_desc_size = 0;
+        self.dhcp_done = false;
+        self.dhcp_ip = [0; 4];
+        self.eapol_keydata.clear();
+        self.eapol_anonce = [0; 32];
+        // The scan list describes the air, not the fw, but it's from before the fault — make the
+        // caller rescan rather than let it connect against entries we can no longer vouch for.
+        self.scan_results.clear();
+
+        // start_firmware() runs the full start_hw → start_fw → ALIVE → bring_up_after_alive path,
+        // which ends with the NVM read, so a successful return leaves us exactly as we were at boot.
+        if self.start_firmware() {
+            self.fw_dead = false;
+            self.link_state = LinkState::Idle;
+            self.cur_ssid = [0; 32];
+            self.cur_ssid_len = 0;
+            crate::serial_println!("[WIFI] P8: *** firmware restarted — adapter recovered. ***");
+            true
+        } else {
+            self.fw_dead = true;
+            self.link_state = LinkState::HwFailed;
+            crate::serial_println!(
+                "[WIFI] P8: *** firmware restart FAILED — adapter needs a reboot. ***");
+            false
+        }
+    }
+
+    /// Leave the current network and return the radio to the idle, scannable state.
+    pub unsafe fn disconnect(&mut self) {
+        if self.fw_dead && !self.restart_firmware() {
+            self.link_state = LinkState::HwFailed;
+            return;
+        }
+        if !self.topology_up {
+            self.link_state = LinkState::Idle;
+            self.cur_ssid = [0; 32];
+            self.cur_ssid_len = 0;
+            return;
+        }
+        // A teardown that asserted has already tried to restart the firmware. If that worked, every
+        // context is gone anyway — which is what we were asking for — so this still counts as a
+        // successful disconnect. Only a failed restart leaves us stuck.
+        if self.teardown_topology() || !self.fw_dead {
+            self.cur_ssid = [0; 32];
+            self.cur_ssid_len = 0;
+            self.link_state = LinkState::Idle;
+        }
+        // Otherwise teardown_aborted/restart_firmware left HwFailed set; keep cur_ssid so the UI can
+        // still name the network we're stuck on.
+    }
+
+    /// Build the firmware-side topology for `target`: tune the radio, create our interface, bind and
+    /// activate the link, register the AP as a station and give it a TX queue. Every step uses an ADD
+    /// action, so this runs at most once per boot — see the `topology_up` guard in `connect`.
+    /// Returns false (leaving `link_state` at HwFailed) if the firmware rejected any step.
+    unsafe fn build_topology(&mut self, target: &ScanResult) -> bool {
+        let bssid = target.bssid;
+
+        // --- P6a.1: PHY_CONTEXT_CMD (grp0 cmd0x08, MLD 32-byte layout) ---
+        crate::serial_println!("[WIFI] P6a: MLD firmware — using MAC_CONF_GROUP context commands.");
+        if !self.send_phy_context(target.channel, target.band) {
+            crate::serial_println!("[WIFI] P6a: PHY_CONTEXT rejected — stopping.");
+            return false;
+        }
+        crate::serial_println!("[WIFI] P6a: PHY_CONTEXT accepted.");
+
+        // --- P6a.1b: RLC_CONFIG_CMD — configure the RX chains (our fw has RLC v2, so this is where
+        // rx_chain_info goes, not PHY_CONTEXT). Fedora sends this right after PHY_CONTEXT; without it
+        // the radio has no RX chains and receives nothing. ---
+        if !self.send_rlc_config() {
+            crate::serial_println!("[WIFI] P6a: RLC_CONFIG rejected — stopping.");
+            return false;
+        }
+        crate::serial_println!("[WIFI] P6a: RLC_CONFIG accepted (RX chains configured).");
+
+        // --- P6a.2: MAC_CONFIG_CMD (grp0x03 cmd0x08) — create our BSS-station interface ---
+        if !self.send_mac_config() {
+            crate::serial_println!("[WIFI] P6a: MAC_CONFIG rejected — stopping.");
+            return false;
+        }
+        crate::serial_println!("[WIFI] P6a: MAC_CONFIG accepted.");
+
+        // --- P6a.3: LINK_CONFIG_CMD ADD (grp0x03 cmd0x09) — create the link (unbound/inactive) ---
+        if !self.send_link_config_add() {
+            crate::serial_println!("[WIFI] P6a: LINK_CONFIG(add) rejected — stopping.");
+            return false;
+        }
+        crate::serial_println!("[WIFI] P6a: LINK_CONFIG(add) accepted.");
+
+        // --- P6a.4: activate the link in TWO steps, exactly like mvm assign_vif_chanctx:
+        // (1) MODIFY with mask=0, active=0 → binds phy_id while INACTIVE (phy_id/addr are only
+        // applied until the link is active); (2) MODIFY mask=ACTIVE|RATES_INFO, active=1 → activate.
+        // Doing both in one command (phy_id + active=1 together) makes the fw ignore the phy binding
+        // and activate a phy-less link → assert 0x2010330f.
+        let bi = if target.beacon_int == 0 { 100 } else { target.beacon_int };
+        if !self.send_link_modify(0x00, 0, bi, "LINK_BINDPHY") {
+            crate::serial_println!("[WIFI] P6a: LINK bind-phy rejected — stopping.");
+            return false;
+        }
+        crate::serial_println!("[WIFI] P6a: LINK phy bound (inactive).");
+        // ACTIVE|RATES_INFO|BEACON_TIMING (BIT0|BIT1|BIT4=0x13): include BEACON_TIMING so the fw
+        // actually applies bi/dtim — session protection (CONF_ASSOC) schedules relative to the AP's
+        // beacons and needs a non-zero beacon interval in the link.
+        if !self.send_link_modify(0x13, 1, bi, "LINK_ACTIVATE") {
+            crate::serial_println!("[WIFI] P6a: LINK activate rejected — stopping.");
+            return false;
+        }
+        crate::serial_println!("[WIFI] P6a: LINK activated (bound to phy, active=1).");
+
+        // Device power (POWER_TABLE_CMD, CAM = no power-save) — init the power/time subsystem.
+        if self.send_device_power() {
+            crate::serial_println!("[WIFI] P6b: DEVICE_POWER (CAM) accepted.");
+        }
+
+        // --- STA_CONFIG_CMD — add the AP as a peer station ---
+        if !self.send_sta_config(&bssid) {
+            crate::serial_println!("[WIFI] P6a: STA_CONFIG rejected — stopping.");
+            return false;
+        }
+        crate::serial_println!("[WIFI] P6a: STA_CONFIG accepted.");
+
+        // --- TLC_MNG_CONFIG_CMD — rate-scaling table for the AP station. Fedora sends this before
+        // the auth; without a rate table the fw can't TX to the station and asserts (class 0x47). ---
+        if self.send_tlc_config() {
+            crate::serial_println!("[WIFI] P6b: TLC_CONFIG accepted (rate table set).");
+        } else {
+            crate::serial_println!("[WIFI] P6b: TLC_CONFIG rejected (continuing).");
+        }
+
+        // --- allocate a TX queue for the AP station ---
+        if !self.send_scd_queue_config() {
+            crate::serial_println!("[WIFI] P6b: TX queue allocation failed — stopping.");
+            return false;
+        }
+        true
+    }
+
+    /// P6c: run the WPA2 4-way handshake. The AP opens it with EAPOL-Key msg 1/4 (a data frame,
+    /// LLC/SNAP ethertype 0x888e, carrying the ANonce) and finishes with msg 3/4.
+    ///
+    /// This is driven as an event loop rather than a fixed wait-then-wait sequence: EAPOL runs over
+    /// unacknowledged frames, so msg 2/4 can be lost, and an AP will then retransmit msg 1/4 with a
+    /// *fresh* ANonce. Answering whatever actually arrives — re-deriving the PTK each time msg 1/4
+    /// shows up — is what a real supplicant does, and it makes the handshake survive a dropped
+    /// frame or a stale association left over from a warm reboot.
+    unsafe fn watch_eapol(&mut self, bssid: &[u8; 6], ssid: &[u8], psk: &[u8]) {
+        wpa_crypto_selftest();
+        // Bound the loop on the clock, not on idle polls: with several APs nearby the beacon flood
+        // means poll_next_rx almost never times out, so a packet-driven budget would barely tick.
+        let tsc_mhz = crate::time::TSC_MHZ.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        let deadline = core::arch::x86_64::_rdtsc() + 8_000 * 1_000 * tsc_mhz;
+        let mut attempts = 0u32;
+        while core::arch::x86_64::_rdtsc() < deadline {
             match self.poll_next_rx(100) {
                 Some(v) => {
                     let cmd = read_volatile((v as *const u8).add(4));
                     let grp = read_volatile((v as *const u8).add(5));
-                    if cmd == 0xC1 && grp == 0x00 {
-                        if let Some(msg) = self.scan_eapol(v) {
-                            if msg == 3 {
-                                crate::serial_println!("[WIFI] P6c: *** msg 3/4 received — PTK/MIC verified by AP! ***");
-                                self.send_eapol_msg4(bssid);
-                                if self.install_ptk() {
-                                    crate::serial_println!("[WIFI] P6c: *** PTK installed — WPA2 handshake COMPLETE, link encrypted! ***");
-                                }
-                                return;
-                            }
+                    if cmd != 0xC1 || grp != 0x00 { continue; }
+                    match self.scan_eapol(v) {
+                        // msg 1/4 — (re)start: scan_eapol has captured the ANonce + replay counter.
+                        Some(1) => {
+                            attempts += 1;
+                            crate::serial_println!("[WIFI] P6c: msg 1/4 → replying with msg 2/4 (attempt {}).",
+                                attempts);
+                            self.send_eapol_msg2(bssid, ssid, psk);
                         }
+                        // msg 3/4 — the AP verified our MIC, so the PTK is correct.
+                        Some(3) => {
+                            crate::serial_println!("[WIFI] P6c: *** msg 3/4 received — PTK/MIC verified by AP! ***");
+                            self.send_eapol_msg4(bssid);
+                            if self.install_ptk() {
+                                crate::serial_println!("[WIFI] P6c: *** PTK installed — WPA2 handshake COMPLETE, link encrypted! ***");
+                                // GTK too, else broadcast/multicast frames (a broadcast DHCP
+                                // OFFER, ARP) arrive encrypted with a key we don't hold.
+                                self.keys_installed = true;
+                                if self.install_gtk() {
+                                    crate::serial_println!("[WIFI] P6c: *** GTK installed — broadcast RX enabled. ***");
+                                }
+                                // Encryption is up, so the passphrase was right. Anything that goes
+                                // wrong from here is a DHCP problem, reported distinctly so the
+                                // picker doesn't tell the user to retype a correct password.
+                                self.link_state = LinkState::NoLease;
+                                self.send_dhcp_discover(bssid);
+                                if self.dhcp_done { self.link_state = LinkState::Connected; }
+                            }
+                            return;
+                        }
+                        _ => {}
                     }
                 }
-                None => budget_ms -= 100,
+                None => {}
             }
         }
-        crate::serial_println!("[WIFI] P6c: no msg 3/4 (MIC may be wrong / try other passphrase).");
+        crate::serial_println!(
+            "[WIFI] P6c: handshake did not complete ({} msg 2/4 sent, no msg 3/4).", attempts);
     }
 
     /// Scan an RX_MPDU for the EAPOL ethertype (0x888e). EAPOL-Key layout from the ethertype: +2 ver,
@@ -1596,7 +2207,14 @@ impl IntelWifiDriver {
                     return Some(1);
                 } else if mic && ack && install {
                     for k in 0..8 { self.eapol_replay[k] = rd(o + 11 + k); } // echo in msg 4/4
-                    crate::serial_println!("[WIFI] P6c: *** EAPOL msg 3/4 *** key_info={:#06x}", key_info);
+                    // key_data_length@+99 (BE), key data@+101 — AES-key-wrapped, carries the GTK.
+                    let kd_len = ((rd(o + 99) as usize) << 8) | rd(o + 100) as usize;
+                    self.eapol_keydata.clear();
+                    if kd_len >= 16 && o + 101 + kd_len <= cap {
+                        for k in 0..kd_len { self.eapol_keydata.push(rd(o + 101 + k)); }
+                    }
+                    crate::serial_println!("[WIFI] P6c: *** EAPOL msg 3/4 *** key_info={:#06x} key_data={} B",
+                        key_info, self.eapol_keydata.len());
                     return Some(3);
                 } else {
                     crate::serial_println!("[WIFI] P6c: EAPOL key_info={:#06x} (other)", key_info);
@@ -1629,6 +2247,7 @@ impl IntelWifiDriver {
         pdata.extend_from_slice(lo_n); pdata.extend_from_slice(hi_n);
         let ptk = sha1_prf(&pmk, b"Pairwise key expansion", &pdata, 48);
         self.eapol_kck.copy_from_slice(&ptk[0..16]);   // KCK — EAPOL MICs
+        self.eapol_kek.copy_from_slice(&ptk[16..32]);  // KEK — unwraps msg 3/4 key data (GTK)
         self.eapol_tk.copy_from_slice(&ptk[32..48]);   // TK  — CCMP pairwise key
         let kck = self.eapol_kck;
 
@@ -1659,7 +2278,7 @@ impl IntelWifiDriver {
 
         crate::serial_println!("[WIFI] P6c: TX EAPOL msg 2/4 (SNonce+MIC, psk={:?})…",
             core::str::from_utf8(psk).unwrap_or("?"));
-        self.tx_data_frame(&f[..153], 24);
+        self.tx_data_frame(&f[..153], 24, 0x6);
     }
 
     /// Build + TX EAPOL-Key msg 4/4 (final ack): key_info=0x030a (v2|pairwise|MIC|Secure), zero
@@ -1681,7 +2300,7 @@ impl IntelWifiDriver {
         let mic = hmac_sha1(&kck, &f[32..131]);
         f[113..129].copy_from_slice(&mic[..16]);
         crate::serial_println!("[WIFI] P6c: TX EAPOL msg 4/4 (final ack)…");
-        self.tx_data_frame(&f[..131], 24);
+        self.tx_data_frame(&f[..131], 24, 0x6);
     }
 
     /// Install the pairwise CCMP key (TK) into the fw via SEC_KEY_CMD so it can encrypt/decrypt
@@ -1695,6 +2314,198 @@ impl IntelWifiDriver {
         c[12..16].copy_from_slice(&0x02u32.to_le_bytes()); // key_flags = CIPHER_CCMP
         c[16..32].copy_from_slice(&self.eapol_tk);      // TK (16 B)
         self.send_cfg_checked("SEC_KEY(PTK)", DATA_PATH_GROUP, 0x18, &c)
+    }
+
+    /// Recover the group key from msg 3/4 and install it, so the hardware can decrypt broadcast and
+    /// multicast traffic (ARP, and a DHCP OFFER the AP chooses to broadcast). The key data is AES
+    /// key-wrapped (RFC 3394) with the KEK; inside sits a GTK KDE: dd <len> 00-0f-ac 01 <keyinfo>
+    /// <rsv> <GTK…>, where keyinfo bits 0-1 are the key index. Installed with MCAST_KEY set.
+    unsafe fn install_gtk(&mut self) -> bool {
+        if self.eapol_keydata.is_empty() {
+            crate::serial_println!("[WIFI] P6c: no msg 3/4 key data — GTK unavailable.");
+            return false;
+        }
+        let kek = self.eapol_kek;
+        let plain = match aes_key_unwrap(&kek, &self.eapol_keydata) {
+            Some(p) => p,
+            None => { crate::serial_println!("[WIFI] P6c: GTK unwrap FAILED (KEK wrong?)."); return false; }
+        };
+        // Walk the KDEs for the GTK (OUI 00:0f:ac, data type 1).
+        let mut i = 0usize;
+        while i + 2 <= plain.len() {
+            let (t, len) = (plain[i], plain[i + 1] as usize);
+            if t != 0xdd || len < 6 || i + 2 + len > plain.len() { break; }
+            if plain[i + 2..i + 5] == [0x00, 0x0f, 0xac] && plain[i + 5] == 0x01 {
+                let key_id = (plain[i + 6] & 0x03) as u32;
+                let gtk = &plain[i + 8..i + 2 + len];
+                if gtk.len() < 16 {
+                    crate::serial_println!("[WIFI] P6c: GTK too short ({} B).", gtk.len());
+                    return false;
+                }
+                let mut c = [0u8; 80];
+                c[0..4].copy_from_slice(&(FW_CTXT_ACTION_ADD as u32).to_le_bytes());
+                c[4..8].copy_from_slice(&1u32.to_le_bytes());       // sta_mask = BIT(sta_id 0)
+                c[8..12].copy_from_slice(&key_id.to_le_bytes());    // GTK key index (1 or 2)
+                c[12..16].copy_from_slice(&0x42u32.to_le_bytes());  // CIPHER_CCMP | MCAST_KEY
+                c[16..32].copy_from_slice(&gtk[..16]);
+                crate::serial_println!("[WIFI] P6c: GTK recovered (idx {}, {} B) — installing…",
+                    key_id, gtk.len());
+                return self.send_cfg_checked("SEC_KEY(GTK)", DATA_PATH_GROUP, 0x18, &c);
+            }
+            i += 2 + len;
+        }
+        crate::serial_println!("[WIFI] P6c: no GTK KDE in key data.");
+        false
+    }
+
+    /// P6d: build a DHCP frame (802.11 data + LLC/SNAP + IPv4 + UDP + BOOTP) into `f` with message
+    /// type `mtype` (1=DISCOVER, 3=REQUEST). For REQUEST, adds option 50 (requested IP = the offered
+    /// address) and option 54 (server id). Uses the stored transaction id. Returns the frame length.
+    unsafe fn build_dhcp(&self, f: &mut [u8], bssid: &[u8; 6], mtype: u8, req: bool) -> usize {
+        for b in f.iter_mut() { *b = 0; }
+        // 802.11 data (ToDS): A1=RA=AP, A2=TA=us, A3=DA=broadcast (IP dest is 255.255.255.255).
+        f[0] = 0x08; f[1] = 0x01;
+        f[4..10].copy_from_slice(bssid);
+        f[10..16].copy_from_slice(&self.mac_addr);
+        f[16..22].copy_from_slice(&[0xff; 6]);
+        f[24..32].copy_from_slice(&[0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00]); // LLC/SNAP, IP
+        let ip = 32;
+        f[ip] = 0x45; f[ip + 8] = 64; f[ip + 9] = 17;    // IPv4 IHL5, TTL=64, proto=UDP
+        f[ip + 16..ip + 20].copy_from_slice(&[255, 255, 255, 255]); // dst = broadcast; src stays 0
+        let udp = ip + 20;
+        f[udp..udp + 2].copy_from_slice(&68u16.to_be_bytes());     // src port 68
+        f[udp + 2..udp + 4].copy_from_slice(&67u16.to_be_bytes()); // dst port 67
+        let dh = udp + 8;
+        f[dh] = 1; f[dh + 1] = 1; f[dh + 2] = 6;         // BOOTREQUEST, Ethernet, hlen 6
+        f[dh + 4..dh + 8].copy_from_slice(&self.dhcp_xid);
+        f[dh + 28..dh + 34].copy_from_slice(&self.mac_addr);        // chaddr
+        f[dh + 236..dh + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]); // magic cookie
+        let mut o = dh + 240;
+        f[o] = 53; f[o + 1] = 1; f[o + 2] = mtype; o += 3;         // DHCP message type
+        if req {
+            f[o] = 50; f[o + 1] = 4; f[o + 2..o + 6].copy_from_slice(&self.dhcp_ip); o += 6; // req IP
+            f[o] = 54; f[o + 1] = 4; f[o + 2..o + 6].copy_from_slice(&self.dhcp_server); o += 6; // srv
+        }
+        f[o] = 55; f[o + 1] = 3; f[o + 2] = 1; f[o + 3] = 3; f[o + 4] = 6; o += 5; // param req list
+        f[o] = 255; o += 1;                              // end
+        let end = o;
+        let udp_len = (end - udp) as u16;
+        f[udp + 4..udp + 6].copy_from_slice(&udp_len.to_be_bytes());
+        let ip_total = (end - ip) as u16;
+        f[ip + 2..ip + 4].copy_from_slice(&ip_total.to_be_bytes());
+        let ck = ip_checksum(&f[ip..ip + 20]);
+        f[ip + 10..ip + 12].copy_from_slice(&ck.to_be_bytes());
+        end
+    }
+
+    /// P6d: full DHCP handshake over the encrypted link. TX DISCOVER → wait OFFER (captures the
+    /// offered IP + server id) → TX REQUEST → wait ACK. On ACK we hold a real lease = online.
+    unsafe fn send_dhcp_discover(&mut self, bssid: &[u8; 6]) {
+        self.dhcp_xid = (core::arch::x86_64::_rdtsc() as u32).to_be_bytes();
+        let mut f = [0u8; 400];
+
+        // DISCOVER → OFFER. DHCP rides UDP, so retransmission is normal and expected.
+        let mut offered = false;
+        for attempt in 1..=4 {
+            let end = self.build_dhcp(&mut f, bssid, 1, false);
+            crate::serial_println!("[WIFI] P6d: TX DHCP DISCOVER #{} ({} B, encrypted)…", attempt, end);
+            self.tx_data_frame(&f[..end], 24, 0x0);      // flags 0 → fw CCMP-encrypts
+            if self.wait_dhcp(bssid, 2) { offered = true; break; }
+        }
+        if !offered { crate::serial_println!("[WIFI] P6d: no DHCP OFFER after 4 tries."); return; }
+
+        crate::serial_println!("[WIFI] P6d: OFFER {}.{}.{}.{} from server {}.{}.{}.{} — requesting…",
+            self.dhcp_ip[0], self.dhcp_ip[1], self.dhcp_ip[2], self.dhcp_ip[3],
+            self.dhcp_server[0], self.dhcp_server[1], self.dhcp_server[2], self.dhcp_server[3]);
+
+        // REQUEST → ACK (claims the lease; the server may hand out a different address, so the ACK's
+        // yiaddr — captured by scan_dhcp — is what we actually hold).
+        for attempt in 1..=4 {
+            let n = self.build_dhcp(&mut f, bssid, 3, true);
+            crate::serial_println!("[WIFI] P6d: TX DHCP REQUEST #{} ({} B)…", attempt, n);
+            self.tx_data_frame(&f[..n], 24, 0x0);
+            if self.wait_dhcp(bssid, 5) {
+                self.dhcp_done = true;
+                crate::serial_println!(
+                    "[WIFI] P6d: *** DHCP ACK — ONLINE! leased IP {}.{}.{}.{} ***",
+                    self.dhcp_ip[0], self.dhcp_ip[1], self.dhcp_ip[2], self.dhcp_ip[3]);
+                crate::serial_println!(
+                    "[WIFI] P6d: mask {}.{}.{}.{}  gateway {}.{}.{}.{}  dns {}.{}.{}.{}",
+                    self.dhcp_mask[0], self.dhcp_mask[1], self.dhcp_mask[2], self.dhcp_mask[3],
+                    self.dhcp_router[0], self.dhcp_router[1], self.dhcp_router[2], self.dhcp_router[3],
+                    self.dhcp_dns[0], self.dhcp_dns[1], self.dhcp_dns[2], self.dhcp_dns[3]);
+                return;
+            }
+        }
+        crate::serial_println!("[WIFI] P6d: no DHCP ACK after 4 tries.");
+    }
+
+    /// Watch the RX ring ~2.5 s for a DHCP reply of the wanted message type. Captures yiaddr and the
+    /// server id into self. Also logs TX_RESP status (did our encrypted frame get ACKed?).
+    unsafe fn wait_dhcp(&mut self, _bssid: &[u8; 6], want: u8) -> bool {
+        let mut budget_ms: i32 = 1500;
+        let mut mpdus = 0u32;
+        while budget_ms > 0 {
+            match self.poll_next_rx(100) {
+                Some(v) => {
+                    let cmd = read_volatile((v as *const u8).add(4));
+                    let grp = read_volatile((v as *const u8).add(5));
+                    if cmd == 0xC1 && grp == 0x00 {
+                        mpdus += 1;
+                        if let Some(t) = self.scan_dhcp(v) { if t == want { return true; } }
+                    } else if cmd == 0x1C && grp == 0x00 {
+                        let st = read_volatile((v as *const u8).add(44) as *const u16) & 0xff;
+                        crate::serial_println!("[WIFI] P6d: TX_RESP status={:#04x} ({})",
+                            st, if st == 0x01 { "ACKed" } else { "not ACKed" });
+                    }
+                }
+                None => budget_ms -= 100,
+            }
+        }
+        crate::serial_println!("[WIFI] P6d: window closed ({} MPDUs seen, none matched type {}).",
+            mpdus, want);
+        false
+    }
+
+    /// Scan an RX_MPDU for the DHCP magic cookie (63 82 53 63); capture the offered IP (yiaddr, 220 B
+    /// before the cookie) and server id (option 54) into self. Returns the DHCP message type.
+    unsafe fn scan_dhcp(&mut self, v: u64) -> Option<u8> {
+        let p = v as *const u8;
+        let rd = |o: usize| read_volatile(p.add(o));
+        let total = (read_volatile(p as *const u32) & 0x3FFF) as usize;
+        let cap = if (40..=4096).contains(&total) { total } else { 512 };
+        let mut o = 8;
+        while o + 4 <= cap {
+            if rd(o) == 0x63 && rd(o + 1) == 0x82 && rd(o + 2) == 0x53 && rd(o + 3) == 0x63
+                && o >= 236
+                // BOOTP starts 236 B before the cookie; xid@+4 must be the one we sent (other
+                // clients' DHCP traffic is broadcast on this network too).
+                && (0..4).all(|k| rd(o - 232 + k) == self.dhcp_xid[k])
+            {
+                let yi = o - 220;                        // yiaddr = magic - (236-16)
+                for k in 0..4 { self.dhcp_ip[k] = rd(yi + k); }
+                let mut mtype = 0u8;
+                let mut i = o + 4;                       // walk options for type 53 + server id 54
+                while i + 2 <= cap && rd(i) != 0xff {
+                    let (opt, len) = (rd(i), rd(i + 1) as usize);
+                    match opt {
+                        53 => mtype = rd(i + 2),
+                        54 if len == 4 => for k in 0..4 { self.dhcp_server[k] = rd(i + 2 + k); },
+                        1  if len == 4 => for k in 0..4 { self.dhcp_mask[k] = rd(i + 2 + k); },
+                        3  if len >= 4 => for k in 0..4 { self.dhcp_router[k] = rd(i + 2 + k); },
+                        6  if len >= 4 => for k in 0..4 { self.dhcp_dns[k] = rd(i + 2 + k); },
+                        _ => {}
+                    }
+                    i += 2 + len;
+                }
+                crate::serial_println!(
+                    "[WIFI] P6d: *** DHCP reply *** type={} (2=OFFER,5=ACK) ip={}.{}.{}.{}",
+                    mtype, self.dhcp_ip[0], self.dhcp_ip[1], self.dhcp_ip[2], self.dhcp_ip[3]);
+                return Some(mtype);
+            }
+            o += 1;
+        }
+        None
     }
 
     /// POWER_TABLE_CMD (device power, legacy id 0x77 → LONG_GROUP). iwl_device_power_cmd (4 B):
@@ -1728,7 +2539,7 @@ impl IntelWifiDriver {
     /// offload_assist=MH_SIZE, flags=ENCRYPT_DIS|HIGH_PRI, dram=0, rate_n_flags=0} + frame, laid out
     /// contiguously. TFD: TB0 = first 20 B (dedicated first-TB buf), TB1 = the rest. Byte-count
     /// table (gen2): DIV_ROUND_UP(len,4) | (fetch_chunks<<12). Doorbell = (wptr+1)|(qid<<16).
-    unsafe fn tx_data_frame(&mut self, frame: &[u8], hdr_len: usize) -> bool {
+    unsafe fn tx_data_frame(&mut self, frame: &[u8], hdr_len: usize, tx_flags: u32) -> bool {
         let (ring, cmdbuf, ftb, bc) =
             match (self.tx_data_ring, self.tx_data_cmdbuf, self.tx_data_ftb, self.tx_data_bc) {
                 (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
@@ -1738,10 +2549,14 @@ impl IntelWifiDriver {
         let wptr = self.tx_data_wptr;
         let idx = (wptr & 0x3F) as usize;              // 64-entry queue
         let dev_len = 4 + 20 + frame.len();            // cmd_header + tx_cmd_v9 fixed + frame
-        if dev_len > 256 { crate::serial_println!("[WIFI] tx: frame too large."); return false; }
+        if dev_len > TX_SLOT_SIZE as usize {
+            crate::serial_println!("[WIFI] tx: frame too large ({} B).", dev_len);
+            return false;
+        }
+        let slot = (idx & (TX_SLOTS - 1)) as u64;      // ring of dev_cmd staging buffers
 
         // --- dev_cmd bytes ---
-        let cb = (cmdbuf.virt + (idx * 256) as u64) as *mut u8;
+        let cb = (cmdbuf.virt + slot * TX_SLOT_SIZE) as *mut u8;
         core::ptr::write_bytes(cb, 0, dev_len);
         write_volatile(cb.add(0), 0x1c);               // iwl_cmd_header.cmd = TX_CMD
         write_volatile(cb.add(1), 0x00);               // .group_id = LEGACY
@@ -1750,16 +2565,16 @@ impl IntelWifiDriver {
         // iwl_tx_cmd_v9 @4:
         write_volatile(cb.add(4) as *mut u16, frame.len() as u16);           // len
         write_volatile(cb.add(6) as *mut u16, ((hdr_len / 2) as u16) << 8);  // offload_assist = MH_SIZE
-        write_volatile(cb.add(8) as *mut u32, 0x0000_0006u32);               // flags = ENCRYPT_DIS|HIGH_PRI
+        write_volatile(cb.add(8) as *mut u32, tx_flags); // 0x6=ENCRYPT_DIS|HIGH_PRI (mgmt/EAPOL); 0=fw CCMP-encrypts
         // dram_info@12 (8 B) = 0. rate_n_flags@20 = 0: with TLC configured the fw picks the rate
         // from the station's rate table (like the driver does for mgmt) — no CMD_RATE forcing.
         for (i, &b) in frame.iter().enumerate() { write_volatile(cb.add(24 + i), b); } // frame @24
-        let cb_phys = cmdbuf.phys + (idx * 256) as u64;
+        let cb_phys = cmdbuf.phys + slot * TX_SLOT_SIZE;
 
         // --- TB0: first 20 B into the dedicated first-TB buffer ---
-        let ftbv = (ftb.virt + (idx * 64) as u64) as *mut u8;
+        let ftbv = (ftb.virt + slot * 64) as *mut u8;
         core::ptr::copy_nonoverlapping(cb, ftbv, IWL_FIRST_TB_SIZE);
-        let ftbp = ftb.phys + (idx * 64) as u64;
+        let ftbp = ftb.phys + slot * 64;
 
         // --- TFD (iwl_tfh_tfd): num_tbs@0, tbs[]{tb_len le16, addr le64} @2,@12 ---
         let tfd = (ring.virt + (idx * TFH_TFD_SIZE) as u64) as *mut u8;
@@ -1852,11 +2667,11 @@ impl IntelWifiDriver {
     /// reply addressed to us (within the session-protection window). Logs the TX_RESP. Returns true
     /// if any frame addressed to us arrives.
     unsafe fn tx_mgmt_await_reply(&mut self, frame: &[u8], label: &str) -> bool {
-        if !self.tx_data_frame(frame, 24) {
+        if !self.tx_data_frame(frame, 24, 0x6) {
             crate::serial_println!("[WIFI] P6b: {} TX enqueue failed.", label);
             return false;
         }
-        if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 {
+        if self.take_sw_err() {
             crate::serial_println!("[WIFI] P6b: SW_ERR after {} TX — decoding:", label);
             self.report_fw_error();
             return false;
@@ -1887,7 +2702,7 @@ impl IntelWifiDriver {
     /// frame the AP sends to us, so its presence means the frame is addressed to us regardless of
     /// the (version-dependent) iwl_rx_mpdu_desc size. Reports the frame-control subtype and, for an
     /// auth frame, the auth seq + status. Returns true iff a frame addressed to us was found.
-    unsafe fn scan_rx_for_us(&self, v: u64) -> bool {
+    unsafe fn scan_rx_for_us(&mut self, v: u64) -> bool {
         let p = v as *const u8;
         let rd = |o: usize| read_volatile(p.add(o));
         let total = (read_volatile(p as *const u32) & 0x3FFF) as usize;
@@ -1896,6 +2711,15 @@ impl IntelWifiDriver {
         while o + 6 <= cap {
             if (0..6).all(|k| rd(o + k) == self.mac_addr[k]) {
                 let f = o - 4;            // our MAC is Address1 → frame starts 4 B earlier
+                // Calibrate the RX descriptor size once, from a frame we've positively identified.
+                // Every later RX (the smoltcp Device path) reads the 802.11 header at 8+rx_desc_size
+                // instead of brute-force searching. iwl_rx_mpdu_desc's size varies by fw/device, and
+                // this sidesteps having to know which variant this one uses.
+                if self.rx_desc_size == 0 && f >= 8 {
+                    self.rx_desc_size = f - 8;
+                    crate::serial_println!("[WIFI] P7: RX desc size calibrated = {} B (802.11 hdr @ pkt+{})",
+                        self.rx_desc_size, f);
+                }
                 let fc = rd(f);
                 let ftype = (fc >> 2) & 0x3;
                 let subtype = fc >> 4;
@@ -1939,21 +2763,38 @@ impl IntelWifiDriver {
         const TX_Q_SIZE: usize = 64;      // TFDs (≥ IWL_MGMT_QUEUE_SIZE=16, power of 2)
         const CB_SIZE: u32 = 3;           // ilog2(64) − 3
         let ring_pages = (TX_Q_SIZE * TFH_TFD_SIZE + 4095) / 4096; // 64*256 = 16 KiB = 4 pages
-        let ring = match self.alloc_dma(ring_pages) {
-            Some(r) => r,
-            None => { crate::serial_println!("[WIFI] P6b: TFD ring alloc failed."); return false; }
-        };
-        let bc = match self.alloc_dma(1) {
-            Some(b) => b,
-            None => { crate::serial_println!("[WIFI] P6b: bc-table alloc failed."); return false; }
-        };
-        let cmdbuf = match self.alloc_dma(1) {
-            Some(b) => b,
-            None => { crate::serial_println!("[WIFI] P6b: tx cmdbuf alloc failed."); return false; }
-        };
-        let ftb = match self.alloc_dma(1) {
-            Some(b) => b,
-            None => { crate::serial_println!("[WIFI] P6b: tx ftb alloc failed."); return false; }
+        // Reuse the rings across reconnects. There is no dma free, so allocating fresh ones on every
+        // network switch would leak ~56 KiB a time; zeroing them is enough to hand the fw a clean queue.
+        let (ring, bc, cmdbuf, ftb) = match (self.tx_data_ring, self.tx_data_bc,
+                                             self.tx_data_cmdbuf, self.tx_data_ftb) {
+            (Some(r), Some(b), Some(c), Some(f)) => {
+                for reg in [&r, &b, &c, &f] {
+                    core::ptr::write_bytes(reg.virt as *mut u8, 0, reg.pages * 4096);
+                }
+                (r, b, c, f)
+            }
+            _ => {
+                let ring = match self.alloc_dma(ring_pages) {
+                    Some(r) => r,
+                    None => { crate::serial_println!("[WIFI] P6b: TFD ring alloc failed."); return false; }
+                };
+                let bc = match self.alloc_dma(1) {
+                    Some(b) => b,
+                    None => { crate::serial_println!("[WIFI] P6b: bc-table alloc failed."); return false; }
+                };
+                // dev_cmd staging: TX_SLOTS × TX_SLOT_SIZE. Each slot must hold cmd_header +
+                // tx_cmd_v9 + a full-MTU 802.11 frame (~1556 B), so 512-byte slots — fine for
+                // mgmt/EAPOL — would silently reject every real data packet.
+                let cmdbuf = match self.alloc_dma((TX_SLOTS * TX_SLOT_SIZE as usize + 4095) / 4096) {
+                    Some(b) => b,
+                    None => { crate::serial_println!("[WIFI] P6b: tx cmdbuf alloc failed."); return false; }
+                };
+                let ftb = match self.alloc_dma(1) {
+                    Some(b) => b,
+                    None => { crate::serial_println!("[WIFI] P6b: tx ftb alloc failed."); return false; }
+                };
+                (ring, bc, cmdbuf, ftb)
+            }
         };
         self.tx_data_ring = Some(ring);
         self.tx_data_bc = Some(bc);
@@ -1971,7 +2812,7 @@ impl IntelWifiDriver {
 
         if !self.send_host_cmd(DATA_PATH_GROUP, 0x17, &c) { return false; }
         self.delay_ms(5);
-        if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 {
+        if self.take_sw_err() {
             crate::serial_println!("[WIFI] P6b: SW_ERR after SCD_QUEUE_CONFIG — decoding:");
             self.report_fw_error();
             return false;
@@ -2196,7 +3037,7 @@ impl IntelWifiDriver {
             n_chan, c.len());
         if !self.send_host_cmd(0x01, 0x0d, &c) { return; }
         self.delay_ms(10);
-        if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 {
+        if self.take_sw_err() {
             crate::serial_println!("[WIFI] P5d: SW_ERR after SCAN_REQ — decoding:");
             self.report_fw_error();
             return;
@@ -2240,7 +3081,7 @@ impl IntelWifiDriver {
         }
         if !done {
             crate::serial_println!("[WIFI] P5d: scan ended without SCAN_COMPLETE (beacons={}).", frames);
-            if self.read32(CSR_INT) & INT_BIT_SW_ERR != 0 { self.report_fw_error(); }
+            if self.take_sw_err() { self.report_fw_error(); }
         }
         crate::serial_println!("[WIFI] P5d: {} unique network(s) stored.", self.scan_results.len());
     }
@@ -2290,6 +3131,7 @@ impl IntelWifiDriver {
         let mut ssid = [0u8; 32];
         let mut ssid_len = 0usize;
         let mut channel = 0u8;
+        let mut rsn = false;
         let mut ie = f + 36;
         while ie + 2 <= cap {
             let tag = rd(ie);
@@ -2300,9 +3142,16 @@ impl IntelWifiDriver {
                 for k in 0..ssid_len { ssid[k] = rd(ie + 2 + k); }
             } else if tag == 0x03 && len >= 1 {  // DS Parameter Set → channel
                 channel = rd(ie + 2);
+            } else if tag == 48 {                // RSN element → WPA2/WPA3
+                rsn = true;
             }
             ie += 2 + len;
         }
+        // Capability info (le16) sits at f+34: 24 hdr + 8 timestamp + 2 beacon interval. Bit 4 =
+        // Privacy, i.e. the BSS requires a key. Privacy without an RSN IE means WEP or WPA1, neither
+        // of which our supplicant speaks — the picker greys those out rather than failing mid-connect.
+        let capability = (rd(f + 34) as u16) | ((rd(f + 35) as u16) << 8);
+        let secure = capability & 0x0010 != 0;
 
         // Sanitise SSID to printable ASCII; empty/all-zero ⇒ hidden network.
         let mut name = [0u8; 32];
@@ -2324,6 +3173,7 @@ impl IntelWifiDriver {
         if !self.scan_results.iter().any(|r| r.bssid == bssid) {
             let mut rec = ScanResult {
                 ssid: [0; 32], ssid_len: ssid_len as u8, bssid, channel, band, beacon_int,
+                secure, rsn,
             };
             rec.ssid[..ssid_len].copy_from_slice(&ssid[..ssid_len]);
             self.scan_results.push(rec);
@@ -2542,5 +3392,187 @@ impl IntelWifiDriver {
                 }
             }
         }
+    }
+
+    // =====================================================================================
+    // Phase 7: 802.11 ⟷ 802.3 translation — the bridge between the WiFi link and smoltcp.
+    // =====================================================================================
+
+    /// True once we hold a DHCP lease, i.e. the link is usable for IP traffic.
+    pub fn is_online(&self) -> bool { self.dhcp_done && self.rx_desc_size != 0 }
+
+    /// The leased address / mask / gateway / DNS, for configuring the smoltcp interface.
+    pub fn lease(&self) -> ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) {
+        (self.dhcp_ip, self.dhcp_mask, self.dhcp_router, self.dhcp_dns)
+    }
+
+    /// Pull one received frame off the RX ring and convert it to an Ethernet (802.3) frame for
+    /// smoltcp. Returns None when nothing is pending or the frame isn't IP traffic for us.
+    ///
+    /// Downlink frames are FromDS: A1 = DA (us or a group address), A2 = BSSID, A3 = SA. The fw has
+    /// already decrypted the payload in place but leaves the 8-byte CCMP header behind (it only
+    /// strips the MIC), so a Protected frame carries 8 bytes of IV/PN we must skip. After that sits
+    /// the LLC/SNAP header whose last 2 bytes are the EtherType — exactly what 802.3 wants.
+    unsafe fn rx_ethernet(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        if self.rx_desc_size == 0 { return None; }
+        loop {
+            let v = self.poll_next_rx(0)?;          // non-blocking probe
+            let p = v as *const u8;
+            let rd = |o: usize| read_volatile(p.add(o));
+            if rd(4) != 0xC1 || rd(5) != 0x00 { continue; }   // not an RX_MPDU
+
+            // mpdu_len is the first field of iwl_rx_mpdu_desc; the frame follows the descriptor.
+            let mpdu_len = read_volatile(p.add(8) as *const u16) as usize;
+            let f = 8 + self.rx_desc_size;
+            let total = (read_volatile(p as *const u32) & 0x3FFF) as usize + 4;
+            if mpdu_len < 32 || f + mpdu_len > total { continue; }
+
+            let (fc0, fc1) = (rd(f), rd(f + 1));
+            if (fc0 >> 2) & 0x3 != 2 { continue; }            // data frames only
+            self.rx_seen += 1;
+            let subtype = fc0 >> 4;
+            if subtype & 0x04 != 0 { continue; }              // null / QoS-null: no payload
+
+            // 802.11 header length, and whether this is an aggregate (A-MSDU).
+            let mut hlen = 24;
+            if fc1 & 0x03 == 0x03 { hlen += 6; }              // 4-address frame (WDS)
+            let mut amsdu = false;
+            if subtype & 0x08 != 0 {                          // QoS data: 2-byte QoS control
+                amsdu = rd(f + hlen) & 0x80 != 0;             // QoS control bit 7 = A-MSDU present
+                hlen += 2;
+            }
+            let ccmp = if fc1 & 0x40 != 0 { 8 } else { 0 };   // CCMP header (fw decrypts in place)
+
+            // Locate LLC/SNAP by signature rather than by arithmetic. Two things shift it and
+            // neither is reliably predictable from the frame alone: the device inserts 2 padding
+            // bytes after the header to 4-byte-align the payload (IWL_RX_MPDU_MFLG2_PAD), and an
+            // A-MSDU prefixes a 14-byte subframe header. Requiring the full 6-byte signature
+            // aa aa 03 00 00 00 makes a false match effectively impossible.
+            let snap6 = |o: usize| rd(o) == 0xaa && rd(o + 1) == 0xaa && rd(o + 2) == 0x03
+                                && rd(o + 3) == 0x00 && rd(o + 4) == 0x00 && rd(o + 5) == 0x00;
+            let base = f + hlen + ccmp;
+            let limit = f + mpdu_len + 2;                      // +2 covers device padding
+            let mut s = 0usize;
+            let mut d = 0usize;
+            while d <= 20 {
+                if base + d + 8 > limit { break; }
+                if snap6(base + d) { s = base + d; break; }
+                d += 1;
+            }
+            if s == 0 {
+                // Dump the first few misses — the raw header says exactly what the layout is.
+                if self.rx_diag < 4 {
+                    self.rx_diag += 1;
+                    let n = core::cmp::min(mpdu_len, 48);
+                    let mut b = alloc::vec::Vec::with_capacity(n);
+                    for k in 0..n { b.push(rd(f + k)); }
+                    crate::serial_println!(
+                        "[WIFI] P7: NOSNAP fc={:02x},{:02x} hlen={} ccmp={} amsdu={} len={} : {:02x?}",
+                        fc0, fc1, hlen, ccmp, amsdu, mpdu_len, &b[..]);
+                }
+                continue;
+            }
+
+            // Destination/source. For an A-MSDU they come from the subframe header immediately
+            // before the SNAP; otherwise from the 802.11 addresses, per the DS bits.
+            let (da, sa, payload_len) = if amsdu && s >= f + 14 {
+                let sub_len = ((rd(s - 2) as usize) << 8) | rd(s - 1) as usize;
+                if sub_len < 8 { continue; }
+                (s - 14, s - 8, sub_len - 8)
+            } else {
+                let (da, sa) = match fc1 & 0x03 {
+                    0x02 => (f + 4, f + 16),                   // FromDS: A1=DA, A3=SA
+                    0x00 => (f + 4, f + 10),                   // IBSS:   A1=DA, A2=SA
+                    _ => continue,                             // ToDS frames aren't ours to receive
+                };
+                if mpdu_len < hlen + ccmp + 8 { continue; }
+                (da, sa, mpdu_len - hlen - ccmp - 8)
+            };
+            if payload_len > 1600 || s + 8 + payload_len > limit { continue; }
+
+            let mut eth = alloc::vec::Vec::with_capacity(14 + payload_len);
+            for k in 0..6 { eth.push(rd(da + k)); }
+            for k in 0..6 { eth.push(rd(sa + k)); }
+            eth.push(rd(s + 6)); eth.push(rd(s + 7));         // EtherType from SNAP
+            for k in 0..payload_len { eth.push(rd(s + 8 + k)); }
+
+            self.rx_passed += 1;
+            if self.rx_passed <= 6 {
+                crate::serial_println!(
+                    "[WIFI] P7: rx eth #{} type={:02x}{:02x} len={} (hlen={} ccmp={} pad={} amsdu={})",
+                    self.rx_passed, eth[12], eth[13], eth.len(), hlen, ccmp,
+                    d.saturating_sub(if amsdu { 14 } else { 0 }), amsdu);
+            }
+            return Some(eth);
+        }
+    }
+
+    /// One-line view of whether the Device is moving traffic at all.
+    pub fn net_stats(&self) -> (u32, u32, u32) { (self.rx_seen, self.rx_passed, self.tx_count) }
+
+    /// Convert an Ethernet frame from smoltcp into an 802.11 data frame and transmit it. ToDS:
+    /// A1 = RA = the AP, A2 = TA = us, A3 = the real destination. tx_flags = 0 so the firmware
+    /// CCMP-encrypts with the installed PTK (0x6 = ENCRYPT_DIS is for mgmt/EAPOL only).
+    unsafe fn tx_ethernet(&mut self, eth: &[u8]) -> bool {
+        if eth.len() < 14 { return false; }
+        let payload = &eth[14..];
+        let mut f = alloc::vec::Vec::with_capacity(32 + payload.len());
+        f.extend_from_slice(&[0x08, 0x01, 0x00, 0x00]);       // FC = data, ToDS; duration 0
+        f.extend_from_slice(&self.ap_bssid);                  // A1 = RA = AP
+        f.extend_from_slice(&self.mac_addr);                  // A2 = TA = us
+        f.extend_from_slice(&eth[0..6]);                      // A3 = DA
+        f.extend_from_slice(&[0x00, 0x00]);                   // sequence control (fw fills it in)
+        f.extend_from_slice(&[0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00]); // LLC/SNAP
+        f.extend_from_slice(&eth[12..14]);                    // EtherType
+        f.extend_from_slice(payload);
+        self.tx_count += 1;
+        if self.tx_count <= 6 {
+            crate::serial_println!("[WIFI] P7: tx eth #{} type={:02x}{:02x} len={} -> 802.11 {} B",
+                self.tx_count, eth[12], eth[13], eth.len(), f.len());
+        }
+        self.tx_data_frame(&f, 24, 0x0)
+    }
+}
+
+// =========================================================================================
+// smoltcp Device — the WiFi link presented to the IP stack as an ordinary Ethernet interface.
+// =========================================================================================
+impl smoltcp::phy::Device for IntelWifiDriver {
+    type RxToken<'a> = WifiRxToken where Self: 'a;
+    type TxToken<'a> = WifiTxToken<'a> where Self: 'a;
+
+    fn receive<'a>(&'a mut self, _t: smoltcp::time::Instant)
+        -> Option<(Self::RxToken<'a>, Self::TxToken<'a>)>
+    {
+        let frame = unsafe { self.rx_ethernet() }?;
+        Some((WifiRxToken(frame), WifiTxToken(self)))
+    }
+
+    fn transmit<'a>(&'a mut self, _t: smoltcp::time::Instant) -> Option<Self::TxToken<'a>> {
+        // The AP station's queue must exist and we must know which AP to address.
+        if self.tx_data_ring.is_none() || self.ap_bssid == [0; 6] { return None; }
+        Some(WifiTxToken(self))
+    }
+
+    fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+        let mut caps = smoltcp::phy::DeviceCapabilities::default();
+        caps.max_transmission_unit = 1500;
+        caps.max_burst_size = Some(1);
+        caps
+    }
+}
+
+pub struct WifiRxToken(alloc::vec::Vec<u8>);
+impl smoltcp::phy::RxToken for WifiRxToken {
+    fn consume<R, F>(mut self, f: F) -> R where F: FnOnce(&mut [u8]) -> R { f(&mut self.0) }
+}
+
+pub struct WifiTxToken<'a>(&'a mut IntelWifiDriver);
+impl<'a> smoltcp::phy::TxToken for WifiTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R where F: FnOnce(&mut [u8]) -> R {
+        let mut buf = alloc::vec![0u8; len];
+        let result = f(&mut buf);
+        unsafe { self.0.tx_ethernet(&buf); }
+        result
     }
 }

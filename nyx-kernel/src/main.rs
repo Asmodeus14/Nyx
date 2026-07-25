@@ -39,6 +39,7 @@ pub mod c_stubs;
 pub mod usb;
 pub mod partitioner;
 pub mod thermal;
+pub mod smbios;
 pub mod laptop_fans;
 pub mod installer;
 
@@ -130,6 +131,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut mapper = unsafe { memory::init(phys_mem_offset, &boot_info.memory_regions) };
     allocator::init_heap(&mut mapper, &mut memory::MEMORY_MANAGER.lock().as_mut().unwrap().frame_allocator).unwrap();
 
+    // Who is this machine? Read-only, and needed before anything vendor-specific runs — the fan
+    // tachometer is gated on the answer instead of on a hand-flipped constant. Needs the memory map
+    // because this firmware does not shadow SMBIOS in the legacy window, so we have to go looking.
+    smbios::init(&boot_info.memory_regions);
+
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
         let raw_buffer = fb.buffer_mut();
@@ -167,6 +173,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::enable();
 
     if let Some(rsdp_addr) = boot_info.rsdp_addr.into_option() {
+        // Second-best machine identity, for firmware that keeps SMBIOS out of reach: the RSDP's own
+        // six-character OEM ID. Coarse, but it is the one vendor string we are always handed.
+        smbios::note_acpi_oem(rsdp_addr);
         acpi::init(rsdp_addr);
         acpi::init_intel_acpica();
         acpi::scan_for_modern_inputs();

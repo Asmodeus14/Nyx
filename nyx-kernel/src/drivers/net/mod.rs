@@ -11,14 +11,19 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 pub static NET_DRIVER: Mutex<Option<crate::drivers::net::rtl8168::Rtl8168Driver>> = Mutex::new(None);
-// WiFi (Intel AX201 CNVi) — owns the driver instance parallel to NET_DRIVER. Not yet plugged
-// into poll_network(); becomes a second smoltcp Device at Phase 7.
+// WiFi (Intel Wireless-AC 9462 CNVi) — a second smoltcp Device, on its own interface so a fault
+// here can never disturb the wired stack.
 pub static WIFI_DRIVER: Mutex<Option<crate::drivers::net::iwlwifi::IntelWifiDriver>> = Mutex::new(None);
+pub static WIFI_IFACE: Mutex<Option<Interface>> = Mutex::new(None);
+pub static WIFI_SOCKETS: Mutex<Option<SocketSet<'static>>> = Mutex::new(None);
+pub static WIFI_DNS_HANDLE: Mutex<Option<SocketHandle>> = Mutex::new(None);
+static WIFI_DNS_QUERY: Mutex<Option<smoltcp::socket::dns::QueryHandle>> = Mutex::new(None);
+static WIFI_DNS_TRIES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static NET_IFACE: Mutex<Option<Interface>> = Mutex::new(None);
 pub static GLOBAL_SOCKETS: Mutex<Option<SocketSet<'static>>> = Mutex::new(None);
 pub static DHCP_HANDLE: Mutex<Option<SocketHandle>> = Mutex::new(None);
 
-// 🔥 MILESTONE 3.2: Global handle for the DNS resolution socket
+//  MILESTONE 3.2: Global handle for the DNS resolution socket
 pub static DNS_HANDLE: Mutex<Option<SocketHandle>> = Mutex::new(None);
 
 pub static NETWORK_PENDING: AtomicBool = AtomicBool::new(false);
@@ -28,7 +33,354 @@ lazy_static::lazy_static! {
     pub static ref RX_BUFFER_POOL: Mutex<Vec<Box<[u8; 2048]>>> = Mutex::new(Vec::new());
 }
 
+// ============================================================================
+// P8c: the WiFi locking rules. Read this before touching WIFI_* from a syscall.
+// ============================================================================
+//
+// ★ WIFI_DRIVER / WIFI_IFACE / WIFI_SOCKETS / WIFI_DNS_* are plain spin locks, and the IDLE TASK
+//   takes them from poll_wifi with interrupts ENABLED — so the holder can be preempted mid-hold.
+//   A syscall, by contrast, runs with interrupts DISABLED (SYSCALL clears IF via the FMASK MSR set
+//   in init_syscalls). Blocking on one of those locks from a syscall is therefore a HARD DEADLOCK:
+//   the holder is a task that can only be resumed by the timer interrupt, and the spinner has the
+//   timer masked, so on that core neither ever makes progress. The core spins at 100% forever —
+//   and the thermal governor is itself an ordinary kernel task, so it dies with the scheduler and
+//   nothing is left to command the fans or throttle the package. That is a runaway-heat wedge, not
+//   just a hang.
+//
+//   The rule, enforced by the syscall arms in interrupts.rs:
+//     - Those four locks are only ever acquired with interrupts ENABLED. The long operations
+//       (scan / connect / disconnect) re-enable IF for their duration, exactly as the sys_sleep_ms
+//       arm does. Preemptible holder + preemptible waiter is merely slow; it cannot deadlock.
+//     - The frequent pollers (tray glyph at 1 Hz, picker at 2 Hz) never touch the driver at all.
+//       They read WIFI_SNAPSHOT below.
+//
+// ★ WIFI_SNAPSHOT is the opposite discipline: only ever taken with interrupts off, never nested
+//   inside anything but the driver lock, and only ever held for a bounded memcpy. A lock that is
+//   never held across a preemption point can't participate in this deadlock at all.
+
+/// A published, read-only view of the radio: exactly the bytes syscalls 544/546 hand back.
+///
+/// Publishing rather than reaching into the driver is what keeps the pollers off WIFI_DRIVER — a
+/// join holds that lock for ~10 seconds, and a 1 Hz tray poll that blocked on it would be a
+/// once-a-second chance to wedge the machine (see the rules above).
+pub struct WifiSnapshot {
+    /// nyx_api::WifiStatus, 53 bytes: state u32, ip/mask/router/dns, ssid_len, ssid[32].
+    pub status: [u8; 53],
+    /// nyx_api::WifiNetwork, 44 bytes each, hidden SSIDs already filtered out.
+    pub nets: Vec<[u8; 44]>,
+    /// False until a driver has been bound at all, so "no adapter" stays distinguishable from
+    /// "adapter present but idle" — the picker prints a different message for each.
+    pub present: bool,
+}
+
+pub static WIFI_SNAPSHOT: Mutex<WifiSnapshot> = Mutex::new(WifiSnapshot {
+    status: [0; 53],
+    nets: Vec::new(),
+    present: false,
+});
+
+/// The extra LinkState the driver itself never produces: the radio is administratively off. Mirrors
+/// `nyx_api::WIFI_RADIO_OFF` — keep the two in step.
+pub const WIFI_STATE_RADIO_OFF: u32 = 6;
+
+/// Wi-Fi soft-kill — the "Wi-Fi: Off" switch in the picker.
+///
+/// This is deliberately a SOFT kill: the firmware stays loaded and the adapter stays powered. Only
+/// the things the user can see stop happening — the link is torn down, the interface is dropped, and
+/// scans and joins are refused until it goes back on. Turning the radio back on is then instant.
+///
+/// The alternative, an actual power-down and firmware reload, was rejected: reloading firmware on
+/// this adapter is the single operation that can fail outright and leave it needing
+/// `restart_firmware()`, and a toggle the user flicks casually must not be able to break the radio.
+///
+/// An atomic rather than a lock, because it is read from `publish_wifi_snapshot` (interrupts on) and
+/// from the syscall arms (interrupts off) — the shape that has deadlocked this kernel before.
+static WIFI_RADIO_OFF: AtomicBool = AtomicBool::new(false);
+
+pub fn wifi_radio_on() -> bool {
+    !WIFI_RADIO_OFF.load(Ordering::Relaxed)
+}
+
+pub fn set_wifi_radio_off(off: bool) {
+    WIFI_RADIO_OFF.store(off, Ordering::Relaxed);
+}
+
+/// Serialises the long WiFi operations against each other. They run with interrupts enabled, so two
+/// of them really can overlap (the picker and the boot agent both call connect); without this the
+/// second would block on WIFI_DRIVER for the first's full ten seconds. Refusing is better than
+/// queueing — the caller gets the current state back immediately instead of freezing its UI.
+static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Claim the radio for a long operation. False means one is already running; do nothing.
+pub fn wifi_try_begin() -> bool {
+    WIFI_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+}
+
+pub fn wifi_end() {
+    WIFI_BUSY.store(false, Ordering::Release);
+}
+
+/// The LinkState from the last published snapshot, for callers that couldn't run.
+pub fn wifi_cached_state() -> u32 {
+    // Masked for the same reason as the publish below: this is reachable from both sides of the
+    // preemption boundary, and the read is two words.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let s = WIFI_SNAPSHOT.lock();
+        u32::from_le_bytes([s.status[0], s.status[1], s.status[2], s.status[3]])
+    })
+}
+
+/// Re-publish the snapshot from the live driver. Call this at the end of every operation that can
+/// change the link or the scan list, while still holding the driver lock and with interrupts on.
+pub fn publish_wifi_snapshot(w: &crate::drivers::net::iwlwifi::IntelWifiDriver) {
+    let (state, ip, ssid) = w.status();
+    let mut status = [0u8; 53];
+
+    // ★ "Radio off" is imposed HERE, not at each caller. Every reader — the tray glyph, the picker,
+    // the boot agent — goes through this snapshot, so a single override is what stops them from
+    // disagreeing with each other about whether Wi-Fi is on. Everything else is left zeroed: with the
+    // radio off there is no address, no SSID and no network list to show, and reporting a stale lease
+    // would make the switch look like it did nothing.
+    if !wifi_radio_on() {
+        status[0..4].copy_from_slice(&WIFI_STATE_RADIO_OFF.to_le_bytes());
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut snap = WIFI_SNAPSHOT.lock();
+            snap.status = status;
+            snap.nets = Vec::new();
+            snap.present = true;
+        });
+        return;
+    }
+
+    status[0..4].copy_from_slice(&(state as u32).to_le_bytes());
+    status[4..8].copy_from_slice(&ip);
+    status[8..12].copy_from_slice(&w.dhcp_mask);
+    status[12..16].copy_from_slice(&w.dhcp_router);
+    status[16..20].copy_from_slice(&w.dhcp_dns);
+    status[20] = ssid.len() as u8;
+    status[21..21 + ssid.len()].copy_from_slice(ssid);
+
+    let mut nets = Vec::new();
+    for net in w.networks().iter() {
+        let name = &net.ssid[..net.ssid_len as usize];
+        if name.is_empty() {
+            continue; // hidden SSID: nothing for the user to click
+        }
+        let mut e = [0u8; 44];
+        e[..name.len()].copy_from_slice(name);
+        e[32] = net.ssid_len;
+        e[33] = net.channel;
+        e[34] = net.band;
+        e[35] = (net.secure as u8)
+            | ((net.rsn as u8) << 1)
+            | (((!ssid.is_empty() && ssid == name) as u8) << 2);
+        e[36..42].copy_from_slice(&net.bssid);
+        nets.push(e);
+    }
+
+    // Built before the lock so the only thing done under it is the handover.
+    //
+    // ★ Masked, because this runs inside the interrupts-ON window of a Wi-Fi syscall (a join takes
+    // seconds, so it must be preemptible) while the readers — the 1 Hz tray and the 2 Hz picker — take
+    // this same lock with interrupts OFF. Without the mask the timer could preempt us mid-handover
+    // and the next tray poll would spin on it forever. Publishing is a bounded memcpy, so making the
+    // holder non-preemptible costs nothing.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut snap = WIFI_SNAPSHOT.lock();
+        snap.status = status;
+        snap.nets = nets;
+        snap.present = true;
+    });
+}
+
+/// Bring the WiFi link up as an IP interface, using the lease the driver already negotiated with
+/// its own DHCP exchange. Configuring statically (rather than adding a smoltcp DHCP socket) avoids
+/// two DHCP clients bidding for the same MAC, and means any traffic that flows is proof the
+/// 802.11⟷802.3 translation is correct. Called once, after connect() reports a lease.
+pub fn init_wifi_iface() {
+    use smoltcp::iface::Config;
+    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+
+    let mut driver_lock = WIFI_DRIVER.lock();
+    let driver = match driver_lock.as_mut() { Some(d) => d, None => return };
+    if !driver.is_online() {
+        crate::serial_println!("[WIFI] P7: no lease — skipping interface setup.");
+        return;
+    }
+    let (ip, mask, router, dns) = driver.lease();
+    let prefix = mask.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
+
+    let mut config = Config::new();
+    config.hardware_addr = Some(HardwareAddress::Ethernet(
+        EthernetAddress::from_bytes(&driver.mac_addr)));
+    let mut iface = Interface::new(config, driver);
+
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::Ipv4(Ipv4Cidr::new(
+            Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]), prefix)));
+    });
+    if router != [0, 0, 0, 0] {
+        let _ = iface.routes_mut().add_default_ipv4_route(
+            Ipv4Address::new(router[0], router[1], router[2], router[3]));
+    }
+
+    // A DNS lookup is the cheapest end-to-end proof: it needs ARP for the gateway, UDP out through
+    // the encrypted link, routing, and a reply back through the GTK/PTK decrypt path.
+    let server = if dns == [0, 0, 0, 0] { [8, 8, 8, 8] } else { dns };
+    let servers = alloc::vec![smoltcp::wire::IpAddress::Ipv4(
+        Ipv4Address::new(server[0], server[1], server[2], server[3]))];
+    let mut sockets = SocketSet::new(alloc::vec![]);
+    let dns_handle = sockets.add(DnsSocket::new(&servers[..], alloc::vec![]));
+    WIFI_DNS_TRIES.store(0, Ordering::Relaxed);   // P8: reset per connect, not per boot
+
+    {
+        let sock = sockets.get_mut::<DnsSocket>(dns_handle);
+        match sock.start_query(iface.context(), "example.com",
+                               smoltcp::wire::DnsQueryType::A) {
+            Ok(q) => {
+                *WIFI_DNS_QUERY.lock() = Some(q);
+                crate::serial_println!("[WIFI] P7: resolving example.com via {}.{}.{}.{}…",
+                    server[0], server[1], server[2], server[3]);
+            }
+            Err(e) => crate::serial_println!("[WIFI] P7: DNS query failed to start: {:?}", e),
+        }
+    }
+
+    crate::serial_println!(
+        "[WIFI] P7: interface up — {}.{}.{}.{}/{} gw {}.{}.{}.{}",
+        ip[0], ip[1], ip[2], ip[3], prefix, router[0], router[1], router[2], router[3]);
+
+    *WIFI_DNS_HANDLE.lock() = Some(dns_handle);
+    *WIFI_SOCKETS.lock() = Some(sockets);
+    *WIFI_IFACE.lock() = Some(iface);
+}
+
+/// P8: drop the WiFi IP interface. Called when the link goes away (disconnect / network switch) so
+/// smoltcp stops polling a device whose lease no longer exists.
+pub fn teardown_wifi_iface() {
+    *WIFI_DNS_QUERY.lock() = None;
+    *WIFI_DNS_HANDLE.lock() = None;
+    *WIFI_SOCKETS.lock() = None;
+    *WIFI_IFACE.lock() = None;
+    crate::serial_println!("[WIFI] P8: IP interface torn down.");
+}
+
+/// Drive the WiFi interface. Mirrors poll_network() but touches only the WIFI_* statics, so it can
+/// never deadlock against or disturb the wired path.
+///
+/// ★ Acquires every one of its locks with try_lock and gives up on the first miss, which makes it
+/// safe to call from ANY context, at any interrupt state. That matters more than it looks: this is
+/// reached from poll_network(), which the socket read/write and DNS syscall arms call directly with
+/// interrupts still disabled. A blocking acquire on any of these would let an ordinary socket read
+/// wedge the machine against the idle task holding the same lock — the deadlock described at the
+/// top of this file. A skipped poll costs nothing; the idle task retries within a millisecond.
+pub fn poll_wifi() {
+    // Radio off: the interface is already gone, so the work below would find nothing anyway. Bailing
+    // explicitly keeps the idle task off the driver lock entirely while the switch is off.
+    if !wifi_radio_on() {
+        return;
+    }
+
+    // A connect or scan holds the driver for SECONDS. Blocking here would spin a core for the whole
+    // join instead of halting, even in the cases where it wouldn't deadlock outright.
+    let mut driver_lock = match WIFI_DRIVER.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
+    let (mut iface_lock, mut sockets_lock, mut dns_lock) =
+        match (WIFI_IFACE.try_lock(), WIFI_SOCKETS.try_lock(), WIFI_DNS_HANDLE.try_lock()) {
+            (Some(i), Some(s), Some(d)) => (i, s, d),
+            _ => return,
+        };
+
+    if let (Some(driver), Some(iface), Some(sockets), Some(dns_handle)) =
+        (driver_lock.as_mut(), iface_lock.as_mut(), sockets_lock.as_mut(), dns_lock.as_mut())
+    {
+        let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        let tsc_mhz = crate::time::TSC_MHZ.load(Ordering::Relaxed).max(1);
+        let timestamp = Instant::from_millis((tsc / (tsc_mhz * 1000)) as i64);
+
+        let _ = iface.poll(timestamp, driver, sockets);
+
+        // Report the DNS answer. A failure here is almost always "nothing came back", so retry a
+        // few times before giving up — and print the Device counters, which say whether the link
+        // is moving frames at all (the difference between "no TX", "no RX" and "RX not parsed").
+        let mut query_lock = match WIFI_DNS_QUERY.try_lock() {
+            Some(g) => g,
+            None => return,
+        };
+        if let Some(q) = *query_lock {
+            let sock = sockets.get_mut::<DnsSocket>(*dns_handle);
+            match sock.get_query_result(q) {
+                Ok(addrs) => {
+                    crate::serial_println!("[WIFI] P7: *** DNS RESOLVED — INTERNET REACHABLE *** {:?}",
+                        addrs.first());
+                    *query_lock = None;
+                }
+                Err(GetQueryResultError::Pending) => {}
+                Err(e) => {
+                    let (seen, passed, tx) = driver.net_stats();
+                    let n = WIFI_DNS_TRIES.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::serial_println!(
+                        "[WIFI] P7: DNS attempt {} failed ({:?}) — data frames seen={} parsed={} tx={}",
+                        n, e, seen, passed, tx);
+                    *query_lock = None;
+                    if n < 4 {
+                        match sock.start_query(iface.context(), "example.com",
+                                               smoltcp::wire::DnsQueryType::A) {
+                            Ok(nq) => *query_lock = Some(nq),
+                            Err(se) => crate::serial_println!("[WIFI] P7: retry failed to start: {:?}", se),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn poll_network() {
+    // ★ The WIRED half runs with interrupts masked — the equivalent of spin_lock_irqsave.
+    //
+    // These five locks are blocked on from syscall context with interrupts OFF (the socket read,
+    // socket write and DNS-resolve arms all take GLOBAL_SOCKETS directly, and reach the rest
+    // through this function). Meanwhile this function is ALSO called with interrupts ON — from the
+    // idle task, and from the socket arms that re-enable IF around their blocking waits. That mix
+    // is precisely the deadlock described at the top of this file: a preemptible holder plus a
+    // non-preemptible waiter on the same core, neither able to make progress.
+    //
+    // Masking here makes the holder non-preemptible instead, so an interrupts-off waiter only ever
+    // waits out a bounded critical section. Fixing it in the callee rather than at the six call
+    // sites means a future caller can't reintroduce the bug by forgetting. `without_interrupts`
+    // saves and restores IF, so calling it from an already-masked syscall is a no-op wrapper.
+    //
+    // Cost: one wired smoltcp poll's worth of interrupt latency in the idle path. That is the
+    // standard trade for a lock shared with non-preemptible context, and it is bounded by the
+    // rtl8168 RX ring.
+    x86_64::instructions::interrupts::without_interrupts(poll_network_locked);
+
+    // ★★ The WiFi poll runs OUTSIDE that mask, deliberately. It used to be the last statement of
+    // poll_network_locked, and that starved userspace to a standstill.
+    //
+    // Why it must not be masked: on an associated link this drains a beacon flood, and every frame
+    // costs a signature scan plus an 802.11 -> 802.3 conversion. Masking it meant the idle task —
+    // which calls this in a tight loop — spent essentially all of its time with IF=0, so the timer
+    // never preempted it and no userspace task was ever scheduled again. The kernel stayed alive
+    // (serial kept printing); the UI was simply never given the CPU. It presents as "userspace froze
+    // a few seconds after I stopped touching it", because going idle is what lets the idle task run
+    // back-to-back. Note this is STARVATION, not deadlock: nothing is stuck, the machine is just
+    // never in a state where it can switch tasks.
+    //
+    // Why it is safe to leave interrupts on: poll_wifi `try_lock`s every one of its locks and bails
+    // on the first miss, so it cannot block, let alone deadlock, whatever IF happens to be. And
+    // nothing ever blocks on a WIFI_* lock with interrupts off — the tray and picker syscalls read
+    // the masked WIFI_SNAPSHOT instead, and the scan/connect/disconnect arms enable IF before they
+    // touch the driver. So a preemptible holder here closes no cycle.
+    poll_wifi();
+}
+
+fn poll_network_locked() {
     let was_pending = NETWORK_PENDING.swap(false, Ordering::Acquire);
 
     let mut driver_lock = NET_DRIVER.lock();
@@ -67,7 +419,7 @@ pub fn poll_network() {
         
         let _ = iface.poll(timestamp, driver, sockets);
         
-        // 🔥 THE FIX: Extract DHCP config FIRST, drop the lock, THEN apply it!
+        //  THE FIX: Extract DHCP config FIRST, drop the lock, THEN apply it!
         let mut dhcp_config = None;
         let mut dhcp_deconfig = false;
         
@@ -114,4 +466,5 @@ pub fn poll_network() {
             iface.routes_mut().remove_default_ipv4_route();
         }
     }
+
 }

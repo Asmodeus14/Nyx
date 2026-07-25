@@ -156,6 +156,48 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Blit `src` at `x,y`, blending every pixel by its OWN alpha channel.
+    ///
+    /// Distinct from `composite_buffer`, which memcpys at opacity 255 and so treats a transparent
+    /// source pixel as opaque black — fine for window surfaces (rectangular and fully opaque), wrong
+    /// for icons, whose whole point is a transparent surround. `tint`, when set, replaces the RGB and
+    /// keeps only the source alpha: that's how one glyph sheet renders in any colour.
+    pub fn blit_rgba(&mut self, x: usize, y: usize, src: &[u32], src_w: usize, src_h: usize, tint: Option<u32>) {
+        if src_w == 0 || src_h == 0 { return; }
+        for cy in 0..src_h {
+            let dst_y = y + cy;
+            if dst_y >= self.height { break; }
+            let dst_row = dst_y * self.width + x;
+            let src_row = cy * src_w;
+            for cx in 0..src_w {
+                if x + cx >= self.width { break; }
+                let s = src[src_row + cx];
+                let a = (s >> 24) & 0xFF;
+                if a == 0 { continue; }
+                let s = match tint {
+                    Some(t) => (a << 24) | (t & 0x00FF_FFFF),
+                    None => s,
+                };
+                let d = &mut self.buffer[dst_row + cx];
+                *d = if a == 255 { s } else { alpha_blend(s, *d) };
+            }
+        }
+    }
+
+    /// Nearest-neighbour scale of an RGBA buffer. Icons ship at one size; this is what lets the
+    /// taskbar and the start menu draw the same asset at different sizes without a second file.
+    pub fn scale_rgba(src: &[u32], sw: usize, sh: usize, dw: usize, dh: usize) -> alloc::vec::Vec<u32> {
+        let mut out = alloc::vec![0u32; dw * dh];
+        if sw == 0 || sh == 0 || dw == 0 || dh == 0 { return out; }
+        for dy in 0..dh {
+            let sy = dy * sh / dh;
+            for dx in 0..dw {
+                out[dy * dw + dx] = src[sy * sw + dx * sw / dw];
+            }
+        }
+        out
+    }
+
     /// Draw `text` with the proportional TTF font. `cx,cy` is the TOP-LEFT of the first line (the pen
     /// baseline is derived internally via the font ascent, so existing top-left call sites keep working).
     /// Advances per-glyph by each glyph's own advance (proportional). Wraps near the right edge and on
@@ -174,6 +216,34 @@ impl<'a> Canvas<'a> {
             if cx + line_h >= self.width.saturating_sub(10) {
                 cx = start_x;
                 cy += line_h;
+            }
+        }
+    }
+
+    /// Draw one glyph centred on its INK box inside the rect `(rx, ry, rw, rh)`.
+    ///
+    /// `print_str` positions text by the LINE box (baseline = y + ascent), which is right for running
+    /// text but wrong for a single glyph alone in a small plate: the line box is taller than the plate,
+    /// and under a proportional font every character has a different advance, bearing and ink height.
+    /// A fixed pixel offset therefore lands differently for each glyph — which is why the title-bar
+    /// controls looked off-centre after the UI moved from the fixed 9x16 bitmap font to the TTF.
+    /// Centring on the rasterized ink box is what "looks centred" actually means.
+    pub fn draw_char_centered(&mut self, rx: usize, ry: usize, rw: usize, rh: usize,
+                              c: char, color: u32, scale: usize) {
+        let px = crate::font::px_for(scale);
+        let asc = crate::font::ascent(scale) as i32;
+        // ★ Resolve the placement BEFORE drawing. `with_glyph` and `draw_char` both take the global
+        // FONT spin lock, so calling draw_char inside the closure would deadlock on it.
+        let placement = crate::font::with_glyph(c, px, |g| {
+            if g.w == 0 || g.h == 0 { return None; }
+            Some((
+                rx as i32 + (rw as i32 - g.w as i32) / 2 - g.bearing_x,
+                ry as i32 + (rh as i32 - g.h as i32) / 2 + g.bearing_y - asc,
+            ))
+        }).flatten();
+        if let Some((gx, gy)) = placement {
+            if gx >= 0 && gy >= 0 {
+                self.draw_char(gx as usize, gy as usize, c, color, scale);
             }
         }
     }

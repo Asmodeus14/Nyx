@@ -61,6 +61,7 @@ impl SettingsApp {
 }
 
 impl NyxApp for SettingsApp {
+    fn icon_path(&self) -> &str { "/mnt/nvme/apps/Settings.nyx/icon.png" }
     fn title(&self) -> &str { "System Settings" }
     fn initial_width(&self) -> usize { 680 }
     fn initial_height(&self) -> usize { 450 }

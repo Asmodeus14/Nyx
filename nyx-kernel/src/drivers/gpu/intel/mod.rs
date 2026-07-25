@@ -20,6 +20,21 @@ pub const BLT_RING_TAIL: u32 = 0x22030;
 pub const BLT_RING_HEAD: u32 = 0x22034;
 const BLT_RING_START: u32 = 0x22038;
 const BLT_RING_CTL: u32 = 0x2203C;
+/// Master switch for GT power saving (forcewake release → RC6 → deep package C-states).
+///
+/// Set false to pin the GT awake exactly as the driver behaved before, if releasing forcewake ever
+/// turns out to break blits or rendering on some machine. Leaving it true is what keeps the laptop
+/// from cooking itself at idle — see `forcewake_blt_put`.
+pub const GPU_POWER_SAVE: bool = true;
+
+/// How long the GT must be idle before we drop forcewake. Long enough that an actively-rendering
+/// desktop never pays a wake, short enough that being left alone still reaches RC6 quickly.
+pub const GPU_PARK_IDLE_MS: u64 = 1000;
+
+/// GGTT address the blitter ring is mapped at. Was a local in `initialize()`; `ensure_blt_ready`
+/// needs the same value to re-arm the ring after a park, and two copies would silently diverge.
+pub const BLT_RING_GVA: u32 = 0x1000_0000;
+
 const FORCEWAKE_BLT: u32 = 0xA188;
 const FORCEWAKE_ACK_BLT: u32 = 0x130044;
 const PIPEA_STAT: u32 = 0x70024;
@@ -70,6 +85,10 @@ pub struct IntelGpuDriver {
     pub scanout_gva: u32,          // GVA of our owned scanout buffer (0 => fall back to GVA-0)
     pub active_surf_reg: u32,      // MMIO offset of the ENABLED plane's SURF register (pipe+0x19C)
     pub plane_armed: bool,         // have we pointed the plane at scanout_gva yet? (arm once)
+    /// UPTIME_MS of the last blitter submission, and whether the GT is currently parked. Together
+    /// these implement a DELAYED park — see `maybe_park_gpu`.
+    pub last_gpu_active_ms: u64,
+    pub gpu_parked: bool,
 }
 
 unsafe impl Send for IntelGpuDriver {}
@@ -100,6 +119,7 @@ impl IntelGpuDriver {
             fence_phys: 0, fence_virt: core::ptr::null_mut(),
             next_fence_val: 0, current_fence_target: 0,
             scanout_gva: 0, active_surf_reg: 0, plane_armed: false,
+            last_gpu_active_ms: 0, gpu_parked: false,
         }
     }
 
@@ -114,8 +134,84 @@ impl IntelGpuDriver {
     pub unsafe fn wake_up_gpu(&self) {
         self.write_reg(FORCEWAKE_BLT, 0x00010001);
         while (self.read_reg(FORCEWAKE_ACK_BLT) & 1) == 0 {
-            core::hint::spin_loop(); 
+            core::hint::spin_loop();
         }
+    }
+
+    /// Release the blitter forcewake so the GT can actually park.
+    ///
+    /// ★★★ THIS IS THE FIX FOR "the laptop heats up while completely idle".
+    ///
+    /// `wake_up_gpu()` was called once in `initialize()` and **never released**, so forcewake was
+    /// asserted permanently from boot. Forcewake's whole job is to stop the power well sleeping, so
+    /// the GT never entered RC6 — and on Intel, deep PACKAGE C-states are gated on the iGPU reaching
+    /// RC6. The uncore, ring, memory controller and PLLs therefore stayed energised forever. That
+    /// takes an idle Comet Lake package from ~2 W to something like 8-10 W, continuously, which is
+    /// what drove the machine to its 95 °C trip with the CPU at ~2.5 % busy and nobody touching it.
+    /// (Linux avoids this by refcounting forcewake with an autosuspend timer; we simply never
+    /// dropped it. `render/mod.rs` even documents the consequence: "forcewake is held from bring_up
+    /// and never released, so the render well is NOT actually parking (RC6)".)
+    ///
+    /// Masked write: mask bit 16 set, value bit 0 clear = drop the request.
+    pub unsafe fn forcewake_blt_put(&self) {
+        self.write_reg(FORCEWAKE_BLT, 0x0001_0000);
+    }
+
+    /// Re-acquire the blitter well and, if it actually parked, restore the ring programming.
+    ///
+    /// Mirrors `RenderEngine::ensure_ready`. RC6 does not preserve the legacy ring registers, so a
+    /// submit issued after a park would otherwise write TAIL to a disabled ring and hang. Idempotent
+    /// and cheap when the well never slept (the common case mid-frame).
+    pub unsafe fn ensure_blt_ready(&mut self) {
+        self.last_gpu_active_ms = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed);
+        if !self.gpu_parked {
+            // Fast path: the well is already awake and the ring live. This is the common case and
+            // must stay cheap — it runs on every single blitter submission.
+            return;
+        }
+        self.gpu_parked = false;
+        self.wake_up_gpu();
+        if (self.read_reg(BLT_RING_CTL) & 1) == 0 {
+            // Ring lost its programming while parked — re-arm exactly as `initialize` does. Safe to
+            // reset HEAD/TAIL to 0: the engine is idle (it parked), the ring is empty, and
+            // `submit_command` reads TAIL back from the register on every call, so it resyncs.
+            self.write_reg(BLT_RING_CTL, 0);
+            self.write_reg(BLT_RING_START, BLT_RING_GVA);
+            self.write_reg(BLT_RING_HEAD, 0);
+            self.write_reg(BLT_RING_TAIL, 0);
+            self.write_reg(BLT_RING_CTL, 0x0000_0001);
+        }
+    }
+
+    /// Park the GT only once it has been idle for `GPU_PARK_IDLE_MS`.
+    ///
+    /// ★ The delay is the whole point. Parking at every quiescent point (i.e. after each frame's
+    /// `sys_gpu_sync`) meant the compositor paid a forcewake wake + RC6 exit on the very next
+    /// submission — once per frame, on every mouse-move redraw. The desktop became visibly sluggish,
+    /// and the tell was that opening a continuously-rendering app (glcube) made it smooth again:
+    /// under constant load the GT never parked, so the cost vanished. This is exactly why i915 uses a
+    /// delayed autosuspend rather than dropping forcewake the moment the engine goes quiet.
+    ///
+    /// One second of idle costs nothing in latency terms and still captures all the heat: the machine
+    /// cooks when it is left alone for minutes, not between two frames.
+    pub unsafe fn maybe_park_gpu(&mut self) {
+        if !GPU_POWER_SAVE || self.gpu_parked { return; }
+        let now = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(self.last_gpu_active_ms) < GPU_PARK_IDLE_MS { return; }
+        self.gpu_parked = true;
+        self.park_gpu();
+    }
+
+    /// Let the whole GT sleep. Both domains must be released — RC6 needs every forcewake dropped, so
+    /// parking only one buys nothing. Prefer `maybe_park_gpu`; this is the unconditional form.
+    pub unsafe fn park_gpu(&mut self) {
+        if !GPU_POWER_SAVE { return; }
+        // The render domain lives in the same MMIO BAR. Releasing it is safe because
+        // `RenderEngine::ensure_ready()` runs before every render and both re-acquires forcewake and
+        // re-arms the RCS ring if RC6 cleared it — that path already exists and was written for
+        // exactly this case.
+        self.write_reg(crate::drivers::gpu::intel::render::FORCEWAKE_RENDER, 0x0001_0000);
+        self.forcewake_blt_put();
     }
 
     pub unsafe fn map_ggtt_page(&self, gpu_page_number: u32, phys_ram_addr: u64, coherent: bool) {
@@ -220,6 +316,10 @@ impl IntelGpuDriver {
     }
 
     pub unsafe fn submit_command(&mut self, dwords: &[u32]) -> Result<(), GpuHangError> {
+        // Every blitter path (fill_rect / copy_rect / submit_fence) funnels through here, so this is
+        // the one place that has to guarantee the well is awake and the ring is armed. Before power
+        // saving this was implicit: forcewake was taken once at boot and never dropped.
+        self.ensure_blt_ready();
         if let Some(ring_ptr) = self.ring_virt_addr {
             let ring = ring_ptr as *mut u32;
             let mut timeout = 0;
@@ -342,12 +442,12 @@ impl IntelGpuDriver {
             self.ring_virt_addr = Some(crate::memory::phys_to_virt(ring_phys).unwrap());
 
             // Map it high in the GGTT, safely away from 0x0 (The Null Trap)
-            let ring_gva: u32 = 0x1000_0000;
-            self.map_ggtt_page(ring_gva / 4096, ring_phys, true); 
+            let ring_gva: u32 = BLT_RING_GVA;
+            self.map_ggtt_page(ring_gva / 4096, ring_phys, true);
 
             self.wake_up_gpu();
-            self.write_reg(BLT_RING_CTL, 0); 
-            self.write_reg(BLT_RING_START, ring_gva); 
+            self.write_reg(BLT_RING_CTL, 0);
+            self.write_reg(BLT_RING_START, ring_gva);
             self.write_reg(BLT_RING_HEAD, 0);
             self.write_reg(BLT_RING_TAIL, 0);
             self.write_reg(BLT_RING_CTL, 0x00000001); 

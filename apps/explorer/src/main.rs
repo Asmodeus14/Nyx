@@ -172,6 +172,7 @@ impl ExplorerApp {
 }
 
 impl NyxApp for ExplorerApp {
+    fn icon_path(&self) -> &str { "/mnt/nvme/apps/Explorer.nyx/icon.png" }
     fn title(&self) -> &str { "Nyx Explorer Suite" }
     fn initial_width(&self) -> usize { 650 }
     fn initial_height(&self) -> usize { 450 }

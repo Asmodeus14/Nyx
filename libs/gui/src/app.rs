@@ -8,6 +8,11 @@ pub trait NyxApp {
     fn initial_width(&self) -> usize { 640 }
     fn initial_height(&self) -> usize { 400 }
     
+    /// Absolute path to this app's icon PNG, normally the `icon.png` in its own `.nyx` bundle. The
+    /// compositor draws it on the window's taskbar button. Default: none, and the button falls back
+    /// to the app's initial letter.
+    fn icon_path(&self) -> &str { "" }
+
     fn init(&mut self) {}
 
     fn update(&mut self) -> bool { false }
@@ -49,6 +54,13 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
     header.title.fill(0);
     let len = title_bytes.len().min(64);
     header.title[..len].copy_from_slice(&title_bytes[..len]);
+
+    // The app declares its own icon: it knows its bundle path, the compositor doesn't (there is no
+    // argv, and a pid says nothing about which binary it came from).
+    let icon_bytes = app.icon_path().as_bytes();
+    header.icon.fill(0);
+    let ilen = icon_bytes.len().min(96);
+    header.icon[..ilen].copy_from_slice(&icon_bytes[..ilen]);
 
     if !sys_ipc_send(COMPOSITOR_PID, MSG_REQ_WINDOW, shm_id, 0) { sys_exit(1); }
     let mut msg = IpcMessage { sender_pid: 0, msg_type: 0, data1: 0, data2: 0 };

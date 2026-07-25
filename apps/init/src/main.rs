@@ -18,6 +18,15 @@ pub extern "C" fn _start() -> ! {
         sys_exit(1);
     }
 
+    // 2. Reconnect to the remembered Wi-Fi network, if there is one. Headless and short-lived: it
+    // blocks for ~10 s inside the kernel while it associates, which is exactly why it runs as its
+    // own process rather than inline here.
+    sys_print("[INIT] Spawning WifiAgent.nyx (auto-reconnect)...\n");
+    if sys_fork() == 0 {
+        sys_execve("/mnt/nvme/apps/WifiAgent.nyx/run.bin\0");
+        sys_exit(1);
+    }
+
     loop { sys_sleep_ms(1000); }
 }
 #[panic_handler]

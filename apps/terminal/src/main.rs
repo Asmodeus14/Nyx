@@ -153,6 +153,7 @@ fn replace_ext(path: &str, new_ext: &str) -> String {
 }
 
 impl NyxApp for TerminalApp {
+    fn icon_path(&self) -> &str { "/mnt/nvme/apps/Terminal.nyx/icon.png" }
     fn title(&self) -> &str { "Nyx Matrix Terminal" }
     fn initial_width(&self) -> usize { 640 }
     fn initial_height(&self) -> usize { 400 }

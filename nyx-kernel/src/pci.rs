@@ -162,6 +162,17 @@ pub fn bind_intel_wifi(dev: &PciDevice) {
 
     *crate::drivers::net::WIFI_DRIVER.lock() = Some(wifi);
     crate::serial_println!("[PCI] Wi-Fi driver stored.");
+
+    // Publish the boot scan so the tray glyph and the picker have something to read before any
+    // syscall has touched the driver — those two never look at WIFI_DRIVER themselves (see the
+    // locking rules in drivers/net/mod.rs), so without this they'd see an empty snapshot and
+    // report "no adapter" until the user manually rescanned.
+    if let Some(w) = crate::drivers::net::WIFI_DRIVER.lock().as_ref() {
+        crate::drivers::net::publish_wifi_snapshot(w);
+    }
+
+    // P8: boot only scans — there is no link yet. The IP interface is built by sys_wifi_connect,
+    // once the user has picked a network in the Wi-Fi picker and DHCP has handed us a lease.
 }
 
 // ==========================================

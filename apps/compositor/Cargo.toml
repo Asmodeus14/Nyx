@@ -7,6 +7,9 @@ edition = "2021"
 # Updated relative paths to the libs folder
 nyx-api = { path = "../../libs/api" }
 nyx-gui = { path = "../../libs/gui" }
+# Shared image decoders. The desktop's icons are all PNG, so skip the JPEG decoder — it is ~150 KiB
+# of code the compositor would never reach.
+nyx-image = { path = "../../libs/image", default-features = false }
 
 # Allocator for Vec, String, Box
 linked_list_allocator = "0.10.5"
