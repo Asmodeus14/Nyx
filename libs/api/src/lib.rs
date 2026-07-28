@@ -807,6 +807,71 @@ impl UdpSocket {
     }
 }
 
+/// A blocking TCP connection.
+///
+/// The kernel routes this to whichever stack has a link — WiFi when it is up, the wired NIC
+/// otherwise — and the choice is fixed for the socket's lifetime. `read` returning 0 means the peer
+/// closed (EOF) *or* the link went away; there is no way to tell those apart from here, and for a
+/// fetch-then-retry client there is no useful difference.
+pub struct TcpStream {
+    pub fd: i64,
+}
+
+impl TcpStream {
+    /// Open a connection. Blocks through the handshake (the kernel gives up after 10 s).
+    pub fn connect(ip: [u8; 4], port: u16) -> Option<Self> {
+        let fd = sys_socket(2, 1, 0); // AF_INET, SOCK_STREAM
+        if fd < 0 {
+            return None;
+        }
+        let addr = sockaddr_in {
+            sin_family: 2,
+            sin_port: port.to_be(),
+            sin_addr: ip,
+            sin_zero: [0; 8],
+        };
+        if sys_connect(fd, &addr as *const _ as *const u8, core::mem::size_of::<sockaddr_in>()) != 0 {
+            sys_close(fd);
+            return None;
+        }
+        Some(Self { fd })
+    }
+
+    /// Resolve `host`, then connect to it.
+    pub fn connect_host(host: &str, port: u16) -> Option<Self> {
+        Self::connect(sys_dns_resolve(host)?, port)
+    }
+
+    /// One write. May be short — TCP only takes what fits in the send window, so use `write_all`
+    /// for anything that has to arrive in full.
+    pub fn write(&self, data: &[u8]) -> i64 {
+        sys_write(self.fd, data)
+    }
+
+    /// Write every byte, looping over short writes. False if the connection failed partway.
+    pub fn write_all(&self, mut data: &[u8]) -> bool {
+        while !data.is_empty() {
+            let n = self.write(data);
+            if n <= 0 {
+                return false;
+            }
+            data = &data[n as usize..];
+        }
+        true
+    }
+
+    /// Read up to `buf.len()` bytes. 0 = EOF, negative = error.
+    pub fn read(&self, buf: &mut [u8]) -> i64 {
+        sys_read(self.fd, buf)
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        sys_close(self.fd);
+    }
+}
+
 pub fn sys_getrandom(buf: &mut [u8]) -> i64 {
     syscall(318, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0) as i64
 }

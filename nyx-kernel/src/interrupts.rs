@@ -157,26 +157,23 @@ fn terminate_current_user_process() -> ! {
         let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
         if curr_idx < percpu.scheduler.tasks.len() {
             let task = &mut percpu.scheduler.tasks[curr_idx];
+            // Collect first, free once the fd table is clear — the free path must not run while a
+            // borrow of `task` is live (see destroy_socket).
+            let mut doomed_sockets = alloc::vec::Vec::new();
             for i in 0..32 {
                 if let Some(crate::scheduler::FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
                     if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
-                        let sock = sock_mtx.lock();
-                        if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
-                            match sock.kind {
-                                crate::scheduler::SocketKind::Tcp(handle) => {
-                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                                    socket.abort();
-                                    sockets.remove(handle);
-                                },
-                                crate::scheduler::SocketKind::Udp(handle) => { sockets.remove(handle); }
-                            }
-                        }
+                        let s = sock_mtx.lock();
+                        doomed_sockets.push((s.stack, s.gen, s.kind.clone()));
                     }
                 }
                 task.fd_table[i] = None;
             }
             crate::memory::clear_user_address_space(task.cr3);
             task.state = crate::scheduler::TaskState::Zombie;
+            for (stack, gen, kind) in doomed_sockets {
+                destroy_socket(stack, gen, kind);
+            }
         }
     }
     crate::apic::end_of_interrupt();
@@ -742,24 +739,21 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
 
-            if arg1 < 32 { 
+            if arg1 < 32 {
                 // Cleanly tear down TCP sockets to avoid Windows NAT exhaustion!
-                if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[arg1 as usize] {
-                    let sock = sock_mtx.lock();
-                    if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
-                        match sock.kind {
-                            SocketKind::Tcp(handle) => {
-                                let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                                socket.abort(); // Send TCP RST
-                                sockets.remove(handle); // Free the memory
-                            },
-                            SocketKind::Udp(handle) => {
-                                sockets.remove(handle);
-                            }
-                        }
+                //
+                // Snapshot, clear the slot, THEN destroy — destroy_socket may yield (see its note).
+                // The strong_count test matches the exit path: a socket still reachable through a
+                // dup2'd or inherited fd must not be RST out from under the other holder.
+                let doomed = match &task.fd_table[arg1 as usize] {
+                    Some(FileDescriptor::Socket(m)) if alloc::sync::Arc::strong_count(m) == 1 => {
+                        let s = m.lock();
+                        Some((s.stack, s.gen, s.kind.clone()))
                     }
-                }
-                task.fd_table[arg1 as usize] = None; 
+                    _ => None,
+                };
+                task.fd_table[arg1 as usize] = None;
+                if let Some((stack, gen, kind)) = doomed { destroy_socket(stack, gen, kind); }
             }
             frame.rax = 0;
         },
@@ -1175,27 +1169,22 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             crate::serial_println!("[PID {}] Exited (Code: {})", my_pid, exit_code);
             task.exit_code = exit_code; // B1: retained for the parent's wait4 before reaping.
 
-            // 1. Safe FD Teardown using Arc Reference Counting
+            // 1. Safe FD Teardown using Arc Reference Counting.
+            //    Collect first and free after the fd table is clear: the free path must not run
+            //    while a borrow of `task` is live (see destroy_socket).
+            let mut doomed_sockets = alloc::vec::Vec::new();
             for i in 0..32 {
                 if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
                     if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
-                        let sock = sock_mtx.lock();
-                        if let Some(sockets) = crate::drivers::net::GLOBAL_SOCKETS.lock().as_mut() {
-                            match sock.kind {
-                                SocketKind::Tcp(handle) => {
-                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                                    socket.abort(); // Send TCP RST
-                                    sockets.remove(handle); // Free the memory
-                                },
-                                SocketKind::Udp(handle) => {
-                                    sockets.remove(handle);
-                                }
-                            }
-                        }
+                        let s = sock_mtx.lock();
+                        doomed_sockets.push((s.stack, s.gen, s.kind.clone()));
                     }
                 }
                 // Safely drop our reference to the FD
                 task.fd_table[i] = None;
+            }
+            for (stack, gen, kind) in doomed_sockets {
+                destroy_socket(stack, gen, kind);
             }
 
             // B-β.2a: threads share `cr3`. Count OTHER live tasks in this address space across all
@@ -1259,23 +1248,12 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let buf_ptr = arg1 as *mut u8;
             let len = arg2 as usize;
             if is_valid_user_ptr(buf_ptr, len) {
-                // B1: fill from a TSC/uptime-mixed xorshift instead of a constant, so std's
-                // HashMap RandomState (and any getrandom() user) gets non-repeating bytes. Not
-                // cryptographically strong, but adequate for hash-DoS resistance on this target.
-                let mut seed = {
-                    let tsc: u64;
-                    unsafe { core::arch::asm!("rdtsc", out("rax") tsc, out("rdx") _, options(nomem, nostack)); }
-                    tsc ^ crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                };
-                let mut i = 0;
-                while i < len {
-                    // xorshift64*
-                    seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27;
-                    let r = seed.wrapping_mul(0x2545_F491_4F6C_DD1D);
-                    let n = core::cmp::min(8, len - i);
-                    unsafe { core::ptr::copy_nonoverlapping(r.to_le_bytes().as_ptr(), buf_ptr.add(i), n); }
-                    i += n;
-                }
+                // Hardware RDSEED/RDRAND (see random.rs), falling back to the old TSC-seeded
+                // xorshift only on a CPU with no DRNG at all. This used to be the xorshift
+                // unconditionally, which was written for HashMap seeding and is guessable — and
+                // rustls draws ECDHE keys and GCM nonces from right here.
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                crate::random::fill(buf);
                 frame.rax = len as u64;
             } else {
                 frame.rax = EFAULT as u64;
@@ -2026,6 +2004,28 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = crate::drivers::net::wifi_cached_state() as u64;
         }
 
+        // sys_socket_set_timeout(fd, ms) — blocking read/write deadline for a socket. 0 = forever.
+        //
+        // The moral equivalent of SO_RCVTIMEO/SO_SNDTIMEO, as one knob because nothing here needs
+        // them to differ. Exists because the alternative is unbounded: a TLS handshake that stalls
+        // mid-flight leaves the calling thread inside the kernel's blocking loop with no way out,
+        // and userspace cannot time it out from the outside because it never regains control.
+        549 => {
+            let fd = arg1 as usize;
+            frame.rax = EBADF as u64;
+            if fd < 32 && KERNEL_CR3.load(Ordering::Relaxed) != 0 {
+                let percpu = crate::percpu::current();
+                let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                if curr_idx < percpu.scheduler.tasks.len() {
+                    let task = &mut percpu.scheduler.tasks[curr_idx];
+                    if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
+                        sock_mtx.lock().timeout_ms = arg2;
+                        frame.rax = 0;
+                    }
+                }
+            }
+        }
+
         513 => { // sys_wait_vsync — returns 1 if the vblank was observed, 0 on timeout / no GPU.
             let mut seen = 0u64;
             unsafe {
@@ -2449,55 +2449,78 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                 return open_file.read(buf_slice) as isize;
             },
             FileDescriptor::Socket(sock_mtx) => {
-                crate::drivers::net::poll_network();
-                let sock = sock_mtx.lock();
+                // ★ Copy everything needed out of the fd table BEFORE the wait loop below, which
+                // re-enables interrupts and yields via `int 0x41`. `task` is a raw &mut into the
+                // scheduler's task Vec; holding a borrow of its fd_table across a deschedule would
+                // dangle if that Vec reallocated while this task was away.
+                let (kind, is_non_blocking, stack, gen, timeout_ms) = {
+                    let s = sock_mtx.lock();
+                    (s.kind.clone(), s.non_blocking, s.stack, s.gen, s.timeout_ms)
+                };
+                crate::drivers::net::poll_stack(stack);
 
-                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-                if let Some(sockets) = sockets_lock.as_mut() {
-                    match sock.kind {
-                        SocketKind::Udp(handle) => {
+                match kind {
+                    SocketKind::Udp(handle) => {
+                        let got = crate::drivers::net::with_sockets(stack, gen, |sockets| {
                             let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
-                            if let Ok((data, _meta)) = socket.recv() {
-                                let copy_len = core::cmp::min(data.len(), len);
-                                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
-                                return copy_len as isize;
+                            match socket.recv() {
+                                Ok((data, _meta)) => {
+                                    let copy_len = core::cmp::min(data.len(), len);
+                                    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
+                                    Some(copy_len as isize)
+                                }
+                                Err(_) => None,
                             }
-                        },
-                        SocketKind::Tcp(handle) => {
-                            let is_non_blocking = sock.non_blocking;
-                            drop(sock); // Drop lock during the yield cycle
+                        });
+                        if let Some(Some(n)) = got { return n; }
+                        return EAGAIN as isize;
+                    },
+                    SocketKind::Tcp(handle) => {
+                        let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                        loop {
+                            crate::drivers::net::poll_stack(stack);
 
-                            loop {
-                                crate::drivers::net::poll_network();
-                                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-                                if let Some(sockets) = sockets_lock.as_mut() {
-                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                                    if socket.can_recv() {
-                                        let user_slice = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
-                                        if let Ok(received) = socket.recv_slice(user_slice) {
-                                            if received > 0 { return received as isize; }
-                                        }
-                                    } else if !socket.may_recv() {
-                                        return 0; // Connection closed gracefully (EOF)
+                            let got = crate::drivers::net::with_sockets(stack, gen, |sockets| {
+                                let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                if socket.can_recv() {
+                                    let user_slice = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                                    match socket.recv_slice(user_slice) {
+                                        Ok(n) if n > 0 => Some(n as isize),
+                                        _ => None,
                                     }
+                                } else if !socket.may_recv() {
+                                    Some(0) // Connection closed gracefully (EOF)
+                                } else {
+                                    None
                                 }
-                                drop(sockets_lock);
+                            });
+                            match got {
+                                Some(Some(n)) => return n,
+                                Some(None) => {}   // nothing readable yet
+                                None => return 0,  // link (and its whole SocketSet) went away: EOF
+                            }
 
-                                if is_non_blocking {
-                                    return EAGAIN as isize; // Async bypass
-                                }
+                            if is_non_blocking {
+                                return EAGAIN as isize; // Async bypass
+                            }
 
-                                // Yield thread safely while waiting for new hardware frames
-                                unsafe {
-                                    x86_64::instructions::interrupts::enable();
-                                    core::arch::asm!("int 0x41");
-                                    x86_64::instructions::interrupts::disable();
+                            // Bail out on a stalled peer rather than blocking this thread forever.
+                            if timeout_ms != 0 {
+                                let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                                if now.saturating_sub(start_ms) > timeout_ms {
+                                    return ETIMEDOUT as isize;
                                 }
+                            }
+
+                            // Yield thread safely while waiting for new hardware frames
+                            unsafe {
+                                x86_64::instructions::interrupts::enable();
+                                core::arch::asm!("int 0x41");
+                                x86_64::instructions::interrupts::disable();
                             }
                         }
                     }
                 }
-                return EAGAIN as isize; 
             },
             FileDescriptor::PipeRead(pipe_mtx) => {
                 let mut pipe = pipe_mtx.lock();
@@ -2543,52 +2566,59 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
         match fd_enum {
             FileDescriptor::File(open_file) => return open_file.write(buf_slice) as isize,
             FileDescriptor::Socket(sock_mtx) => {
-                crate::drivers::net::poll_network(); 
+                // Same reason as the read path: snapshot the socket before any yield, never hold a
+                // borrow of the fd table across `int 0x41`.
+                let (kind, is_non_blocking, stack, gen, remote, timeout_ms) = {
+                    let s = sock_mtx.lock();
+                    (s.kind.clone(), s.non_blocking, s.stack, s.gen, s.remote, s.timeout_ms)
+                };
+                crate::drivers::net::poll_stack(stack);
 
-                let sock = sock_mtx.lock();
-                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-                
-                if let Some(sockets) = sockets_lock.as_mut() {
-                    match sock.kind {
-                        SocketKind::Udp(handle) => {
+                match kind {
+                    SocketKind::Udp(handle) => {
+                        let endpoint = match remote { Some(e) => e, None => return EAGAIN as isize };
+                        let sent = crate::drivers::net::with_sockets(stack, gen, |sockets| {
                             let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
-                            if let Some(endpoint) = sock.remote {
-                                if socket.send_slice(buf_slice, endpoint).is_ok() {
-                                    return buf_slice.len() as isize;
+                            socket.send_slice(buf_slice, endpoint).is_ok()
+                        });
+                        if sent == Some(true) { return buf_slice.len() as isize; }
+                        return EAGAIN as isize;
+                    },
+                    SocketKind::Tcp(handle) => {
+                        let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                        loop {
+                            crate::drivers::net::poll_stack(stack);
+
+                            let sent = crate::drivers::net::with_sockets(stack, gen, |sockets| {
+                                let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                                if socket.can_send() { socket.send_slice(buf_slice).ok() } else { None }
+                            });
+                            match sent {
+                                Some(Some(n)) => return n as isize,
+                                Some(None) => {}                 // send window full; wait
+                                None => return EBADF as isize,   // link went away
+                            }
+
+                            if is_non_blocking {
+                                return EAGAIN as isize;
+                            }
+
+                            // A peer that stops draining our send window must not wedge us forever.
+                            if timeout_ms != 0 {
+                                let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                                if now.saturating_sub(start_ms) > timeout_ms {
+                                    return ETIMEDOUT as isize;
                                 }
                             }
-                        },
-                        SocketKind::Tcp(handle) => {
-                            let is_non_blocking = sock.non_blocking;
-                            drop(sock);
 
-                            loop {
-                                crate::drivers::net::poll_network();
-                                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-                                if let Some(sockets) = sockets_lock.as_mut() {
-                                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                                    if socket.can_send() {
-                                        if let Ok(sent) = socket.send_slice(buf_slice) {
-                                            return sent as isize;
-                                        }
-                                    }
-                                }
-                                drop(sockets_lock);
-
-                                if is_non_blocking {
-                                    return EAGAIN as isize;
-                                }
-
-                                unsafe {
-                                    x86_64::instructions::interrupts::enable();
-                                    core::arch::asm!("int 0x41");
-                                    x86_64::instructions::interrupts::disable();
-                                }
+                            unsafe {
+                                x86_64::instructions::interrupts::enable();
+                                core::arch::asm!("int 0x41");
+                                x86_64::instructions::interrupts::disable();
                             }
                         }
                     }
                 }
-                return EAGAIN as isize;
             },
             FileDescriptor::PipeWrite(pipe_mtx) => {
                 let mut pipe = pipe_mtx.lock();
@@ -2613,19 +2643,28 @@ const EINPROGRESS: i64 = -115;
 const ECONNREFUSED: i64 = -111;
 const ETIMEDOUT: i64 = -110;
 
+/// Abort and free a socket in whichever stack owns it.
+///
+/// Takes the socket's identity BY VALUE so no borrow of the fd table is alive across the call. It
+/// never blocks on a WiFi lock — if that set is busy the free is deferred to the poller — so this is
+/// safe from the interrupts-disabled teardown paths.
+fn destroy_socket(stack: crate::drivers::net::NetStack, gen: u64, kind: SocketKind) {
+    crate::drivers::net::destroy_socket_deferred(stack, gen, kind);
+}
+
 #[no_mangle]
 pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
-    let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-    if sockets_lock.is_none() { *sockets_lock = Some(smoltcp::iface::SocketSet::new(alloc::vec![])); }
-    
-    if let Some(sockets) = sockets_lock.as_mut() {
-        // 🔥 MILESTONE 3.1: Linux checks if SOCK_NONBLOCK (2048 / 0x800) is set in the type parameter
-        let is_non_blocking = (_typ & 2048) != 0;
-        let clean_type = _typ & !2048; // Strip the flag out to get the raw type (1 = TCP, 2 = UDP)
+    // Route to whichever stack actually has a link. Chosen ONCE, here, and remembered on the socket:
+    // the handle below is an index into this stack's SocketSet and is meaningless in the other one.
+    let (stack, gen) = crate::drivers::net::active_stack();
 
-        let local_port = NEXT_LOCAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        
-        let handle = if clean_type == 1 {
+    // 🔥 MILESTONE 3.1: Linux checks if SOCK_NONBLOCK (2048 / 0x800) is set in the type parameter
+    let is_non_blocking = (_typ & 2048) != 0;
+    let clean_type = _typ & !2048; // Strip the flag out to get the raw type (1 = TCP, 2 = UDP)
+    let local_port = NEXT_LOCAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    let handle = crate::drivers::net::with_sockets(stack, gen, |sockets| {
+        if clean_type == 1 {
             let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
             let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0; 32768]);
             let socket = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
@@ -2636,23 +2675,40 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
             let mut socket = smoltcp::socket::udp::Socket::new(rx_buffer, tx_buffer);
             let _ = socket.bind(local_port);
             sockets.add(socket)
+        }
+    });
+
+    if let Some(handle) = handle {
+        let kind = if clean_type == 1 { SocketKind::Tcp(handle) } else { SocketKind::Udp(handle) };
+
+        // ★ Every failure path from here on must remove the socket again. It is already in the
+        // SocketSet, and each one owns 64 KiB of TX/RX buffers — leaking one per failed open would
+        // exhaust the heap under a browser, which opens sockets constantly.
+        let placed = 'place: {
+            if KERNEL_CR3.load(Ordering::Relaxed) == 0 { break 'place None; }
+            let percpu = crate::percpu::current();
+
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { break 'place None; }
+
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            for i in 3..32 {
+                if task.fd_table[i].is_none() {
+                    let ks = KernelSocket {
+                        kind: kind.clone(), local_port, remote: None,
+                        non_blocking: is_non_blocking, stack, gen,
+                        timeout_ms: 0, // block forever until userspace asks otherwise (syscall 549)
+                    };
+                    task.fd_table[i] = Some(FileDescriptor::Socket(Arc::new(Mutex::new(ks))));
+                    break 'place Some(i as i64);
+                }
+            }
+            None
         };
 
-        let kind = if clean_type == 1 { SocketKind::Tcp(handle) } else { SocketKind::Udp(handle) };
-        let ks = KernelSocket { kind, local_port, remote: None, non_blocking: is_non_blocking };
-        
-        if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return EBADF; }
-        let percpu = crate::percpu::current();
-        
-        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-        if curr_idx >= percpu.scheduler.tasks.len() { return EBADF; }
-        
-        let task = &mut percpu.scheduler.tasks[curr_idx];
-        for i in 3..32 {
-            if task.fd_table[i].is_none() {
-                task.fd_table[i] = Some(FileDescriptor::Socket(Arc::new(Mutex::new(ks))));
-                return i as i64;
-            }
+        match placed {
+            Some(fd) => return fd,
+            None => destroy_socket(stack, gen, kind),
         }
     }
     -24 // EMFILE
@@ -2684,16 +2740,16 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
         if let SocketKind::Tcp(handle) = sock.kind {
             let local_port = sock.local_port;
             let is_non_blocking = sock.non_blocking;
-            
-            {
-                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-                let mut iface_lock = crate::drivers::net::NET_IFACE.lock();
-                if let (Some(sockets), Some(iface)) = (sockets_lock.as_mut(), iface_lock.as_mut()) {
-                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                    if socket.connect(iface.context(), IpEndpoint::new(addr, port), local_port).is_err() {
-                        return ECONNREFUSED;
-                    }
-                } else { return EBADF; }
+            let stack = sock.stack;
+            let gen = sock.gen;
+
+            match crate::drivers::net::with_stack(stack, gen, |sockets, iface| {
+                let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                socket.connect(iface.context(), IpEndpoint::new(addr, port), local_port).is_ok()
+            }) {
+                Some(true) => {}
+                Some(false) => return ECONNREFUSED,
+                None => return EBADF, // stack gone (link dropped) or never came up
             }
 
             // Drop lock while we poll/sleep to avoid cross-thread deadlocks
@@ -2707,20 +2763,16 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
             // Blocking Loop: Put thread to sleep until TCP handshakes finish or fail
             let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
             loop {
-                crate::drivers::net::poll_network();
-                
-                let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-                if let Some(sockets) = sockets_lock.as_mut() {
-                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                    
-                    if socket.state() == smoltcp::socket::tcp::State::Established {
-                        return 0; // Connected!
-                    }
-                    if socket.state() == smoltcp::socket::tcp::State::Closed {
-                        return ECONNREFUSED; // Connection rejected
-                    }
+                crate::drivers::net::poll_stack(stack);
+
+                match crate::drivers::net::with_sockets(stack, gen, |sockets| {
+                    sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle).state()
+                }) {
+                    Some(smoltcp::socket::tcp::State::Established) => return 0,
+                    Some(smoltcp::socket::tcp::State::Closed) => return ECONNREFUSED,
+                    Some(_) => {}
+                    None => return ECONNREFUSED, // link went away mid-handshake
                 }
-                drop(sockets_lock);
 
                 // Timeout check (safely timeout after 10 seconds)
                 let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
@@ -2761,24 +2813,33 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
         Err(_) => return 0,
     };
 
-    crate::serial_println!("[DNS] Resolving: {}", hostname_str);
+    // Resolve on whichever stack has the link, and read that stack's DNS socket — the WiFi one is
+    // configured from the DHCP lease the driver negotiated, the wired one from its own DHCP.
+    let (stack, gen) = crate::drivers::net::active_stack();
+    crate::serial_println!("[DNS] Resolving {} via {:?} (gen {})", hostname_str, stack, gen);
+
+    let dns_handle = match crate::drivers::net::dns_handle(stack) {
+        Some(h) => h,
+        None => {
+            // Wired: poll_network has never built its socket set. WiFi: no interface, or its
+            // handle lock was busy. Either way there is no resolver to ask.
+            crate::serial_println!("[DNS] no DNS socket on {:?} — is the link up?", stack);
+            return 0;
+        }
+    };
 
     // 1. Fire the DNS Query
-    let query_handle = {
-        let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-        let mut iface_lock = crate::drivers::net::NET_IFACE.lock();
-        let dns_lock = crate::drivers::net::DNS_HANDLE.lock();
-        
-        if let (Some(sockets), Some(iface), Some(dns_handle)) = (sockets_lock.as_mut(), iface_lock.as_mut(), *dns_lock) {
-            let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
-            match dns_socket.start_query(iface.context(), hostname_str, smoltcp::wire::DnsQueryType::A) {
-                Ok(handle) => handle,
-                Err(e) => {
-                    crate::serial_println!("[DNS] Failed to start query: {:?}", e);
-                    return 0;
-                }
-            }
-        } else {
+    let query_handle = match crate::drivers::net::with_stack(stack, gen, |sockets, iface| {
+        let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
+        dns_socket.start_query(iface.context(), hostname_str, smoltcp::wire::DnsQueryType::A)
+    }) {
+        Some(Ok(handle)) => handle,
+        Some(Err(e)) => {
+            crate::serial_println!("[DNS] Failed to start query: {:?}", e);
+            return 0;
+        }
+        None => {
+            crate::serial_println!("[DNS] {:?} stack has no interface/socket set (gen {})", stack, gen);
             return 0;
         }
     };
@@ -2787,35 +2848,40 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
     
     // 2. Safely Block until the DNS Server Replies
     loop {
-        crate::drivers::net::poll_network();
-        
-        let mut sockets_lock = crate::drivers::net::GLOBAL_SOCKETS.lock();
-        if let Some(sockets) = sockets_lock.as_mut() {
-            let dns_handle = crate::drivers::net::DNS_HANDLE.lock().unwrap();
+        crate::drivers::net::poll_stack(stack);
+
+        let result = crate::drivers::net::with_sockets(stack, gen, |sockets| {
             let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
-            
             match dns_socket.get_query_result(query_handle) {
                 Ok(addrs) => {
                     for addr in addrs.iter() {
                         if let smoltcp::wire::IpAddress::Ipv4(ipv4) = addr {
-                            crate::serial_println!("[DNS] Resolved {} -> {}", hostname_str, ipv4);
-                            let octets = ipv4.0;
+                            let o = ipv4.0;
                             // Pack the 4 bytes into a single u64 to return across the Syscall boundary
-                            return (octets[0] as u64) | ((octets[1] as u64) << 8) | ((octets[2] as u64) << 16) | ((octets[3] as u64) << 24);
+                            return Some((o[0] as u64) | ((o[1] as u64) << 8)
+                                | ((o[2] as u64) << 16) | ((o[3] as u64) << 24));
                         }
                     }
-                    return 0; // No IPv4 found
-                },
-                Err(smoltcp::socket::dns::GetQueryResultError::Pending) => {
-                    // Still waiting...
-                },
+                    Some(0) // answered, but no IPv4 in it
+                }
+                Err(smoltcp::socket::dns::GetQueryResultError::Pending) => None,
                 Err(_) => {
                     crate::serial_println!("[DNS] Query Failed/NXDOMAIN.");
-                    return 0; 
+                    Some(0)
                 }
             }
+        });
+        match result {
+            Some(Some(packed)) => {
+                if packed != 0 {
+                    crate::serial_println!("[DNS] Resolved {} -> {}.{}.{}.{}", hostname_str,
+                        packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff, (packed >> 24) & 0xff);
+                }
+                return packed;
+            }
+            Some(None) => {}   // still waiting
+            None => return 0,  // stack went away
         }
-        drop(sockets_lock);
 
         let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
         if current_ms.saturating_sub(start_ms) > 5000 {

@@ -68,6 +68,90 @@ impl TerminalApp {
         }
     }
 
+    /// One line describing the Wi-Fi link, including the DNS server from its DHCP lease.
+    ///
+    /// The kernel only routes sockets to the Wi-Fi stack once `init_wifi_iface` has published an
+    /// interface, which needs a DHCP lease — so "connected but no IP" and "not connected" both mean
+    /// traffic falls back to the wired NIC, and on this laptop that goes nowhere.
+    fn link_summary(&self) -> String {
+        match sys_wifi_status() {
+            None => "wifi: no adapter\n".to_string(),
+            Some(st) => {
+                let state = match st.state {
+                    WIFI_IDLE => "idle (not connected)",
+                    WIFI_CONNECTING => "connecting",
+                    WIFI_CONNECTED => "connected",
+                    WIFI_AUTH_FAILED => "auth failed",
+                    WIFI_NO_LEASE => "associated but NO DHCP LEASE",
+                    WIFI_HW_FAILED => "hardware failure",
+                    WIFI_RADIO_OFF => "radio OFF",
+                    _ => "unknown",
+                };
+                format!(
+                    "wifi: {} ssid={:?} ip={}.{}.{}.{} gw={}.{}.{}.{} dns={}.{}.{}.{}\n",
+                    state, st.name(),
+                    st.ip[0], st.ip[1], st.ip[2], st.ip[3],
+                    st.router[0], st.router[1], st.router[2], st.router[3],
+                    st.dns[0], st.dns[1], st.dns[2], st.dns[3],
+                )
+            }
+        }
+    }
+
+    /// `fetch <url>` — the end-to-end proof that userspace networking reaches the internet.
+    ///
+    /// Exercises the whole stack in one command: DNS on the active link, a routed TCP socket, the
+    /// `std::net` PAL, and — for `https://` — a real TLS 1.3 handshake against the system roots.
+    /// Before the socket syscalls learned about the WiFi stack this could not work at all on this
+    /// laptop, because the only working link is the radio.
+    ///
+    /// Everything above the socket lives in `nyx_net`, so this command and the browser share one
+    /// HTTP implementation — redirects, chunked bodies and TLS included. A failure here is a failure
+    /// the browser would have had too, which is the point of keeping the command.
+    fn do_fetch(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.output_history.push_str("usage: fetch <url>   (http:// or https://)\n");
+            return;
+        }
+
+        // Print the link state up front: a DNS failure is almost always "there is no usable link"
+        // rather than a real name-resolution problem, and this says which without needing serial.
+        self.output_history.push_str(&self.link_summary());
+        self.output_history.push_str(&format!("GET {arg}\n"));
+
+        let resp = match nyx_net::get(arg) {
+            Ok(r) => r,
+            Err(e) => {
+                self.output_history.push_str(&format!("  failed: {e}\n"));
+                return;
+            }
+        };
+
+        // Report where the body actually came from — with redirects followed silently, the final URL
+        // is the only way to tell that `http://x` quietly became `https://www.x/`.
+        self.output_history.push_str(&format!(
+            "  {} | {} bytes | {}\n  from {}\n",
+            resp.status,
+            resp.body.len(),
+            resp.content_type().unwrap_or("(no content-type)"),
+            resp.url
+        ));
+
+        // Only the head of the response goes on screen — a full page would blow out the scrollback,
+        // and the byte count above is what actually proves the transfer.
+        let text = resp.text();
+        // Cut on a char boundary, not a byte index: `text` comes from from_utf8_lossy, so a fixed
+        // 1024 can land mid-sequence and slicing there panics.
+        let cut = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(core::iter::once(text.len()))
+            .take_while(|&i| i <= 1024)
+            .last()
+            .unwrap_or(0);
+        self.output_history.push_str(&format!("--- head ---\n{}\n", &text[..cut]));
+    }
+
     // D4: `toolchains` — enumerate the registry's installed language backends. This is the single
     // place the terminal learns what languages it can build; adding one is a one-line change in
     // Registry::with_defaults(), no terminal edit needed.
@@ -223,6 +307,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("Commands: help, clear, echo <text>, settings, explorer, sysmon, network\n");
                 self.output_history.push_str("  toolchains        - list installed language compilers\n");
                 self.output_history.push_str("  compile [file]    - compile a source file (defaults to the bundled sample.ql)\n");
+                self.output_history.push_str("  fetch <url>       - HTTP/HTTPS GET over the active link (WiFi or wired)\n");
             } else if cmd == "clear" {
                 self.output_history.clear();
             } else if cmd == "toolchains" {
@@ -231,6 +316,8 @@ impl NyxApp for TerminalApp {
                 self.do_compile(DEFAULT_SAMPLE);
             } else if let Some(arg) = cmd.strip_prefix("compile ") {
                 self.do_compile(arg.trim());
+            } else if let Some(arg) = cmd.strip_prefix("fetch ") {
+                self.do_fetch(arg.trim());
             } else if cmd == "settings" {
                 self.output_history.push_str("Launching Settings...\n");
                 if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Settings.nyx/run.bin\0"); sys_exit(1); }

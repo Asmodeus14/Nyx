@@ -27,6 +27,19 @@ pub struct KernelSocket {
     pub local_port: u16,
     pub remote: Option<smoltcp::wire::IpEndpoint>,
     pub non_blocking: bool,
+    /// Which of the two smoltcp stacks this socket lives in. A `SocketHandle` is an index into one
+    /// specific `SocketSet`, so looking it up in the other stack would alias an unrelated socket.
+    pub stack: crate::drivers::net::NetStack,
+    /// The WiFi interface generation this socket was created against (0 for wired, which is never
+    /// destroyed). Goes stale when a disconnect/reconnect rebuilds the set — see `stack_alive`.
+    pub gen: u64,
+    /// Blocking read/write deadline in milliseconds; 0 = block forever (the historical behaviour).
+    ///
+    /// Without this a stalled peer wedges the calling thread permanently: the blocking loops in
+    /// `sys_read`/`sys_write` only exit on data or on the link dying, so a half-open connection or a
+    /// TLS handshake that stops mid-flight has no way out — and userspace cannot impose its own
+    /// deadline, because it never regains control to check one. Set via syscall 549.
+    pub timeout_ms: u64,
 }
 
 #[derive(Clone)]

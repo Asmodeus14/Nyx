@@ -179,6 +179,18 @@ def main():
         return insert_arm_after_cfg_select(os.path.join(B, "process", "mod.rs"), arm, MARK)
     do("process/mod.rs", process)
 
+    # --- Browser blocker #3: std::net. Real TcpStream + lookup_host over the kernel's
+    #     socket(41)/connect(42)/read/write/close and dns_resolve(534); TcpListener and UdpSocket
+    #     stay as the unsupported stubs (the kernel has no listen/accept and no bound UDP). rustls
+    #     and every HTTP client are written against std::net, so nothing above this could link
+    #     without it. The arm goes in sys/net/connection/mod.rs, whose FIRST cfg_select is the
+    #     connection one — sys/net/mod.rs itself has none. Hostname falls through to unsupported. ---
+    def net():
+        copy("sys/net_nyx.rs", os.path.join(B, "net", "connection", "nyx.rs"))
+        arm = f'    target_os = "nyx" => {{ {MARK}\n        mod nyx;\n        pub use nyx::*;\n    }}\n'
+        return insert_arm_after_cfg_select(os.path.join(B, "net", "connection", "mod.rs"), arm, MARK)
+    do("net/connection/mod.rs", net)
+
     # --- B-γ.3: sys::exit. `std::process::exit` (and returning from `main`) calls
     #     `crate::sys::exit::exit(code)`. nyx has no arm in that cfg_select, so it fell through to
     #     `_ => crate::intrinsics::abort()` (a `ud2` invalid opcode) — every std process that reached

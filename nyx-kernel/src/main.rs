@@ -22,6 +22,7 @@ pub mod smp;
 pub mod percpu;
 pub mod time;
 pub mod rtc;
+pub mod random;
 pub mod task;
 pub mod executor;
 pub mod scheduler;
@@ -135,6 +136,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // tachometer is gated on the answer instead of on a hand-flipped constant. Needs the memory map
     // because this firmware does not shadow SMBIOS in the legacy window, so we have to go looking.
     smbios::init(&boot_info.memory_regions);
+
+    // Probe the CPU's DRNG before anything can ask for entropy. TLS key material comes from
+    // getrandom(318), and the PRNG that used to back it is guessable — see random.rs.
+    random::init();
 
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();

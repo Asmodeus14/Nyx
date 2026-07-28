@@ -13,6 +13,9 @@ nyx-gui = { path = "../../libs/gui" }
 # D4: the pluggable compiler registry. Plain std + qclang_compiler (default-features=false → logos +
 # thiserror), all proven to build for target_os=nyx. This is what makes `compile`/`toolchains` work.
 nyx-toolchains = { path = "../../libs/toolchains" }
+# HTTP/1.1 + TLS 1.3 (rustls + the RustCrypto provider). Backs `fetch`, and is the same transport
+# the browser uses — one HTTP implementation, so a bug found here is fixed for both.
+nyx-net = { path = "../../libs/net" }
 
 [[bin]]
 name = "nyx-terminal"

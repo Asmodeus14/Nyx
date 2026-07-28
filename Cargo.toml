@@ -11,6 +11,9 @@ members = [
     "libs/gui",
     "libs/image",
     "libs/toolchains",
+    # HTTP/TLS transport for the browser work. A workspace member so `cargo test -p nyx-net` can
+    # exercise the URL and HTTP parsing on the host — only the socket layer needs real hardware.
+    "libs/net",
     
     # Applications
     "apps/init",

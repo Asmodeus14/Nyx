@@ -195,6 +195,272 @@ pub fn publish_wifi_snapshot(w: &crate::drivers::net::iwlwifi::IntelWifiDriver) 
     });
 }
 
+// ============================================================================
+// Userspace socket routing: which of the two stacks a socket lives in.
+// ============================================================================
+//
+// There are two independent smoltcp stacks here (wired rtl8168 and WiFi), and until now the socket
+// syscalls could only ever reach the wired one. On a laptop whose only working link is WiFi that
+// meant userspace had no network at all. A socket therefore records the stack it was created in and
+// every later operation is routed back to it — a socket must never be looked up in the other set,
+// because SocketHandles are indices and would silently alias an unrelated socket.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetStack {
+    Wired,
+    Wifi,
+}
+
+/// True once `init_wifi_iface` has published an interface. A lock-free flag rather than probing
+/// `WIFI_IFACE`, so the (very hot) routing decision never has to touch a lock that a ten-second
+/// join might be holding.
+static WIFI_IFACE_UP: AtomicBool = AtomicBool::new(false);
+
+/// Bumped every time a WiFi interface is created. `teardown_wifi_iface` destroys the whole
+/// `SocketSet`, so handles held by userspace outlive the set they refer to; after a reconnect a
+/// fresh set would hand out the SAME indices to different sockets. A socket carries the generation
+/// it was created in, and a mismatch means "this connection died with the link" — without it a
+/// read on a stale fd would quietly return another program's data.
+static WIFI_IFACE_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn wifi_iface_gen() -> u64 {
+    WIFI_IFACE_GEN.load(Ordering::Relaxed)
+}
+
+/// The stack a newly created socket should live in, plus its generation. WiFi wins when it is up:
+/// it is the link that has a default route on this machine.
+pub fn active_stack() -> (NetStack, u64) {
+    if WIFI_IFACE_UP.load(Ordering::Relaxed) && wifi_radio_on() {
+        (NetStack::Wifi, wifi_iface_gen())
+    } else {
+        (NetStack::Wired, 0)
+    }
+}
+
+/// Is a socket from `stack`/`gen` still backed by a live interface?
+pub fn stack_alive(stack: NetStack, gen: u64) -> bool {
+    match stack {
+        NetStack::Wired => true,
+        NetStack::Wifi => WIFI_IFACE_UP.load(Ordering::Relaxed) && wifi_iface_gen() == gen,
+    }
+}
+
+/// Run `f` against a stack's `SocketSet` and `Interface`, taking the locks with the interrupt
+/// discipline that stack requires. `None` means the stack isn't up (or the WiFi link went away).
+///
+/// ★ The two halves have OPPOSITE rules, which is the whole reason this helper exists — see the
+/// discipline notes at the top of this file:
+///   - **Wired** locks are shared with `poll_network_locked`, which runs masked. We mask too, so an
+///     interrupts-off syscall only ever waits out a bounded critical section.
+///   - **WiFi** locks are held by the idle task WITH INTERRUPTS ON, so blocking on one from a
+///     syscall (which runs at IF=0) is a hard deadlock: the holder can only be resumed by the timer,
+///     and the waiter has the timer masked. We therefore enable interrupts for the acquisition and
+///     restore the caller's IF afterwards, making both parties preemptible.
+pub fn with_stack<R>(
+    stack: NetStack,
+    gen: u64,
+    f: impl FnOnce(&mut SocketSet<'static>, &mut Interface) -> R,
+) -> Option<R> {
+    match stack {
+        NetStack::Wired => x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut iface_lock = NET_IFACE.lock();
+            let mut sockets_lock = GLOBAL_SOCKETS.lock();
+            match (sockets_lock.as_mut(), iface_lock.as_mut()) {
+                (Some(s), Some(i)) => Some(f(s, i)),
+                _ => None,
+            }
+        }),
+        NetStack::Wifi => {
+            if !stack_alive(NetStack::Wifi, gen) {
+                return None;
+            }
+            let had = x86_64::instructions::interrupts::are_enabled();
+            if !had {
+                x86_64::instructions::interrupts::enable();
+            }
+            // Same order poll_wifi uses (iface before sockets); it only ever try_locks, but keeping
+            // one global order means a future blocking caller can't invert it into a cycle.
+            let out = {
+                let mut iface_lock = WIFI_IFACE.lock();
+                let mut sockets_lock = WIFI_SOCKETS.lock();
+                match (sockets_lock.as_mut(), iface_lock.as_mut()) {
+                    (Some(s), Some(i)) => Some(f(s, i)),
+                    _ => None,
+                }
+            };
+            if !had {
+                x86_64::instructions::interrupts::disable();
+            }
+            out
+        }
+    }
+}
+
+/// `with_stack` for operations that need only the socket set.
+///
+/// Deliberately NOT `with_stack(.., |s, _| ..)`: the wired set is usable before its interface has a
+/// DHCP lease, and creating a socket must keep working in that window (it is also where the wired
+/// set gets lazily created, matching the original `sys_socket`). Requiring an `Interface` here would
+/// make `socket()` fail on an unconfigured wired link.
+pub fn with_sockets<R>(
+    stack: NetStack,
+    gen: u64,
+    f: impl FnOnce(&mut SocketSet<'static>) -> R,
+) -> Option<R> {
+    match stack {
+        NetStack::Wired => x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut sockets_lock = GLOBAL_SOCKETS.lock();
+            if sockets_lock.is_none() {
+                *sockets_lock = Some(SocketSet::new(alloc::vec![]));
+            }
+            sockets_lock.as_mut().map(f)
+        }),
+        NetStack::Wifi => {
+            if !stack_alive(NetStack::Wifi, gen) {
+                return None;
+            }
+            let had = x86_64::instructions::interrupts::are_enabled();
+            if !had {
+                x86_64::instructions::interrupts::enable();
+            }
+            let out = WIFI_SOCKETS.lock().as_mut().map(f);
+            if !had {
+                x86_64::instructions::interrupts::disable();
+            }
+            out
+        }
+    }
+}
+
+/// Drive one stack. Used by the socket syscalls' wait loops, which must not spin on a stack that
+/// nothing else is polling.
+pub fn poll_stack(stack: NetStack) {
+    match stack {
+        NetStack::Wired => poll_network(),
+        NetStack::Wifi => poll_wifi(),
+    }
+}
+
+/// The DNS socket belonging to a stack. Each stack has its own, pointed at the servers from that
+/// link's own DHCP lease, so a lookup is always asked of the resolver that can actually answer it.
+///
+/// ★ The WiFi arm must NOT be a bare `try_lock`. `poll_wifi` holds `WIFI_DNS_HANDLE` for the whole
+/// of `iface.poll()`, so a lookup that happens to land during a poll would miss and be reported as
+/// "there is no resolver" — a coin-flip failure that looks exactly like a dead link. Block for it,
+/// but with the WiFi discipline (enable IF for the acquisition, restore the caller's IF), because
+/// the holder is the preemptible idle task and waiting at IF=0 would deadlock outright.
+pub fn dns_handle(stack: NetStack) -> Option<SocketHandle> {
+    match stack {
+        NetStack::Wired => {
+            x86_64::instructions::interrupts::without_interrupts(|| *DNS_HANDLE.lock())
+        }
+        NetStack::Wifi => {
+            if !WIFI_IFACE_UP.load(Ordering::Relaxed) {
+                return None;
+            }
+            let had = x86_64::instructions::interrupts::are_enabled();
+            if !had {
+                x86_64::instructions::interrupts::enable();
+            }
+            let out = *WIFI_DNS_HANDLE.lock();
+            if !had {
+                x86_64::instructions::interrupts::disable();
+            }
+            out
+        }
+    }
+}
+
+/// Sockets whose owning process died while their `SocketSet` was locked by someone else.
+///
+/// Process teardown runs with interrupts DISABLED on purpose ("don't get buried alive"), so it can
+/// neither block on the WiFi locks (deadlock — the holder needs the timer to finish) nor enable
+/// interrupts to take them safely (it would risk being descheduled mid-teardown). Deferring is the
+/// way out: the pollers already hold the right lock with the right discipline, so they do the free.
+/// Without this a browser's connections would leak 64 KiB of smoltcp buffers each.
+static REAP_QUEUE: Mutex<Vec<(NetStack, u64, crate::scheduler::SocketKind)>> = Mutex::new(Vec::new());
+
+/// Free a socket now if its stack's lock is free, otherwise queue it for the poller.
+///
+/// Safe to call at any interrupt state — it never blocks on a WiFi lock. The wired path *does* block,
+/// but under `without_interrupts`, which is the discipline `poll_network_locked` already follows, so
+/// its holder is never preemptible and the wait is bounded.
+pub fn destroy_socket_deferred(stack: NetStack, gen: u64, kind: crate::scheduler::SocketKind) {
+    let done = match stack {
+        NetStack::Wired => x86_64::instructions::interrupts::without_interrupts(|| {
+            match GLOBAL_SOCKETS.lock().as_mut() {
+                Some(s) => {
+                    free_in(s, &kind);
+                    true
+                }
+                None => true, // no set at all: nothing to free
+            }
+        }),
+        NetStack::Wifi => {
+            if !stack_alive(NetStack::Wifi, gen) {
+                true // the whole SocketSet is already gone
+            } else {
+                match WIFI_SOCKETS.try_lock() {
+                    Some(mut g) => match g.as_mut() {
+                        Some(s) => {
+                            free_in(s, &kind);
+                            true
+                        }
+                        None => true,
+                    },
+                    None => false, // busy — defer
+                }
+            }
+        }
+    };
+    if !done {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            REAP_QUEUE.lock().push((stack, gen, kind));
+        });
+    }
+}
+
+fn free_in(sockets: &mut SocketSet<'static>, kind: &crate::scheduler::SocketKind) {
+    match *kind {
+        crate::scheduler::SocketKind::Tcp(h) => {
+            sockets.get_mut::<smoltcp::socket::tcp::Socket>(h).abort(); // send TCP RST
+            sockets.remove(h);
+        }
+        crate::scheduler::SocketKind::Udp(h) => {
+            sockets.remove(h);
+        }
+    }
+}
+
+/// Free any deferred sockets belonging to `stack`. Called by the pollers with `sockets` already held.
+fn drain_reaps(stack: NetStack, gen: u64, sockets: &mut SocketSet<'static>) {
+    // Masked and bounded: this lock is reached from process teardown at IF=0 as well as from here,
+    // so it must never be held across a preemption point (the WIFI_SNAPSHOT discipline).
+    let mine = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut q = REAP_QUEUE.lock();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut mine = Vec::new();
+        let mut keep = Vec::new();
+        for e in q.drain(..) {
+            // A stale generation means that whole SocketSet is gone; drop the entry, don't requeue.
+            if e.0 == stack && e.1 == gen {
+                mine.push(e);
+            } else if e.0 == stack {
+                // same stack, dead generation: nothing to free
+            } else {
+                keep.push(e);
+            }
+        }
+        *q = keep;
+        mine
+    });
+    for (_, _, kind) in mine.iter() {
+        free_in(sockets, kind);
+    }
+}
+
 /// Bring the WiFi link up as an IP interface, using the lease the driver already negotiated with
 /// its own DHCP exchange. Configuring statically (rather than adding a smoltcp DHCP socket) avoids
 /// two DHCP clients bidding for the same MAC, and means any traffic that flows is proof the
@@ -252,14 +518,21 @@ pub fn init_wifi_iface() {
         "[WIFI] P7: interface up — {}.{}.{}.{}/{} gw {}.{}.{}.{}",
         ip[0], ip[1], ip[2], ip[3], prefix, router[0], router[1], router[2], router[3]);
 
+    // New generation before publishing, so any socket created against this interface is stamped
+    // with it; UP goes last, once there is actually something behind the flag.
+    WIFI_IFACE_GEN.fetch_add(1, Ordering::Relaxed);
     *WIFI_DNS_HANDLE.lock() = Some(dns_handle);
     *WIFI_SOCKETS.lock() = Some(sockets);
     *WIFI_IFACE.lock() = Some(iface);
+    WIFI_IFACE_UP.store(true, Ordering::Release);
 }
 
 /// P8: drop the WiFi IP interface. Called when the link goes away (disconnect / network switch) so
 /// smoltcp stops polling a device whose lease no longer exists.
 pub fn teardown_wifi_iface() {
+    // Down first: this stops new sockets being routed here, and makes every socket already stamped
+    // with this generation report a dead link rather than indexing into a set that is about to go.
+    WIFI_IFACE_UP.store(false, Ordering::Release);
     *WIFI_DNS_QUERY.lock() = None;
     *WIFI_DNS_HANDLE.lock() = None;
     *WIFI_SOCKETS.lock() = None;
@@ -298,6 +571,9 @@ pub fn poll_wifi() {
     if let (Some(driver), Some(iface), Some(sockets), Some(dns_handle)) =
         (driver_lock.as_mut(), iface_lock.as_mut(), sockets_lock.as_mut(), dns_lock.as_mut())
     {
+        // Free sockets whose process exited while this set was locked (see REAP_QUEUE).
+        drain_reaps(NetStack::Wifi, wifi_iface_gen(), sockets);
+
         let tsc = unsafe { core::arch::x86_64::_rdtsc() };
         let tsc_mhz = crate::time::TSC_MHZ.load(Ordering::Relaxed).max(1);
         let timestamp = Instant::from_millis((tsc / (tsc_mhz * 1000)) as i64);
@@ -407,7 +683,10 @@ fn poll_network_locked() {
         (driver_lock.as_mut(), iface_lock.as_mut(), sockets_lock.as_mut(), dhcp_lock.as_mut(), dns_lock.as_mut()) {
         
         if was_pending { driver.ack_interrupt(); }
-        
+
+        // Free sockets whose process exited while this set was locked (see REAP_QUEUE).
+        drain_reaps(NetStack::Wired, 0, sockets);
+
         let mut lo: u32; let mut hi: u32;
         unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
         let tsc = ((hi as u64) << 32) | (lo as u64);

@@ -1,0 +1,29 @@
+[package]
+name = "nyx-net"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP/1.1 + TLS 1.3 client for Nyx — the transport layer under the browser"
+
+[lib]
+name = "nyx_net"
+path = "src/lib.rs"
+
+[lints.rust]
+# `rng.rs` is gated on target_os="nyx", which rustc does not know about when this crate is built for
+# the host (which it is, for `cargo test`). Declare the value rather than silencing the lint, so a
+# genuine typo in a cfg still gets caught.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("nyx"))'] }
+
+[dependencies]
+# No default features: rustls defaults to the aws-lc-rs provider, which is C/asm and cannot build
+# for nyx (no C toolchain exists in this repo).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+# ★ Must keep ITS defaults. `default-features = false` drops the crate's `alloc` feature and it is
+# written against alloc::{Arc, Box} -> ~95 "cannot find type `Box`" errors that read like a missing
+# target, not a missing feature.
+rustls-rustcrypto = "0.0.2-alpha"
+# 1.0 directly; the 0.26.x line is just a shim that re-exports 1.0.
+webpki-roots = "1.0"
+# The whole crypto stack funnels its entropy through getrandom 0.2 (via rand_core 0.6), and there is
+# no target_os="nyx" backend, so we register one. See src/rng.rs.
+getrandom = { version = "0.2", features = ["custom"] }
