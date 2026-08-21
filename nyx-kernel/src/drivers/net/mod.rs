@@ -175,7 +175,9 @@ pub fn publish_wifi_snapshot(w: &crate::drivers::net::iwlwifi::IntelWifiDriver) 
         e[34] = net.band;
         e[35] = (net.secure as u8)
             | ((net.rsn as u8) << 1)
-            | (((!ssid.is_empty() && ssid == name) as u8) << 2);
+            | (((!ssid.is_empty() && ssid == name) as u8) << 2)
+            // bit3: RSN present but the group cipher is not CCMP — see ScanResult::group_cipher_unsupported.
+            | ((net.group_cipher_unsupported() as u8) << 3);
         e[36..42].copy_from_slice(&net.bssid);
         nets.push(e);
     }

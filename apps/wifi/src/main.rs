@@ -460,6 +460,15 @@ impl NyxApp for WifiApp {
             canvas.print_str(36, 50, st_text, Color::TEXT_MUTED, 1);
         }
 
+        // What this OS can actually join, stated up front. Without it a greyed-out row is a dead
+        // end — the user is told a network won't work but not what would. Right-aligned, and only
+        // when there is genuinely room, so it can never collide with the buttons above it.
+        let caps = "Supports WPA2-PSK (AES/CCMP)";
+        let caps_w = Canvas::text_width(caps, 1);
+        if w > caps_w + 260 {
+            canvas.print_str(w - caps_w - 20, 50, caps, Color::TEXT_MUTED, 1);
+        }
+
         // Rescan is refused by the kernel while associated (it retunes the radio off the AP channel
         // for seconds), so grey it out rather than letting the click fail.
         Self::draw_button(
@@ -552,7 +561,19 @@ impl NyxApp for WifiApp {
             if net.is_current() && self.connected() {
                 canvas.print_str(36, y + 22, "Connected", Color::ACCENT_GREEN, 1);
             } else if unsupported {
-                canvas.print_str(36, y + 22, "Unsupported security", Color::TEXT_MUTED, 1);
+                // Name the actual obstacle. "Unsupported security" told the user nothing they could
+                // act on; "the router is in mixed mode" points straight at the setting to change.
+                canvas.print_str(
+                    36,
+                    y + 22,
+                    if net.needs_tkip() {
+                        "TKIP group cipher — router is in WPA/WPA2 mixed mode"
+                    } else {
+                        "WEP or WPA1 — not supported"
+                    },
+                    Color::TEXT_MUTED,
+                    1,
+                );
             } else if self.saved.as_deref() == Some(net.name()) {
                 canvas.print_str(36, y + 22, "Remembered", Color::TEXT_MUTED, 1);
             }
@@ -561,15 +582,18 @@ impl NyxApp for WifiApp {
         // ── Password / join panel ──
         if let Some(i) = self.sel {
             let pt = self.panel_top();
-            let (secure, unsupported, name) = match self.nets.get(i) {
-                Some(n) => (n.is_secure(), n.is_unsupported_security(), String::from(n.name())),
-                None => (false, false, String::new()),
+            let (secure, unsupported, tkip, name) = match self.nets.get(i) {
+                Some(n) => (n.is_secure(), n.is_unsupported_security(), n.needs_tkip(), String::from(n.name())),
+                None => (false, false, false, String::new()),
             };
 
             canvas.fill_rect(0, pt, w, h.saturating_sub(pt), Color::WARM_SURFACE);
             canvas.fill_rect(0, pt, w, 1, Color::WARM_BORDER);
 
-            let prompt = if unsupported {
+            let prompt = if tkip {
+                alloc::format!(
+                    "\"{}\" uses a TKIP group cipher. Set the router to WPA2-AES only.", name)
+            } else if unsupported {
                 alloc::format!("\"{}\" uses WEP or WPA1 — not supported.", name)
             } else if secure {
                 alloc::format!("Enter the password for \"{}\"", name)

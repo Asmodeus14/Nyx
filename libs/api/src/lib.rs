@@ -577,8 +577,15 @@ impl WifiNetwork {
         core::str::from_utf8(&self.ssid[..self.ssid_len as usize]).unwrap_or("?")
     }
     pub fn is_secure(&self) -> bool { self.flags & 0x01 != 0 }
-    /// True when the AP is secured with something we can't join (WEP / WPA1: privacy but no RSN IE).
-    pub fn is_unsupported_security(&self) -> bool { self.is_secure() && self.flags & 0x02 == 0 }
+    /// WEP or WPA1: the privacy bit is set but there is no RSN IE.
+    pub fn is_legacy_security(&self) -> bool { self.is_secure() && self.flags & 0x02 == 0 }
+    /// WPA2, but the AP's GROUP cipher is TKIP rather than CCMP — a router left in WPA/WPA2 mixed
+    /// mode. Nyx speaks CCMP only, so the AP rejects the association outright (status 41).
+    pub fn needs_tkip(&self) -> bool { self.flags & 0x08 != 0 }
+    /// Anything secured in a way we cannot actually join. Kept as one predicate because every
+    /// caller wants the same behaviour — grey the row out, refuse Join — while the two accessors
+    /// above let the UI say *which* problem it is rather than a bare "unsupported".
+    pub fn is_unsupported_security(&self) -> bool { self.is_legacy_security() || self.needs_tkip() }
     pub fn is_current(&self) -> bool { self.flags & 0x04 != 0 }
 }
 

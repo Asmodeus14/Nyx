@@ -121,6 +121,111 @@ unsafe fn write_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
     }
 }
 
+// ===================== Phase 2: readiness (poll / select) =====================
+
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+
+/// Largest `nfds` serviced in one call. Bounds the work done per pass and keeps a `select` fd_set
+/// to a single 64-bit word. The fd table is 32 entries today, so this is already generous.
+const POLL_MAX: usize = 64;
+
+/// Clone a descriptor out of the current task's fd table.
+///
+/// Cloning rather than borrowing is the entire point. The loops below yield via `int 0x41`, and the
+/// scheduler's `tasks: Vec<Process>` can reallocate while this task is descheduled — a borrow of
+/// `fd_table` held across that yield dangles. The `Arc`s inside keep the pipe/socket alive on their
+/// own, so the snapshot stays valid even if the table moves. Same hazard the socket read path
+/// documents; `poll` just faces it N times over instead of once.
+unsafe fn snapshot_fd(fd: usize) -> Option<FileDescriptor> {
+    let percpu = crate::percpu::current();
+    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if curr_idx >= percpu.scheduler.tasks.len() { return None; }
+    let table = &percpu.scheduler.tasks[curr_idx].fd_table;
+    if fd >= table.len() { return None; }
+    table[fd].clone()
+}
+
+/// What would this descriptor do right now, without actually reading or writing it?
+/// Returns `(readable, writable, hup)`.
+///
+/// Deliberately does NOT poll the network stack — the caller does that once per pass. Polling per
+/// fd would re-run the whole smoltcp state machine N times per loop; that is a heat and latency
+/// problem this kernel has already been burned by once.
+fn fd_readiness(fd: &FileDescriptor) -> (bool, bool, bool) {
+    match fd {
+        // A regular file never blocks — both directions always complete. POSIX requires both bits.
+        FileDescriptor::File(_) => (true, true, false),
+
+        FileDescriptor::PipeRead(q) => {
+            let has_data = !q.lock().is_empty();
+            // Holding the last Arc means every writer is gone. Without surfacing that, a reader
+            // polls an orphaned pipe forever instead of seeing EOF.
+            let hup = alloc::sync::Arc::strong_count(q) == 1;
+            // Readable on HUP too: read() returns 0 at once, which is a completed call, not a block.
+            (has_data || hup, false, hup)
+        }
+
+        FileDescriptor::PipeWrite(q) => {
+            let hup = alloc::sync::Arc::strong_count(q) == 1;
+            (false, !hup, hup)
+        }
+
+        FileDescriptor::Socket(sock_mtx) => {
+            let (kind, stack, gen) = {
+                let s = sock_mtx.lock();
+                (s.kind.clone(), s.stack, s.gen)
+            };
+            let r = match kind {
+                SocketKind::Udp(h) => crate::drivers::net::with_sockets(stack, gen, |set| {
+                    let s = set.get_mut::<smoltcp::socket::udp::Socket>(h);
+                    (s.can_recv(), s.can_send(), false)
+                }),
+                SocketKind::Tcp(h) => crate::drivers::net::with_sockets(stack, gen, |set| {
+                    let s = set.get_mut::<smoltcp::socket::tcp::Socket>(h);
+                    // A peer that has sent FIN is READABLE: recv() returns 0 immediately. Calling
+                    // that "not ready" is precisely how a poll loop hangs on a closed connection.
+                    let eof = !s.may_recv();
+                    (s.can_recv() || eof, s.can_send(), eof && !s.may_send())
+                }),
+            };
+            // None means the link and its whole SocketSet went away. That is an error, not quiet
+            // inactivity, so report hup rather than leave the caller blocking on a dead stack.
+            match r { Some(v) => v, None => (false, false, true) }
+        }
+    }
+}
+
+/// Poll each network stack backing a socket in this set exactly once. Hoisted out of the per-fd
+/// loop on purpose — see `fd_readiness`.
+fn poll_stacks_once(fds: &[Option<FileDescriptor>]) {
+    let (mut wired, mut wifi) = (false, false);
+    for f in fds.iter().flatten() {
+        if let FileDescriptor::Socket(m) = f {
+            match m.lock().stack {
+                crate::drivers::net::NetStack::Wired => wired = true,
+                crate::drivers::net::NetStack::Wifi => wifi = true,
+            }
+        }
+    }
+    if wired { crate::drivers::net::poll_stack(crate::drivers::net::NetStack::Wired); }
+    if wifi { crate::drivers::net::poll_stack(crate::drivers::net::NetStack::Wifi); }
+}
+
+/// Give up the CPU while waiting for readiness to change.
+///
+/// SYSCALL clears IF, so the `enable()` is not optional: without it this yields with interrupts
+/// masked and the timer that would wake us never fires — the machine freezes, mouse included.
+/// This is the idiom the socket paths already use; it is copied rather than reinvented.
+#[inline]
+unsafe fn readiness_yield() {
+    x86_64::instructions::interrupts::enable();
+    core::arch::asm!("int 0x41");
+    x86_64::instructions::interrupts::disable();
+}
+
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
     let start = ptr as u64;
     if start == 0 && len == 0 { return false; }
@@ -1664,6 +1769,143 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         24 => { // SYS_SCHED_YIELD — give up the rest of this quantum.
             unsafe { core::arch::asm!("int 0x41"); }
             frame.rax = 0;
+        },
+
+        7 => { // SYS_POLL(fds_ptr, nfds, timeout_ms). timeout < 0 blocks indefinitely.
+            let ptr = arg1 as *mut u8;
+            let nfds = arg2 as usize;
+            let timeout = arg3 as i64;
+            if nfds > POLL_MAX { frame.rax = EINVAL as u64; return; }
+            if nfds > 0 && !is_valid_user_ptr(ptr, nfds * 8) { frame.rax = EFAULT as u64; return; }
+
+            // Copy the request in ONCE. The wait below spans yields, and re-reading user memory on
+            // each pass would let another thread rewrite the request mid-call.
+            let mut want = [(0i32, 0i16); POLL_MAX];
+            for i in 0..nfds {
+                let e = unsafe { ptr.add(i * 8) };
+                want[i] = unsafe {
+                    ((e as *const i32).read_unaligned(), (e.add(4) as *const i16).read_unaligned())
+                };
+            }
+
+            let start = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+            let mut out = [0i16; POLL_MAX];
+            let mut snap: alloc::vec::Vec<Option<FileDescriptor>> =
+                alloc::vec::Vec::with_capacity(nfds);
+
+            loop {
+                // Re-snapshot every pass: a descriptor can be closed by another thread between
+                // passes, and a stale Arc would report a dead pipe as readable forever.
+                snap.clear();
+                for i in 0..nfds {
+                    let fd = want[i].0;
+                    snap.push(if fd < 0 { None } else { unsafe { snapshot_fd(fd as usize) } });
+                }
+                poll_stacks_once(&snap);
+
+                let mut ready = 0usize;
+                for i in 0..nfds {
+                    let (fd, ev) = want[i];
+                    let mut re = 0i16;
+                    if fd < 0 {
+                        // POSIX: a negative fd is ignored and reports revents 0.
+                    } else if let Some(d) = &snap[i] {
+                        let (r, w, h) = fd_readiness(d);
+                        if r && (ev & POLLIN) != 0 { re |= POLLIN; }
+                        if w && (ev & POLLOUT) != 0 { re |= POLLOUT; }
+                        // HUP is reported whether or not it was asked for — that is what lets a
+                        // caller watching only POLLIN still learn the peer is gone.
+                        if h { re |= POLLHUP; }
+                    } else {
+                        re = POLLNVAL;
+                    }
+                    out[i] = re;
+                    if re != 0 { ready += 1; }
+                }
+
+                let expired = timeout >= 0 && {
+                    let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                    timeout == 0 || now.saturating_sub(start) >= timeout as u64
+                };
+                if ready > 0 || expired {
+                    // `out` is all zeros on the timeout path, which is exactly what POSIX wants.
+                    for i in 0..nfds {
+                        unsafe { (ptr.add(i * 8 + 6) as *mut i16).write_unaligned(out[i]); }
+                    }
+                    frame.rax = ready as u64;
+                    return;
+                }
+                unsafe { readiness_yield(); }
+            }
+        },
+
+        23 => { // SYS_SELECT(nfds, readfds, writefds, exceptfds, timeout)
+            let nfds = arg1 as usize;
+            let (rp, wp, ep) = (arg2 as *mut u64, arg3 as *mut u64, arg4 as *mut u64);
+            let tp = arg5 as *const i64;
+            if nfds > POLL_MAX { frame.rax = EINVAL as u64; return; }
+
+            // Only one 64-bit word is examined: POSIX says bits at or above nfds are not looked at,
+            // and POLL_MAX caps nfds at 64. Touching only what we validated keeps us away from the
+            // rest of the caller's 128-byte fd_set, which we have no business writing.
+            for p in [rp, wp, ep] {
+                if !p.is_null() && !is_valid_user_ptr(p as *const u8, 8) {
+                    frame.rax = EFAULT as u64; return;
+                }
+            }
+            // struct timeval { i64 tv_sec; i64 tv_usec }. A NULL pointer means block indefinitely.
+            let timeout: i64 = if tp.is_null() { -1 } else {
+                if !is_valid_user_ptr(tp as *const u8, 16) { frame.rax = EFAULT as u64; return; }
+                let (s, us) = unsafe { (tp.read_unaligned(), tp.add(1).read_unaligned()) };
+                s.saturating_mul(1000).saturating_add(us / 1000)
+            };
+
+            let rin = if rp.is_null() { 0u64 } else { unsafe { rp.read_unaligned() } };
+            let win = if wp.is_null() { 0u64 } else { unsafe { wp.read_unaligned() } };
+
+            let start = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+            let mut snap: alloc::vec::Vec<Option<FileDescriptor>> =
+                alloc::vec::Vec::with_capacity(nfds);
+
+            loop {
+                snap.clear();
+                for fd in 0..nfds { snap.push(unsafe { snapshot_fd(fd) }); }
+                poll_stacks_once(&snap);
+
+                let (mut rout, mut wout, mut count) = (0u64, 0u64, 0usize);
+                for fd in 0..nfds {
+                    let bit = 1u64 << fd;
+                    let (want_r, want_w) = (rin & bit != 0, win & bit != 0);
+                    if !want_r && !want_w { continue; }
+                    match &snap[fd] {
+                        // select has no per-fd error slot, so a bad descriptor fails the whole
+                        // call. That is the documented behaviour and it beats silently dropping it.
+                        None => { frame.rax = EBADF as u64; return; }
+                        Some(d) => {
+                            let (r, w, h) = fd_readiness(d);
+                            if want_r && (r || h) { rout |= bit; count += 1; }
+                            if want_w && w { wout |= bit; count += 1; }
+                        }
+                    }
+                }
+
+                let expired = timeout >= 0 && {
+                    let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                    timeout == 0 || now.saturating_sub(start) >= timeout as u64
+                };
+                if count > 0 || expired {
+                    unsafe {
+                        if !rp.is_null() { rp.write_unaligned(rout); }
+                        if !wp.is_null() { wp.write_unaligned(wout); }
+                        // We surface no exceptional conditions, so this is always cleared rather
+                        // than left holding whatever the caller passed in.
+                        if !ep.is_null() { ep.write_unaligned(0); }
+                    }
+                    frame.rax = count as u64;
+                    return;
+                }
+                unsafe { readiness_yield(); }
+            }
         },
 
         39 | 186 => { // SYS_GETPID / SYS_GETTID (threads carry their own pid here).

@@ -237,6 +237,23 @@ pub struct ScanResult {
     pub rsn_ie_len: u8,
 }
 
+impl ScanResult {
+    /// True when the AP's RSN group cipher is anything other than CCMP-128.
+    ///
+    /// Our supplicant installs a CCMP GTK and nothing else, so a TKIP group cipher (a router in
+    /// WPA/WPA2 mixed mode) is unjoinable in two separate ways: the AP rejects our assoc-request
+    /// outright with status 41, and even if it did not, every broadcast frame — the DHCP OFFER
+    /// among them — would arrive encrypted with a cipher we cannot decrypt. Surfacing this in the
+    /// picker turns a mid-connect failure into a network that is visibly greyed out beforehand.
+    pub fn group_cipher_unsupported(&self) -> bool {
+        let n = self.rsn_ie_len as usize;
+        // No RSN IE at all is WEP/WPA1, which the `rsn` flag already reports; don't double-blame it.
+        if n < 6 { return false; }
+        let s = &self.rsn_ie[2..6];
+        !(s[0] == 0x00 && s[1] == 0x0f && s[2] == 0xac && s[3] == 0x04)
+    }
+}
+
 /// Where the link is in the connect state machine. Reported to userspace by `sys_wifi_status` so the
 /// picker can show "Connecting…" / "Connected" / an error without guessing from the IP.
 #[derive(Clone, Copy, PartialEq, Eq)]
