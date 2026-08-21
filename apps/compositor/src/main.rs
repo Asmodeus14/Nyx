@@ -39,12 +39,7 @@ struct MenuEntry {
 const MENU: [MenuEntry; 15] = [
     MenuEntry { label: "Browser",        icon: "/mnt/nvme/apps/Browser.nyx/icon.png", exec: "/mnt/nvme/apps/Browser.nyx/run.bin\0" },
     MenuEntry { label: "Terminal",       icon: "/mnt/nvme/apps/Terminal.nyx/icon.png", exec: "/mnt/nvme/apps/Terminal.nyx/run.bin\0" },
-    // DIAGNOSTIC (temporary): label and slot unchanged, but exec points at a known-good binary.
-    // execve (syscall 59) is never reached when this row is clicked, while every other row works
-    // through the identical fork+execve code — so the variable is this entry, not the launch path.
-    // If clicking this now opens a Terminal, the click/fork path is fine and the fault is in the
-    // exec STRING or the HelloC binary. If it still freezes, the fault is in this menu ROW.
-    MenuEntry { label: "Hello C (musl)", icon: "/mnt/nvme/apps/HelloC.nyx/icon.png", exec: "/mnt/nvme/apps/Terminal.nyx/run.bin\0" },
+    MenuEntry { label: "Hello C (musl)", icon: "/mnt/nvme/apps/HelloC.nyx/icon.png", exec: "/mnt/nvme/apps/HelloC.nyx/run.bin\0" },
     MenuEntry { label: "Settings",       icon: "/mnt/nvme/apps/Settings.nyx/icon.png", exec: "/mnt/nvme/apps/Settings.nyx/run.bin\0" },
     MenuEntry { label: "Explorer",       icon: "/mnt/nvme/apps/Explorer.nyx/icon.png", exec: "/mnt/nvme/apps/Explorer.nyx/run.bin\0" },
     MenuEntry { label: "Network Suite",  icon: "/mnt/nvme/apps/Network.nyx/icon.png", exec: "/mnt/nvme/apps/Network.nyx/run.bin\0" },
