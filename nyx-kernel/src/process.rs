@@ -359,6 +359,14 @@ pub struct Process {
     /// on: the joiner futex-waits on this word, and the exiting thread clearing it is the wakeup.
     /// 0 = not requested.
     pub clear_child_tid: u64,
+    /// Per-signal disposition, indexed by signal number: `[handler, flags, restorer, mask]`.
+    /// A plain array rather than a struct so it stays trivially clonable across fork.
+    pub sigactions: alloc::vec::Vec<[u64; 4]>,
+    /// Signals currently blocked from delivery (bit N-1 = signal N).
+    pub sigmask: u64,
+    /// Signals raised but not yet delivered. Cleared in the child on fork: POSIX says the child's
+    /// pending set starts empty, and inheriting it would re-run a handler the parent already had.
+    pub sigpending: u64,
     pub state: TaskState,
     pub cpu_ticks: u64,      
     pub name: [u8; 16],      
@@ -397,6 +405,9 @@ impl Process {
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
             clear_child_tid: 0,
+            sigactions: alloc::vec![[0u64; 4]; 64],
+            sigmask: 0,
+            sigpending: 0,
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -423,6 +434,9 @@ impl Process {
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
             clear_child_tid: 0,
+            sigactions: alloc::vec![[0u64; 4]; 64],
+            sigmask: 0,
+            sigpending: 0,
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -459,6 +473,9 @@ impl Process {
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
             clear_child_tid: 0,
+            sigactions: alloc::vec![[0u64; 4]; 64],
+            sigmask: 0,
+            sigpending: 0,
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],

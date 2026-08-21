@@ -125,6 +125,110 @@ unsafe fn write_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
     }
 }
 
+// ===================== Phase 5: signal delivery =====================
+
+const SA_RESTORER: u64 = 0x0400_0000;
+const SIGKILL: usize = 9;
+const SIGSTOP: usize = 19;
+
+/// What we push on the user stack before jumping to a handler, and what `rt_sigreturn` reads back.
+/// The layout is ours alone — the kernel writes it and the kernel reads it — so it holds exactly
+/// the registers `sysretq` needs restored, and nothing more.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SigFrame {
+    r15: u64, r14: u64, r13: u64, r12: u64, r11: u64, r10: u64, r9: u64, r8: u64,
+    rdi: u64, rsi: u64, rbp: u64, rdx: u64, rcx: u64, rbx: u64, rax: u64,
+    rip: u64, rflags: u64, rsp: u64, oldmask: u64,
+}
+
+/// Deliver one pending, unblocked signal by redirecting the return-to-user.
+///
+/// Called on the way OUT of the dispatcher, after the syscall's result is already in `frame.rax`,
+/// so a handler sees a completed call and `rt_sigreturn` restores that result untouched.
+///
+/// Mechanically: `sysretq` takes its target from `rcx` and its flags from `r11`, so pointing `rcx`
+/// at the handler and swapping `user_rsp` for a freshly built frame IS the delivery. There is no
+/// separate "enter userspace" path to hook.
+unsafe fn deliver_pending_signal(frame: &mut SyscallStackFrame) {
+    if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return; }
+    if GsBase::read().as_u64() == 0 { return; }
+    let percpu = crate::percpu::current();
+    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if curr_idx >= percpu.scheduler.tasks.len() { return; }
+
+    loop {
+        let (sig, act, oldmask) = {
+            let t = &percpu.scheduler.tasks[curr_idx];
+            let deliverable = t.sigpending & !t.sigmask;
+            if deliverable == 0 { return; }
+            // Lowest-numbered first, which is what Linux does and what programs expect.
+            let sig = deliverable.trailing_zeros() as usize + 1;
+            (sig, t.sigactions[sig], t.sigmask)
+        };
+        let bit = 1u64 << (sig - 1);
+        percpu.scheduler.tasks[curr_idx].sigpending &= !bit;
+
+        let handler = act[0];
+        if handler == 1 { continue; }            // SIG_IGN
+        if handler == 0 {
+            // SIG_DFL. Default actions (terminate, stop, core) are NOT implemented yet. Logged
+            // rather than dropped silently, because otherwise "kill did nothing" is unattributable.
+            crate::serial_println!("[SIG] {} SIG_DFL — default actions not implemented, ignored",
+                sig as u32);
+            continue;
+        }
+        if act[1] & SA_RESTORER == 0 {
+            // Linux x86-64 has no kernel-provided trampoline; libc supplies one via sa_restorer.
+            // Without it there is no way back from the handler, so refuse rather than jump into a
+            // handler that can never return.
+            crate::serial_println!("[SIG] {} has no SA_RESTORER — cannot deliver", sig as u32);
+            continue;
+        }
+
+        let saved = SigFrame {
+            r15: frame.r15, r14: frame.r14, r13: frame.r13, r12: frame.r12,
+            r11: frame.r11, r10: frame.r10, r9: frame.r9, r8: frame.r8,
+            rdi: frame.rdi, rsi: frame.rsi, rbp: frame.rbp, rdx: frame.rdx,
+            rcx: frame.rcx, rbx: frame.rbx, rax: frame.rax,
+            rip: frame.rcx, rflags: frame.r11, rsp: frame.user_rsp, oldmask,
+        };
+
+        // The 128-byte red zone below rsp belongs to the interrupted function and must survive.
+        let mut sp = frame.user_rsp.saturating_sub(128) & !0xF;
+        sp = sp.saturating_sub(core::mem::size_of::<SigFrame>() as u64) & !0xF;
+        let ret_slot = sp.saturating_sub(8);
+
+        // ★ Both checks. is_valid_user_ptr only range-checks, and writing to an unmapped user
+        // address from kernel mode panics the MACHINE — a thread with a nearly-exhausted stack
+        // would otherwise take the whole box down at the moment it received a signal.
+        let span = frame.user_rsp.saturating_sub(ret_slot) as usize;
+        if ret_slot == 0
+            || !is_valid_user_ptr(ret_slot as *const u8, span)
+            || !crate::memory::user_addr_mapped(sp)
+            || !crate::memory::user_addr_mapped(ret_slot)
+        {
+            crate::serial_println!("[SIG] {} undeliverable: user stack unwritable", sig as u32);
+            continue;
+        }
+
+        (sp as *mut SigFrame).write_volatile(saved);
+        // The handler returns into sa_restorer, whose only job is to call rt_sigreturn.
+        (ret_slot as *mut u64).write_volatile(act[2]);
+
+        // SysV entry contract: RSP % 16 == 8 on entry, as if reached by `call`. `sp` is
+        // 16-aligned, so `sp - 8` satisfies that by construction.
+        frame.user_rsp = ret_slot;
+        frame.rcx = handler;      // sysretq jumps here
+        frame.rdi = sig as u64;   // handler(int signum)
+        frame.rsi = 0;            // siginfo — SA_SIGINFO is not supported
+        frame.rdx = 0;            // ucontext — likewise
+        // Block this signal, plus whatever the action asked for, until rt_sigreturn restores it.
+        percpu.scheduler.tasks[curr_idx].sigmask = oldmask | bit | act[3];
+        return;
+    }
+}
+
 // ===================== Phase 4: current working directory =====================
 
 /// The calling task's cwd. Cloned rather than borrowed — callers go on to touch the VFS, and
@@ -925,6 +1029,14 @@ fn rtc_packed_to_unix(p: u64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
+    syscall_dispatch_inner(frame);
+    // Wrapped rather than appended to the body: the dispatcher has dozens of early `return`s, and
+    // any one of them would skip delivery — a signal that only arrives after *some* syscalls is
+    // worse than one that never arrives, because the bug is intermittent.
+    unsafe { deliver_pending_signal(frame); }
+}
+
+fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
     if !is_valid_user_ptr(frame.rcx as *const u8, 1) { frame.rcx = 0; }
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { frame.rax = ENOSYS as u64; return; }
     if GsBase::read().as_u64() == 0 { frame.rax = ENOSYS as u64; return; }
@@ -1057,8 +1169,111 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         // 10 (SYS_MPROTECT) is implemented further down — it used to be a `frame.rax = 0` stub
         // here, which silently shadowed the real arm because match arms are tried in order.
         12 => { frame.rax = 0; }, // SYS_BRK
-        13 => { frame.rax = 0; }, // SYS_RT_SIGACTION
-        14 => { frame.rax = 0; }, // SYS_RT_SIGPROCMASK
+        13 => { // SYS_RT_SIGACTION(sig, act, oldact, sigsetsize)
+            // struct kernel_sigaction { handler@0, flags@8, restorer@16, mask@24 } — which is
+            // exactly the [u64; 4] we store, so no field shuffling is needed.
+            let sig = arg1 as usize;
+            if sig == 0 || sig > 64 { frame.rax = EINVAL as u64; return; }
+            // SIGKILL and SIGSTOP may never be caught or ignored. Accepting a handler for them
+            // would let a process make itself unkillable.
+            if sig == SIGKILL || sig == SIGSTOP { frame.rax = EINVAL as u64; return; }
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ESRCH as u64; return; }
+
+            let cur = percpu.scheduler.tasks[curr_idx].sigactions[sig];
+            if arg3 != 0 {
+                if !is_valid_user_ptr(arg3 as *const u8, 32) { frame.rax = EFAULT as u64; return; }
+                unsafe {
+                    let p = arg3 as *mut u64;
+                    for k in 0..4 { p.add(k).write_unaligned(cur[k]); }
+                }
+            }
+            if arg2 != 0 {
+                if !is_valid_user_ptr(arg2 as *const u8, 32) { frame.rax = EFAULT as u64; return; }
+                let mut new = [0u64; 4];
+                unsafe {
+                    let p = arg2 as *const u64;
+                    for k in 0..4 { new[k] = p.add(k).read_unaligned(); }
+                }
+                percpu.scheduler.tasks[curr_idx].sigactions[sig] = new;
+            }
+            frame.rax = 0;
+        },
+
+        14 => { // SYS_RT_SIGPROCMASK(how, set, oldset, sigsetsize)
+            const SIG_BLOCK: u64 = 0;
+            const SIG_UNBLOCK: u64 = 1;
+            const SIG_SETMASK: u64 = 2;
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ESRCH as u64; return; }
+            let old = percpu.scheduler.tasks[curr_idx].sigmask;
+
+            if arg3 != 0 {
+                if !is_valid_user_ptr(arg3 as *const u8, 8) { frame.rax = EFAULT as u64; return; }
+                unsafe { (arg3 as *mut u64).write_unaligned(old); }
+            }
+            if arg2 != 0 {
+                if !is_valid_user_ptr(arg2 as *const u8, 8) { frame.rax = EFAULT as u64; return; }
+                let set = unsafe { (arg2 as *const u64).read_unaligned() };
+                let newmask = match arg1 {
+                    SIG_BLOCK => old | set,
+                    SIG_UNBLOCK => old & !set,
+                    SIG_SETMASK => set,
+                    _ => { frame.rax = EINVAL as u64; return; }
+                };
+                // SIGKILL and SIGSTOP can never be blocked, however they were asked for.
+                let undeniable = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+                percpu.scheduler.tasks[curr_idx].sigmask = newmask & !undeniable;
+            }
+            frame.rax = 0;
+        },
+
+        15 => { // SYS_RT_SIGRETURN — restore the context saved before the handler ran.
+            let sp = frame.user_rsp;
+            if !is_valid_user_ptr(sp as *const u8, core::mem::size_of::<SigFrame>())
+                || !unsafe { crate::memory::user_addr_mapped(sp) }
+            {
+                frame.rax = EFAULT as u64;
+                return;
+            }
+            let sf = unsafe { (sp as *const SigFrame).read_volatile() };
+            frame.r15 = sf.r15; frame.r14 = sf.r14; frame.r13 = sf.r13; frame.r12 = sf.r12;
+            frame.r10 = sf.r10; frame.r9 = sf.r9; frame.r8 = sf.r8;
+            frame.rdi = sf.rdi; frame.rsi = sf.rsi; frame.rbp = sf.rbp; frame.rdx = sf.rdx;
+            frame.rbx = sf.rbx;
+            frame.rcx = sf.rip;       // sysretq returns here
+            frame.r11 = sf.rflags;    // ...with these flags
+            frame.user_rsp = sf.rsp;
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx < percpu.scheduler.tasks.len() {
+                percpu.scheduler.tasks[curr_idx].sigmask = sf.oldmask;
+            }
+            // ★ rax LAST and unconditional: it carries the interrupted syscall's return value.
+            // Every other arm ends by setting rax to its own result; doing that here would
+            // overwrite the very thing the interrupted call returned, and the program would see a
+            // read() or write() report a wrong length purely because a signal arrived.
+            frame.rax = sf.rax;
+            return;
+        },
+
+        62 => { // SYS_KILL(pid, sig)
+            let target = arg1;
+            let sig = arg2 as usize;
+            if sig > 64 { frame.rax = EINVAL as u64; return; }
+            let percpu = crate::percpu::current();
+            let mut found = false;
+            for t in percpu.scheduler.tasks.iter_mut() {
+                if t.pid == target && t.state != crate::scheduler::TaskState::Empty {
+                    found = true;
+                    // sig 0 is the existence probe: report whether the target is there, send nothing.
+                    if sig != 0 { t.sigpending |= 1u64 << (sig - 1); }
+                }
+            }
+            frame.rax = if found { 0 } else { ESRCH as u64 };
+        },
         
         16 => { // SYS_IOCTL 
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
