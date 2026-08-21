@@ -343,6 +343,57 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
     }
     rows.push(row);
 
+    // --- openat: the shape a C library actually uses ---------------------------------------
+    // Nyx's own open(2) is (ptr, len, flags), which no libc will ever produce. openat takes a
+    // NUL-terminated string, so this row is the one that proves the musl-facing path works.
+    announce("openat");
+    let mut c_file = String::from(file.as_str());
+    c_file.push('\0');
+    const AT_FDCWD: usize = (-100i64) as usize;
+    let oa = unsafe {
+        raw::sys4(raw::SYS_OPENAT, AT_FDCWD, c_file.as_ptr() as usize, 0, 0)
+    };
+    if oa >= 0 {
+        unsafe { raw::sys1(raw::SYS_CLOSE, oa as usize) };
+    }
+    let mut row = Row::new(257, "openat");
+    row.raw = render_ret(oa);
+    row.verdict = if base.is_missing(oa) {
+        Verdict::Missing
+    } else if oa < 0 {
+        Verdict::Fail
+    } else {
+        Verdict::Pass
+    };
+    row.note = String::from("AT_FDCWD + a NUL-terminated C string");
+    rows.push(row);
+
+    // --- relative open after chdir ------------------------------------------------------------
+    // Nothing else proves relative resolution actually works: every other row passes an absolute
+    // path, so `resolve_path` could be a no-op and the whole grid would still be green.
+    announce("relative open (after chdir)");
+    let mut row = Row::new(2, "relative open");
+    let cd = unsafe { raw::sys2(raw::SYS_CHDIR, SCRATCH.as_ptr() as usize, SCRATCH.len()) };
+    if cd < 0 {
+        row.raw = format!("chdir={}", cd as i32);
+        row.verdict = Verdict::Fail;
+        row.note = String::from("could not chdir into the scratch directory");
+    } else {
+        // Bare name, no leading slash — this only resolves if cwd is being consulted.
+        let rfd = unsafe { nyx_open("probe_file", O_RDONLY) };
+        if rfd >= 0 {
+            unsafe { raw::sys1(raw::SYS_CLOSE, rfd as usize) };
+        }
+        row.raw = render_ret(rfd);
+        row.verdict = if rfd >= 0 { Verdict::Pass } else { Verdict::Fail };
+        row.note = String::from("opens \"probe_file\" by bare name after chdir");
+        // ★ Restore cwd unconditionally. Leaving it inside SCRATCH would make every later probe
+        // resolve relative paths somewhere unintended, and the cleanup below would miss its
+        // targets — one row's side effect quietly corrupting the rest of the run.
+        unsafe { raw::sys2(raw::SYS_CHDIR, "/".as_ptr() as usize, 1) };
+    }
+    rows.push(row);
+
     announce("rename");
     let r = unsafe {
         raw::sys4(

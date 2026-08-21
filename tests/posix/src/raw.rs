@@ -42,6 +42,7 @@ pub const SYS_WAIT4: usize = 61;
 pub const SYS_FCNTL: usize = 72;
 pub const SYS_GETCWD: usize = 79;
 pub const SYS_CHDIR: usize = 80;
+pub const SYS_OPENAT: usize = 257;
 pub const SYS_RENAME: usize = 82;
 pub const SYS_MKDIR: usize = 83;
 pub const SYS_RMDIR: usize = 84;
