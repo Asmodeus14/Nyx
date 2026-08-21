@@ -140,6 +140,10 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
                 // done here.
                 crate::memory::allocate_user_pages_at(start_page, num_pages, true)?;
 
+                crate::serial_println!(
+                    "[ELF] LOAD vaddr={:#x} memsz={:#x} filesz={:#x} flags={} pages={}",
+                    phdr.p_vaddr, phdr.p_memsz, phdr.p_filesz, phdr.p_flags, num_pages as u32);
+
                 // Accumulate the UNION of p_flags per page as we go.
                 for p in 0..num_pages {
                     let page = start_page + (p as u64) * 4096;
@@ -187,6 +191,8 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
     //    shared page would revoke write access its neighbour needs, so each page gets the union of
     //    every segment sitting on it. The union can only ever be more permissive, never less, so
     //    this trades a little W^X strictness for never breaking a valid binary.
+    crate::serial_println!("[ELF] segments loaded, entry={:#x}, protecting {} page(s)",
+        header.e_entry, page_prot.len() as u32);
     if ENFORCE_ELF_PROT {
         const PF_X: u32 = 1;
         const PF_W: u32 = 2;
@@ -205,6 +211,7 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
         }
     }
 
+    crate::serial_println!("[ELF] load complete — handing off to entry");
     Ok(LoadedElf {
         entry: header.e_entry,
         phdr_vaddr,
