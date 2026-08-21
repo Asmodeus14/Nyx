@@ -230,6 +230,11 @@ pub struct ScanResult {
     pub beacon_int: u16, // beacon interval in TU (from the beacon fixed body)
     pub secure: bool,    // Privacy bit set in the beacon capability field (needs a passphrase)
     pub rsn: bool,       // an RSN IE (tag 48) is present → WPA2/WPA3, which is what our supplicant does
+    /// The AP's RSN IE body, kept verbatim from the beacon. Retained rather than logged-and-dropped
+    /// because the thing it explains — an RSN-class assoc rejection — happens at connect time, and
+    /// a scan-time log line sits hundreds of lines earlier in the boot log where nobody reads it.
+    pub rsn_ie: [u8; 48],
+    pub rsn_ie_len: u8,
 }
 
 /// Where the link is in the connect state machine. Reported to userspace by `sys_wifi_status` so the
@@ -1834,6 +1839,10 @@ impl IntelWifiDriver {
             if self.send_assoc(&bssid, ssid) {
                 crate::serial_println!("[WIFI] P6c: associated — waiting for WPA2 4-way handshake.");
                 self.watch_eapol(&bssid, ssid, psk);
+            } else if (40..=46).contains(&self.last_mgmt_status) {
+                // An RSN-class rejection means the AP parsed our RSN IE and named the field it
+                // disagreed with, so the two IEs side by side ARE the diagnosis.
+                self.log_rsn_mismatch(&target);
             }
         }
     }
@@ -2645,6 +2654,45 @@ impl IntelWifiDriver {
         self.mgmt_accepted("auth")
     }
 
+    /// Print the AP's RSN IE beside our own after an RSN-class rejection. Ours is a compile-time
+    /// constant, so the only unknown is theirs.
+    fn log_rsn_mismatch(&self, target: &ScanResult) {
+        let n = target.rsn_ie_len as usize;
+        if n == 0 {
+            crate::serial_println!("[WIFI] P6b: the AP's beacon carried no RSN IE — cannot compare.");
+            return;
+        }
+        let mut hex = alloc::string::String::new();
+        for k in 0..n {
+            hex.push_str(&alloc::format!("{:02x} ", target.rsn_ie[k]));
+        }
+        crate::serial_println!("[WIFI] P6b: AP  RSN IE ({} B): {}", n as u32, hex);
+        crate::serial_println!("[WIFI] P6b: OUR RSN IE (20 B): 01 00 00 0f ac 04 01 00 00 0f ac 04 01 00 00 0f ac 02 00 00");
+        // Group cipher = bytes 2..6 of the body, immediately after the 2-byte version.
+        if n >= 6 {
+            let suite = &target.rsn_ie[2..6];
+            let name = if suite[..3] == [0x00, 0x0f, 0xac] {
+                match suite[3] {
+                    1 => "WEP-40", 2 => "TKIP", 4 => "CCMP-128", 5 => "WEP-104",
+                    8 => "GCMP-128", 9 => "GCMP-256", 10 => "CCMP-256", _ => "unknown suite",
+                }
+            } else {
+                "vendor-specific suite"
+            };
+            crate::serial_println!(
+                "[WIFI] P6b: AP group cipher = {:02x}-{:02x}-{:02x}-{:02x} ({}); we demand CCMP-128.",
+                suite[0], suite[1], suite[2], suite[3], name);
+            // TKIP as the GROUP cipher is what a router in WPA/WPA2 mixed mode advertises for
+            // legacy clients. Matching it means implementing TKIP for broadcast traffic, because
+            // the DHCP OFFER arrives broadcast and GTK-encrypted — not a constant swap.
+            if suite[..3] == [0x00, 0x0f, 0xac] && suite[3] == 2 {
+                crate::serial_println!(
+                    "[WIFI] P6b: → the AP is in WPA/WPA2 mixed mode. Setting it to WPA2-AES only is \
+                     the cheap fix; supporting it as-is means a TKIP GTK path.");
+            }
+        }
+    }
+
     /// Did the AP actually accept us? `tx_mgmt_await_reply` answers "a frame came back", which is a
     /// weaker claim than "we are in". Separating the two is what keeps a rejected association from
     /// being reported as success and then misdiagnosed downstream as a bad passphrase.
@@ -3235,7 +3283,7 @@ impl IntelWifiDriver {
         if !self.scan_results.iter().any(|r| r.bssid == bssid) {
             let mut rec = ScanResult {
                 ssid: [0; 32], ssid_len: ssid_len as u8, bssid, channel, band, beacon_int,
-                secure, rsn,
+                secure, rsn, rsn_ie, rsn_ie_len: rsn_ie_len as u8,
             };
             rec.ssid[..ssid_len].copy_from_slice(&ssid[..ssid_len]);
             self.scan_results.push(rec);
