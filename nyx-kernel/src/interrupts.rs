@@ -36,6 +36,7 @@ const EINVAL: i64 = -22;
 const EMFILE: i64 = -24;
 const ENOSPC: i64 = -28;
 const ESPIPE: i64 = -29;
+const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const ENOTEMPTY: i64 = -39;
 
@@ -121,6 +122,54 @@ unsafe fn write_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
         core::ptr::write_unaligned(buf.add(88) as *mut i64, st.mtime as i64);  // st_mtime
         core::ptr::write_unaligned(buf.add(104) as *mut i64, st.ctime as i64); // st_ctime
     }
+}
+
+// ===================== Phase 4: current working directory =====================
+
+/// The calling task's cwd. Cloned rather than borrowed — callers go on to touch the VFS, and
+/// holding a borrow into `scheduler.tasks` across that is the same dangling hazard `poll` documents.
+unsafe fn current_cwd() -> alloc::string::String {
+    let percpu = crate::percpu::current();
+    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if curr_idx >= percpu.scheduler.tasks.len() {
+        return alloc::string::String::from("/");
+    }
+    percpu.scheduler.tasks[curr_idx].cwd.clone()
+}
+
+/// Resolve a possibly-relative path against the calling task's cwd, collapsing `.` and `..`.
+///
+/// Absolute paths are returned untouched. Normalising them too would also strip trailing slashes,
+/// and VFS mount resolution is sensitive to those — not a risk worth taking for a case nothing
+/// currently produces. The consequence, stated plainly: an ABSOLUTE path containing `..` is still
+/// passed through literally and will not resolve. That was already true before this change.
+///
+/// The `..` collapsing matters because the ext4 driver resolves names literally: it would look for
+/// a directory actually called `..`, fail, and report ENOENT — sending the caller to debug a
+/// missing file rather than an unresolved path.
+unsafe fn resolve_path(path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        return alloc::string::String::from(path);
+    }
+    let mut joined = current_cwd();
+    if !joined.ends_with('/') { joined.push('/'); }
+    joined.push_str(path);
+
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for c in joined.split('/') {
+        match c {
+            "" | "." => {}
+            // `..` at the root pops nothing, which is what POSIX requires: / is its own parent.
+            ".." => { parts.pop(); }
+            other => parts.push(other),
+        }
+    }
+    let mut out = alloc::string::String::from("/");
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 { out.push('/'); }
+        out.push_str(p);
+    }
+    out
 }
 
 // ===================== Phase 2: readiness (poll / select) =====================
@@ -898,7 +947,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if !is_valid_user_ptr(buf_ptr, len) { frame.rax = EFAULT as u64; return; }
 
             let path_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
-            if let Ok(path) = core::str::from_utf8(path_slice) {
+            if let Ok(raw_path) = core::str::from_utf8(path_slice) {
+                // Phase 4: relative paths resolve against the task's cwd. NOTE: open is the only
+                // path syscall doing this today — stat/mkdir/unlink and friends still require an
+                // absolute path. Inconsistent, and named here rather than left to be discovered,
+                // because a libc port hits it immediately.
+                let resolved = unsafe { resolve_path(raw_path) };
+                let path = resolved.as_str();
                 // B-γ.2: honor Linux-style open flags in arg3 (previously ignored). Nyx's open takes
                 // (ptr, len, flags) — the path stays a (ptr,len) slice, not a C string.
                 const O_CREAT: u64 = 0x40;
@@ -1433,6 +1488,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 let parent = &percpu.scheduler.tasks[curr_idx];
                 child.parent_pid = Some(parent.pid);
                 child.mmap_bump = parent.mmap_bump;
+                // cwd is inherited, not reset — a child that silently starts at / would resolve
+                // every relative path somewhere its parent never intended.
+                child.cwd = parent.cwd.clone();
 
                 // 1. Share memory frames (CoW implementation). Fallible: on OOM mid-walk, tear the
                 // half-built child address space back down and fail the fork gracefully.
@@ -1827,6 +1885,43 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 // POSIX: ENOMEM when the range contains pages that are not mapped.
                 Err(_) => ENOMEM as u64,
             };
+        },
+
+        79 => { // SYS_GETCWD(buf, size)
+            let buf = arg1 as *mut u8;
+            let size = arg2 as usize;
+            if size == 0 || !is_valid_user_ptr(buf, size) { frame.rax = EFAULT as u64; return; }
+            let cwd = unsafe { current_cwd() };
+            let need = cwd.len() + 1; // + NUL
+            if need > size { frame.rax = ERANGE as u64; return; }
+            unsafe {
+                core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf, cwd.len());
+                *buf.add(cwd.len()) = 0;
+            }
+            // Linux returns the length INCLUDING the terminating NUL, and both musl and glibc
+            // depend on that: their wrappers return `buf` on a positive result, so returning the
+            // string length instead would silently under-report by one and truncate long paths.
+            frame.rax = need as u64;
+        },
+
+        80 => { // SYS_CHDIR(path_ptr, path_len)
+            let path = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            let target = unsafe { resolve_path(path) };
+            // It must exist AND be a directory. Letting chdir into a regular file "succeed" would
+            // push the failure into every later relative open, somewhere else entirely.
+            match crate::vfs::VFS.stat(&target) {
+                Some(st) if st.is_dir() => {}
+                Some(_) => { frame.rax = ENOTDIR as u64; return; }
+                None => { frame.rax = ENOENT as u64; return; }
+            }
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            percpu.scheduler.tasks[curr_idx].cwd = target;
+            frame.rax = 0;
         },
 
         24 => { // SYS_SCHED_YIELD — give up the rest of this quantum.

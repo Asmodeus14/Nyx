@@ -350,6 +350,10 @@ pub struct Process {
     /// it is always length `FD_MAX` — never grown or shrunk — so `fd_table[i]` is safe exactly when
     /// `i < FD_MAX`, and every caller still has to check.
     pub fd_table: alloc::vec::Vec<Option<FileDescriptor>>,
+    /// Current working directory, always stored absolute and without a trailing slash (except for
+    /// the root itself). Inherited across fork and preserved across execve, which is what makes a
+    /// shell's `cd` stick for the commands it launches.
+    pub cwd: alloc::string::String,
     pub state: TaskState,
     pub cpu_ticks: u64,      
     pub name: [u8; 16],      
@@ -386,6 +390,7 @@ impl Process {
             kernel_stack_top: kernel_stack,
             mmap_bump: 0x4000_0000_0000, 
             fd_table: alloc::vec![None; FD_MAX],
+            cwd: alloc::string::String::from("/"),
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -410,6 +415,7 @@ impl Process {
             kernel_stack_top: kernel_stack,
             mmap_bump: 0x4000_0000_0000,
             fd_table: alloc::vec![None; FD_MAX],
+            cwd: alloc::string::String::from("/"),
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -444,6 +450,7 @@ impl Process {
             kernel_stack_top: kernel_stack,
             mmap_bump: 0x4000_0000_0000,
             fd_table: alloc::vec![None; FD_MAX],
+            cwd: alloc::string::String::from("/"),
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
