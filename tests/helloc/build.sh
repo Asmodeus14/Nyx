@@ -33,7 +33,7 @@ NYX_BASE=0x40000000
 
 # Stale artifacts are worse than missing ones: a variant that fails to build would otherwise be
 # shipped as whatever the previous run left behind, and get tested under the wrong name.
-rm -f "$OUT/hello" "$OUT/hello_lo" "$OUT/bare" "$OUT/smoke" "$OUT/hello_hi" "$OUT/bare_hi"
+rm -f "$OUT/hello" "$OUT/hello_lo" "$OUT/bare" "$OUT/smoke" "$OUT/cpptest"
 
 build_musl() {  # $1 = output name, $2 = source file, $3... = extra linker flags
   local out="$1" src="$2"; shift 2
@@ -50,6 +50,32 @@ build_musl() {  # $1 = output name, $2 = source file, $3... = extra linker flags
     -o "$OUT/$out"
 }
 
+build_cpp() {  # $1 = output name, $2 = source, $3... = extra linker flags
+  local out="$1" src="$2"; shift 2
+  # libsupc++ is gcc's C++ ABI runtime (__cxa_throw, guards, RTTI, operator new) and libgcc_eh is
+  # the unwinder. Together they are everything the C++ LANGUAGE needs -- libc++ proper is only the
+  # library on top, so this gate is reachable without cmake.
+  #
+  # Link order is left-to-right for static archives: libsupc++ calls malloc, so libc must follow
+  # it, and the unwinder calls dl_iterate_phdr, which musl also supplies.
+  #
+  # No C++ headers are on the include path on purpose -- see cpptest.cpp.
+  g++ -static -nostdinc -nostdinc++ -nostdlib -fno-stack-protector -O2 \
+    -isystem "$GCCINC" \
+    -isystem "$M/include" \
+    -isystem "$M/obj/include" \
+    -isystem "$M/arch/x86_64" \
+    -isystem "$M/arch/generic" \
+    "$@" \
+    "$M/lib/crt1.o" \
+    "$OUT/$src" \
+    "$OUT/gnu_compat.c" \
+    "$(g++ -print-file-name=libsupc++.a)" \
+    "$(g++ -print-file-name=libgcc_eh.a)" \
+    "$M/lib/libc.a" -lgcc \
+    -o "$OUT/$out"
+}
+
 build_bare() {  # $1 = output name, $2... = extra linker flags
   local out="$1"; shift
   # -nostartfiles: the program supplies its own _start. -e _start names it as the entry point.
@@ -62,12 +88,13 @@ build_musl hello    hello.c "-Wl,-Ttext-segment=$NYX_BASE"
 build_musl hello_lo hello.c                          # gcc's default 0x400000 — the regression test
 build_musl smoke    smoke.c "-Wl,-Ttext-segment=$NYX_BASE"
 build_bare bare     "-Wl,-Ttext-segment=$NYX_BASE"
+build_cpp  cpptest cpptest.cpp "-Wl,-Ttext-segment=$NYX_BASE"
 
 # Print the entry point and every LOAD for each. This is a build-time check on purpose: a
 # -Ttext-segment that silently did nothing would make the whole experiment a null result, and
 # finding that out from the serial log costs a power cycle. Read these before booting.
-echo "[helloc] built 4 binaries:"
-for f in hello hello_lo smoke bare; do
+echo "[helloc] built 5 binaries:"
+for f in hello hello_lo smoke bare cpptest; do
   echo "----- $f -----"
   readelf -hl "$OUT/$f" | grep -E 'Type:|Entry point|LOAD|INTERP|TLS' || true
 done

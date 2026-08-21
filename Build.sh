@@ -171,6 +171,7 @@ if [ -f vendor/musl/lib/libc.a ]; then
     cp tests/helloc/hello_lo build_initrd/apps/HelloC.nyx/hello_lo
     cp tests/helloc/smoke    build_initrd/apps/HelloC.nyx/smoke
     cp tests/helloc/bare     build_initrd/apps/HelloC.nyx/bare
+    cp tests/helloc/cpptest  build_initrd/apps/HelloC.nyx/cpptest
   else
     echo "  (helloc build FAILED — HelloC.nyx ships with no binaries)"
   fi
