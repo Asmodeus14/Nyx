@@ -233,6 +233,26 @@ pub fn allocate_user_pages_at(
                     // Just release the unused frame and leave the page intact; the caller copies
                     // its segment bytes on top.
                     system.frame_allocator.deallocate_frame(frame);
+
+                    // ★★★ ...but ONLY if the page is one WE could have mapped. "Keep whatever is
+                    // there" was unconditional, and that is an arbitrary kernel-memory write.
+                    //
+                    // The Nyx kernel is linked at 0x200000..~0x15d5000 and `clone_kernel_page_table`
+                    // copies ALL 512 PML4 entries, so the kernel image is mapped in EVERY address
+                    // space; `clear_user_address_space` preserves it because it carries no USER
+                    // bit. A binary linked at gcc's default 0x400000 therefore lands inside the
+                    // kernel's own .text — `map_to` reports PageAlreadyMapped, we kept the
+                    // kernel's mapping, and `load_elf_full` copied the segment ONTO THE RUNNING
+                    // KERNEL. That was the HelloC freeze: CR2 0x400003, a kernel-mode #PF during
+                    // the segment copy.
+                    //
+                    // It only faulted because .text is read-only. The kernel's .data/.bss above
+                    // 0x15d2520 IS writable, so a binary linked a little higher would have
+                    // silently corrupted live kernel state with no fault at all — an unprivileged
+                    // ELF granted an arbitrary kernel write. Fail closed instead.
+                    if !page_is_user_writable(page.start_address().as_u64()) {
+                        return Err("ELF segment overlaps a non-user mapping (refusing to write through it)");
+                    }
                 },
                 Err(_) => {
                     system.frame_allocator.deallocate_frame(frame);
@@ -373,6 +393,22 @@ unsafe fn pte_for(cr3: u64, vaddr: u64) -> Option<*mut u64> {
 pub unsafe fn user_addr_mapped(vaddr: u64) -> bool {
     let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
     pte_for(cr3, vaddr).is_some()
+}
+
+/// Is `vaddr` mapped in the CURRENT address space as a USER + WRITABLE 4 KiB page — i.e. a page
+/// this loader could plausibly have mapped itself?
+///
+/// Used to tell "an earlier segment of the SAME binary already mapped this page" (legitimate, and
+/// the reason `allocate_user_pages_at` tolerates `PageAlreadyMapped` at all) from "something else
+/// owns this address". Fails CLOSED: an absent level or a huge page returns false, because the one
+/// thing we must never do is assume an unfamiliar mapping is safe to write through.
+pub unsafe fn page_is_user_writable(vaddr: u64) -> bool {
+    let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+    match pte_for(cr3, vaddr) {
+        // PRESENT (bit 0) + WRITABLE (bit 1) + USER (bit 2).
+        Some(p) => { let e = *p; (e & 1) != 0 && (e & 0x2) != 0 && (e & 0x4) != 0 }
+        None => false,
+    }
 }
 
 /// Apply `PROT_WRITE` / `PROT_EXEC` to an already-mapped user range in the CURRENT address space.
