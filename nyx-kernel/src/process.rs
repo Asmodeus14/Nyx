@@ -71,6 +71,14 @@ pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
 }
 
 /// Load all PT_LOAD segments and collect the metadata the SysV auxv needs (PT_PHDR/PT_TLS).
+/// Master switch for Phase 3 step 3 (per-segment ELF protection).
+///
+/// Kept as a named constant because this is the highest-blast-radius change in the W^X work: one
+/// segment protected wrongly kills every app at `_start` with nothing but `[SEGFAULT]` on serial.
+/// Flipping this to `false` restores "every segment RWX" in one line, which is a far faster way to
+/// confirm or clear this change as the cause of a bad boot than bisecting a revert.
+const ENFORCE_ELF_PROT: bool = true;
+
 /// Static binaries only — PT_INTERP (dynamic) is rejected.
 pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
     if file_data.len() < core::mem::size_of::<Elf64_Ehdr>() { return Err("File too small"); }
@@ -82,6 +90,9 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
 
     let mut tls: Option<TlsTemplate> = None;
     let mut phdr_vaddr: u64 = 0;
+    // (page vaddr, union of p_flags of every PT_LOAD segment touching it). See the ★ block after
+    // the loop.
+    let mut page_prot: alloc::vec::Vec<(u64, u32)> = alloc::vec::Vec::new();
 
     for i in 0..header.e_phnum {
         let offset = ph_offset + (i as usize * ph_size);
@@ -116,10 +127,19 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
                 let end_page = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFF;
                 let num_pages = ((end_page - start_page) / 4096) as usize;
 
-                // exec = true for every segment for now. Honouring each segment's real p_flags is
-                // Phase 3 step 3, kept separate because getting one segment wrong kills every app
-                // at _start with nothing but [SEGFAULT] on serial to go on.
+                // Mapped writable AND executable here regardless of p_flags; the real protection is
+                // applied in one pass after the loop. See the ★ block below for why it cannot be
+                // done here.
                 crate::memory::allocate_user_pages_at(start_page, num_pages, true)?;
+
+                // Accumulate the UNION of p_flags per page as we go.
+                for p in 0..num_pages {
+                    let page = start_page + (p as u64) * 4096;
+                    match page_prot.iter_mut().find(|e| e.0 == page) {
+                        Some(e) => e.1 |= phdr.p_flags,
+                        None => page_prot.push((page, phdr.p_flags)),
+                    }
+                }
 
                 unsafe {
                     let dest = phdr.p_vaddr as *mut u8;
@@ -145,6 +165,35 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // ★ Phase 3 step 3: apply each segment's real p_flags — but only AFTER every segment is
+    // loaded, and per PAGE rather than per segment. Both parts are load-bearing:
+    //
+    //  - This function writes the segment contents itself. Mapping .text read-only up front would
+    //    make our own `copy_nonoverlapping` fault in KERNEL mode, and a kernel-mode page fault
+    //    panics the whole machine rather than killing one process.
+    //  - ELF segments legitimately share a page — .rodata ending where .data or .tdata begins is
+    //    the ordinary case, already documented in memory.rs. Stamping one segment's flags onto a
+    //    shared page would revoke write access its neighbour needs, so each page gets the union of
+    //    every segment sitting on it. The union can only ever be more permissive, never less, so
+    //    this trades a little W^X strictness for never breaking a valid binary.
+    if ENFORCE_ELF_PROT {
+        const PF_X: u32 = 1;
+        const PF_W: u32 = 2;
+        let mut wx_pages = 0usize;
+        for (page, f) in page_prot.iter() {
+            let (w, x) = (f & PF_W != 0, f & PF_X != 0);
+            if w && x { wx_pages += 1; }
+            unsafe { crate::memory::protect_user_range(*page, 1, w, x)? };
+        }
+        // A page that ends up both writable and executable defeats the point of the exercise. It is
+        // legal and we allow it, but it is worth naming rather than leaving silent.
+        if wx_pages > 0 {
+            crate::serial_println!(
+                "[ELF] {} page(s) are both writable and executable (segments sharing a page)",
+                wx_pages as u32);
         }
     }
 
