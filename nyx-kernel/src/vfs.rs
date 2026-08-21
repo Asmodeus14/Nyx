@@ -266,12 +266,27 @@ impl VirtualFileSystem {
         results
     }
     
+    /// Resolve a path for `open(2)`.
+    ///
+    /// ★ This used to return `Some(path)` for anything under a mount point WITHOUT ever asking the
+    /// filesystem whether the file existed — so `open()` handed back a descriptor for any path at
+    /// all, and a read of a nonexistent file looked exactly like an empty one. Every "does this
+    /// exist?" check written as an `open` silently succeeded.
+    ///
+    /// It stayed hidden because the only thing that ever noticed was a probe verifying a *rename*,
+    /// which required the old path to stop opening. It was reported as a broken rename.
+    ///
+    /// `stat` is the existence check; it needs a real filesystem lookup, which is exactly what was
+    /// missing. Callers that want create-on-open pass O_CREAT/O_TRUNC, and the dispatcher creates
+    /// the file before calling this, so those still resolve.
     pub fn open_path(&self, path: &str) -> Option<String> {
-        if self.resolve_mount(path).is_some() {
-            Some(String::from(path))
-        } else {
-            None
+        if self.resolve_mount(path).is_none() {
+            return None;
         }
+        if self.stat(path).is_none() {
+            return None;
+        }
+        Some(String::from(path))
     }
     
     pub fn create_dir(&self, path: &str) -> bool {

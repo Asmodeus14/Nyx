@@ -281,6 +281,27 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
     let renamed = scratch("probe_renamed");
     let link = scratch("probe_link");
 
+    // --- open on a path that does not exist -------------------------------------------------
+    // Its own row because nothing else asserts it, and the one thing that ever noticed reported it
+    // as a broken `rename`. An open(2) that succeeds for any path makes every existence check
+    // written as an open silently true, and a read of a missing file indistinguishable from an
+    // empty one.
+    announce("open (nonexistent)");
+    let ghost = scratch("definitely_absent_file");
+    let gfd = unsafe { nyx_open(&ghost, O_RDONLY) };
+    if gfd >= 0 {
+        unsafe { raw::sys1(raw::SYS_CLOSE, gfd as usize) };
+    }
+    let mut row = Row::new(2, "open (missing)");
+    row.raw = render_ret(gfd);
+    row.verdict = if gfd < 0 { Verdict::Pass } else { Verdict::Fail };
+    row.note = String::from(if gfd < 0 {
+        "correctly refuses a path that is not there"
+    } else {
+        "returned a descriptor for a file that does not exist"
+    });
+    rows.push(row);
+
     announce("mkdir");
     let r = unsafe { raw::sys3(raw::SYS_MKDIR, dir.as_ptr() as usize, dir.len(), 0o755) };
     let made = exists(&dir);
