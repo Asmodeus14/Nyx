@@ -15,3 +15,6 @@ vendor/musl/config.mak
 vendor/musl/_install/
 
 tests/helloc/hello
+tests/helloc/hello_lo
+tests/helloc/bare
+

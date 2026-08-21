@@ -149,11 +149,29 @@ cp apps/browser/target/x86_64-unknown-nyx/release/browser build_initrd/apps/Brow
 cp tests/posix/target/x86_64-unknown-nyx/release/posixprobe build_initrd/apps/PosixProbe.nyx/run.bin 2>/dev/null || true
 cp tests/posix/probe.txt build_initrd/apps/PosixProbe.nyx/probe.txt 2>/dev/null || true
 
-# C hello-world against musl. Skipped rather than fatal when libc.a is absent: musl is built by
+# C test binaries. Skipped rather than fatal when libc.a is absent: musl is built by
 # ./Build-musl.sh, which is deliberately NOT part of this script (it takes ~90s and changes rarely).
+#
+# run.bin is linked at 0x40000000 where the native apps live. gcc's default 0x400000 sits INSIDE
+# the kernel image (linked 0x200000..~0x15d5000, and mapped into every address space), which is
+# what froze the machine. `hello_lo` keeps that broken base deliberately: it is the regression
+# test for the loader's overlap check, and must now fail cleanly instead of killing the box.
+# Launch the extras from the terminal with `exec <path>`.
 if [ -f vendor/musl/lib/libc.a ]; then
-  echo "[9j] Building C hello-world (musl)..."
-  ./tests/helloc/build.sh >/dev/null 2>&1 && cp tests/helloc/hello build_initrd/apps/HelloC.nyx/run.bin || echo "  (helloc build failed)"
+  echo "[9j] Building C test binaries (musl + libc-free, two load addresses)..."
+  # Output is NOT silenced and the destination is cleared first. Previously a failed build only
+  # printed a note while leaving the PREVIOUS run.bin in place — so the next boot silently tested
+  # a stale binary under the new binary's name, which is the most expensive kind of wrong.
+  rm -f build_initrd/apps/HelloC.nyx/run.bin \
+        build_initrd/apps/HelloC.nyx/hello_lo \
+        build_initrd/apps/HelloC.nyx/bare
+  if ./tests/helloc/build.sh; then
+    cp tests/helloc/hello    build_initrd/apps/HelloC.nyx/run.bin
+    cp tests/helloc/hello_lo build_initrd/apps/HelloC.nyx/hello_lo
+    cp tests/helloc/bare     build_initrd/apps/HelloC.nyx/bare
+  else
+    echo "  (helloc build FAILED — HelloC.nyx ships with no binaries)"
+  fi
 else
   echo "[9j] helloc skipped - run ./Build-musl.sh to build libc.a first"
 fi
