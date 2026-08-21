@@ -1932,7 +1932,26 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         59 => { // sys_execve
             let ptr = arg1 as *const u8;
             let len = arg2 as usize;
-            
+            // FIRST thing, before touching the pointer: this is the line that says whether the arm
+            // is entered at all. Nothing printed for one particular binary while the identical
+            // click path worked for others, and everything below dereferences user memory.
+            crate::serial_println!("[EXEC] arm entered: ptr={:#x} len={}", arg1, len as u32);
+
+            // ★ This read had NO validation. `from_raw_parts` on an unvalidated user pointer is a
+            // kernel-mode read, and a kernel-mode read of an unmapped address panics the MACHINE
+            // rather than killing the caller — so a bad path argument here took the whole box down
+            // instead of returning an error. Both checks: range, then actually-mapped.
+            if len == 0 || len > 4096 || !is_valid_user_ptr(ptr, len) {
+                crate::serial_println!("[EXEC] refused: bad path pointer/len");
+                frame.rax = EFAULT as u64;
+                return;
+            }
+            if !unsafe { crate::memory::user_addr_mapped(arg1) } {
+                crate::serial_println!("[EXEC] refused: path page not mapped");
+                frame.rax = EFAULT as u64;
+                return;
+            }
+
             // 1. Copy the path to a safe Kernel String BEFORE shredding user memory!
             let path_str = if let Ok(s) = core::str::from_utf8(unsafe { core::slice::from_raw_parts(ptr, len) }) {
                 alloc::string::String::from(s.trim_matches(char::from(0)).trim())
