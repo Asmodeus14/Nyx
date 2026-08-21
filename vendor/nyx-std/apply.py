@@ -228,9 +228,29 @@ def main():
         return "patched"
     do("exit.rs (nyx exit_group arm)", sys_exit)
 
-    # --- io/error: reuse the existing `generic` module (errno/error_string/…) for nyx. ---
-    do("io/error/mod.rs (reuse generic)",
-       lambda: add_os_to_arm(os.path.join(B, "io", "error", "mod.rs"), "generic", 'target_os = "nyx"'))
+    # --- io/error: nyx gets its OWN errno table.
+    #     It used to reuse std's `generic` module, which is a stub: `decode_error_kind` returns
+    #     `Uncategorized` for every code and `error_string` returns the literal "operation
+    #     successful" for every errno. That produced the message "operation successful (os error
+    #     110)" for a timeout, and — far worse — made every `e.kind()` test in std-facing code
+    #     silently false. The browser's stepped fetch relies on `ErrorKind::TimedOut` meaning "no
+    #     data yet", so with the stub in place a routine short read was read as a hard failure. ---
+    def io_error():
+        path = os.path.join(B, "io", "error", "mod.rs")
+        # Undo the old `add_os_to_arm` edit first. That helper assumed a single-predicate arm and
+        # met a multi-line `any( ... )`, so it rewrote the closing `    ) => {` into
+        # `    any(), target_os = "nyx") =>  {`. That happens to still parse (a nested empty `any()`
+        # is simply false), which is why it went unnoticed — but leaving nyx listed on the generic
+        # arm as well as its own is a trap for whoever reads this next.
+        if os.path.isfile(path):
+            text = open(path, encoding="utf-8").read()
+            broken = '    any(), target_os = "nyx") =>  {'
+            if broken in text:
+                open(path, "w", encoding="utf-8").write(text.replace(broken, "    ) => {"))
+        copy("sys/io_error_nyx.rs", os.path.join(B, "io", "error", "nyx.rs"))
+        arm = f'    target_os = "nyx" => {{ {MARK}\n        mod nyx;\n        pub use nyx::*;\n    }}\n'
+        return insert_arm_after_cfg_select(path, arm, MARK)
+    do("io/error/mod.rs (nyx errno table)", io_error)
 
     # --- C2: std/build.rs allowlist. std's build.rs emits `cfg(restricted_std)` for any target NOT
     #     in its known-platform list; that cfg makes std (and EVERY downstream crate that touches it,

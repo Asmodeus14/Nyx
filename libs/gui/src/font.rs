@@ -211,29 +211,59 @@ pub fn with_glyph<R>(c: char, px: usize, f: impl FnOnce(&Glyph) -> R) -> Option<
 
 /// Horizontal advance (pixels) of a single glyph at `scale`.
 pub fn advance(c: char, scale: usize) -> usize {
-    let px = px_for(scale);
-    with_glyph(c, px, |g| g.advance).unwrap_or(CHAR_WIDTH * scale)
+    advance_px(c, px_for(scale))
 }
 
 /// Ascent (pixels above the baseline) at `scale`.
 pub fn ascent(scale: usize) -> usize {
-    let mut guard = FONT.lock();
-    if !ensure_loaded(&mut guard) {
-        return (CHAR_HEIGHT * scale * 3) / 4;
-    }
-    let st = guard.as_ref().unwrap();
-    let s = px_for(scale) as f32 / st.upem;
-    libm::ceilf(st.face.ascender() as f32 * s) as usize
+    ascent_px(px_for(scale))
 }
 
 /// Full line height (pixels) at `scale` = (ascender - descender + line_gap) * scale.
 pub fn line_height(scale: usize) -> usize {
+    line_height_px(px_for(scale))
+}
+
+// --- Pixel-exact variants -------------------------------------------------------------------
+//
+// The `scale` API can only express integer multiples of BASE_PX (14), which is fine for UI chrome
+// and wrong for a browser: CSS asks for 32px h1 and 24px h2, and both would round to scale 2 and
+// render identically. The rasterizer has always worked in pixels (`with_glyph` takes px) — these
+// just expose that, and the scale functions above are now thin wrappers so there is one code path.
+
+/// Horizontal advance (pixels) of a single glyph rasterized at `px` height.
+pub fn advance_px(c: char, px: usize) -> usize {
+    let px = px.max(1);
+    with_glyph(c, px, |g| g.advance).unwrap_or(px / 2)
+}
+
+/// Ascent (pixels above the baseline) at `px` height.
+pub fn ascent_px(px: usize) -> usize {
+    let px = px.max(1);
     let mut guard = FONT.lock();
     if !ensure_loaded(&mut guard) {
-        return CHAR_HEIGHT * scale;
+        return (px * 3) / 4;
     }
     let st = guard.as_ref().unwrap();
-    let s = px_for(scale) as f32 / st.upem;
+    let s = px as f32 / st.upem;
+    libm::ceilf(st.face.ascender() as f32 * s) as usize
+}
+
+/// Full line height (pixels) at `px` height = (ascender - descender + line_gap) scaled.
+pub fn line_height_px(px: usize) -> usize {
+    let px = px.max(1);
+    let mut guard = FONT.lock();
+    if !ensure_loaded(&mut guard) {
+        return px;
+    }
+    let st = guard.as_ref().unwrap();
+    let s = px as f32 / st.upem;
     let lh = (st.face.ascender() as i32 - st.face.descender() as i32 + st.face.line_gap() as i32) as f32 * s;
     libm::ceilf(lh) as usize
+}
+
+/// Advance of a whole string at `px` height. Newlines are not handled — callers doing their own
+/// line breaking (the browser) never pass them.
+pub fn text_width_px(text: &str, px: usize) -> usize {
+    text.chars().map(|c| advance_px(c, px)).sum()
 }

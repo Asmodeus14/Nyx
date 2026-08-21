@@ -1,0 +1,21 @@
+[package]
+name = "nyx-web"
+version = "0.1.0"
+edition = "2021"
+description = "HTML/CSS engine for Nyx — html5ever DOM, cssparser stylesheets, selector matching and cascade"
+
+[lib]
+name = "nyx_web"
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("nyx"))'] }
+
+[dependencies]
+# Servo's real HTML parser. Not a shortcut: real pages are full of unclosed tags, implied <tbody>,
+# misnested inlines and stray text before <html>, and the tree-construction rules that repair all of
+# that are the spec's, not something worth re-deriving. Proven to build for target_os=nyx.
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+# Servo's CSS tokenizer — handles strings, escapes, comments, at-rules and error recovery.
+cssparser = "0.34"

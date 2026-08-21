@@ -1,0 +1,3 @@
+nyx posix probe fixture
+line two
+line three

@@ -34,7 +34,7 @@ macro_rules! trace {
 
 /// A response body larger than this is refused rather than allowed to exhaust the userspace heap.
 /// Nyx processes do not get an OOM killer; an unbounded read would just wedge the machine.
-const MAX_BODY: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_BODY: usize = 8 * 1024 * 1024;
 /// Headers past this point are a malformed or hostile server, not a real response.
 const MAX_HEADERS: usize = 64 * 1024;
 /// Redirect chains longer than this are a loop.
@@ -131,7 +131,7 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 }
 
 /// Plain or encrypted, behind one Read+Write so the HTTP code never branches on it.
-enum Transport {
+pub(crate) enum Transport {
     Plain(TcpStream),
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
@@ -161,9 +161,16 @@ impl Write for Transport {
 }
 
 impl Transport {
-    fn connect(url: &Url, start: &Instant) -> Result<Transport, Error> {
-        trace!(start, "resolving + connecting to {}:{}", url.host, url.port);
-        let sock = TcpStream::connect((url.host.as_str(), url.port))?;
+    /// `addr` is pre-resolved by the caller. Passing it in rather than handing
+    /// `(host, port)` to `TcpStream::connect` keeps DNS and the TCP handshake as two separately
+    /// observable steps — they fail for unrelated reasons and each can stall on its own.
+    pub(crate) fn connect(
+        url: &Url,
+        addr: std::net::SocketAddr,
+        start: &Instant,
+    ) -> Result<Transport, Error> {
+        trace!(start, "connecting to {addr} for {}:{}", url.host, url.port);
+        let sock = TcpStream::connect(addr)?;
         trace!(start, "tcp connected");
 
         // Arm the deadline before any traffic. Doing it after the handshake would leave exactly the
@@ -189,6 +196,58 @@ impl Transport {
             }
         }
     }
+
+    /// Re-arm both socket deadlines. The stepped fetch uses a much shorter one than `get`, because
+    /// there a timeout means "come back next frame" rather than "give up".
+    pub(crate) fn set_timeout(&mut self, d: Duration) -> Result<(), Error> {
+        let sock = match self {
+            Transport::Plain(s) => s,
+            Transport::Tls(s) => &mut s.sock,
+        };
+        sock.set_read_timeout(Some(d))?;
+        sock.set_write_timeout(Some(d))?;
+        Ok(())
+    }
+
+    /// Hand the request over without waiting for it to reach the wire.
+    ///
+    /// For TLS this only fills rustls's own outgoing buffer — no I/O and so nothing to time out. The
+    /// handshake and the flush both happen inside the first `read`, which is exactly where the
+    /// stepped fetch can afford to be interrupted and resume. Writing here instead would put a
+    /// blocking handshake in a path that has no way to report progress.
+    pub(crate) fn queue_request(&mut self, req: &[u8]) -> Result<(), Error> {
+        match self {
+            // A request this small always fits in the socket's send buffer, so this does not block.
+            Transport::Plain(s) => {
+                s.write_all(req)?;
+                s.flush()?;
+            }
+            Transport::Tls(s) => {
+                s.conn.writer().write_all(req)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The request bytes for a GET. Shared so the blocking and stepped paths cannot drift apart.
+pub(crate) fn request_line(url: &Url) -> Vec<u8> {
+    // Host must carry the port when it is non-default, or name-based virtual hosts answer wrong.
+    let host_header = if url.port == url.scheme.default_port() {
+        url.host.clone()
+    } else {
+        format!("{}:{}", url.host, url.port)
+    };
+    format!(
+        "GET {} HTTP/1.1\r\n\
+         Host: {host_header}\r\n\
+         User-Agent: Nyx/0.1\r\n\
+         Accept: */*\r\n\
+         Accept-Encoding: identity\r\n\
+         Connection: close\r\n\r\n",
+        url.path
+    )
+    .into_bytes()
 }
 
 /// rustls does not expose the root count once the config is built, and the number is genuinely
@@ -228,26 +287,12 @@ pub fn get(url: &str) -> Result<Response, Error> {
 pub fn get_once(url: &Url) -> Result<Response, Error> {
     let start = Instant::now();
     trace!(&start, "GET {url}");
-    let mut transport = Transport::connect(url, &start)?;
+    let addr = crate::fetch::resolve_host(url)?;
+    let mut transport = Transport::connect(url, addr, &start)?;
 
-    // Host must carry the port when it is non-default, or name-based virtual hosts answer wrong.
-    let host_header = if url.port == url.scheme.default_port() {
-        url.host.clone()
-    } else {
-        format!("{}:{}", url.host, url.port)
-    };
-    let request = format!(
-        "GET {} HTTP/1.1\r\n\
-         Host: {host_header}\r\n\
-         User-Agent: Nyx/0.1\r\n\
-         Accept: */*\r\n\
-         Accept-Encoding: identity\r\n\
-         Connection: close\r\n\r\n",
-        url.path
-    );
     // For HTTPS this is where the handshake actually happens — rustls defers it to the first I/O —
     // so a stall here is a TLS problem, not a request-sending problem.
-    transport.write_all(request.as_bytes())?;
+    transport.write_all(&request_line(url))?;
     transport.flush()?;
     trace!(&start, "request sent (handshake done for https)");
 
@@ -294,7 +339,7 @@ fn read_head(transport: &mut Transport) -> Result<(Vec<u8>, Vec<u8>), Error> {
     }
 }
 
-fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), Error> {
+pub(crate) fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), Error> {
     let text = String::from_utf8_lossy(head);
     let mut lines = text.split("\r\n");
 
@@ -452,11 +497,11 @@ fn take_line(transport: &mut Transport, pending: &mut Vec<u8>) -> Result<Option<
 
 /// A server that closes without a TLS `close_notify` is extremely common with `Connection: close`,
 /// and rustls surfaces that as `UnexpectedEof`. Treating it as a hard error would fail most fetches.
-fn is_clean_eof(e: &std::io::Error) -> bool {
+pub(crate) fn is_clean_eof(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::UnexpectedEof
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }

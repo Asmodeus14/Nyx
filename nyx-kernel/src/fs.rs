@@ -64,6 +64,21 @@ extern "C" {
     // Milestones 1.3 & 1.7 Additions
     fn nyx_fs_delete_file(path: *const u8) -> i32;
     fn nyx_fs_sync(path: *const u8) -> i32;
+
+    // Phase 1 (POSIX floor): metadata + namespace operations. All of these are thin covers over
+    // lwext4 calls that were already compiled in and simply never reached from Rust.
+    fn nyx_fs_stat(
+        path: *const u8,
+        out_mode: *mut u32,
+        out_size: *mut u64,
+        out_ino: *mut u32,
+        out_atime: *mut u32,
+        out_mtime: *mut u32,
+        out_ctime: *mut u32,
+    ) -> i32;
+    fn nyx_fs_remove_dir(path: *const u8) -> i32;
+    fn nyx_fs_rename(path: *const u8, new_path: *const u8) -> i32;
+    fn nyx_fs_symlink(target: *const u8, path: *const u8) -> i32;
     
     // The directory lister
     fn nyx_fs_list_dir(
@@ -194,6 +209,46 @@ impl crate::vfs::FileSystem for NvmeLwExt4Fs {
     fn delete_file(&mut self, path: &str) -> Result<(), FsError> {
         let c_path = to_c_path(path);
         if unsafe { nyx_fs_delete_file(c_path.as_ptr()) == 1 } { Ok(()) } else { Err(FsError::IoError) }
+    }
+
+    // --- Phase 1 (POSIX floor) ---
+
+    fn stat(&self, path: &str) -> Result<crate::vfs::FileStat, FsError> {
+        let c_path = to_c_path(path);
+        let mut st = crate::vfs::FileStat::default();
+        let ok = unsafe {
+            nyx_fs_stat(
+                c_path.as_ptr(),
+                &mut st.mode,
+                &mut st.size,
+                &mut st.ino,
+                &mut st.atime,
+                &mut st.mtime,
+                &mut st.ctime,
+            )
+        };
+        if ok == 1 { Ok(st) } else { Err(FsError::NotFound) }
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), FsError> {
+        let c_path = to_c_path(path);
+        if unsafe { nyx_fs_remove_dir(c_path.as_ptr()) == 1 } { Ok(()) } else { Err(FsError::IoError) }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), FsError> {
+        let c_from = to_c_path(from);
+        let c_to = to_c_path(to);
+        if unsafe { nyx_fs_rename(c_from.as_ptr(), c_to.as_ptr()) == 1 } { Ok(()) } else { Err(FsError::IoError) }
+    }
+
+    fn symlink(&mut self, target: &str, path: &str) -> Result<(), FsError> {
+        // The target is stored verbatim in the link, so it must NOT go through to_c_path — that
+        // rewrites /mnt/nvme/... into the driver's own /mnt/... namespace, which is correct for a
+        // path being resolved and wrong for a string being recorded. It still needs a NUL.
+        let mut c_target = alloc::string::String::from(target).into_bytes();
+        c_target.push(0);
+        let c_path = to_c_path(path);
+        if unsafe { nyx_fs_symlink(c_target.as_ptr(), c_path.as_ptr()) == 1 } { Ok(()) } else { Err(FsError::IoError) }
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {

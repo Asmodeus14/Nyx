@@ -14,9 +14,11 @@
 //! # Ok::<(), nyx_net::Error>(())
 //! ```
 
+pub mod fetch;
 pub mod http;
 mod rng;
 pub mod url;
 
+pub use fetch::{Fetch, Progress};
 pub use http::{get, get_once, Error, Response};
 pub use url::{Scheme, Url};

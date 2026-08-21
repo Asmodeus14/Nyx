@@ -1,5 +1,9 @@
 #include "ext4.h"
 #include "ext4_mbr.h"
+// ext4.h stops at the public API; `struct ext4_inode`'s accessors and the endian helpers live one
+// level down, and nyx_fs_stat needs both to read a size out of a raw inode.
+#include "ext4_inode.h"
+#include "ext4_super.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -149,6 +153,77 @@ int nyx_fs_delete_file(const char* path) {
         return 1; // Success
     }
     return 0; // Failed (e.g., file doesn't exist, or folder not empty)
+}
+
+// ==========================================
+// METADATA + NAMESPACE BRIDGES  (Phase 1: the POSIX floor)
+// ==========================================
+//
+// These exist because lwext4 already implements all of it. The Phase 1 plan assumed the VFS had no
+// inode numbers, no timestamps and no rename/symlink backing, and budgeted three synthesised
+// half-answers (st_ino = path hash, st_mtime = RTC-now, rename = honest ENOSYS). Reading the
+// vendored ext4.h showed that was wrong on every count — so `stat` reports the real on-disk inode
+// and the real mtime, and `rename`/`symlink` do the real thing instead of lying or refusing.
+
+// Fills a caller-provided block with the metadata `stat(2)` needs. Returns 1 on success, 0 if the
+// path does not resolve. Every out-param is optional-by-value (written only on success), so a
+// partially-failing call cannot leave the caller reading uninitialised fields as real data.
+int nyx_fs_stat(const char* path,
+                uint32_t* out_mode, uint64_t* out_size, uint32_t* out_ino,
+                uint32_t* out_atime, uint32_t* out_mtime, uint32_t* out_ctime) {
+    uint32_t mode = 0;
+    if (ext4_mode_get(path, &mode) != EOK) return 0;
+
+    // Size comes from the inode, not from fopen: opening a directory fails, and a directory still
+    // has a size. ext4_raw_inode_fill gives both the inode number and the raw inode.
+    //
+    // ext4_inode_get_size DEREFERENCES the superblock (it checks rev_level before folding in
+    // size_hi), so it must never be handed NULL — that is a null deref inside kernel C, which on Nyx
+    // is a kernel-mode fault and takes the machine down. Fetch the real superblock; if that fails,
+    // fall back to the low half of the size, which is correct for anything under 4 GB.
+    uint32_t ino = 0;
+    struct ext4_inode inode;
+    uint64_t size = 0;
+    if (ext4_raw_inode_fill(path, &ino, &inode) == EOK) {
+        struct ext4_sblock *sb = 0;
+        if (ext4_get_sblock("/mnt/", &sb) == EOK && sb) {
+            size = ext4_inode_get_size(sb, &inode);
+        } else {
+            size = (uint64_t)to_le32(inode.size_lo);
+        }
+    }
+
+    uint32_t atime = 0, mtime = 0, ctime = 0;
+    ext4_atime_get(path, &atime);
+    ext4_mtime_get(path, &mtime);
+    ext4_ctime_get(path, &ctime);
+
+    *out_mode  = mode;
+    *out_size  = size;
+    *out_ino   = ino;
+    *out_atime = atime;
+    *out_mtime = mtime;
+    *out_ctime = ctime;
+    return 1;
+}
+
+// Removes an EMPTY directory. `ext4_fremove` is the file path and fails on a directory, so rmdir
+// needs its own call — conflating them is how "rmdir succeeded" ends up meaning nothing happened.
+int nyx_fs_remove_dir(const char* path) {
+    return ext4_dir_rm(path) == EOK ? 1 : 0;
+}
+
+int nyx_fs_rename(const char* path, const char* new_path) {
+    return ext4_frename(path, new_path) == EOK ? 1 : 0;
+}
+
+int nyx_fs_symlink(const char* target, const char* path) {
+    return ext4_fsymlink(target, path) == EOK ? 1 : 0;
+}
+
+// type: 0 = any, otherwise an EXT4_DE_* constant (EXT4_DE_DIR = 2, EXT4_DE_REG_FILE = 1).
+int nyx_fs_exists(const char* path, int type) {
+    return ext4_inode_exist(path, type) == EOK ? 1 : 0;
 }
 // Forces the block cache to flush its journal to the physical NVMe drive
 int nyx_fs_sync(const char* path) {

@@ -31,6 +31,38 @@ pub struct StatFs {
     pub block_size: u32,
 }
 
+/// Phase 1: everything `stat(2)` needs about one path.
+///
+/// These are **real on-disk values**, not synthesised ones. The plan for this phase budgeted a path
+/// hash for `ino` and the current RTC reading for `mtime`, on the assumption that the VFS had no
+/// inode or timestamp concept — reading the vendored lwext4 headers showed it has both. That matters
+/// beyond tidiness: anything that caches on mtime (make, rsync, a build system, a browser cache)
+/// silently misbehaves against a clock that reports "now" for every file, and a hashed inode number
+/// makes hardlink detection and `same_file` checks quietly wrong.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileStat {
+    pub size: u64,
+    /// Full POSIX mode word — file-type bits included, which is what makes `is_dir` real rather
+    /// than a guess based on "did list_dir return anything".
+    pub mode: u32,
+    pub ino: u32,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
+}
+
+/// POSIX file-type bits, as they appear in the top of `st_mode`.
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+
+impl FileStat {
+    pub fn is_dir(&self) -> bool { self.mode & S_IFMT == S_IFDIR }
+    pub fn is_file(&self) -> bool { self.mode & S_IFMT == S_IFREG }
+    pub fn is_symlink(&self) -> bool { self.mode & S_IFMT == S_IFLNK }
+}
+
 /// Any storage driver (NVMe, AHCI, TAR RAMFS) must implement this trait.
 pub trait FileSystem: Send + Sync {
     /// Reads up to buf.len() bytes from the file at the given offset.
@@ -49,6 +81,14 @@ pub trait FileSystem: Send + Sync {
 
     // 🔥 MILESTONE 1.3: Delete File Added
     fn delete_file(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
+
+    // --- Phase 1 (POSIX floor). Defaults refuse rather than pretend: a read-only driver that
+    // silently returned Ok(()) from `rename` would make the syscall a STUB, which is the one
+    // outcome worse than not having it. ---
+    fn stat(&self, _path: &str) -> Result<FileStat, FsError> { Err(FsError::Unsupported) }
+    fn remove_dir(&mut self, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
+    fn rename(&mut self, _from: &str, _to: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
+    fn symlink(&mut self, _target: &str, _path: &str) -> Result<(), FsError> { Err(FsError::Unsupported) }
 
     // 🔥 MILESTONE 1.7: Sync/Flush to commit Journal to physical disk
     fn sync(&mut self) -> Result<(), FsError> { Ok(()) }
@@ -269,6 +309,57 @@ impl VirtualFileSystem {
             let mut mounts = self.mounts.lock();
             if let Some(driver) = mounts.get_mut(&mount_point) {
                 return driver.delete_file(&rel_path).is_ok();
+            }
+        }
+        false
+    }
+
+    // --- Phase 1 (POSIX floor) ---
+
+    /// Metadata for one path. `None` means the path does not resolve to a mount, or the driver
+    /// cannot stat it — the caller turns that into ENOENT.
+    pub fn stat(&self, path: &str) -> Option<FileStat> {
+        let (mount_point, rel_path) = self.resolve_mount(path)?;
+        let mounts = self.mounts.lock();
+        let driver = mounts.get(&mount_point)?;
+        driver.stat(&rel_path).ok()
+    }
+
+    /// Remove an EMPTY directory. Deliberately separate from `delete_file`: the underlying
+    /// `ext4_fremove` fails on a directory, so routing rmdir through it would have reported failure
+    /// for the correct case and never removed anything.
+    pub fn remove_dir(&self, path: &str) -> bool {
+        if let Some((mount_point, rel_path)) = self.resolve_mount(path) {
+            let mut mounts = self.mounts.lock();
+            if let Some(driver) = mounts.get_mut(&mount_point) {
+                return driver.remove_dir(&rel_path).is_ok();
+            }
+        }
+        false
+    }
+
+    /// Rename within a single mount. **Cross-mount renames are refused**, not silently turned into
+    /// a copy: `rename(2)` promises atomicity, and a copy+delete across two filesystems is neither
+    /// atomic nor reversible if it fails halfway.
+    pub fn rename(&self, from: &str, to: &str) -> bool {
+        let (from_mount, from_rel) = match self.resolve_mount(from) { Some(v) => v, None => return false };
+        let (to_mount, to_rel) = match self.resolve_mount(to) { Some(v) => v, None => return false };
+        if from_mount != to_mount { return false; }
+
+        let mut mounts = self.mounts.lock();
+        if let Some(driver) = mounts.get_mut(&from_mount) {
+            return driver.rename(&from_rel, &to_rel).is_ok();
+        }
+        false
+    }
+
+    /// Create a symlink at `path` pointing at `target`. `target` is stored verbatim (it may be
+    /// relative, and it need not exist), so only `path` is resolved to a mount.
+    pub fn symlink(&self, target: &str, path: &str) -> bool {
+        if let Some((mount_point, rel_path)) = self.resolve_mount(path) {
+            let mut mounts = self.mounts.lock();
+            if let Some(driver) = mounts.get_mut(&mount_point) {
+                return driver.symlink(target, &rel_path).is_ok();
             }
         }
         false

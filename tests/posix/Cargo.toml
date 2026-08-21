@@ -1,0 +1,27 @@
+[package]
+name = "posixprobe"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 0 of the POSIX-floor work: a syscall conformance harness.
+#
+# It answers one question that nothing else can — for every syscall a libc port will need, is it
+# MISSING, a STUB that returns success and does nothing, present-but-wrong, or genuinely working?
+# And separately: does the Rust std PAL expose it, or is there a second wall there?
+#
+# Every effort estimate for the musl/Ladybird work is a guess until this has been run on hardware,
+# which is why it is built before any of that work starts.
+#
+# Built standalone against targets/x86_64-unknown-nyx.json via Build-std.sh — NOT a workspace member
+# (it needs the std target + build-std, like tests/stdhello and apps/stdgui).
+[[bin]]
+name = "posixprobe"
+path = "src/main.rs"
+
+[dependencies]
+nyx-api = { path = "../../libs/api" }
+nyx-gui = { path = "../../libs/gui" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2

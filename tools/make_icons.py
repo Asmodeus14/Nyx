@@ -261,6 +261,33 @@ def wifi():
     return im
 
 
+def browser():
+    """A globe with a latitude band and two meridians — the universal 'web' mark."""
+    im = tile((52, 120, 246, 255))
+    im.ring(24, 24, 13, 2.8, WHITE)                 # globe outline
+    im.line(11, 24, 37, 24, 2.4, WHITE)             # equator
+    # Meridians, as nested rings squeezed horizontally by drawing narrower arcs.
+    im.ring(24, 24, 13, 2.2, WHITE, math.pi * 0.5 - 0.9, math.pi * 0.5 + 0.9)
+    im.ring(24, 24, 13, 2.2, WHITE, math.pi * 1.5 - 0.9, math.pi * 1.5 + 0.9)
+    im.ring(24, 24, 6.5, 2.2, WHITE)                # inner meridian ellipse, approximated
+    return im
+
+
+def posixprobe():
+    """A checklist: three rows, the first two ticked, the third crossed — pass/pass/fail."""
+    im = tile((99, 110, 114, 255))
+    for i, ok in enumerate((True, True, False)):
+        y = 14 + i * 10
+        im.rect(23, y + 3, 13, 2, WHITE)            # the item's line of text
+        if ok:
+            im.line(12, y + 4, 15, y + 7, 2.2, (46, 204, 113, 255))
+            im.line(15, y + 7, 20, y + 1, 2.2, (46, 204, 113, 255))
+        else:
+            im.line(13, y + 1, 19, y + 7, 2.2, (231, 76, 60, 255))
+            im.line(19, y + 1, 13, y + 7, 2.2, (231, 76, 60, 255))
+    return im
+
+
 def nyx():
     """The shell's own mark: an orange plate with an angular N."""
     im = tile((255, 87, 34, 255))
@@ -283,6 +310,8 @@ ICONS = {
     "stdgui": stdgui,
     "notepad": notepad,
     "wifi": wifi,
+    "browser": browser,
+    "posixprobe": posixprobe,
     "nyx": nyx,
 }
 

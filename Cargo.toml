@@ -14,6 +14,9 @@ members = [
     # HTTP/TLS transport for the browser work. A workspace member so `cargo test -p nyx-net` can
     # exercise the URL and HTTP parsing on the host — only the socket layer needs real hardware.
     "libs/net",
+    # HTML/CSS engine (html5ever + cssparser). Host-testable for the same reason as libs/net —
+    # debugging a layout bug through a serial log is not a workflow.
+    "libs/web",
     
     # Applications
     "apps/init",
@@ -36,7 +39,7 @@ default-members = ["nyx-kernel"]
 
 # The std-port spike crate uses a different target + build-std=std; keep Cargo from pulling it
 # into the workspace (it must be built standalone against x86_64-unknown-nyx.json).
-exclude = ["tests/stdhello", "tests/stdchild", "apps/qcstudio", "apps/stdgui", "apps/terminal", "apps/notepad", "vendor"]
+exclude = ["tests/stdhello", "tests/stdchild", "tests/posix", "apps/qcstudio", "apps/stdgui", "apps/terminal", "apps/notepad", "apps/browser", "vendor"]
 
 resolver = "2"
 

@@ -22,13 +22,22 @@ pub static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 // Atomic counter prevents Ephemeral Port exhaustion!
 static NEXT_LOCAL_PORT: AtomicU16 = AtomicU16::new(49152);
 
+const EPERM: i64 = -1;
+const ENOENT: i64 = -2;
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
-const EFAULT: i64 = -14; 
+const EACCES: i64 = -13;
+const EFAULT: i64 = -14;
+const EEXIST: i64 = -17;
+const ENOTDIR: i64 = -20;
+const EISDIR: i64 = -21;
 const EINVAL: i64 = -22;
 const EMFILE: i64 = -24;
-const ENOSYS: i64 = -38; 
+const ENOSPC: i64 = -28;
+const ESPIPE: i64 = -29;
+const ENOSYS: i64 = -38;
+const ENOTEMPTY: i64 = -39;
 
 #[repr(C)]
 pub struct SockAddrIn {
@@ -59,6 +68,57 @@ pub struct SystemInfo {
     /// as unknown, the reason is "we have no driver for THIS machine", and naming the machine is what
     /// turns that from a shrug into something actionable.
     pub machine: [u8; 80],
+}
+
+/// Size of x86_64 `struct stat`, and the offset of the name inside `struct linux_dirent64`.
+const STAT_SIZE: usize = 144;
+const DIRENT_HEADER: usize = 19; // u64 d_ino + i64 d_off + u16 d_reclen + u8 d_type
+
+/// Borrow a userspace path argument as a `&str`.
+///
+/// Nyx passes paths as `(ptr, len)` rather than as NUL-terminated C strings — see the Phase 1 block
+/// in the dispatcher for why that convention is kept for now. The `PATH_MAX` cap is not cosmetic:
+/// `is_valid_user_ptr` only range-checks and cannot tell a mapped page from an unmapped one, so
+/// bounding the length is what keeps a bogus `len` from walking into unmapped memory and taking the
+/// machine down with a kernel-mode fault.
+///
+/// # Safety
+/// The caller must not hold the returned borrow across anything that could unmap the pages.
+unsafe fn user_path<'a>(ptr: u64, len: u64) -> Option<&'a str> {
+    const PATH_MAX: u64 = 4096;
+    if len == 0 || len > PATH_MAX { return None; }
+    if !is_valid_user_ptr(ptr as *const u8, len as usize) { return None; }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    core::str::from_utf8(bytes).ok()
+}
+
+/// Write an x86_64 `struct stat` into userspace.
+///
+/// The layout is fixed by the ABI, so the offsets are spelled out rather than mirrored in a Rust
+/// struct — a `#[repr(C)]` copy would look tidier and would silently drift the day someone adds a
+/// field. Everything not backed by real data is zeroed, which is the honest answer: Nyx has no uid,
+/// gid, device numbers or link counts, and writing plausible-looking values for them would be
+/// inventing facts a caller might act on.
+///
+/// # Safety
+/// `buf` must be a valid, writable user pointer to at least `STAT_SIZE` bytes.
+unsafe fn write_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
+    unsafe {
+        core::ptr::write_bytes(buf, 0, STAT_SIZE);
+        core::ptr::write_unaligned(buf.add(0) as *mut u64, 0);                 // st_dev
+        core::ptr::write_unaligned(buf.add(8) as *mut u64, st.ino as u64);     // st_ino
+        core::ptr::write_unaligned(buf.add(16) as *mut u64, 1);                // st_nlink
+        core::ptr::write_unaligned(buf.add(24) as *mut u32, st.mode);          // st_mode
+        core::ptr::write_unaligned(buf.add(28) as *mut u32, 0);                // st_uid
+        core::ptr::write_unaligned(buf.add(32) as *mut u32, 0);                // st_gid
+        core::ptr::write_unaligned(buf.add(40) as *mut u64, 0);                // st_rdev
+        core::ptr::write_unaligned(buf.add(48) as *mut i64, st.size as i64);   // st_size
+        core::ptr::write_unaligned(buf.add(56) as *mut i64, 4096);             // st_blksize
+        core::ptr::write_unaligned(buf.add(64) as *mut i64, ((st.size + 511) / 512) as i64); // st_blocks
+        core::ptr::write_unaligned(buf.add(72) as *mut i64, st.atime as i64);  // st_atime
+        core::ptr::write_unaligned(buf.add(88) as *mut i64, st.mtime as i64);  // st_mtime
+        core::ptr::write_unaligned(buf.add(104) as *mut i64, st.ctime as i64); // st_ctime
+    }
 }
 
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
@@ -849,7 +909,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             frame.rax = total_written as u64;
         },
         
-        22 => { // SYS_PIPE
+        22 | 293 => { // SYS_PIPE / SYS_PIPE2
+            // pipe2's flags (O_CLOEXEC, O_NONBLOCK) are accepted and ignored: Nyx has no exec-time
+            // fd closing and pipes are already non-blocking on the read side. Refusing the call
+            // outright would block every libc that only knows pipe2, for no gain.
             let fd_array_ptr = arg1 as *mut i32;
             if !is_valid_user_ptr(fd_array_ptr as *const u8, 8) { frame.rax = EFAULT as u64; return; }
             
@@ -892,6 +955,321 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     frame.rax = newfd as u64;
                 } else { frame.rax = EBADF as u64; }
             } else { frame.rax = EBADF as u64; }
+        },
+
+        // ═══════════════════════════════════════════════════════════════════════════════════════
+        // Phase 1 — the POSIX filesystem floor.
+        //
+        // Every arm here is a thin cover over `vfs.rs`, which in turn covers lwext4. Nothing new is
+        // invented; these are the calls a libc reaches for on its first day and that Nyx simply
+        // never claimed.
+        //
+        // **Path convention.** Paths are `(ptr, len)` — a slice, not a NUL-terminated C string —
+        // because that is what `open(2)` has always been on Nyx and a kernel with two conventions
+        // at once is worse than a kernel with one unusual one. Converting everything to C strings is
+        // a single atomic change owed to the musl port, not something to do half of now.
+        // ═══════════════════════════════════════════════════════════════════════════════════════
+
+        8 => { // SYS_LSEEK(fd, offset, whence) -> new absolute offset
+            const SEEK_SET: u64 = 0;
+            const SEEK_CUR: u64 = 1;
+            const SEEK_END: u64 = 2;
+
+            let fd = arg1 as usize;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            if fd >= 32 { frame.rax = EBADF as u64; return; }
+
+            match &task.fd_table[fd] {
+                Some(FileDescriptor::File(open_file)) => {
+                    // SEEK_END needs the size, and file_size takes the VFS lock — resolve it BEFORE
+                    // taking the offset lock, never inside it.
+                    let size = crate::vfs::VFS.file_size(&open_file.path).unwrap_or(0) as i64;
+                    let mut off = open_file.offset.lock();
+                    let base = match arg3 {
+                        SEEK_SET => 0i64,
+                        SEEK_CUR => *off as i64,
+                        SEEK_END => size,
+                        _ => { frame.rax = EINVAL as u64; return; }
+                    };
+                    let target = base.saturating_add(arg2 as i64);
+                    // Seeking past EOF is legal (that is how sparse files are made); seeking to a
+                    // negative offset is not.
+                    if target < 0 { frame.rax = EINVAL as u64; return; }
+                    *off = target as usize;
+                    frame.rax = target as u64;
+                }
+                // ESPIPE is the specific, expected answer for a pipe or socket. Reporting EBADF
+                // instead would send a libc looking for a closed descriptor.
+                Some(_) => frame.rax = ESPIPE as u64,
+                None => frame.rax = EBADF as u64,
+            }
+        },
+
+        4 => { // SYS_STAT(path_ptr, path_len, statbuf)
+            let path = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            let buf = arg3 as *mut u8;
+            if !is_valid_user_ptr(buf, STAT_SIZE) { frame.rax = EFAULT as u64; return; }
+            match crate::vfs::VFS.stat(path) {
+                Some(st) => { unsafe { write_stat(buf, &st) }; frame.rax = 0; }
+                None => frame.rax = ENOENT as u64,
+            }
+        },
+
+        5 => { // SYS_FSTAT(fd, statbuf)
+            let fd = arg1 as usize;
+            let buf = arg2 as *mut u8;
+            if !is_valid_user_ptr(buf, STAT_SIZE) { frame.rax = EFAULT as u64; return; }
+
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            if fd >= 32 { frame.rax = EBADF as u64; return; }
+
+            // Copy the path out before touching the VFS: `stat` takes the mount lock, and holding a
+            // borrow of the task's fd_table across that is how the scheduler's `tasks` Vec gets
+            // reallocated under a live reference.
+            let path = match &percpu.scheduler.tasks[curr_idx].fd_table[fd] {
+                Some(FileDescriptor::File(f)) => f.path.clone(),
+                Some(_) => {
+                    // A pipe or socket has no path. Report a plausible fstat rather than an error —
+                    // libcs call fstat on every descriptor to size their I/O buffers, and failing
+                    // here breaks stdio on a pipe.
+                    let st = crate::vfs::FileStat { mode: 0o010000 | 0o600, ..Default::default() };
+                    unsafe { write_stat(buf, &st) };
+                    frame.rax = 0;
+                    return;
+                }
+                None => { frame.rax = EBADF as u64; return; }
+            };
+
+            match crate::vfs::VFS.stat(&path) {
+                Some(st) => { unsafe { write_stat(buf, &st) }; frame.rax = 0; }
+                None => frame.rax = ENOENT as u64,
+            }
+        },
+
+        262 => { // SYS_NEWFSTATAT(dirfd, path_ptr, path_len, statbuf)
+            // `dirfd` is accepted and ignored: Process has no cwd yet (Phase 4), so every path is
+            // treated as absolute. AT_FDCWD with an absolute path — which is what a libc emits for
+            // `stat("/x")` — is therefore already correct; a relative path silently resolves from
+            // the root, which is the honest limit of this until Phase 4 lands.
+            let path = match unsafe { user_path(arg2, arg3) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            let buf = arg4 as *mut u8;
+            if !is_valid_user_ptr(buf, STAT_SIZE) { frame.rax = EFAULT as u64; return; }
+            match crate::vfs::VFS.stat(path) {
+                Some(st) => { unsafe { write_stat(buf, &st) }; frame.rax = 0; }
+                None => frame.rax = ENOENT as u64,
+            }
+        },
+
+        217 => { // SYS_GETDENTS64(fd, buf, buf_len) -> bytes written, 0 at end of directory
+            let fd = arg1 as usize;
+            let buf = arg2 as *mut u8;
+            let buf_len = arg3 as usize;
+            if buf_len == 0 || !is_valid_user_ptr(buf, buf_len) { frame.rax = EFAULT as u64; return; }
+
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            if fd >= 32 { frame.rax = EBADF as u64; return; }
+
+            let open_file = match &percpu.scheduler.tasks[curr_idx].fd_table[fd] {
+                Some(FileDescriptor::File(f)) => f.clone(),
+                Some(_) => { frame.rax = ENOTDIR as u64; return; }
+                None => { frame.rax = EBADF as u64; return; }
+            };
+
+            let entries = crate::vfs::VFS.list_dir(&open_file.path);
+            // The fd's `offset` doubles as the entry cursor for a directory. That is safe because a
+            // descriptor is either read() as a file or getdents64()'d as a directory, never both —
+            // and it is what makes the "call until it returns 0" contract work without a second
+            // per-fd field.
+            let mut cursor = open_file.offset.lock();
+            let mut written = 0usize;
+
+            while *cursor < entries.len() {
+                let raw = &entries[*cursor];
+                // `list_dir` marks directories with a trailing '/'. Strip it for d_name and use it
+                // for d_type — a name that still carries the marker would break every consumer.
+                let is_dir = raw.ends_with('/');
+                let name = raw.trim_end_matches('/');
+                let name_bytes = name.as_bytes();
+
+                // struct linux_dirent64: u64 d_ino, i64 d_off, u16 d_reclen, u8 d_type, then the
+                // NUL-terminated name. Records are 8-byte aligned.
+                let reclen = (DIRENT_HEADER + name_bytes.len() + 1 + 7) & !7;
+                if written + reclen > buf_len {
+                    // Not even one more record fits. If we have written nothing at all the caller's
+                    // buffer is too small for this entry and must be told so, or it will spin.
+                    if written == 0 { frame.rax = EINVAL as u64; return; }
+                    break;
+                }
+
+                // A real inode number if the entry can be stat'd, 0 otherwise. Never a hash: a
+                // fabricated inode that collides makes two distinct files look like the same file.
+                let child = alloc::format!("{}/{}", open_file.path.trim_end_matches('/'), name);
+                let ino = crate::vfs::VFS.stat(&child).map(|s| s.ino as u64).unwrap_or(0);
+
+                unsafe {
+                    let rec = buf.add(written);
+                    core::ptr::write_unaligned(rec as *mut u64, ino);
+                    core::ptr::write_unaligned(rec.add(8) as *mut i64, (*cursor as i64) + 1);
+                    core::ptr::write_unaligned(rec.add(16) as *mut u16, reclen as u16);
+                    // DT_DIR = 4, DT_REG = 8.
+                    core::ptr::write_unaligned(rec.add(18), if is_dir { 4u8 } else { 8u8 });
+                    core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), rec.add(DIRENT_HEADER), name_bytes.len());
+                    // NUL, plus the alignment padding — zeroed so the caller never reads stack junk.
+                    for p in (DIRENT_HEADER + name_bytes.len())..reclen {
+                        core::ptr::write(rec.add(p), 0u8);
+                    }
+                }
+
+                written += reclen;
+                *cursor += 1;
+            }
+
+            frame.rax = written as u64;
+        },
+
+        21 => { // SYS_ACCESS(path_ptr, path_len, mode)
+            // Nyx has no permission model, so this answers the only question it can answer
+            // truthfully: does the path exist? R_OK/W_OK/X_OK all resolve to that.
+            let path = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            frame.rax = if crate::vfs::VFS.stat(path).is_some() { 0 } else { ENOENT as u64 };
+        },
+
+        32 => { // SYS_DUP(oldfd) -> lowest free fd
+            let oldfd = arg1 as usize;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            if oldfd >= 32 { frame.rax = EBADF as u64; return; }
+
+            match task.fd_table[oldfd].clone() {
+                Some(fd_obj) => {
+                    let mut out = EMFILE;
+                    for i in 3..32 {
+                        if task.fd_table[i].is_none() {
+                            task.fd_table[i] = Some(fd_obj);
+                            out = i as i64;
+                            break;
+                        }
+                    }
+                    frame.rax = out as u64;
+                }
+                None => frame.rax = EBADF as u64,
+            }
+        },
+
+        72 => { // SYS_FCNTL(fd, cmd, arg)
+            const F_DUPFD: u64 = 0;
+            const F_GETFD: u64 = 1;
+            const F_SETFD: u64 = 2;
+            const F_GETFL: u64 = 3;
+            const F_SETFL: u64 = 4;
+
+            let fd = arg1 as usize;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+            if fd >= 32 || task.fd_table[fd].is_none() { frame.rax = EBADF as u64; return; }
+
+            match arg2 {
+                F_DUPFD => {
+                    let fd_obj = task.fd_table[fd].clone();
+                    let mut out = EMFILE;
+                    for i in (arg3 as usize).max(3)..32 {
+                        if task.fd_table[i].is_none() {
+                            task.fd_table[i] = fd_obj;
+                            out = i as i64;
+                            break;
+                        }
+                    }
+                    frame.rax = out as u64;
+                }
+                // Nyx stores no per-fd flags: there is no close-on-exec (execve rebuilds the table)
+                // and no O_NONBLOCK. Report the cleared state rather than inventing one, and accept
+                // the setters so a libc's start-up sequence completes.
+                F_GETFD | F_GETFL => frame.rax = 0,
+                F_SETFD | F_SETFL => frame.rax = 0,
+                _ => frame.rax = EINVAL as u64,
+            }
+        },
+
+        83 => { // SYS_MKDIR(path_ptr, path_len, mode)
+            let path = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            // mkdir on an existing path is EEXIST, not success — std::fs::create_dir relies on the
+            // distinction, and create_dir_all relies on std::fs::create_dir making it.
+            if crate::vfs::VFS.stat(path).is_some() { frame.rax = EEXIST as u64; return; }
+            frame.rax = if crate::vfs::VFS.create_dir(path) { 0 } else { EACCES as u64 };
+        },
+
+        84 => { // SYS_RMDIR(path_ptr, path_len)
+            let path = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            match crate::vfs::VFS.stat(path) {
+                None => { frame.rax = ENOENT as u64; return; }
+                Some(st) if !st.is_dir() => { frame.rax = ENOTDIR as u64; return; }
+                Some(_) => {}
+            }
+            // lwext4's ext4_dir_rm refuses a non-empty directory; surface that as ENOTEMPTY rather
+            // than a generic failure, because it is the one case callers routinely handle.
+            frame.rax = if crate::vfs::VFS.remove_dir(path) { 0 } else { ENOTEMPTY as u64 };
+        },
+
+        87 => { // SYS_UNLINK(path_ptr, path_len)
+            let path = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            match crate::vfs::VFS.stat(path) {
+                None => { frame.rax = ENOENT as u64; return; }
+                // unlink is for names, not directories. Silently removing one would make rmdir's
+                // emptiness check bypassable.
+                Some(st) if st.is_dir() => { frame.rax = EISDIR as u64; return; }
+                Some(_) => {}
+            }
+            frame.rax = if crate::vfs::VFS.delete_file(path) { 0 } else { EACCES as u64 };
+        },
+
+        82 => { // SYS_RENAME(old_ptr, old_len, new_ptr, new_len)
+            let from = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            let to = match unsafe { user_path(arg3, arg4) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            if crate::vfs::VFS.stat(from).is_none() { frame.rax = ENOENT as u64; return; }
+            frame.rax = if crate::vfs::VFS.rename(from, to) { 0 } else { EACCES as u64 };
+        },
+
+        88 => { // SYS_SYMLINK(target_ptr, target_len, path_ptr, path_len)
+            let target = match unsafe { user_path(arg1, arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            let path = match unsafe { user_path(arg3, arg4) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            if crate::vfs::VFS.stat(path).is_some() { frame.rax = EEXIST as u64; return; }
+            frame.rax = if crate::vfs::VFS.symlink(target, path) { 0 } else { EACCES as u64 };
         },
 
         41 => frame.rax = sys_socket(arg1, arg2, arg3) as u64,
@@ -1234,11 +1612,30 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         158 => { // SYS_ARCH_PRCTL (TLS Support)
             let code = arg1;
             let addr = arg2;
-            if code == 0x1002 { // ARCH_SET_FS
-                unsafe { x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr)); }
-                frame.rax = 0;
-            } else {
-                frame.rax = EINVAL as u64;
+            match code {
+                0x1002 => { // ARCH_SET_FS
+                    unsafe { x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr)); }
+                    frame.rax = 0;
+                },
+                0x1003 => { // ARCH_GET_FS
+                    // SYSCALL does not swap FS, so the MSR still holds the caller's own base and is
+                    // authoritative for the running task; `Process::saved_fs_base` is only the
+                    // context-switch spill and can be stale while the task is on-CPU. `addr` is a
+                    // userspace `unsigned long *`.
+                    if is_valid_user_ptr(addr as *const u8, 8) {
+                        let base = x86_64::registers::model_specific::FsBase::read().as_u64();
+                        unsafe { (addr as *mut u64).write_volatile(base); }
+                        frame.rax = 0;
+                    } else {
+                        frame.rax = EFAULT as u64;
+                    }
+                },
+                // ARCH_SET_GS / ARCH_GET_GS (0x1001 / 0x1004) stay refused deliberately. GS_BASE
+                // holds this core's `percpu` block while we are in kernel mode, so servicing a GS
+                // request from inside the syscall handler would overwrite it and take the core down.
+                // Doing it properly means going through KERNEL_GS_BASE and swapgs; nothing needs GS
+                // TLS yet, and an honest EINVAL beats a machine-killing guess.
+                _ => { frame.rax = EINVAL as u64; },
             }
         },
 
@@ -2424,7 +2821,17 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         534 => { 
             frame.rax = sys_dns_resolve(arg1 as usize, arg2 as usize); 
         },
-        _ => { frame.rax = EINVAL as u64; }
+        // An unimplemented syscall must be distinguishable from a bad argument.
+        //
+        // This arm used to return EINVAL, which made "this kernel has never heard of syscall N"
+        // byte-identical to "you passed nonsense to a syscall it does have". Nothing could tell the
+        // two apart — not the PAL (which now maps ENOSYS to `ErrorKind::Unsupported`), not a libc,
+        // and not a person reading a log. The serial line is the other half: a port failing on a
+        // missing syscall should say WHICH one, rather than leaving it to be bisected.
+        _ => {
+            crate::serial_println!("[SYSCALL] unimplemented syscall {}", id);
+            frame.rax = ENOSYS as u64;
+        }
     }
 }
 
@@ -2886,6 +3293,17 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
         let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
         if current_ms.saturating_sub(start_ms) > 5000 {
             crate::serial_println!("[DNS] Timeout.");
+            // Cancel before giving up. `get_query_result` frees the slot on success or failure, but
+            // a query still Pending is freed ONLY here — and the socket is built with a growable
+            // `vec![]`, so an abandoned query is not merely a leaked slot: smoltcp keeps
+            // retransmitting it forever, and every `poll_stack` (which every blocking socket
+            // syscall calls in a tight loop) walks the whole list. Enough timeouts and the machine
+            // spends all its time re-sending dead lookups.
+            crate::drivers::net::with_sockets(stack, gen, |sockets| {
+                sockets
+                    .get_mut::<smoltcp::socket::dns::Socket>(dns_handle)
+                    .cancel_query(query_handle);
+            });
             return 0;
         }
 

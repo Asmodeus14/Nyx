@@ -270,8 +270,14 @@ impl<'a> Canvas<'a> {
     /// relative to the baseline (`y + ascent`). Each texel's grayscale COVERAGE blends `color` over the
     /// existing pixel — real antialiasing (replaces the old binary `>50` write).
     pub fn draw_char(&mut self, x: usize, y: usize, c: char, color: u32, scale: usize) {
-        let px = crate::font::px_for(scale);
-        let baseline = y as i32 + crate::font::ascent(scale) as i32;
+        self.draw_char_px(x, y, c, color, crate::font::px_for(scale));
+    }
+
+    /// Draw one glyph at an exact pixel height rather than an integer `scale`. Used by the browser,
+    /// where font sizes come from CSS and are not multiples of `BASE_PX`.
+    pub fn draw_char_px(&mut self, x: usize, y: usize, c: char, color: u32, px: usize) {
+        let px = px.max(1);
+        let baseline = y as i32 + crate::font::ascent_px(px) as i32;
         let width = self.width;
         let height = self.height;
         crate::font::with_glyph(c, px, |g| {

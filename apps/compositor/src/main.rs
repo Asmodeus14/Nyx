@@ -36,7 +36,8 @@ struct MenuEntry {
 /// text pass, an identical one for the CPU fallback, and a chain of `else if rel_y < N` for the
 /// clicks — so adding an app meant editing three places and a wrong threshold silently launched the
 /// neighbouring entry. Now the renderer and the hit-test both iterate this.
-const MENU: [MenuEntry; 12] = [
+const MENU: [MenuEntry; 14] = [
+    MenuEntry { label: "Browser",        icon: "/mnt/nvme/apps/Browser.nyx/icon.png", exec: "/mnt/nvme/apps/Browser.nyx/run.bin\0" },
     MenuEntry { label: "Terminal",       icon: "/mnt/nvme/apps/Terminal.nyx/icon.png", exec: "/mnt/nvme/apps/Terminal.nyx/run.bin\0" },
     MenuEntry { label: "Settings",       icon: "/mnt/nvme/apps/Settings.nyx/icon.png", exec: "/mnt/nvme/apps/Settings.nyx/run.bin\0" },
     MenuEntry { label: "Explorer",       icon: "/mnt/nvme/apps/Explorer.nyx/icon.png", exec: "/mnt/nvme/apps/Explorer.nyx/run.bin\0" },
@@ -49,6 +50,7 @@ const MENU: [MenuEntry; 12] = [
     MenuEntry { label: "Std GUI",        icon: "/mnt/nvme/apps/StdGui.nyx/icon.png", exec: "/mnt/nvme/apps/StdGui.nyx/run.bin\0" },
     MenuEntry { label: "Notepad",        icon: "/mnt/nvme/apps/Notepad.nyx/icon.png", exec: "/mnt/nvme/apps/Notepad.nyx/run.bin\0" },
     MenuEntry { label: "Wi-Fi",          icon: "/mnt/nvme/apps/Wifi.nyx/icon.png", exec: "/mnt/nvme/apps/Wifi.nyx/run.bin\0" },
+    MenuEntry { label: "POSIX Probe",    icon: "/mnt/nvme/apps/PosixProbe.nyx/icon.png", exec: "/mnt/nvme/apps/PosixProbe.nyx/run.bin\0" },
 ];
 
 /// The shell's own mark, in the compositor's bundle like every other app's icon.
@@ -58,7 +60,7 @@ const NYX_LOGO: &str = "/mnt/nvme/apps/WindowServer.nyx/icon.png";
 // it was wide, which got worse with every app added. A 3-wide grid keeps the panel close to square
 // and leaves room for the search field.
 const MENU_COLS: usize = 3;
-const MENU_ROWS: usize = 4;          // 3x4 = 12 slots, i.e. the whole launcher with no scrolling
+const MENU_ROWS: usize = 5;          // 3x5 = 15 slots; 14 apps fit with no scrolling
 const MENU_TILE_W: usize = 124;
 const MENU_TILE_H: usize = 88;
 const MENU_PAD: usize = 14;

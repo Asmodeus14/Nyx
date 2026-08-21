@@ -23,8 +23,6 @@ pub mod percpu;
 pub mod time;
 pub mod rtc;
 pub mod random;
-pub mod task;
-pub mod executor;
 pub mod scheduler;
 pub mod pci;
 pub mod drivers;
@@ -32,7 +30,6 @@ pub mod fs;
 pub mod vfs;
 pub mod process;
 pub mod gui;
-pub mod window;
 pub mod mouse;
 pub mod shell;
 pub mod entity;
@@ -151,8 +148,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
              if let Some(phys) = crate::memory::virt_to_phys(fb_virt_ptr) { crate::gui::FRAMEBUFFER_PHYS_ADDR = phys; }
              else { crate::gui::FRAMEBUFFER_PHYS_ADDR = fb_virt_ptr; }
         }
-        
-        crate::window::WINDOW_MANAGER.lock().set_resolution(info.width, info.height);
         
         {
             let mut mouse_state = crate::mouse::MOUSE_STATE.lock();

@@ -70,6 +70,15 @@ echo "[9f] Building terminal (std target_os=nyx)..."
 # Notepad: std target_os=nyx text editor that saves to /mnt/nvme.
 echo "[9g] Building notepad (std target_os=nyx)..."
 ./Build-std.sh apps/notepad notepad || echo "  (notepad build skipped/failed — continuing)"
+# The browser: nyx_net (HTTP/TLS) + nyx_web (html5ever/cssparser/cascade/layout) + nyx_gui. Must
+# SUCCEED — it is the point of the whole net/web stack, and silently shipping a stale binary here
+# would mean "testing" a browser that predates the change under test.
+echo "[9h] Building browser (std target_os=nyx)..."
+./Build-std.sh apps/browser browser
+# The POSIX conformance harness (Phase 0 of the libc work). Every estimate for that work is a guess
+# until this has been run on hardware, so it ships with every image.
+echo "[9i] Building posixprobe (std target_os=nyx)..."
+./Build-std.sh tests/posix posixprobe || echo "  (posixprobe build skipped/failed — continuing)"
 
 echo "[10/10] Generating App Tarball..."
 rm -rf build_initrd
@@ -89,8 +98,12 @@ mkdir -p build_initrd/apps/StdChild.nyx
 mkdir -p build_initrd/apps/QcStudio.nyx
 mkdir -p build_initrd/apps/StdGui.nyx
 mkdir -p build_initrd/apps/Notepad.nyx
+mkdir -p build_initrd/apps/Browser.nyx
 mkdir -p build_initrd/apps/Wifi.nyx
 mkdir -p build_initrd/apps/WifiAgent.nyx
+# The harness writes ONLY inside this scratch directory (probes/mod.rs panics on any path that
+# escapes it). It has to exist up front — mkdir(2) is one of the things being probed.
+mkdir -p build_initrd/apps/PosixProbe.nyx/scratch
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
@@ -127,6 +140,13 @@ cp apps/qcstudio/samples/expected.qasm build_initrd/apps/QcStudio.nyx/expected.q
 cp apps/stdgui/target/x86_64-unknown-nyx/release/stdgui build_initrd/apps/StdGui.nyx/run.bin 2>/dev/null || true
 # Notepad: std target_os=nyx text editor (saves to /mnt/nvme via std::fs).
 cp apps/notepad/target/x86_64-unknown-nyx/release/notepad build_initrd/apps/Notepad.nyx/run.bin 2>/dev/null || true
+# The browser. Not `|| true`: a missing binary here would show up as a start-menu tile that silently
+# does nothing, which is far harder to diagnose than a failed build.
+cp apps/browser/target/x86_64-unknown-nyx/release/browser build_initrd/apps/Browser.nyx/run.bin
+# POSIX conformance harness + the fixed-content file its read-only probes measure themselves against
+# (its size is cross-checked with syscall 541, which already works, so a wrong `read` is detectable).
+cp tests/posix/target/x86_64-unknown-nyx/release/posixprobe build_initrd/apps/PosixProbe.nyx/run.bin 2>/dev/null || true
+cp tests/posix/probe.txt build_initrd/apps/PosixProbe.nyx/probe.txt 2>/dev/null || true
 
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true
@@ -164,6 +184,8 @@ install_icon qcstudio    QcStudio
 install_icon stdgui      StdGui
 install_icon notepad     Notepad
 install_icon wifi        Wifi
+install_icon browser     Browser
+install_icon posixprobe  PosixProbe
 # The shell's own mark, in the compositor's bundle.
 install_icon nyx         WindowServer
 
