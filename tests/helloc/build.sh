@@ -33,10 +33,10 @@ NYX_BASE=0x40000000
 
 # Stale artifacts are worse than missing ones: a variant that fails to build would otherwise be
 # shipped as whatever the previous run left behind, and get tested under the wrong name.
-rm -f "$OUT/hello" "$OUT/hello_lo" "$OUT/bare" "$OUT/hello_hi" "$OUT/bare_hi"
+rm -f "$OUT/hello" "$OUT/hello_lo" "$OUT/bare" "$OUT/smoke" "$OUT/hello_hi" "$OUT/bare_hi"
 
-build_musl() {  # $1 = output name, $2... = extra linker flags
-  local out="$1"; shift
+build_musl() {  # $1 = output name, $2 = source file, $3... = extra linker flags
+  local out="$1" src="$2"; shift 2
   cc -static -nostdinc -nostdlib -fno-stack-protector -O2 \
     -isystem "$GCCINC" \
     -isystem "$M/include" \
@@ -45,7 +45,7 @@ build_musl() {  # $1 = output name, $2... = extra linker flags
     -isystem "$M/arch/generic" \
     "$@" \
     "$M/lib/crt1.o" \
-    "$OUT/hello.c" \
+    "$OUT/$src" \
     "$M/lib/libc.a" -lgcc \
     -o "$OUT/$out"
 }
@@ -58,15 +58,16 @@ build_bare() {  # $1 = output name, $2... = extra linker flags
     "$OUT/bare.c" -o "$OUT/$out"
 }
 
-build_musl hello    "-Wl,-Ttext-segment=$NYX_BASE"
-build_musl hello_lo                                  # gcc's default 0x400000 — the regression test
+build_musl hello    hello.c "-Wl,-Ttext-segment=$NYX_BASE"
+build_musl hello_lo hello.c                          # gcc's default 0x400000 — the regression test
+build_musl smoke    smoke.c "-Wl,-Ttext-segment=$NYX_BASE"
 build_bare bare     "-Wl,-Ttext-segment=$NYX_BASE"
 
 # Print the entry point and every LOAD for each. This is a build-time check on purpose: a
 # -Ttext-segment that silently did nothing would make the whole experiment a null result, and
 # finding that out from the serial log costs a power cycle. Read these before booting.
-echo "[helloc] built 3 variants:"
-for f in hello hello_lo bare; do
+echo "[helloc] built 4 binaries:"
+for f in hello hello_lo smoke bare; do
   echo "----- $f -----"
   readelf -hl "$OUT/$f" | grep -E 'Type:|Entry point|LOAD|INTERP|TLS' || true
 done

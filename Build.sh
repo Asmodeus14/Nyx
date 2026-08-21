@@ -164,10 +164,12 @@ if [ -f vendor/musl/lib/libc.a ]; then
   # a stale binary under the new binary's name, which is the most expensive kind of wrong.
   rm -f build_initrd/apps/HelloC.nyx/run.bin \
         build_initrd/apps/HelloC.nyx/hello_lo \
+        build_initrd/apps/HelloC.nyx/smoke \
         build_initrd/apps/HelloC.nyx/bare
   if ./tests/helloc/build.sh; then
     cp tests/helloc/hello    build_initrd/apps/HelloC.nyx/run.bin
     cp tests/helloc/hello_lo build_initrd/apps/HelloC.nyx/hello_lo
+    cp tests/helloc/smoke    build_initrd/apps/HelloC.nyx/smoke
     cp tests/helloc/bare     build_initrd/apps/HelloC.nyx/bare
   else
     echo "  (helloc build FAILED — HelloC.nyx ships with no binaries)"

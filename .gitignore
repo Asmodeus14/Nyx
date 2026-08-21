@@ -18,3 +18,4 @@ tests/helloc/hello
 tests/helloc/hello_lo
 tests/helloc/bare
 
+tests/helloc/smoke
