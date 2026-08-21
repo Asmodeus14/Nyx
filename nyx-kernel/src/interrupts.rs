@@ -70,6 +70,8 @@ pub struct SystemInfo {
     pub machine: [u8; 80],
 }
 
+use crate::process::FD_MAX;
+
 /// Size of x86_64 `struct stat`, and the offset of the name inside `struct linux_dirent64`.
 const STAT_SIZE: usize = 144;
 const DIRENT_HEADER: usize = 19; // u64 d_ino + i64 d_off + u16 d_reclen + u8 d_type
@@ -356,7 +358,7 @@ fn terminate_current_user_process() -> ! {
             // Collect first, free once the fd table is clear — the free path must not run while a
             // borrow of `task` is live (see destroy_socket).
             let mut doomed_sockets = alloc::vec::Vec::new();
-            for i in 0..32 {
+            for i in 0..FD_MAX {
                 if let Some(crate::scheduler::FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
                     if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
                         let s = sock_mtx.lock();
@@ -917,7 +919,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     
                     let task = &mut percpu.scheduler.tasks[curr_idx];
                     let mut allocated_fd = -1isize;
-                    for i in 3..32 {
+                    for i in 3..FD_MAX {
                         if task.fd_table[i].is_none() {
                             task.fd_table[i] = Some(crate::scheduler::FileDescriptor::File(
                                 alloc::sync::Arc::new(crate::vfs::OpenFile::new(vnode))
@@ -935,7 +937,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
 
-            if arg1 < 32 {
+            if arg1 < FD_MAX as u64 {
                 // Cleanly tear down TCP sockets to avoid Windows NAT exhaustion!
                 //
                 // Snapshot, clear the slot, THEN destroy — destroy_socket may yield (see its note).
@@ -981,7 +983,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     Err(_) => frame.rax = ENOMEM as u64,
                 }
             } else {
-                if fd >= 0 && fd < 32 {
+                if fd >= 0 && fd < FD_MAX as isize {
                     if let Some(crate::scheduler::FileDescriptor::File(open_file)) = &task.fd_table[fd as usize] {
                         match open_file.mmap(offset, size){
                             Ok(phys_addr) => {
@@ -1007,7 +1009,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
             
-            if arg1 < 32 {
+            if arg1 < FD_MAX as u64 {
                 if let Some(FileDescriptor::File(open_file)) = &task.fd_table[arg1 as usize] {
                     match open_file.ioctl(arg2 as usize, arg3 as usize) {
                         Ok(res) => frame.rax = res as u64,
@@ -1063,7 +1065,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let mut read_fd = -1;
             let mut write_fd = -1;
 
-            for i in 3..32 {
+            for i in 3..FD_MAX {
                 if task.fd_table[i].is_none() {
                     if read_fd == -1 { read_fd = i as i32; }
                     else if write_fd == -1 { write_fd = i as i32; break; }
@@ -1088,7 +1090,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             let task = &mut percpu.scheduler.tasks[curr_idx];
             
-            if oldfd < 32 && newfd < 32 {
+            if oldfd < FD_MAX && newfd < FD_MAX {
                 if let Some(fd_obj) = task.fd_table[oldfd].clone() {
                     task.fd_table[newfd] = Some(fd_obj);
                     frame.rax = newfd as u64;
@@ -1118,7 +1120,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            if fd >= 32 { frame.rax = EBADF as u64; return; }
+            if fd >= FD_MAX { frame.rax = EBADF as u64; return; }
 
             match &task.fd_table[fd] {
                 Some(FileDescriptor::File(open_file)) => {
@@ -1166,7 +1168,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
-            if fd >= 32 { frame.rax = EBADF as u64; return; }
+            if fd >= FD_MAX { frame.rax = EBADF as u64; return; }
 
             // Copy the path out before touching the VFS: `stat` takes the mount lock, and holding a
             // borrow of the task's fd_table across that is how the scheduler's `tasks` Vec gets
@@ -1216,7 +1218,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
-            if fd >= 32 { frame.rax = EBADF as u64; return; }
+            if fd >= FD_MAX { frame.rax = EBADF as u64; return; }
 
             let open_file = match &percpu.scheduler.tasks[curr_idx].fd_table[fd] {
                 Some(FileDescriptor::File(f)) => f.clone(),
@@ -1291,7 +1293,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            if oldfd >= 32 { frame.rax = EBADF as u64; return; }
+            if oldfd >= FD_MAX { frame.rax = EBADF as u64; return; }
 
             match task.fd_table[oldfd].clone() {
                 Some(fd_obj) => {
@@ -1320,7 +1322,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            if fd >= 32 || task.fd_table[fd].is_none() { frame.rax = EBADF as u64; return; }
+            if fd >= FD_MAX || task.fd_table[fd].is_none() { frame.rax = EBADF as u64; return; }
 
             match arg2 {
                 F_DUPFD => {
@@ -1450,7 +1452,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 }
 
                 // 2. Clone file descriptors (Sockets, files, pipes)
-                for i in 0..32 {
+                for i in 0..FD_MAX {
                     if let Some(fd) = &parent.fd_table[i] {
                         child.fd_table[i] = Some(fd.clone());
                     }
@@ -1526,7 +1528,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 thread.mmap_bump = parent.mmap_bump;
 
                 // Share the File Descriptors (Sockets)
-                for i in 0..32 {
+                for i in 0..FD_MAX {
                     if let Some(fd) = &parent.fd_table[i] {
                         thread.fd_table[i] = Some(fd.clone());
                     }
@@ -1691,7 +1693,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             //    Collect first and free after the fd table is clear: the free path must not run
             //    while a borrow of `task` is live (see destroy_socket).
             let mut doomed_sockets = alloc::vec::Vec::new();
-            for i in 0..32 {
+            for i in 0..FD_MAX {
                 if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[i] {
                     if alloc::sync::Arc::strong_count(sock_mtx) == 1 {
                         let s = sock_mtx.lock();
@@ -2706,7 +2708,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         549 => {
             let fd = arg1 as usize;
             frame.rax = EBADF as u64;
-            if fd < 32 && KERNEL_CR3.load(Ordering::Relaxed) != 0 {
+            if fd < FD_MAX && KERNEL_CR3.load(Ordering::Relaxed) != 0 {
                 let percpu = crate::percpu::current();
                 let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                 if curr_idx < percpu.scheduler.tasks.len() {
@@ -3134,7 +3136,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
 fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
     if !is_valid_user_ptr(buf_ptr, len) { return EFAULT as isize; }
-    if len == 0 || fd >= 32 { return EBADF as isize; }
+    if len == 0 || fd >= FD_MAX { return EBADF as isize; }
     
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return EBADF as isize; }
     let percpu = crate::percpu::current();
@@ -3253,7 +3255,7 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
 
 fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
     if !is_valid_user_ptr(buf_ptr, len) { return EFAULT as isize; }
-    if len == 0 || fd >= 32 { return EBADF as isize; }
+    if len == 0 || fd >= FD_MAX { return EBADF as isize; }
     
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return EBADF as isize; }
     let percpu = crate::percpu::current();
@@ -3434,7 +3436,7 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
     let ip = sockaddr.sin_addr;
     let task = &mut percpu.scheduler.tasks[curr_idx];
     
-    if fd >= 32 { return EBADF; }
+    if fd >= FD_MAX { return EBADF; }
     
     if let Some(FileDescriptor::Socket(sock_mtx)) = &task.fd_table[fd] {
         let mut sock = sock_mtx.lock();

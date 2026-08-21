@@ -70,7 +70,6 @@ pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
     load_elf_full(file_data).map(|l| l.entry)
 }
 
-/// Load all PT_LOAD segments and collect the metadata the SysV auxv needs (PT_PHDR/PT_TLS).
 /// Master switch for Phase 3 step 3 (per-segment ELF protection).
 ///
 /// Kept as a named constant because this is the highest-blast-radius change in the W^X work: one
@@ -79,6 +78,15 @@ pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
 /// confirm or clear this change as the cause of a bad boot than bisecting a revert.
 const ENFORCE_ELF_PROT: bool = true;
 
+/// Maximum open descriptors per process.
+///
+/// Was a bare `32` repeated at ~19 sites in the syscall dispatcher. Named, because the number is a
+/// contract between the table's length and every bounds check that guards an index into it: an
+/// out-of-range `fd_table[i]` panics, and a panic in the dispatcher takes down the KERNEL, not the
+/// calling process. 32 was also simply too few — a browser opens more than that in sockets alone.
+pub const FD_MAX: usize = 256;
+
+/// Load all PT_LOAD segments and collect the metadata the SysV auxv needs (PT_PHDR/PT_TLS).
 /// Static binaries only — PT_INTERP (dynamic) is rejected.
 pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
     if file_data.len() < core::mem::size_of::<Elf64_Ehdr>() { return Err("File too small"); }
@@ -336,7 +344,12 @@ pub struct Process {
     pub saved_rsp: u64,              
     pub kernel_stack_top: u64,       
     pub mmap_bump: u64,
-    pub fd_table: [Option<FileDescriptor>; 32],
+    /// Open descriptors. A `Vec` rather than a 256-entry inline array on purpose: `Process` lives
+    /// in `scheduler.tasks: Vec<Process>`, which reallocates, and an inline array would mean
+    /// copying 4 KiB per process on every growth and every fork. Indexing syntax is unchanged, but
+    /// it is always length `FD_MAX` — never grown or shrunk — so `fd_table[i]` is safe exactly when
+    /// `i < FD_MAX`, and every caller still has to check.
+    pub fd_table: alloc::vec::Vec<Option<FileDescriptor>>,
     pub state: TaskState,
     pub cpu_ticks: u64,      
     pub name: [u8; 16],      
@@ -372,7 +385,7 @@ impl Process {
             saved_rsp: kernel_stack, 
             kernel_stack_top: kernel_stack,
             mmap_bump: 0x4000_0000_0000, 
-            fd_table: core::array::from_fn(|_| None),
+            fd_table: alloc::vec![None; FD_MAX],
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -396,7 +409,7 @@ impl Process {
             saved_rsp: kernel_stack,
             kernel_stack_top: kernel_stack,
             mmap_bump: 0x4000_0000_0000,
-            fd_table: core::array::from_fn(|_| None),
+            fd_table: alloc::vec![None; FD_MAX],
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -430,7 +443,7 @@ impl Process {
             saved_rsp: kernel_stack,
             kernel_stack_top: kernel_stack,
             mmap_bump: 0x4000_0000_0000,
-            fd_table: core::array::from_fn(|_| None),
+            fd_table: alloc::vec![None; FD_MAX],
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
