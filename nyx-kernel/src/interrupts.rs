@@ -1428,6 +1428,26 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             } else { frame.rax = EBADF as u64; }
         },
         
+        11 => { // SYS_MUNMAP(addr, len)
+            // Without this, free() could never return memory to the kernel: musl unmaps any block
+            // big enough to have been mmap'd, so a long-running program leaks every large
+            // allocation it ever makes. Harmless at hello-world scale, fatal for a browser.
+            let addr = arg1 as u64;
+            let len = arg2 as usize;
+
+            // POSIX: addr must be page-aligned; length is rounded UP. A misaligned addr is EINVAL
+            // rather than silently rounded, because rounding it would unmap a page the caller
+            // never named.
+            if addr == 0 || (addr & 0xFFF) != 0 || len == 0 { frame.rax = EINVAL as u64; return; }
+            if !is_valid_user_ptr(addr as *const u8, len) { frame.rax = EINVAL as u64; return; }
+
+            let num_pages = (len + 0xFFF) / 0x1000;
+            crate::memory::unmap_user_pages(addr, num_pages);
+            // munmap returns 0 on success even if part of the range was already unmapped —
+            // POSIX explicitly permits unmapping a range containing no mappings.
+            frame.rax = 0;
+        },
+
         19 => { // SYS_READV(fd, iov, iovcnt)
             // musl's __stdio_read issues readv, so WITHOUT this every buffered read fails while
             // writes work (writev was implemented) — which presents as "the file contents differ"
@@ -1877,6 +1897,122 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         42 => frame.rax = sys_connect(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64,
         44 => frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64, 
         45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,
+
+        56 => { // SYS_CLONE(flags, child_stack, ptid, ctid, tls)
+            // What musl's pthread_create issues. Nyx already HAS threads (syscall 58) and already
+            // has the hard half of the contract: the exit path zeroes clear_child_tid and
+            // FUTEX_WAKEs whoever is joining on it, which is how pthread_join terminates. This arm
+            // maps clone's flags onto that machinery.
+            const CLONE_VM: u64 = 0x100;
+            const CLONE_THREAD: u64 = 0x10000;
+            const CLONE_SETTLS: u64 = 0x80000;
+            const CLONE_PARENT_SETTID: u64 = 0x100000;
+            const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+            const CLONE_CHILD_SETTID: u64 = 0x1000000;
+
+            let flags = arg1;
+            let child_stack = arg2;
+            let ptid = arg3;
+            let ctid = arg4;
+            let tls = arg5;
+
+            // Only a genuine THREAD clone is supported. Without CLONE_VM|CLONE_THREAD the caller
+            // wants a new address space, which is fork's job — and quietly giving it a thread
+            // that shares memory instead would corrupt whatever it did next. ENOSYS is the honest
+            // answer; musl's pthread_create always sets both.
+            if flags & CLONE_VM == 0 || flags & CLONE_THREAD == 0 {
+                crate::serial_println!("[56] clone: only CLONE_VM|CLONE_THREAD supported (flags={:#x})", flags);
+                frame.rax = ENOSYS as u64;
+                return;
+            }
+            if child_stack == 0 || !is_valid_user_ptr(child_stack as *const u8, 8) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
+
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EINVAL as u64; return; }
+            let parent_cr3 = percpu.scheduler.tasks[curr_idx].cr3;
+
+            // Fallible: a userspace clone() must never panic the kernel. (Arm 58 still .expect()s.)
+            let mut thread = match crate::process::Process::new_thread(parent_cr3) {
+                Ok(t) => t,
+                Err(_) => { frame.rax = (-11i64) as u64; return; } // -EAGAIN, what pthread expects
+            };
+
+            {
+                let parent = &percpu.scheduler.tasks[curr_idx];
+                thread.parent_pid = Some(parent.pid);
+                thread.mmap_bump = parent.mmap_bump;
+                thread.cwd = parent.cwd.clone();
+                for i in 0..FD_MAX {
+                    if let Some(fd) = &parent.fd_table[i] { thread.fd_table[i] = Some(fd.clone()); }
+                }
+            }
+
+            // CLONE_SETTLS: the new thread's FS base. The scheduler restores saved_fs_base on
+            // switch-in, so setting it here is all that is needed — musl puts its whole thread
+            // descriptor (including the tid that pthread_join reads) at this address.
+            if flags & CLONE_SETTLS != 0 { thread.saved_fs_base = tls; }
+
+            // CLONE_CHILD_CLEARTID: hand the address to the exit path, which zeroes it and wakes
+            // joiners. This single line is what makes pthread_join return instead of hanging.
+            if flags & CLONE_CHILD_CLEARTID != 0 { thread.clear_child_tid = ctid; }
+
+            let tid = thread.pid;
+
+            // CLONE_PARENT_SETTID / CLONE_CHILD_SETTID: publish the tid. Both are written from
+            // here because parent and child share the address space, so there is no difference in
+            // what they observe. Mapped-checked, not merely range-checked: a kernel-mode write to
+            // an unmapped user address panics the MACHINE.
+            for (want, addr) in [(CLONE_PARENT_SETTID, ptid), (CLONE_CHILD_SETTID, ctid)] {
+                if flags & want != 0 && addr != 0
+                    && is_valid_user_ptr(addr as *const u8, 4)
+                    && unsafe { crate::memory::user_addr_mapped(addr) }
+                {
+                    unsafe { (addr as *mut u32).write_volatile(tid as u32); }
+                }
+            }
+
+            // Build the child's resume frame. Modelled on FORK, not on arm 58: fork COPIES the
+            // parent's registers, and musl's __clone stub depends on that — after the syscall it
+            // does `pop %rdi; call *%r9`, so r9 (the thread entry point) must survive. Arm 58
+            // zeroes the registers, which would jump the thread to 0.
+            let stack_top = thread.kernel_stack_top;
+            let iretq_ptr = stack_top - 40;
+            unsafe {
+                let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+                iret_slice[0] = frame.rcx;          // RIP: resume right after the syscall
+                iret_slice[1] = 0x33;               // CS
+                iret_slice[2] = frame.r11 | 0x200;  // RFLAGS, interrupts on
+                iret_slice[3] = child_stack;        // RSP: the caller-supplied thread stack
+                iret_slice[4] = 0x2B;               // SS
+            }
+
+            let regs_ptr = iretq_ptr - 120;
+            unsafe {
+                let regs = core::slice::from_raw_parts_mut(regs_ptr as *mut u64, 15);
+                regs[0] = frame.r15; regs[1] = frame.r14; regs[2] = frame.r13; regs[3] = frame.r12;
+                regs[4] = frame.r11; regs[5] = frame.r10; regs[6] = frame.r9;  regs[7] = frame.r8;
+                regs[8] = frame.rdi; regs[9] = frame.rsi; regs[10] = frame.rbp; regs[11] = frame.rdx;
+                regs[12] = frame.rcx; regs[13] = frame.rbx;
+                regs[14] = 0;                        // rax: the child sees clone() return 0
+            }
+
+            let fxsave_ptr = (regs_ptr - 512) & !0xF;
+            unsafe { crate::process::init_fpu_state(fxsave_ptr as u64); }
+
+            let final_rsp = fxsave_ptr - 16;
+            unsafe {
+                let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+                bottom[0] = regs_ptr;
+                bottom[1] = 0;
+            }
+            thread.saved_rsp = final_rsp;
+
+            frame.rax = tid;                         // the parent sees the new tid
+            percpu.scheduler.tasks.push(thread);
+        },
 
         57 => { // SYS_FORK
             crate::serial::bc("[fork");

@@ -695,6 +695,53 @@ pub fn clear_user_address_space(cr3_phys: PhysAddr) {
     crate::serial::bc("cl)");
 }
 
+/// Unmap `num_pages` starting at `start_vaddr` from the CURRENT address space, freeing the frames
+/// we own. The inverse of `allocate_user_pages_at`; backs `munmap(2)`.
+///
+/// ★ The ownership rules are the same three the teardown path already encodes, and they are the
+/// whole difficulty: a page carrying MMIO (0x10), SHM (0x200) or CoW (0x400) is mapped by someone
+/// ELSE as well, so its PTE may be cleared but its FRAME MUST NOT BE FREED. Returning a shared
+/// frame to the allocator hands live memory to the next allocation, and the corruption surfaces
+/// somewhere unrelated with nothing pointing back here.
+///
+/// Only USER pages are touched. A supervisor mapping in this range is not ours to unmap — the
+/// kernel image itself is mapped low in every address space (see the ELF-overlap check in
+/// `allocate_user_pages_at`), and unmapping it on a bad `munmap` argument would be fatal.
+///
+/// Returns the number of pages actually unmapped.
+pub fn unmap_user_pages(start_vaddr: u64, num_pages: usize) -> usize {
+    let mut freed = 0usize;
+    let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+
+    let mut lock = MEMORY_MANAGER.lock();
+    let system = match lock.as_mut() { Some(s) => s, None => return 0 };
+
+    for i in 0..num_pages {
+        let vaddr = start_vaddr + (i as u64) * 4096;
+        let pte = match unsafe { pte_for(cr3, vaddr) } { Some(p) => p, None => continue };
+        let entry = unsafe { *pte };
+
+        if entry & 1 == 0 { continue; }        // not present
+        if entry & 0x4 == 0 { continue; }      // not USER — not ours to unmap
+
+        if (entry & 0x10) == 0 && (entry & 0x200) == 0 && (entry & 0x400) == 0 {
+            let phys = entry & 0x000FFFFF_FFFFF000;
+            system.frame_allocator.deallocate_frame(
+                PhysFrame::containing_address(PhysAddr::new(phys)));
+        }
+
+        unsafe {
+            *pte = 0;
+            // Per-page invlpg rather than a CR3 reload: munmap is called constantly by any
+            // allocator returning memory, and flushing the entire TLB on each one would undo
+            // far more than it costs.
+            core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack));
+        }
+        freed += 1;
+    }
+    freed
+}
+
 pub fn create_shm_block(size: usize) -> Option<u64> {
     let num_pages = (size + 0xFFF) / 0x1000;
     let mut frames = Vec::with_capacity(num_pages);
