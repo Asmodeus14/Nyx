@@ -89,6 +89,9 @@ pub const FD_MAX: usize = 256;
 /// Load all PT_LOAD segments and collect the metadata the SysV auxv needs (PT_PHDR/PT_TLS).
 /// Static binaries only — PT_INTERP (dynamic) is rejected.
 pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
+    // FIRST statement on purpose. A freeze with zero output cannot distinguish "the loader hung"
+    // from "the loader was never entered", and those point at completely different code.
+    crate::serial_println!("[ELF] load_elf_full: {} bytes", file_data.len() as u32);
     if file_data.len() < core::mem::size_of::<Elf64_Ehdr>() { return Err("File too small"); }
     let header = unsafe { &*(file_data.as_ptr() as *const Elf64_Ehdr) };
     if header.e_ident[0..4] != [0x7F, b'E', b'L', b'F'] { return Err("Invalid ELF Magic"); }
