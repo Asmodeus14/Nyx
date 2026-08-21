@@ -506,6 +506,15 @@ extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) 
 
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _error_code: u64) -> ! {
     if (stack_frame.code_segment & 3) == 3 { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
+    // Before `panic!`, which formats and takes the serial lock — neither is trustworthy once we
+    // are here, and a double fault that cannot announce itself is indistinguishable from a hang.
+    crate::postmortem::mark_why(
+        crate::postmortem::WHY_DOUBLE_FAULT,
+        stack_frame.instruction_pointer.as_u64(),
+    );
+    crate::serial::bc("\n!!DOUBLE FAULT ip=");
+    crate::serial::bc_hex(stack_frame.instruction_pointer.as_u64());
+    crate::serial::bc("\n");
     panic!("EXCEPTION: DOUBLE FAULT");
 }
 
@@ -575,7 +584,26 @@ fn terminate_current_user_process() -> ! {
 extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     let was_user = (stack_frame.code_segment & 3) == 3;
     if was_user { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
-    
+
+    // Breadcrumb KERNEL-mode faults only. A user CoW fault happens constantly right after every
+    // fork, so marking those would flood the wire and change the timing of the very thing being
+    // measured. A kernel-mode fault is the case that kills the machine, and it is supposed to be
+    // impossible — so if this ever appears, it is the answer.
+    if !was_user {
+        // Recorded FIRST: a kernel-mode fault is the one that kills the machine, and CR2 is the
+        // single most useful number in this whole investigation — if it comes back 0x40xxxx the
+        // load-address theory is confirmed without another boot.
+        crate::postmortem::mark_why(
+            crate::postmortem::WHY_KERNEL_PF,
+            x86_64::registers::control::Cr2::read().as_u64(),
+        );
+        crate::serial::bc("\n!KPF cr2=");
+        crate::serial::bc_hex(x86_64::registers::control::Cr2::read().as_u64());
+        crate::serial::bc(" ip=");
+        crate::serial::bc_hex(stack_frame.instruction_pointer.as_u64());
+        crate::serial::bc("\n");
+    }
+
     let cr2 = x86_64::registers::control::Cr2::read().as_u64();
     let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
     
@@ -1074,6 +1102,13 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 }
 
 fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
+    // ── Breadcrumbs (see serial::bc) ──────────────────────────────────────────────────────────
+    // Gated to fork/execve only: this is a debugging aid for one specific freeze, and a
+    // breadcrumb on every syscall would drown the log. It sits ABOVE the three guards below
+    // because two of them return ENOSYS silently — a launch that died there would look
+    // identical to a launch that never issued the syscall at all.
+    match frame.rax { 57 => crate::serial::bc("\n<57"), 59 => crate::serial::bc("\n<59"), _ => {} }
+
     if !is_valid_user_ptr(frame.rcx as *const u8, 1) { frame.rcx = 0; }
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { frame.rax = ENOSYS as u64; return; }
     if GsBase::read().as_u64() == 0 { frame.rax = ENOSYS as u64; return; }
@@ -1749,6 +1784,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,
 
         57 => { // SYS_FORK
+            crate::serial::bc("[fork");
+            crate::postmortem::mark(crate::postmortem::PM_FORK_ENTER);
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ENOSYS as u64; return; }
 
@@ -1839,11 +1876,13 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
 
             child.saved_rsp = final_rsp;
-            
+
             // 4. The parent process receives the child's actual PID!
             frame.rax = child.pid;
 
             percpu.scheduler.tasks.push(child);
+            crate::serial::bc("fork]");
+            crate::postmortem::mark(crate::postmortem::PM_FORK_DONE);
         },
         58 => { // SYS_SPAWN_THREAD
             let entry_point = arg1;
@@ -1930,6 +1969,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
           
        
         59 => { // sys_execve
+            crate::serial::bc("[exec");
+            crate::postmortem::mark(crate::postmortem::PM_EXEC_ENTER);
             let ptr = arg1 as *const u8;
             let len = arg2 as usize;
             // FIRST thing, before touching the pointer: this is the line that says whether the arm
@@ -1964,8 +2005,13 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             // Logged either side: execve reaches read_file_alloc but never reaches load_elf_full for
             // one particular binary, so the read itself is the remaining suspect and this says
             // whether it returns at all.
+            crate::postmortem::mark(crate::postmortem::PM_EXEC_PATH_OK);
             crate::serial_println!("[EXEC] reading \"{}\"", path_str);
+            crate::serial::bc(" read>");
+            crate::postmortem::mark(crate::postmortem::PM_READ_ENTER);
             let read = crate::vfs::VFS.read_file_alloc(&path_str);
+            crate::serial::bc("<read ");
+            crate::postmortem::mark(crate::postmortem::PM_READ_DONE);
             crate::serial_println!("[EXEC] read returned {} bytes",
                 read.as_ref().map(|d| d.len()).unwrap_or(0) as u32);
             if let Some(elf_data) = read {
@@ -1973,7 +2019,11 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 let task = &mut percpu.scheduler.tasks[curr_idx];
 
                 // 3. Shred the old memory
+                crate::serial::bc(" clear>");
+                crate::postmortem::mark(crate::postmortem::PM_CLEAR_ENTER);
                 crate::memory::clear_user_address_space(task.cr3);
+                crate::serial::bc("<clear ");
+                crate::postmortem::mark(crate::postmortem::PM_CLEAR_DONE);
 
                 // 🚨 THE FIX: Reset the bump allocator to a VALID canonical address! 🚨
                 // 0x1000_0000_0000 is safely inside the lower user half.
@@ -2028,6 +2078,11 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         task.name = name_arr;
                         
                         frame.rax = 0; // Success
+                        crate::serial::bc("exec]\n");
+                        // The operation completed. Clear the record rather than leaving the last
+                        // stage behind: a stale breadcrumb reads exactly like a fresh one.
+                        crate::postmortem::mark(crate::postmortem::PM_EXEC_DONE);
+                        crate::postmortem::clear();
                         return;        // Bypass default block exit
                     }
                 }

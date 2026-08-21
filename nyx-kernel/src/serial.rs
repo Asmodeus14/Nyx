@@ -68,6 +68,56 @@ lazy_static! {
     };
 }
 
+/// Breadcrumb: write to COM1 AND to `BOOT_LOG`, taking no lock and running no formatter.
+///
+/// `serial_println!` takes `SERIAL1`'s spin lock and runs `core::fmt`; either can swallow a
+/// message if the machine dies at the wrong moment, and a swallowed message is indistinguishable
+/// from code that was never reached. This avoids both.
+///
+/// ★ It writes `BOOT_LOG` too, and that is not a compromise — **this machine has no serial
+/// capture**. `nyx-recv` is a UDP framebuffer viewer, not a console, and the laptop has no COM
+/// port. Every log line anyone has ever read here came from `BOOT_LOG` via System Monitor
+/// (syscall in `interrupts.rs`). A breadcrumb that only went out COM1 went nowhere at all —
+/// which is exactly the mistake that made the first instrumented boot useless. The raw byte
+/// copy is safe without the lock: bounds are checked, and a torn `BOOT_LOG_IDX` can only
+/// interleave bytes, never write out of range.
+///
+/// The TX-empty wait is BOUNDED. `SerialPort::wait_for_tx_empty` spins forever, so with nothing
+/// attached to COM1 it could become the very hang under investigation.
+pub fn bc(s: &str) {
+    unsafe {
+        let mut data = Port::<u8>::new(0x3F8);
+        let mut line_sts = Port::<u8>::new(0x3F8 + 5);
+        for b in s.bytes() {
+            let mut spins = 0u32;
+            while (line_sts.read() & 0x20) == 0 && spins < 100_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            data.write(b);
+
+            if BOOT_LOG_IDX < BOOT_LOG_SIZE {
+                BOOT_LOG[BOOT_LOG_IDX] = b;
+                BOOT_LOG_IDX += 1;
+            }
+        }
+    }
+}
+
+/// `bc` for a number. Hand-rolled hex because `core::fmt` is the thing being bypassed — and
+/// because the formatter is where a previous bug turned every printed integer into tofu.
+pub fn bc_hex(v: u64) {
+    let digits = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[2 + i] = digits[((v >> (60 - i * 4)) & 0xF) as usize];
+    }
+    // Safe: every byte written above is ASCII.
+    bc(unsafe { core::str::from_utf8_unchecked(&buf) });
+}
+
 // --- NEW: KERNEL BOOT LOG BUFFER ---
 // 128 KB: the GPU pipeline decode (~60 lines) lands late in boot, and at 16 KB the
 // buffer filled mid-decode (stopped at ~line 48) so the userspace sysmon viewer

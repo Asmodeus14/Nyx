@@ -22,6 +22,7 @@ pub mod smp;
 pub mod percpu;
 pub mod time;
 pub mod rtc;
+pub mod postmortem;
 pub mod random;
 pub mod scheduler;
 pub mod pci;
@@ -122,6 +123,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     
     crate::serial_println!("[BOOT] NyxOS Kernel Starting...");
     crate::vga_println!("[BOOT] NyxOS Kernel Boot Sequence Initiated...");
+
+    // FIRST thing after the log exists. This machine has no serial console — BOOT_LOG is RAM and
+    // dies with the box — so after a freeze this CMOS record is the ONLY surviving evidence, and
+    // it must be printed before anything else can crowd the log or overwrite the register.
+    crate::postmortem::report_and_clear();
 
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     unsafe { crate::memory::PHYS_MEM_OFFSET = phys_mem_offset.as_u64(); }
@@ -363,8 +369,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let msg = alloc::format!("{}", info);
-    trigger_rsod(&msg);
+    // ★ BEFORE the `format!` below, which ALLOCATES. If we panicked while the kernel heap lock
+    // was held — or with a corrupt heap — that allocation deadlocks or faults inside the panic
+    // handler itself, and the result is a machine that stops dead with no message and no red
+    // screen. Indistinguishable from a hang that never reached any code at all. This one
+    // lock-free, allocation-free line is the difference between "the kernel panicked" and a
+    // week of bisecting.
+    crate::serial::bc("\n!!PANIC\n");
+    crate::postmortem::mark_why(crate::postmortem::WHY_PANIC, 0);
+
+    // ★★★ DO NOT ALLOCATE. This used to be `let msg = alloc::format!("{}", info);` before
+    // anything was printed or painted — so a panic raised while the kernel heap lock was held,
+    // or with a damaged heap, deadlocked INSIDE the panic handler. No message, no red screen,
+    // no reset: just a dead box, indistinguishable from a hang that never reached any handler.
+    // That is precisely what the HelloC freeze looked like, and the CMOS record proved the
+    // panic handler HAD run.
+    //
+    // `core::fmt` does not need the heap — only `format!` does. `_vga_print` and `_print` both
+    // take `fmt::Arguments`, so `info` can be rendered straight into them with no allocation.
+    x86_64::instructions::interrupts::disable();
+    unsafe {
+        if let Some(painter) = &mut crate::gui::SCREEN_PAINTER {
+            let buf = painter.buffer.as_mut();
+            for i in (0..buf.len()).step_by(4) {
+                buf[i] = 0; buf[i+1] = 0; buf[i+2] = 255; buf[i+3] = 255;
+            }
+        }
+    }
+    crate::serial_println!("[PANIC] {}", info);
+    crate::vga_println!("\n\n  [FATAL KERNEL PANIC]\n  -> {}", info);
+    loop { x86_64::instructions::hlt(); }
 }
 
 pub fn trigger_rsod(msg: &str) -> ! {

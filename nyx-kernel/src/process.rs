@@ -91,6 +91,10 @@ pub const FD_MAX: usize = 256;
 pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
     // FIRST statement on purpose. A freeze with zero output cannot distinguish "the loader hung"
     // from "the loader was never entered", and those point at completely different code.
+    // `bc` comes before `serial_println!` because it cannot be swallowed by the serial lock or
+    // the formatter, so the two together also say WHICH of those two swallowed a message.
+    crate::serial::bc("(elf");
+    crate::postmortem::mark(crate::postmortem::PM_ELF_ENTER);
     crate::serial_println!("[ELF] load_elf_full: {} bytes", file_data.len() as u32);
     if file_data.len() < core::mem::size_of::<Elf64_Ehdr>() { return Err("File too small"); }
     let header = unsafe { &*(file_data.as_ptr() as *const Elf64_Ehdr) };
@@ -141,7 +145,17 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
                 // Mapped writable AND executable here regardless of p_flags; the real protection is
                 // applied in one pass after the loop. See the ★ block below for why it cannot be
                 // done here.
+                //
+                // Bracketed with the segment's own address: HelloC is the first binary to load
+                // anywhere near 0x400000 (every Nyx-native app links at 0x40000000), and
+                // `allocate_user_pages_at` deliberately KEEPS a pre-existing mapping rather than
+                // replacing it — so if something already owns these pages, the copy below writes
+                // straight through someone else's mapping. This says exactly which segment.
+                crate::serial::bc(" map");
+                crate::serial::bc_hex(start_page);
+                crate::postmortem::mark_at(crate::postmortem::PM_ELF_MAP, start_page);
                 crate::memory::allocate_user_pages_at(start_page, num_pages, true)?;
+                crate::serial::bc("=ok");
 
                 crate::serial_println!(
                     "[ELF] LOAD vaddr={:#x} memsz={:#x} filesz={:#x} flags={} pages={}",
@@ -156,6 +170,10 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
                     }
                 }
 
+                crate::serial::bc(" copy");
+                // The vaddr, not the page: the loop runs once per PT_LOAD and each pass
+                // overwrites the stage, so "died in a copy" is useless without knowing WHICH.
+                crate::postmortem::mark_at(crate::postmortem::PM_ELF_COPY, phdr.p_vaddr);
                 unsafe {
                     let dest = phdr.p_vaddr as *mut u8;
                     let src = file_data.as_ptr().add(phdr.p_offset as usize);
@@ -167,6 +185,7 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
                         core::ptr::write_bytes(bss_start, 0, bss_len as usize);
                     }
                 }
+                crate::serial::bc("=ok");
 
                 // If no PT_PHDR was present, derive the phdr in-memory address from whichever
                 // PT_LOAD segment actually contains the program-header file range (the common case
@@ -200,11 +219,14 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
         const PF_X: u32 = 1;
         const PF_W: u32 = 2;
         let mut wx_pages = 0usize;
+        crate::serial::bc(" prot>");
+        crate::postmortem::mark(crate::postmortem::PM_ELF_PROT);
         for (page, f) in page_prot.iter() {
             let (w, x) = (f & PF_W != 0, f & PF_X != 0);
             if w && x { wx_pages += 1; }
             unsafe { crate::memory::protect_user_range(*page, 1, w, x)? };
         }
+        crate::serial::bc("<prot");
         // A page that ends up both writable and executable defeats the point of the exercise. It is
         // legal and we allow it, but it is worth naming rather than leaving silent.
         if wx_pages > 0 {
@@ -214,6 +236,8 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
         }
     }
 
+    crate::serial::bc("elf)");
+    crate::postmortem::mark(crate::postmortem::PM_ELF_DONE);
     crate::serial_println!("[ELF] load complete — handing off to entry");
     Ok(LoadedElf {
         entry: header.e_entry,

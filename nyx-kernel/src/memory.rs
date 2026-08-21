@@ -200,7 +200,9 @@ pub fn allocate_user_pages_at(
     num_pages: usize,
     exec: bool,
 ) -> Result<u64, &'static str> {
-    let mut system_lock = MEMORY_MANAGER.lock();
+    // Watchdogged: this call holds the lock across the `write_bytes` below, which touches a
+    // freshly mapped USER address. A fault there re-enters the lock via the page-fault handler.
+    let mut system_lock = lock_mm_watchdog(MM_SITE_ALLOC_USER_PAGES);
     let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
     let mut active_mapper = unsafe { active_mapper() };
 
@@ -456,8 +458,49 @@ pub unsafe fn protect_user_range(
     Ok(())
 }
 
+/// Site IDs for `lock_mm_watchdog`, so the post-mortem record names WHICH acquire wedged.
+pub const MM_SITE_ALLOC_FRAME: u8 = 1;
+pub const MM_SITE_ALLOC_USER_PAGES: u8 = 2;
+
+/// Take `MEMORY_MANAGER`, but give up and REPORT rather than spin forever.
+///
+/// ★★★ Why this exists. `MEMORY_MANAGER` is a bare `spin::Mutex` with no interrupt masking and
+/// no re-entrancy, and the CoW **page-fault handler** calls `allocate_frame()`, which takes it.
+/// A page fault is an EXCEPTION — `cli` cannot mask it — so any fault on a CPU that already
+/// holds this lock deadlocks against itself. `allocate_user_pages_at` holds it across a
+/// `write_bytes` to a freshly mapped USER address, which is exactly such a fault window.
+///
+/// The result is the worst possible failure mode: instant, whole-machine, and completely
+/// silent. `SYSCALL` cleared IF so the core never yields, and every other core wedges on the
+/// same lock the moment it touches memory. Nothing is printed, nothing panics, the box is just
+/// gone — which is indistinguishable from "the code never ran at all".
+///
+/// This does not FIX the deadlock (that needs the lock itself to mask interrupts, kernel-wide —
+/// the same treatment the kernel heap already got). It makes the deadlock ANNOUNCE itself: the
+/// bounded spin expires, the cause and site go into battery-backed CMOS, and the next boot says
+/// which acquire wedged instead of leaving another mystery freeze. A legitimate contended
+/// acquire completes in microseconds; 50M spins is several orders of magnitude beyond that, so
+/// this cannot fire on a healthy machine.
+fn lock_mm_watchdog(site: u8) -> spin::MutexGuard<'static, Option<MemorySystem>> {
+    for _ in 0..50_000_000u64 {
+        if let Some(g) = MEMORY_MANAGER.try_lock() { return g; }
+        core::hint::spin_loop();
+    }
+
+    crate::postmortem::mark_why(crate::postmortem::WHY_MM_DEADLOCK, site as u64);
+    crate::serial::bc("\n!!MEMORY_MANAGER DEADLOCK site=");
+    crate::serial::bc_hex(site as u64);
+    crate::serial::bc("\n");
+    crate::serial_println!(
+        "[FATAL] MEMORY_MANAGER lock never acquired (site {}). Almost certainly re-entered from \
+         the page-fault handler while a mapping call already held it.", site as u32);
+    loop { x86_64::instructions::hlt(); }
+}
+
 pub fn allocate_frame() -> Option<PhysFrame> {
-    let mut lock = MEMORY_MANAGER.lock();
+    // Watchdogged because THIS is the acquire the page-fault handler makes: if a fault lands
+    // while a mapping call holds the lock, this is where the machine would silently stop.
+    let mut lock = lock_mm_watchdog(MM_SITE_ALLOC_FRAME);
     lock.as_mut().and_then(|sys| sys.frame_allocator.allocate_frame())
 }
 
@@ -556,6 +599,10 @@ pub fn clone_user_address_space(parent_cr3: PhysAddr, child_cr3: PhysAddr) -> Re
 }
 
 pub fn clear_user_address_space(cr3_phys: PhysAddr) {
+    // `MEMORY_MANAGER` is a bare spin lock and this walks four levels of page tables while
+    // holding it, inside a syscall (so IF is clear). If it ever deadlocks or faults mid-walk
+    // the machine stops dead with nothing on the wire, so bracket it — see serial::bc.
+    crate::serial::bc("(cl");
     unsafe {
         let mut lock = crate::memory::MEMORY_MANAGER.lock();
         let system = lock.as_mut().expect("Memory System not initialized");
@@ -645,6 +692,7 @@ pub fn clear_user_address_space(cr3_phys: PhysAddr) {
         let active_cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
         core::arch::asm!("mov cr3, {}", in(reg) active_cr3);
     }
+    crate::serial::bc("cl)");
 }
 
 pub fn create_shm_block(size: usize) -> Option<u64> {
