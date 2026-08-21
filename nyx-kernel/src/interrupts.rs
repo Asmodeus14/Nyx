@@ -1942,7 +1942,14 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             };
 
             // 2. Read the file using the safe Kernel String
-            if let Some(elf_data) = crate::vfs::VFS.read_file_alloc(&path_str) {
+            // Logged either side: execve reaches read_file_alloc but never reaches load_elf_full for
+            // one particular binary, so the read itself is the remaining suspect and this says
+            // whether it returns at all.
+            crate::serial_println!("[EXEC] reading \"{}\"", path_str);
+            let read = crate::vfs::VFS.read_file_alloc(&path_str);
+            crate::serial_println!("[EXEC] read returned {} bytes",
+                read.as_ref().map(|d| d.len()).unwrap_or(0) as u32);
+            if let Some(elf_data) = read {
                 let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                 let task = &mut percpu.scheduler.tasks[curr_idx];
 
