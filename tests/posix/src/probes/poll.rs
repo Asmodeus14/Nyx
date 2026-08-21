@@ -13,6 +13,7 @@ use crate::report::{render_ret, Baseline, Row, Verdict};
 use super::announce;
 
 const POLLIN: i16 = 0x001;
+const POLLHUP: i16 = 0x010;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -103,6 +104,41 @@ pub fn probe(base: Baseline, rows: &mut Vec<Row>) {
     let mut row = Row::new(23, "select");
     row.raw = render_ret(r);
     row.verdict = if base.is_missing(r) { Verdict::Missing } else if r < 0 { Verdict::Fail } else { Verdict::Pass };
+    rows.push(row);
+
+    // --- HUP: a pipe whose writer has gone must say so --------------------------------------
+    //
+    // This needs its own row because the rows above cannot reach it: they keep the write end open
+    // throughout, so an implementation that never reports POLLHUP still passes them both. That is
+    // the same trap as the old `palgap=0` — a verdict no code path can produce is not a
+    // measurement. A reader that cannot see EOF blocks forever on a closed pipe.
+    announce("poll (writer closed)");
+    let mut hfds = [0i32; 2];
+    let mut row = Row::new(7, "poll HUP");
+    if unsafe { raw::sys1(raw::SYS_PIPE, hfds.as_mut_ptr() as usize) } < 0 {
+        row.raw = String::from("-");
+        row.verdict = Verdict::Skip;
+        row.note = String::from("could not create a pipe to hang up");
+    } else {
+        // Close the write end and nothing else: the read end must now report hangup.
+        unsafe { raw::sys1(raw::SYS_CLOSE, hfds[1] as usize) };
+        let mut pfd = PollFd { fd: hfds[0], events: POLLIN, revents: 0 };
+        let r = unsafe { raw::sys3(raw::SYS_POLL, &mut pfd as *mut PollFd as usize, 1, 0) };
+        row.raw = format!("ret={} revents={}", r as i32, pfd.revents as i32);
+        row.verdict = if base.is_missing(r) {
+            Verdict::Missing
+        } else if r < 0 {
+            Verdict::Fail
+        } else if (pfd.revents & POLLHUP) != 0 {
+            Verdict::Pass
+        } else {
+            Verdict::Stub
+        };
+        if row.verdict == Verdict::Stub {
+            row.note = String::from("writer closed but no POLLHUP — a reader would hang on EOF");
+        }
+        unsafe { raw::sys1(raw::SYS_CLOSE, hfds[0] as usize) };
+    }
     rows.push(row);
 
     // --- epoll family: presence only -------------------------------------------------------

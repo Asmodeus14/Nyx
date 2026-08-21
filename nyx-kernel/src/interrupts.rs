@@ -132,20 +132,64 @@ const POLLNVAL: i16 = 0x020;
 /// to a single 64-bit word. The fd table is 32 entries today, so this is already generous.
 const POLL_MAX: usize = 64;
 
-/// Clone a descriptor out of the current task's fd table.
+/// Sample readiness for a set of descriptors, retaining nothing.
 ///
-/// Cloning rather than borrowing is the entire point. The loops below yield via `int 0x41`, and the
-/// scheduler's `tasks: Vec<Process>` can reallocate while this task is descheduled — a borrow of
-/// `fd_table` held across that yield dangles. The `Arc`s inside keep the pipe/socket alive on their
-/// own, so the snapshot stays valid even if the table moves. Same hazard the socket read path
-/// documents; `poll` just faces it N times over instead of once.
-unsafe fn snapshot_fd(fd: usize) -> Option<FileDescriptor> {
+/// Writes one entry per requested fd: `None` if it is not open, else `(readable, writable, hup)`.
+///
+/// Two properties have to hold at once, and they pull against each other:
+///
+/// 1. No borrow of `fd_table` may span a yield. The scheduler's `tasks: Vec<Process>` can
+///    reallocate while this task is descheduled, so a borrow held across `int 0x41` dangles.
+/// 2. Nothing may hold an extra `Arc` reference to a pipe's queue. HUP is derived from
+///    `Arc::strong_count == 1`, so any additional reference makes a hung-up pipe look alive.
+///
+/// The first version satisfied (1) by cloning the descriptor — which broke (2), because the clone
+/// was itself a reference and `strong_count` could never reach 1. Pipe HUP was silently
+/// unreachable. Taking a short borrow and keeping only the resulting tuple satisfies both: the
+/// borrow ends before any yield, and no reference outlives it.
+unsafe fn sample_readiness(fds: &[i32], out: &mut [Option<(bool, bool, bool)>]) {
+    // Pass 1: find which stacks back these descriptors. `poll_stack` has to run BEFORE readiness is
+    // sampled, and exactly once per pass — never per fd.
+    let (mut wired, mut wifi) = (false, false);
+    {
+        let percpu = crate::percpu::current();
+        let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+        if curr_idx >= percpu.scheduler.tasks.len() {
+            for o in out.iter_mut() { *o = None; }
+            return;
+        }
+        let table = &percpu.scheduler.tasks[curr_idx].fd_table;
+        for &fd in fds {
+            if fd < 0 { continue; }
+            if let Some(Some(FileDescriptor::Socket(m))) = table.get(fd as usize) {
+                match m.lock().stack {
+                    crate::drivers::net::NetStack::Wired => wired = true,
+                    crate::drivers::net::NetStack::Wifi => wifi = true,
+                }
+            }
+        }
+    }
+    if wired { crate::drivers::net::poll_stack(crate::drivers::net::NetStack::Wired); }
+    if wifi { crate::drivers::net::poll_stack(crate::drivers::net::NetStack::Wifi); }
+
+    // Pass 2: sample under a fresh short borrow. Nothing here yields.
     let percpu = crate::percpu::current();
     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-    if curr_idx >= percpu.scheduler.tasks.len() { return None; }
+    if curr_idx >= percpu.scheduler.tasks.len() {
+        for o in out.iter_mut() { *o = None; }
+        return;
+    }
     let table = &percpu.scheduler.tasks[curr_idx].fd_table;
-    if fd >= table.len() { return None; }
-    table[fd].clone()
+    for (i, &fd) in fds.iter().enumerate() {
+        out[i] = if fd < 0 {
+            None
+        } else {
+            match table.get(fd as usize) {
+                Some(Some(d)) => Some(fd_readiness(d)),
+                _ => None,
+            }
+        };
+    }
 }
 
 /// What would this descriptor do right now, without actually reading or writing it?
@@ -161,8 +205,11 @@ fn fd_readiness(fd: &FileDescriptor) -> (bool, bool, bool) {
 
         FileDescriptor::PipeRead(q) => {
             let has_data = !q.lock().is_empty();
-            // Holding the last Arc means every writer is gone. Without surfacing that, a reader
-            // polls an orphaned pipe forever instead of seeing EOF.
+            // ★ INVARIANT: callers must pass a descriptor BORROWED from the fd table, never a
+            // clone. The count reaching 1 means this read end is the last reference — every writer
+            // has closed — and any extra reference the caller is holding makes that unreachable,
+            // so a hung-up pipe reads as alive forever and a reader never sees EOF. That is exactly
+            // the bug an earlier snapshot-by-clone version of `sample_readiness` had.
             let hup = alloc::sync::Arc::strong_count(q) == 1;
             // Readable on HUP too: read() returns 0 at once, which is a completed call, not a block.
             (has_data || hup, false, hup)
@@ -196,22 +243,6 @@ fn fd_readiness(fd: &FileDescriptor) -> (bool, bool, bool) {
             match r { Some(v) => v, None => (false, false, true) }
         }
     }
-}
-
-/// Poll each network stack backing a socket in this set exactly once. Hoisted out of the per-fd
-/// loop on purpose — see `fd_readiness`.
-fn poll_stacks_once(fds: &[Option<FileDescriptor>]) {
-    let (mut wired, mut wifi) = (false, false);
-    for f in fds.iter().flatten() {
-        if let FileDescriptor::Socket(m) = f {
-            match m.lock().stack {
-                crate::drivers::net::NetStack::Wired => wired = true,
-                crate::drivers::net::NetStack::Wifi => wifi = true,
-            }
-        }
-    }
-    if wired { crate::drivers::net::poll_stack(crate::drivers::net::NetStack::Wired); }
-    if wifi { crate::drivers::net::poll_stack(crate::drivers::net::NetStack::Wifi); }
 }
 
 /// Give up the CPU while waiting for readiness to change.
@@ -1790,18 +1821,14 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
 
             let start = crate::time::UPTIME_MS.load(Ordering::Relaxed);
             let mut out = [0i16; POLL_MAX];
-            let mut snap: alloc::vec::Vec<Option<FileDescriptor>> =
-                alloc::vec::Vec::with_capacity(nfds);
+            let mut fdlist = [0i32; POLL_MAX];
+            for i in 0..nfds { fdlist[i] = want[i].0; }
+            let mut samp = [None; POLL_MAX];
 
             loop {
-                // Re-snapshot every pass: a descriptor can be closed by another thread between
-                // passes, and a stale Arc would report a dead pipe as readable forever.
-                snap.clear();
-                for i in 0..nfds {
-                    let fd = want[i].0;
-                    snap.push(if fd < 0 { None } else { unsafe { snapshot_fd(fd as usize) } });
-                }
-                poll_stacks_once(&snap);
+                // Re-sampled every pass: a descriptor can be closed by another thread between
+                // passes, and stale readiness would report a dead pipe as live forever.
+                unsafe { sample_readiness(&fdlist[..nfds], &mut samp[..nfds]); }
 
                 let mut ready = 0usize;
                 for i in 0..nfds {
@@ -1809,8 +1836,7 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     let mut re = 0i16;
                     if fd < 0 {
                         // POSIX: a negative fd is ignored and reports revents 0.
-                    } else if let Some(d) = &snap[i] {
-                        let (r, w, h) = fd_readiness(d);
+                    } else if let Some((r, w, h)) = samp[i] {
                         if r && (ev & POLLIN) != 0 { re |= POLLIN; }
                         if w && (ev & POLLOUT) != 0 { re |= POLLOUT; }
                         // HUP is reported whether or not it was asked for — that is what lets a
@@ -1864,25 +1890,23 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let win = if wp.is_null() { 0u64 } else { unsafe { wp.read_unaligned() } };
 
             let start = crate::time::UPTIME_MS.load(Ordering::Relaxed);
-            let mut snap: alloc::vec::Vec<Option<FileDescriptor>> =
-                alloc::vec::Vec::with_capacity(nfds);
+            let mut fdlist = [0i32; POLL_MAX];
+            for fd in 0..nfds { fdlist[fd] = fd as i32; }
+            let mut samp = [None; POLL_MAX];
 
             loop {
-                snap.clear();
-                for fd in 0..nfds { snap.push(unsafe { snapshot_fd(fd) }); }
-                poll_stacks_once(&snap);
+                unsafe { sample_readiness(&fdlist[..nfds], &mut samp[..nfds]); }
 
                 let (mut rout, mut wout, mut count) = (0u64, 0u64, 0usize);
                 for fd in 0..nfds {
                     let bit = 1u64 << fd;
                     let (want_r, want_w) = (rin & bit != 0, win & bit != 0);
                     if !want_r && !want_w { continue; }
-                    match &snap[fd] {
+                    match samp[fd] {
                         // select has no per-fd error slot, so a bad descriptor fails the whole
                         // call. That is the documented behaviour and it beats silently dropping it.
                         None => { frame.rax = EBADF as u64; return; }
-                        Some(d) => {
-                            let (r, w, h) = fd_readiness(d);
+                        Some((r, w, h)) => {
                             if want_r && (r || h) { rout |= bit; count += 1; }
                             if want_w && w { wout |= bit; count += 1; }
                         }
