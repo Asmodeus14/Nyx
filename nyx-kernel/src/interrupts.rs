@@ -1428,16 +1428,47 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             } else { frame.rax = EBADF as u64; }
         },
         
-        20 => { // SYS_WRITEV 
+        19 => { // SYS_READV(fd, iov, iovcnt)
+            // musl's __stdio_read issues readv, so WITHOUT this every buffered read fails while
+            // writes work (writev was implemented) — which presents as "the file contents differ"
+            // rather than as a missing syscall. Deliberately the mirror image of writev below;
+            // a second shape for the same operation is how the two drift apart.
             let fd = arg1 as usize;
-            let iov_ptr = arg2 as *const u64; 
+            let iov_ptr = arg2 as *const u64;
             let iovcnt = arg3 as usize;
-            
-            if !is_valid_user_ptr(iov_ptr as *const u8, iovcnt * 16) { 
-                frame.rax = EFAULT as u64; 
-                return; 
+
+            if !iov_array_ok(iov_ptr, iovcnt) { frame.rax = EFAULT as u64; return; }
+
+            let mut total_read = 0isize;
+            for i in 0..iovcnt {
+                unsafe {
+                    let base = *iov_ptr.add(i * 2);
+                    let len = *iov_ptr.add(i * 2 + 1) as usize;
+
+                    if len > 0 {
+                        let got = sys_read_internal(fd, base as *mut u8, len);
+                        if got < 0 {
+                            if total_read == 0 { total_read = got; }
+                            break;
+                        }
+                        total_read += got;
+                        // A short read ends the call. Continuing into the next iovec would
+                        // silently stitch together non-contiguous file data, and the caller has
+                        // no way to detect that from the returned count.
+                        if (got as usize) < len { break; }
+                    }
+                }
             }
-            
+            frame.rax = total_read as u64;
+        },
+
+        20 => { // SYS_WRITEV
+            let fd = arg1 as usize;
+            let iov_ptr = arg2 as *const u64;
+            let iovcnt = arg3 as usize;
+
+            if !iov_array_ok(iov_ptr, iovcnt) { frame.rax = EFAULT as u64; return; }
+
             let mut total_written = 0isize;
             for i in 0..iovcnt {
                 unsafe {
@@ -3751,6 +3782,31 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = ENOSYS as u64;
         }
     }
+}
+
+/// Validate the `struct iovec[]` that readv/writev are handed, before the arm dereferences it.
+///
+/// Two things the old writev did not do. `iovcnt * 16` can OVERFLOW, and an overflowed product
+/// makes the range check pass for an arbitrarily large array — so cap at IOV_MAX first. And the
+/// array itself is read by the KERNEL (`*iov_ptr.add(..)`), so a range check is not enough:
+/// `is_valid_user_ptr` cannot tell mapped from unmapped, and a kernel-mode read of an unmapped
+/// address panics the MACHINE rather than killing the caller. The individual `iov_base` pointers
+/// need no check here — they are passed to sys_read_internal / sys_write_internal, which validate
+/// exactly as they would for a plain read(2)/write(2).
+fn iov_array_ok(iov_ptr: *const u64, iovcnt: usize) -> bool {
+    const IOV_MAX: usize = 1024;
+    if iovcnt == 0 || iovcnt > IOV_MAX { return false; }
+    let bytes = iovcnt * 16;
+    if !is_valid_user_ptr(iov_ptr as *const u8, bytes) { return false; }
+    // Check every page the array spans, not just the first: it can straddle a boundary where the
+    // second page is absent.
+    let start = iov_ptr as u64;
+    let mut a = start & !0xFFF;
+    while a < start + bytes as u64 {
+        if !unsafe { crate::memory::user_addr_mapped(a) } { return false; }
+        a += 4096;
+    }
+    true
 }
 
 fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
