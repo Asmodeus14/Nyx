@@ -3586,7 +3586,25 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         // and not a person reading a log. The serial line is the other half: a port failing on a
         // missing syscall should say WHICH one, rather than leaving it to be bisected.
         _ => {
-            crate::serial_println!("[SYSCALL] unimplemented syscall {}", id);
+            // ★ Logged ONCE per syscall number, not once per call.
+            //
+            // Unbounded logging here is itself a machine freeze. SYSCALL clears IF, so this line is
+            // emitted with interrupts DISABLED, and the UART runs at roughly 11 KB/s. A libc that
+            // retries an unknown syscall in a loop therefore parks the CPU in the serial port with
+            // interrupts off — no timer, no scheduler, no mouse. Indistinguishable from a hang.
+            //
+            // This was harmless while nothing reached the arm. The first real libc reached it
+            // immediately, which is exactly when a diagnostic aid turns into the fault.
+            static UNIMPL_LOGGED: [core::sync::atomic::AtomicU64; 16] =
+                [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+            let n = id as usize;
+            if n < 1024 {
+                let prev = UNIMPL_LOGGED[n / 64]
+                    .fetch_or(1u64 << (n % 64), core::sync::atomic::Ordering::Relaxed);
+                if prev & (1u64 << (n % 64)) == 0 {
+                    crate::serial_println!("[SYSCALL] unimplemented syscall {} (logged once)", id);
+                }
+            }
             frame.rax = ENOSYS as u64;
         }
     }
