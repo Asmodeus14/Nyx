@@ -36,6 +36,7 @@ const EINVAL: i64 = -22;
 const EMFILE: i64 = -24;
 const ENOSPC: i64 = -28;
 const ESPIPE: i64 = -29;
+const ESRCH: i64 = -3;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const ENOTEMPTY: i64 = -39;
@@ -1791,6 +1792,34 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                 // 2a. Thread exit: leave the shared address space intact. Self-reap this slot
                 // (Empty), so no wait4 is required for a joined worker. The kernel stack leaks,
                 // consistent with the existing process-exit path (which also never frees it).
+
+                // set_tid_address: zero the word and wake whoever is joining on it. Done ONLY on
+                // this branch — in the sole-owner branch below the address space is about to be
+                // shredded, and there is by definition nobody left to join.
+                let ctid = task.clear_child_tid;
+                task.clear_child_tid = 0;
+                if ctid != 0
+                    && is_valid_user_ptr(ctid as *const u8, 4)
+                    // ★ The range check alone is not enough. A kernel-mode write to an unmapped
+                    // user address panics the MACHINE rather than killing this thread, and `ctid`
+                    // came from userspace — the thread could have unmapped its own stack since.
+                    && unsafe { crate::memory::user_addr_mapped(ctid) }
+                {
+                    unsafe { (ctid as *mut u32).write_volatile(0); }
+                    // FUTEX_WAKE on that word. Matched on cr3 as well as address so two processes
+                    // at the same numeric address cannot cross-wake; threads share cr3, so a real
+                    // joiner in this process does match.
+                    for t in percpu.scheduler.tasks.iter_mut() {
+                        if t.futex_addr == ctid && t.cr3 == my_cr3
+                            && t.state == crate::scheduler::TaskState::Blocked
+                        {
+                            t.futex_addr = 0;
+                            t.state = crate::scheduler::TaskState::Ready;
+                        }
+                    }
+                }
+
+                let task = &mut percpu.scheduler.tasks[curr_idx];
                 task.state = crate::scheduler::TaskState::Empty;
             } else {
                 // 2b. Sole owner: shred ONLY the user memory tables securely.
@@ -1839,7 +1868,16 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         },
 
-        218 => { frame.rax = 1; }, // SYS_SET_TID_ADDRESS
+        218 => { // SYS_SET_TID_ADDRESS(tidptr) -> caller's tid
+            // Was `frame.rax = 1`: it claimed success, recorded nothing, and returned a tid of 1
+            // for every thread. Now it stores the address, which is what makes the clear-on-exit
+            // below possible — that clear is the mechanism pthread_join is built on.
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = ESRCH as u64; return; }
+            percpu.scheduler.tasks[curr_idx].clear_child_tid = arg1;
+            frame.rax = percpu.scheduler.tasks[curr_idx].pid;
+        },
 
         318 => { // SYS_GETRANDOM (Required for Rust HashMaps)
             let buf_ptr = arg1 as *mut u8;

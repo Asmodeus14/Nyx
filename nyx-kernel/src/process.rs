@@ -354,6 +354,11 @@ pub struct Process {
     /// the root itself). Inherited across fork and preserved across execve, which is what makes a
     /// shell's `cd` stick for the commands it launches.
     pub cwd: alloc::string::String,
+    /// Userspace address to zero and futex-wake when this THREAD exits (`set_tid_address`, and
+    /// `CLONE_CHILD_CLEARTID` once clone grows flags). This is the mechanism `pthread_join` is built
+    /// on: the joiner futex-waits on this word, and the exiting thread clearing it is the wakeup.
+    /// 0 = not requested.
+    pub clear_child_tid: u64,
     pub state: TaskState,
     pub cpu_ticks: u64,      
     pub name: [u8; 16],      
@@ -391,6 +396,7 @@ impl Process {
             mmap_bump: 0x4000_0000_0000, 
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
+            clear_child_tid: 0,
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -416,6 +422,7 @@ impl Process {
             mmap_bump: 0x4000_0000_0000,
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
+            clear_child_tid: 0,
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],
@@ -451,6 +458,7 @@ impl Process {
             mmap_bump: 0x4000_0000_0000,
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
+            clear_child_tid: 0,
             state: TaskState::Ready,
             cpu_ticks: 0,
             name: [0; 16],

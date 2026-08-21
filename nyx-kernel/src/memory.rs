@@ -364,6 +364,17 @@ unsafe fn pte_for(cr3: u64, vaddr: u64) -> Option<*mut u64> {
     Some(table.add(idx))
 }
 
+/// Is `vaddr` actually backed by a present page in the current address space?
+///
+/// `is_valid_user_ptr` only RANGE-checks — it cannot tell a mapped page from an unmapped one, and a
+/// kernel-mode write to an unmapped user address panics the whole MACHINE rather than killing the
+/// process. Anywhere the kernel writes to a user address it was merely *told* about, rather than one
+/// it just mapped itself, needs this as well as the range check.
+pub unsafe fn user_addr_mapped(vaddr: u64) -> bool {
+    let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+    pte_for(cr3, vaddr).is_some()
+}
+
 /// Apply `PROT_WRITE` / `PROT_EXEC` to an already-mapped user range in the CURRENT address space.
 ///
 /// The whole range is validated before a single PTE is touched: `mprotect(2)` must not partially
