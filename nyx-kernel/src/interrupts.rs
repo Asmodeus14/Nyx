@@ -88,12 +88,49 @@ const DIRENT_HEADER: usize = 19; // u64 d_ino + i64 d_off + u16 d_reclen + u8 d_
 ///
 /// # Safety
 /// The caller must not hold the returned borrow across anything that could unmap the pages.
-unsafe fn user_path<'a>(ptr: u64, len: u64) -> Option<&'a str> {
+unsafe fn user_path(ptr: u64, len: u64) -> Option<alloc::string::String> {
     const PATH_MAX: u64 = 4096;
     if len == 0 || len > PATH_MAX { return None; }
     if !is_valid_user_ptr(ptr as *const u8, len as usize) { return None; }
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    core::str::from_utf8(bytes).ok()
+    let s = core::str::from_utf8(bytes).ok()?;
+    // ★ Relative paths are resolved HERE — the single choke point every path syscall funnels
+    // through — rather than in individual arms. Resolution used to live only in `open`, so a
+    // relative path worked for open() and silently failed for stat/mkdir/unlink/rename. That
+    // inconsistency is worse for a libc than either extreme: whether a path works depends on which
+    // call you happen to make, which is undebuggable from the outside.
+    //
+    // Returns an owned String because the resolved path is built, not borrowed. That is also why
+    // callers take `&path` — the borrow has to outlive nothing.
+    Some(unsafe { resolve_path(s) })
+}
+
+/// Read a NUL-terminated C string from userspace, resolved like any other path.
+///
+/// This is the primitive a libc needs: musl passes C strings, not `(ptr, len)` pairs.
+///
+/// ★ Walking to a NUL is precisely the operation that can run off the end of a mapping, and a
+/// kernel-mode read of an unmapped user address panics the MACHINE. So it is bounded by PATH_MAX
+/// *and* re-checks that the page is present every time it crosses a page boundary — a string
+/// starting three bytes before the end of a mapped page is otherwise a one-instruction machine kill.
+unsafe fn user_cstr(ptr: u64) -> Option<alloc::string::String> {
+    const PATH_MAX: usize = 4096;
+    if ptr == 0 { return None; }
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64);
+    for i in 0..PATH_MAX {
+        let a = ptr.checked_add(i as u64)?;
+        if i == 0 || (a & 0xFFF) == 0 {
+            if !is_valid_user_ptr(a as *const u8, 1) { return None; }
+            if !unsafe { crate::memory::user_addr_mapped(a) } { return None; }
+        }
+        let b = unsafe { (a as *const u8).read_volatile() };
+        if b == 0 {
+            let s = core::str::from_utf8(&buf).ok()?;
+            return Some(unsafe { resolve_path(s) });
+        }
+        buf.push(b);
+    }
+    None // no terminator within PATH_MAX: refuse rather than keep walking
 }
 
 /// Write an x86_64 `struct stat` into userspace.
@@ -1424,6 +1461,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = path.as_str();
             let buf = arg3 as *mut u8;
             if !is_valid_user_ptr(buf, STAT_SIZE) { frame.rax = EFAULT as u64; return; }
             match crate::vfs::VFS.stat(path) {
@@ -1473,6 +1511,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = path.as_str();
             let buf = arg4 as *mut u8;
             if !is_valid_user_ptr(buf, STAT_SIZE) { frame.rax = EFAULT as u64; return; }
             match crate::vfs::VFS.stat(path) {
@@ -1556,6 +1595,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = path.as_str();
             frame.rax = if crate::vfs::VFS.stat(path).is_some() { 0 } else { ENOENT as u64 };
         },
 
@@ -1622,6 +1662,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = path.as_str();
             // mkdir on an existing path is EEXIST, not success — std::fs::create_dir relies on the
             // distinction, and create_dir_all relies on std::fs::create_dir making it.
             if crate::vfs::VFS.stat(path).is_some() { frame.rax = EEXIST as u64; return; }
@@ -1633,6 +1674,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = path.as_str();
             match crate::vfs::VFS.stat(path) {
                 None => { frame.rax = ENOENT as u64; return; }
                 Some(st) if !st.is_dir() => { frame.rax = ENOTDIR as u64; return; }
@@ -1648,6 +1690,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = path.as_str();
             match crate::vfs::VFS.stat(path) {
                 None => { frame.rax = ENOENT as u64; return; }
                 // unlink is for names, not directories. Silently removing one would make rmdir's
@@ -1663,10 +1706,12 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let from = from.as_str();
             let to = match unsafe { user_path(arg3, arg4) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let to = to.as_str();
             if crate::vfs::VFS.stat(from).is_none() { frame.rax = ENOENT as u64; return; }
             let ok = crate::vfs::VFS.rename(from, to);
             // Instrumented because the probe reports "returned success but the file did not move",
@@ -1688,10 +1733,12 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let target = target.as_str();
             let path = match unsafe { user_path(arg3, arg4) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = path.as_str();
             if crate::vfs::VFS.stat(path).is_some() { frame.rax = EEXIST as u64; return; }
             frame.rax = if crate::vfs::VFS.symlink(target, path) { 0 } else { EACCES as u64 };
         },
@@ -2152,6 +2199,54 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             };
         },
 
+        257 => { // SYS_OPENAT(dirfd, path_cstr, flags, mode)
+            // The libc-facing open. Nyx's own open(2) is `(ptr, len, flags)` — a Nyx-ism no C
+            // library will ever produce — so rather than break every existing caller, the POSIX
+            // shape lands here. musl already prefers openat on architectures that lack SYS_open,
+            // so pointing its open at this is a one-line arch decision rather than a port.
+            const AT_FDCWD: i64 = -100;
+            if (arg1 as i64) != AT_FDCWD {
+                // Real dirfd-relative resolution needs a per-fd path, which fds do not carry yet.
+                // ENOSYS rather than silently resolving against cwd: quietly treating "relative to
+                // THIS directory" as "relative to the current one" corrupts whatever it touches.
+                frame.rax = ENOSYS as u64;
+                return;
+            }
+            let path = match unsafe { user_cstr(arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            const O_CREAT: u64 = 0x40;
+            const O_TRUNC: u64 = 0x200;
+            let flags = arg3;
+            if flags & O_TRUNC != 0 {
+                crate::vfs::VFS.delete_file(&path);
+                crate::vfs::VFS.create_file(&path);
+            } else if flags & O_CREAT != 0 {
+                crate::vfs::VFS.create_file(&path);
+            }
+            match crate::vfs::VFS.open_path(&path) {
+                Some(vnode) => {
+                    let percpu = crate::percpu::current();
+                    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                    if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+                    let task = &mut percpu.scheduler.tasks[curr_idx];
+                    let mut got = -1isize;
+                    for i in 3..FD_MAX {
+                        if task.fd_table[i].is_none() {
+                            task.fd_table[i] = Some(crate::scheduler::FileDescriptor::File(
+                                alloc::sync::Arc::new(crate::vfs::OpenFile::new(vnode)),
+                            ));
+                            got = i as isize;
+                            break;
+                        }
+                    }
+                    frame.rax = if got < 0 { EMFILE as u64 } else { got as u64 };
+                }
+                None => frame.rax = ENOENT as u64,
+            }
+        },
+
         79 => { // SYS_GETCWD(buf, size)
             let buf = arg1 as *mut u8;
             let size = arg2 as usize;
@@ -2174,7 +2269,10 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
-            let target = unsafe { resolve_path(path) };
+            let path = path.as_str();
+            // Already absolute: user_path resolves against cwd for EVERY path syscall now, so
+            // resolving again here would be a no-op that implies the opposite.
+            let target = alloc::string::String::from(path);
             // It must exist AND be a directory. Letting chdir into a regular file "succeed" would
             // push the failure into every later relative open, somewhere else entirely.
             match crate::vfs::VFS.stat(&target) {
