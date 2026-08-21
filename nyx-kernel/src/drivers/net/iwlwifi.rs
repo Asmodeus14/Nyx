@@ -573,6 +573,33 @@ pub struct IntelWifiDriver {
     topology_bssid: [u8; 6],          // which BSS that topology is tuned to
     keys_installed: bool,             // PTK/GTK sit in the fw key slots (must be removed on teardown)
     fw_dead: bool,                    // the fw asserted; nothing will work again until a reboot
+    /// Status code from the last auth/assoc response. 0xFFFF = a reply arrived carrying no status
+    /// field (or none arrived). `tx_mgmt_await_reply` only reports that *a frame came back*, so
+    /// without this the driver announced "associated" on a rejection and walked into a 4-way
+    /// handshake that could never complete — the real failure then looked like a wrong passphrase.
+    last_mgmt_status: u16,
+}
+
+/// Decode the 802.11 status codes we can actually hit. The RSN block (40-46) is the interesting
+/// one: it means the AP read our RSN IE and disagreed with a specific field, which is a much more
+/// useful thing to know than "association failed".
+fn assoc_status_text(status: u16) -> &'static str {
+    match status {
+        0 => "success",
+        1 => "unspecified failure",
+        12 => "association denied",
+        17 => "too many associated stations",
+        18 => "basic rates not supported",
+        31 => "robust management policy violation (AP requires MFP)",
+        40 => "invalid information element",
+        41 => "invalid GROUP cipher",
+        42 => "invalid PAIRWISE cipher",
+        43 => "invalid AKMP",
+        44 => "unsupported RSN version",
+        45 => "invalid RSN capabilities",
+        46 => "cipher suite rejected by security policy",
+        _ => "see IEEE 802.11 Table 9-50",
+    }
 }
 
 impl IntelWifiDriver {
@@ -646,6 +673,7 @@ impl IntelWifiDriver {
             topology_bssid: [0; 6],
             keys_installed: false,
             fw_dead: false,
+            last_mgmt_status: 0xFFFF,
         }
     }
 
@@ -2612,7 +2640,27 @@ impl IntelWifiDriver {
         f[16..22].copy_from_slice(bssid);           // Address3 (BSSID) = AP
         f[26] = 0x01;                               // auth_algo=0@24, auth_seq=1@26, status=0@28
         crate::serial_println!("[WIFI] P6b: TX auth (open, seq 1)…");
-        self.tx_mgmt_await_reply(&f, "auth")
+        self.last_mgmt_status = 0xFFFF;
+        if !self.tx_mgmt_await_reply(&f, "auth") { return false; }
+        self.mgmt_accepted("auth")
+    }
+
+    /// Did the AP actually accept us? `tx_mgmt_await_reply` answers "a frame came back", which is a
+    /// weaker claim than "we are in". Separating the two is what keeps a rejected association from
+    /// being reported as success and then misdiagnosed downstream as a bad passphrase.
+    fn mgmt_accepted(&self, label: &str) -> bool {
+        match self.last_mgmt_status {
+            0 => true,
+            0xFFFF => {
+                crate::serial_println!("[WIFI] P6b: {} reply carried no status field — treating as failure.", label);
+                false
+            }
+            s => {
+                crate::serial_println!("[WIFI] P6b: {} REJECTED by the AP — status={} ({}).",
+                    label, s, assoc_status_text(s));
+                false
+            }
+        }
     }
 
     /// P6b.3: build + TX an 802.11 (re)association request carrying the WPA2 RSN IE, then wait for
@@ -2660,7 +2708,9 @@ impl IntelWifiDriver {
             0x00, 0x00,                   // RSN capabilities
         ]); n += 20;
         crate::serial_println!("[WIFI] P6b: TX assoc-req ({} B, RSN/WPA2)…", n);
-        self.tx_mgmt_await_reply(&f[..n], "assoc")
+        self.last_mgmt_status = 0xFFFF;
+        if !self.tx_mgmt_await_reply(&f[..n], "assoc") { return false; }
+        self.mgmt_accepted("assoc")
     }
 
     /// TX a management `frame` (24-byte header) on the AP station's queue and watch the RX ring for a
@@ -2728,6 +2778,7 @@ impl IntelWifiDriver {
                         let algo = (rd(f + 24) as u16) | ((rd(f + 25) as u16) << 8);
                         let aseq = (rd(f + 26) as u16) | ((rd(f + 27) as u16) << 8);
                         let status = (rd(f + 28) as u16) | ((rd(f + 29) as u16) << 8);
+                        self.last_mgmt_status = status;
                         crate::serial_println!(
                             "[WIFI] P6b: *** AUTH RESP *** algo={} seq={} status={} {}",
                             algo, aseq, status, if status == 0 { "(OK)" } else { "(REJECTED)" });
@@ -2735,9 +2786,11 @@ impl IntelWifiDriver {
                         // body: capability@24, status@26, AID@28.
                         let status = (rd(f + 26) as u16) | ((rd(f + 27) as u16) << 8);
                         let aid = ((rd(f + 28) as u16) | ((rd(f + 29) as u16) << 8)) & 0x3FFF;
+                        self.last_mgmt_status = status;
                         crate::serial_println!(
-                            "[WIFI] P6b: *** ASSOC RESP *** status={} aid={} {}",
-                            status, aid, if status == 0 { "(ASSOCIATED)" } else { "(REJECTED)" });
+                            "[WIFI] P6b: *** ASSOC RESP *** status={} aid={} {} — {}",
+                            status, aid, if status == 0 { "(ASSOCIATED)" } else { "(REJECTED)" },
+                            assoc_status_text(status));
                     } else {
                         crate::serial_println!("[WIFI] P6b: rx mgmt to us: fc={:#04x} subtype={:#x}",
                             fc, subtype);
@@ -3132,6 +3185,13 @@ impl IntelWifiDriver {
         let mut ssid_len = 0usize;
         let mut channel = 0u8;
         let mut rsn = false;
+        // Raw RSN IE, kept so it can be logged next to the SSID once the name is known. The
+        // assoc-request RSN IE we transmit is hardcoded to group=CCMP with no MFP; an AP in
+        // WPA/WPA2 mixed mode (group cipher TKIP) and one in WPA2/WPA3 transition mode (MFP
+        // required) BOTH reject that with status 41, and nothing in the reject distinguishes them.
+        // What the AP advertised is the only thing that does.
+        let mut rsn_ie = [0u8; 48];
+        let mut rsn_ie_len = 0usize;
         let mut ie = f + 36;
         while ie + 2 <= cap {
             let tag = rd(ie);
@@ -3144,6 +3204,8 @@ impl IntelWifiDriver {
                 channel = rd(ie + 2);
             } else if tag == 48 {                // RSN element → WPA2/WPA3
                 rsn = true;
+                rsn_ie_len = if len > 48 { 48 } else { len };
+                for k in 0..rsn_ie_len { rsn_ie[k] = rd(ie + 2 + k); }
             }
             ie += 2 + len;
         }
@@ -3187,6 +3249,17 @@ impl IntelWifiDriver {
             crate::serial_println!(
                 "[WIFI]   #{}: \"{}\"  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  ch{}",
                 n, s, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel);
+        }
+        // Layout: ver(2) group(4) pw_cnt(2) pw[](4n) akm_cnt(2) akm[](4n) caps(2). The group cipher
+        // is bytes 2..6 (00-0f-ac-02 = TKIP, -04 = CCMP) and the MFP bits are 0x40/0x80 of the
+        // capabilities. Printed as raw bytes rather than decoded so the log stays trustworthy even
+        // if the decode is wrong.
+        if rsn_ie_len > 0 {
+            let mut hex = alloc::string::String::new();
+            for k in 0..rsn_ie_len {
+                hex.push_str(&alloc::format!("{:02x} ", rsn_ie[k]));
+            }
+            crate::serial_println!("[WIFI]        RSN IE ({} B): {}", rsn_ie_len as u32, hex);
         }
     }
 
