@@ -329,6 +329,73 @@ pub fn identity_map_low_memory() {
     }
 }
 
+/// Locate the page-table entry backing `vaddr` in the address space rooted at `cr3`.
+///
+/// Returns `None` if any level is absent, or if the mapping is a huge page. Splitting a 2 MiB or
+/// 1 GiB page is a separate job, and quietly re-protecting the whole thing because the caller named
+/// one 4 KiB page inside it would change memory the caller never asked about.
+unsafe fn pte_for(cr3: u64, vaddr: u64) -> Option<*mut u64> {
+    let offset = PHYS_MEM_OFFSET;
+    let mut table = (cr3 + offset) as *mut u64;
+    // PML4 -> PDPT -> PD, indexed at bits 39, 30 and 21 respectively.
+    for level in (1..=3).rev() {
+        let idx = ((vaddr >> (12 + 9 * level)) & 0x1FF) as usize;
+        let e = *table.add(idx);
+        if e & 1 == 0 { return None; }
+        // Bit 7 is PS on a PDPT or PD entry; on a PML4 entry it is not a size bit.
+        if level <= 2 && (e & (1 << 7)) != 0 { return None; }
+        table = ((e & 0x000FFFFF_FFFFF000) + offset) as *mut u64;
+    }
+    let idx = ((vaddr >> 12) & 0x1FF) as usize;
+    if *table.add(idx) & 1 == 0 { return None; }
+    Some(table.add(idx))
+}
+
+/// Apply `PROT_WRITE` / `PROT_EXEC` to an already-mapped user range in the CURRENT address space.
+///
+/// The whole range is validated before a single PTE is touched: `mprotect(2)` must not partially
+/// apply, because a caller that receives an error has no way to discover how far it got.
+pub unsafe fn protect_user_range(
+    start: u64,
+    num_pages: usize,
+    write: bool,
+    exec: bool,
+) -> Result<(), &'static str> {
+    let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+
+    for i in 0..num_pages {
+        if pte_for(cr3, start + (i as u64) * 4096).is_none() {
+            return Err("unmapped page in range");
+        }
+    }
+
+    for i in 0..num_pages {
+        let v = start + (i as u64) * 4096;
+        let pte = match pte_for(cr3, v) { Some(p) => p, None => return Err("range changed") };
+        let mut e = *pte;
+
+        // ★ Never grant WRITABLE on a copy-on-write page. The CoW bit (0x400) means this frame is
+        // shared with another address space, and the write FAULT is what triggers the private copy.
+        // Setting the writable bit here would let the write land in the shared frame and silently
+        // corrupt the other process — data loss with no crash to point at it. The CoW fault handler
+        // grants writability itself on first write, which is the only correct moment for it.
+        let is_cow = e & 0x400 != 0;
+        if write {
+            if !is_cow { e |= 1 << 1; }
+        } else {
+            e &= !(1 << 1);
+        }
+
+        // Bit 63 = NX. Safe to set: EFER.NXE is enabled on the BSP by the bootloader and on every
+        // AP by trampoline.asm, so this can never be a reserved-bit fault.
+        if exec { e &= !(1u64 << 63); } else { e |= 1u64 << 63; }
+
+        *pte = e;
+        core::arch::asm!("invlpg [{}]", in(reg) v, options(nostack, preserves_flags));
+    }
+    Ok(())
+}
+
 pub fn allocate_frame() -> Option<PhysFrame> {
     let mut lock = MEMORY_MANAGER.lock();
     lock.as_mut().and_then(|sys| sys.frame_allocator.allocate_frame())

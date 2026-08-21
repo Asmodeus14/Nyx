@@ -994,8 +994,9 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             }
         },
         
-        10 => { frame.rax = 0; }, // SYS_MPROTECT
-        12 => { frame.rax = 0; }, // SYS_BRK 
+        // 10 (SYS_MPROTECT) is implemented further down — it used to be a `frame.rax = 0` stub
+        // here, which silently shadowed the real arm because match arms are tried in order.
+        12 => { frame.rax = 0; }, // SYS_BRK
         13 => { frame.rax = 0; }, // SYS_RT_SIGACTION
         14 => { frame.rax = 0; }, // SYS_RT_SIGPROCMASK
         
@@ -1797,6 +1798,32 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
         // std-port syscalls (B1): the Linux-numbered primitives std needs that
         // were previously falling through to the `_ => EINVAL` arm below.
         // ====================================================================
+        10 => { // SYS_MPROTECT(addr, len, prot)
+            const PROT_READ: u64 = 1;
+            const PROT_WRITE: u64 = 2;
+            const PROT_EXEC: u64 = 4;
+            let (addr, len, prot) = (arg1, arg2 as usize, arg3);
+
+            if addr & 0xFFF != 0 { frame.rax = EINVAL as u64; return; }
+            if len == 0 { frame.rax = 0; return; }
+            // Range-check before walking anything: a page walk driven by an unchecked user address
+            // would happily reach kernel PTEs.
+            if !is_valid_user_ptr(addr as *const u8, len) { frame.rax = EFAULT as u64; return; }
+            // PROT_NONE means clearing PRESENT, which this kernel's fault handler would then read as
+            // a demand-paging miss rather than a protection error. Refused rather than half-done.
+            if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 { frame.rax = EINVAL as u64; return; }
+
+            let pages = (len + 0xFFF) / 0x1000;
+            frame.rax = match unsafe {
+                crate::memory::protect_user_range(
+                    addr, pages, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0)
+            } {
+                Ok(()) => 0,
+                // POSIX: ENOMEM when the range contains pages that are not mapped.
+                Err(_) => ENOMEM as u64,
+            };
+        },
+
         24 => { // SYS_SCHED_YIELD — give up the rest of this quantum.
             unsafe { core::arch::asm!("int 0x41"); }
             frame.rax = 0;
