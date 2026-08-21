@@ -308,6 +308,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  toolchains        - list installed language compilers\n");
                 self.output_history.push_str("  compile [file]    - compile a source file (defaults to the bundled sample.ql)\n");
                 self.output_history.push_str("  fetch <url>       - HTTP/HTTPS GET over the active link (WiFi or wired)\n");
+                self.output_history.push_str("  exec <path>       - fork+execve any binary (a bad one kills this window, not the desktop)\n");
             } else if cmd == "clear" {
                 self.output_history.clear();
             } else if cmd == "toolchains" {
@@ -318,6 +319,18 @@ impl NyxApp for TerminalApp {
                 self.do_compile(arg.trim());
             } else if let Some(arg) = cmd.strip_prefix("fetch ") {
                 self.do_fetch(arg.trim());
+            } else if let Some(arg) = cmd.strip_prefix("exec ") {
+                // Launch an ARBITRARY binary. The start menu lives in the compositor, and the
+                // compositor IS the desktop — so a launch that kills its caller costs a power
+                // cycle. Launching from here costs a terminal window instead, and one boot can
+                // try several binaries with no rebuild in between.
+                //
+                // No trailing NUL needed: sys_execve passes (ptr, len) and the kernel trims.
+                let path = arg.trim();
+                self.output_history.push_str("Exec: ");
+                self.output_history.push_str(path);
+                self.output_history.push('\n');
+                if sys_fork() == 0 { sys_execve(path); sys_exit(1); }
             } else if cmd == "settings" {
                 self.output_history.push_str("Launching Settings...\n");
                 if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Settings.nyx/run.bin\0"); sys_exit(1); }

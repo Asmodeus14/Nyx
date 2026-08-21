@@ -57,6 +57,26 @@ const MENU: [MenuEntry; 15] = [
 /// The shell's own mark, in the compositor's bundle like every other app's icon.
 const NYX_LOGO: &str = "/mnt/nvme/apps/WindowServer.nyx/icon.png";
 
+/// Fork+exec one binary. The single launch path — the click, the Enter key and the Wi-Fi tray
+/// glyph all come through here rather than repeating the idiom.
+///
+/// Bracketed with serial breadcrumbs on BOTH sides of the fork. These are `write(2)` syscalls,
+/// so each one proves the process is alive and can still enter the kernel; a static string in
+/// `.rodata` proves neither. `parent alive` is the load-bearing line: the compositor IS the
+/// desktop, so the compositor going quiet after a click is exactly what a whole-machine freeze
+/// looks like from the outside, and this distinguishes the two.
+fn launch(exec: &str) {
+    sys_print("[LAUNCH] pre-fork\n");
+    if sys_fork() == 0 {
+        sys_print("[LAUNCH] child\n");
+        sys_execve(exec);
+        // Only reached if execve FAILED — on success there is no "after".
+        sys_print("[LAUNCH] execve returned; exec failed\n");
+        sys_exit(1);
+    }
+    sys_print("[LAUNCH] parent alive\n");
+}
+
 // Start menu: a TILE GRID, not a list. One row per app made a 244x536 column — a pillar taller than
 // it was wide, which got worse with every app added. A 3-wide grid keeps the panel close to square
 // and leaves room for the search field.
@@ -780,7 +800,7 @@ impl CompositorState {
                     '\n' | '\r' => {                                   // Enter launches the top hit
                         let first = self.menu_filtered().first().copied();
                         if let Some(i) = first {
-                            if sys_fork() == 0 { sys_execve(MENU[i].exec); sys_exit(1); }
+                            launch(MENU[i].exec);
                         }
                         self.set_start_menu(false);
                     }
@@ -842,7 +862,7 @@ impl CompositorState {
                 let in_search = self.mx >= sx && self.mx < sx + sw && self.my >= sy && self.my < sy + sh;
                 if let Some(slot) = self.menu_slot_at(self.mx, self.my) {
                     if let Some(&i) = self.menu_filtered().get(slot) {
-                        if sys_fork() == 0 { sys_execve(MENU[i].exec); sys_exit(1); }
+                        launch(MENU[i].exec);
                     }
                     self.set_start_menu(false);
                 } else if !in_search {
@@ -856,7 +876,7 @@ impl CompositorState {
             else if self.mx >= net_x && self.mx < net_x + net_w && self.my >= net_y && self.my < net_y + net_h {
                 // The tray Wi-Fi glyph opens the network picker. (This used to exec /bin/nyx-network,
                 // a path that has never existed on an installed system — the button did nothing.)
-                if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Wifi.nyx/run.bin\0"); sys_exit(1); }
+                launch("/mnt/nvme/apps/Wifi.nyx/run.bin\0");
                 self.start_menu_open = false;
                 self.mark_full_redraw();
             }
