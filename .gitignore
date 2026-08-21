@@ -7,3 +7,9 @@
 build_initrd/
 .claude/
 nyx_build_last.log
+
+# musl build outputs (reproducible via ./Build-musl.sh in ~90s)
+vendor/musl/obj/
+vendor/musl/lib/
+vendor/musl/config.mak
+vendor/musl/_install/

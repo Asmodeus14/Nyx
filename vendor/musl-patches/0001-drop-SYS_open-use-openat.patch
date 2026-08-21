@@ -1,0 +1,9 @@
+--- a/arch/x86_64/bits/syscall.h.in
++++ b/arch/x86_64/bits/syscall.h.in
+@@ -1,6 +1,5 @@
+ #define __NR_read				0
+ #define __NR_write				1
+-#define __NR_open				2
+ #define __NR_close				3
+ #define __NR_stat				4
+ #define __NR_fstat				5
