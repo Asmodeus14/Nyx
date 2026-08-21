@@ -4,6 +4,7 @@ pub mod fs;
 pub mod mem;
 pub mod misc;
 pub mod poll;
+pub mod signals;
 
 use crate::report::{Baseline, Report, Row};
 
@@ -47,6 +48,7 @@ pub fn run_all() -> Report {
     poll::probe(baseline, &mut rows);
     fs::probe_destructive(baseline, &mut rows);
     mem::probe(baseline, &mut rows);
+    signals::probe(baseline, &mut rows);
     misc::probe_presence_only(baseline, &mut rows);
 
     let report = Report { rows, baseline };

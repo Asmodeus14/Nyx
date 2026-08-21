@@ -35,6 +35,7 @@ pub const SYS_DUP2: usize = 33;
 pub const SYS_NANOSLEEP: usize = 35;
 pub const SYS_GETPID: usize = 39;
 pub const SYS_SOCKET: usize = 41;
+pub const SYS_KILL: usize = 62;
 pub const SYS_FORK: usize = 57;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_WAIT4: usize = 61;

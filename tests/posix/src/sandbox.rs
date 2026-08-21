@@ -100,6 +100,61 @@ pub fn run_isolated<F: FnOnce()>(probe: F) -> Outcome {
     outcome
 }
 
+/// Like `run_isolated`, but the child reports a byte of its own choosing.
+///
+/// Needed when "the child survived" is not the whole answer. A signal probe has three distinct
+/// outcomes — the handler ran, the syscalls succeeded but the handler never ran, or the child died
+/// trying — and a fixed sentinel can only express two of them. Conflating the middle case with the
+/// last would report broken delivery as a crash, which sends you to the wrong place entirely.
+///
+/// Same rules as `run_isolated` apply to `probe`: raw syscalls only, no allocation, no locks.
+pub fn run_isolated_reporting<F: FnOnce() -> u8>(probe: F) -> Option<u8> {
+    let mut fds = [0i32; 2];
+    if unsafe { raw::sys1(raw::SYS_PIPE, fds.as_mut_ptr() as usize) } < 0 {
+        return None;
+    }
+    let (read_fd, write_fd) = (fds[0] as usize, fds[1] as usize);
+
+    let pid = unsafe { raw::sys0(raw::SYS_FORK) };
+    if pid < 0 {
+        unsafe {
+            raw::sys1(raw::SYS_CLOSE, read_fd);
+            raw::sys1(raw::SYS_CLOSE, write_fd);
+        }
+        return None;
+    }
+
+    if pid == 0 {
+        unsafe { raw::sys1(raw::SYS_CLOSE, read_fd) };
+        let b = probe();
+        unsafe {
+            raw::raw_write(write_fd, &[b]);
+            raw::raw_exit(0);
+        }
+    }
+
+    unsafe { raw::sys1(raw::SYS_CLOSE, write_fd) };
+    let mut byte = [0u8; 1];
+    let mut out = None;
+    for _ in 0..40 {
+        let mut status: i32 = 0;
+        let reaped = unsafe {
+            raw::sys4(raw::SYS_WAIT4, pid as usize, &mut status as *mut i32 as usize, 1, 0)
+        };
+        if unsafe { raw::sys3(raw::SYS_READ, read_fd, byte.as_mut_ptr() as usize, 1) } == 1 {
+            out = Some(byte[0]);
+            break;
+        }
+        if reaped == pid { break; } // exited without reporting: it died mid-probe
+        sleep_ms(25);
+    }
+
+    unsafe { raw::sys1(raw::SYS_CLOSE, read_fd) };
+    let mut status: i32 = 0;
+    unsafe { raw::sys4(raw::SYS_WAIT4, pid as usize, &mut status as *mut i32 as usize, 1, 0) };
+    out
+}
+
 pub fn sleep_ms(ms: u64) {
     // {tv_sec, tv_nsec} on the stack — a live, correctly-sized local, per the harness's pointer rule.
     let ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64];
