@@ -17,6 +17,16 @@
 extern "C" int printf(const char *, ...);
 extern "C" void *malloc(unsigned long);
 
+// Just enough of <stdio.h> to turn buffering off, declared rather than included for the same
+// reason as everything else here: gcc's C++ headers are not on the musl include path.
+extern "C" {
+    struct _IO_FILE;
+    typedef struct _IO_FILE FILE;
+    extern FILE *const stdout;
+    int setvbuf(FILE *, char *, int, unsigned long);
+}
+#define _IONBF 2
+
 // Supplied by libsupc++.
 void *operator new(unsigned long);
 void *operator new[](unsigned long);
@@ -53,6 +63,13 @@ static int thrower(int x) {
 }
 
 int main() {
+    // ★ Unbuffered, for the same reason smoke.c does it — a lesson I documented there and then
+    // failed to carry here, which cost a boot. `abort()` does NOT flush stdio, so when the first
+    // throw failed and terminate->abort ran, every probe line printed up to that point was
+    // discarded with the buffer. The log showed only the banner, which reads exactly like "it
+    // died immediately" rather than "it died on probe 6".
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     printf("=== C++ ABI test on Nyx (musl + libsupc++) ===\n");
 
     if (g_ctor_ran == 0xC7) ok("global ctor");

@@ -60,7 +60,15 @@ build_cpp() {  # $1 = output name, $2 = source, $3... = extra linker flags
   # it, and the unwinder calls dl_iterate_phdr, which musl also supplies.
   #
   # No C++ headers are on the include path on purpose -- see cpptest.cpp.
-  g++ -static -nostdinc -nostdinc++ -nostdlib -fno-stack-protector -O2 \
+  #
+  # ★★★ --eh-frame-hdr is MANDATORY and easy to lose. It emits .eh_frame_hdr and the matching
+  # PT_GNU_EH_FRAME program header, which is how _Unwind_Find_FDE locates the unwind tables: it
+  # walks the phdrs looking for exactly that entry. gcc passes it automatically in a normal link,
+  # but -nostdlib suppresses the spec that does so -- leaving a binary with .eh_frame present but
+  # unreachable. Every throw then finds no handler, calls std::terminate -> abort, and musl's
+  # abort ends in a_crash() = `hlt`, which is privileged, so it surfaces as a #GP at an address
+  # inside abort() with nothing pointing at exceptions at all.
+  g++ -static -nostdinc -nostdinc++ -nostdlib -Wl,--eh-frame-hdr -fno-stack-protector -O2 \
     -isystem "$GCCINC" \
     -isystem "$M/include" \
     -isystem "$M/obj/include" \
