@@ -55,6 +55,10 @@ struct WifiApp {
     nets: Vec<WifiNetwork>,
     sel: Option<usize>,
     psk: String,
+    /// Whether the passphrase is shown in the clear. Always starts false and is forced back to false
+    /// by `reset_psk`, so revealing is a per-entry decision that can't outlive the passphrase it was
+    /// made for — picking a different network never inherits the previous one's reveal.
+    show_psk: bool,
     status: WifiStatus,
     message: String,
     pending: Pending,
@@ -78,6 +82,7 @@ impl WifiApp {
             nets: Vec::new(),
             sel: None,
             psk: String::new(),
+            show_psk: false,
             status: WifiStatus::default(),
             message: String::from("Select a network to connect."),
             pending: Pending::None,
@@ -172,6 +177,23 @@ impl WifiApp {
     }
     fn box_remember(&self) -> Rect {
         (20, self.panel_top() + 88, 16, 16)
+    }
+    /// Show/Hide, sitting between the passphrase field and Cancel. `field_w` is derived from the same
+    /// constant so the two can't overlap when the window is resized.
+    fn btn_reveal(&self) -> Rect {
+        (20 + self.field_w() + 10, self.panel_top() + 42, 62, 30)
+    }
+    /// Width of the passphrase box. Everything to its right — the reveal button, Cancel, Join — is
+    /// laid out from the window's right edge, so this is what's left over.
+    fn field_w(&self) -> usize {
+        self.w.saturating_sub(250)
+    }
+
+    /// Drop the passphrase and re-mask the field. Both together, always: clearing the text while
+    /// leaving `show_psk` set would mean the next network's first keystroke appears in the clear.
+    fn reset_psk(&mut self) {
+        self.psk.clear();
+        self.show_psk = false;
     }
 
     fn state_text(&self) -> (&'static str, u32) {
@@ -327,7 +349,7 @@ impl NyxApp for WifiApp {
                                 // Save only now: a passphrase that completed the 4-way handshake is
                                 // known-good, so the boot agent can never be handed a wrong one.
                                 let saved = self.remember && wifi_save_network(&ssid, &self.psk);
-                                self.psk.clear();
+                                self.reset_psk();
                                 self.sel = None;
                                 if saved {
                                     alloc::format!(
@@ -359,7 +381,7 @@ impl NyxApp for WifiApp {
                 Pending::Disconnect => {
                     sys_wifi_disconnect();
                     self.sel = None;
-                    self.psk.clear();
+                    self.reset_psk();
                     self.message = String::from("Disconnected. Pick a network, or rescan.");
                     self.refresh_list();
                 }
@@ -369,7 +391,7 @@ impl NyxApp for WifiApp {
                     // the unchanged state, so believe the return value, not the request.
                     let got_on = sys_wifi_set_radio(want_on) != WIFI_RADIO_OFF;
                     self.sel = None;
-                    self.psk.clear();
+                    self.reset_psk();
                     self.scroll = 0;
                     self.message = if got_on != want_on {
                         String::from("The radio is busy right now — try the switch again.")
@@ -557,19 +579,48 @@ impl NyxApp for WifiApp {
             canvas.print_str(20, pt + 14, &prompt, Color::TEXT_DARK, 1);
 
             if secure {
-                let fw = w.saturating_sub(180);
+                let fw = self.field_w();
                 canvas.fill_rect(20, pt + 42, fw, 30, Color::WARM_BG);
                 canvas.fill_rect(20, pt + 42, fw, 1, Color::WARM_BORDER);
                 canvas.fill_rect(20, pt + 71, fw, 1, Color::WARM_BORDER);
 
-                // Masked, so a shoulder can't read it back off the screen.
-                let mut dots = String::new();
-                for _ in 0..self.psk.chars().count() {
-                    dots.push('*');
+                // Masked by default so a shoulder can't read it off the screen; Show reveals it for
+                // the one case masking actively hurts — a long passphrase typed wrong, where the
+                // only feedback otherwise is a failed handshake several seconds later.
+                let shown = if self.show_psk {
+                    self.psk.clone()
+                } else {
+                    let mut dots = String::new();
+                    for _ in 0..self.psk.chars().count() {
+                        dots.push('*');
+                    }
+                    dots
+                };
+
+                // Revealed text is proportional and far wider than the same count of '*', so it can
+                // outgrow the box where the mask never did. Scroll to the tail — that's where the
+                // caret is — rather than letting it run under the Show button.
+                let avail = fw.saturating_sub(20);
+                let mut start = 0;
+                while start < shown.len() && Canvas::text_width(&shown[start..], 1) > avail {
+                    start += 1;
+                    while start < shown.len() && !shown.is_char_boundary(start) {
+                        start += 1;
+                    }
                 }
-                canvas.print_str(30, pt + 50, &dots, Color::TEXT_DARK, 1);
-                let cw = Canvas::text_width(&dots, 1);
+                let visible = &shown[start..];
+
+                canvas.print_str(30, pt + 50, visible, Color::TEXT_DARK, 1);
+                let cw = Canvas::text_width(visible, 1);
                 canvas.fill_rect(30 + cw + 1, pt + 48, 1, 18, Color::TEXT_DARK);
+
+                Self::draw_button(
+                    canvas,
+                    self.btn_reveal(),
+                    if self.show_psk { "Hide" } else { "Show" },
+                    !self.busy,
+                    false,
+                );
             }
 
             Self::draw_button(canvas, self.btn_cancel(), "Cancel", !self.busy, false);
@@ -668,13 +719,23 @@ impl NyxApp for WifiApp {
 
         // Panel widgets (checked before the list — they sit below it).
         if self.sel.is_some() {
+            // Gated on `secure` because that's the only case draw() paints the button. Without the
+            // guard an open network would still have a live click target where nothing is drawn.
+            let secure = self
+                .sel
+                .and_then(|i| self.nets.get(i))
+                .map_or(false, |n| n.is_secure());
+            if secure && hit(self.btn_reveal(), mx, my) {
+                self.show_psk = !self.show_psk;
+                return true;
+            }
             if hit(self.box_remember(), mx, my) {
                 self.remember = !self.remember;
                 return true;
             }
             if hit(self.btn_cancel(), mx, my) {
                 self.sel = None;
-                self.psk.clear();
+                self.reset_psk();
                 self.message = String::from("Select a network to connect.");
                 return true;
             }
@@ -702,7 +763,7 @@ impl NyxApp for WifiApp {
                     return false;
                 }
                 self.sel = Some(idx);
-                self.psk.clear();
+                self.reset_psk();
                 // Default the checkbox to "yes" for a fresh pick, so remembering is the norm.
                 self.remember = true;
                 self.message = String::from("Enter the password, then press Join.");
