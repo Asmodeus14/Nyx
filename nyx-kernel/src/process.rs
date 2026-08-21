@@ -76,7 +76,7 @@ pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
 /// segment protected wrongly kills every app at `_start` with nothing but `[SEGFAULT]` on serial.
 /// Flipping this to `false` restores "every segment RWX" in one line, which is a far faster way to
 /// confirm or clear this change as the cause of a bad boot than bisecting a revert.
-const ENFORCE_ELF_PROT: bool = false; // TEMPORARILY OFF — bisecting the HelloC freeze
+const ENFORCE_ELF_PROT: bool = true;
 
 /// Maximum open descriptors per process.
 ///
