@@ -70,6 +70,28 @@ pub fn load_elf(file_data: &[u8]) -> Result<u64, &'static str> {
     load_elf_full(file_data).map(|l| l.entry)
 }
 
+/// Initialise a 512-byte FXSAVE area to the architectural RESET state for a fresh task.
+///
+/// ★★★ FCW is the point. Five sites used to do `write_bytes(ptr, 0, 512)` followed by only the
+/// MXCSR store, which left the x87 control word at **0x0000** — and a zero FCW has every x87
+/// exception UNMASKED (bits 0-5 clear) plus precision control set to single rather than extended.
+/// So the first x87 arithmetic that is inexact or underflows raises an unmasked exception, the CPU
+/// reports it as **#MF on the next x87 instruction**, and with no #MF handler in the IDT that
+/// escalates straight to a double fault: machine dead.
+///
+/// Nothing caught it because **Rust never emits x87** — it uses SSE, which is governed by MXCSR,
+/// the one field those sites did set. musl's `strtod`/`decfloat` does long-double arithmetic on
+/// the x87 stack and was the first code on this system to execute an x87 instruction at all.
+///
+/// Correct values: **FCW 0x037F** (PC=extended, RC=nearest, all six exceptions masked — the
+/// value `fninit` leaves behind), FTW 0 (abridged form: all registers empty), MXCSR 0x1F80 (all
+/// SIMD exceptions masked).
+pub unsafe fn init_fpu_state(fxsave_ptr: u64) {
+    core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
+    *(fxsave_ptr as *mut u16) = 0x037F;              // FCW  @ 0
+    *(fxsave_ptr as *mut u32).add(6) = 0x1F80;       // MXCSR @ 24
+}
+
 /// Master switch for Phase 3 step 3 (per-segment ELF protection).
 ///
 /// Kept as a named constant because this is the highest-blast-radius change in the W^X work: one

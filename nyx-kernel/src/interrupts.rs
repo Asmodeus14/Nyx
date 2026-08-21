@@ -470,6 +470,23 @@ lazy_static! {
         idt.page_fault.set_handler_fn(pf_handler);
         idt.general_protection_fault.set_handler_fn(gpf_handler);
         idt.invalid_opcode.set_handler_fn(ud_handler);
+
+        // ★★★ An exception vector with NO handler is a MACHINE KILLER: the CPU cannot deliver the
+        // exception, so it escalates to #DF and takes the whole box down instead of the one
+        // process at fault. Only 3/6/8/13/14 were registered, which was survivable exactly as long
+        // as nothing ever raised anything else.
+        //
+        // musl's strtod raised #MF (vector 16) and double-faulted the machine. The IDT is the
+        // wrong place to be selective: these all now kill only the offending process.
+        idt.divide_error.set_handler_fn(divide_error_handler);              // 0  #DE
+        idt.device_not_available.set_handler_fn(device_not_available_handler); // 7 #NM
+        idt.x87_floating_point.set_handler_fn(x87_fp_handler);              // 16 #MF
+        idt.simd_floating_point.set_handler_fn(simd_fp_handler);            // 19 #XM
+        idt.overflow.set_handler_fn(overflow_handler);                      // 4  #OF
+        idt.bound_range_exceeded.set_handler_fn(bound_range_handler);       // 5  #BR
+        idt.alignment_check.set_handler_fn(alignment_check_handler);        // 17 #AC
+        idt.stack_segment_fault.set_handler_fn(stack_segment_handler);      // 12 #SS
+        idt.segment_not_present.set_handler_fn(segment_not_present_handler);// 11 #NP
         
         unsafe {
             idt[0x40].set_handler_addr(VirtAddr::new(timer_interrupt_stub as *const () as u64));
@@ -544,6 +561,53 @@ extern "x86-interrupt" fn ud_handler(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: INVALID OPCODE (#UD)\nIP: {:#x}\nCS: {:#x}",
         stack_frame.instruction_pointer.as_u64(), stack_frame.code_segment);
 }
+
+/// The CPU exceptions that had no IDT entry at all until musl's `strtod` raised one.
+///
+/// Every one of these was previously a guaranteed double fault — the CPU cannot deliver an
+/// exception with no handler, so it escalates, and the machine dies with no message rather than
+/// the offending process dying with one. They share this macro because the handling is identical
+/// and the only thing that matters is that NONE of them is missing: being selective about which
+/// CPU exceptions to catch is how you end up debugging a silent freeze for a week.
+///
+/// The kernel arm still panics — a fault of this kind in ring 0 IS fatal — but it now says so.
+macro_rules! fatal_user_exception {
+    ($name:ident, $label:literal) => {
+        extern "x86-interrupt" fn $name(stack_frame: InterruptStackFrame) {
+            let was_user = (stack_frame.code_segment & 3) == 3;
+            if was_user { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
+            if was_user {
+                crate::serial_println!("\n[{}] User Process Terminated. IP={:#x}",
+                    $label, stack_frame.instruction_pointer.as_u64());
+                terminate_current_user_process();
+            }
+            panic!("EXCEPTION: {}\nIP: {:#x}", $label, stack_frame.instruction_pointer.as_u64());
+        }
+    };
+    ($name:ident, $label:literal, err) => {
+        extern "x86-interrupt" fn $name(stack_frame: InterruptStackFrame, error_code: u64) {
+            let was_user = (stack_frame.code_segment & 3) == 3;
+            if was_user { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
+            if was_user {
+                crate::serial_println!("\n[{}] User Process Terminated. err={:#x} IP={:#x}",
+                    $label, error_code, stack_frame.instruction_pointer.as_u64());
+                terminate_current_user_process();
+            }
+            panic!("EXCEPTION: {} err={:#x}\nIP: {:#x}",
+                $label, error_code, stack_frame.instruction_pointer.as_u64());
+        }
+    };
+}
+
+fatal_user_exception!(divide_error_handler,          "#DE divide error");
+fatal_user_exception!(device_not_available_handler,  "#NM device not available (FPU)");
+fatal_user_exception!(x87_fp_handler,                "#MF x87 floating-point");
+fatal_user_exception!(simd_fp_handler,               "#XM SIMD floating-point");
+fatal_user_exception!(overflow_handler,              "#OF overflow");
+fatal_user_exception!(bound_range_handler,           "#BR bound range exceeded");
+fatal_user_exception!(alignment_check_handler,       "#AC alignment check", err);
+fatal_user_exception!(stack_segment_handler,         "#SS stack segment fault", err);
+fatal_user_exception!(segment_not_present_handler,   "#NP segment not present", err);
 
 /// Tear down the currently-running user process (close FDs, shred its address space, mark Zombie) and
 /// hlt-loop until the scheduler switches away. Shared by the page-fault, #GP, and #UD handlers so a
@@ -1864,8 +1928,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
 
             let fxsave_ptr = (regs_ptr - 512) & !0xF;
             unsafe {
-                core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
-                *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+                crate::process::init_fpu_state(fxsave_ptr as u64);
             }
 
             let final_rsp = fxsave_ptr - 16;
@@ -1926,8 +1989,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
 
             let fxsave_ptr = (regs_ptr - 512) & !0xF;
             unsafe {
-                core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
-                *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+                crate::process::init_fpu_state(fxsave_ptr as u64);
             }
 
             let final_rsp = fxsave_ptr - 16;

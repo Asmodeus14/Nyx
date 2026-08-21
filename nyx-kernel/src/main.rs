@@ -284,8 +284,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let regs_ptr = iretq_ptr - 120;
         core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120); 
         let fxsave_ptr = (regs_ptr - 512) & !0xF;
-        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512); 
-        *(fxsave_ptr as *mut u32).add(6) = 0x1F80; 
+        crate::process::init_fpu_state(fxsave_ptr as u64);
         let final_rsp = fxsave_ptr - 16;
         let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
         bottom[0] = regs_ptr; bottom[1] = 0;
@@ -305,8 +304,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let regs_ptr = iretq_ptr - 120;
         core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
         let fxsave_ptr = (regs_ptr - 512) & !0xF;
-        core::ptr::write_bytes(fxsave_ptr as *mut u8, 0, 512);
-        *(fxsave_ptr as *mut u32).add(6) = 0x1F80;
+        crate::process::init_fpu_state(fxsave_ptr as u64);
         let final_rsp = fxsave_ptr - 16;
         let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
         bottom[0] = regs_ptr; bottom[1] = 0;
