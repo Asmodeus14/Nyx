@@ -189,13 +189,26 @@ pub unsafe fn map_mmio(phys_addr: u64, size: usize) -> Result<u64, &'static str>
     Ok(phys_addr)
 }
 
-pub fn allocate_user_pages_at(start_vaddr: u64, num_pages: usize) -> Result<u64, &'static str> {
+/// Map `num_pages` of fresh user memory at `start_vaddr`.
+///
+/// `exec` is required rather than defaulted on purpose: it decides whether this range can hold
+/// executable code, which is a security property, and a default would let new call sites acquire
+/// one silently. Only the ELF loader passes `true` today — stacks and anonymous mmap are data and
+/// get NX, so a buffer overflow into them has nothing to jump to.
+pub fn allocate_user_pages_at(
+    start_vaddr: u64,
+    num_pages: usize,
+    exec: bool,
+) -> Result<u64, &'static str> {
     let mut system_lock = MEMORY_MANAGER.lock();
     let system = system_lock.as_mut().ok_or("Memory System not initialized")?;
     let mut active_mapper = unsafe { active_mapper() };
 
     let start_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(start_vaddr));
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    // Safe to set: EFER.NXE is on for the BSP (bootloader) and every AP (trampoline.asm), which is
+    // already relied on by the kernel stacks being mapped NO_EXECUTE.
+    if !exec { flags |= PageTableFlags::NO_EXECUTE; }
 
     for i in 0..num_pages {
         let page = start_page + i as u64;

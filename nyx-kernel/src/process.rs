@@ -116,7 +116,10 @@ pub fn load_elf_full(file_data: &[u8]) -> Result<LoadedElf, &'static str> {
                 let end_page = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFF;
                 let num_pages = ((end_page - start_page) / 4096) as usize;
 
-                crate::memory::allocate_user_pages_at(start_page, num_pages)?;
+                // exec = true for every segment for now. Honouring each segment's real p_flags is
+                // Phase 3 step 3, kept separate because getting one segment wrong kills every app
+                // at _start with nothing but [SEGFAULT] on serial to go on.
+                crate::memory::allocate_user_pages_at(start_page, num_pages, true)?;
 
                 unsafe {
                     let dest = phdr.p_vaddr as *mut u8;

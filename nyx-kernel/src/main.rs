@@ -336,7 +336,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let stack_base = 0x7FFF_0000_0000;
     let stack_pages = 32;
-    crate::memory::allocate_user_pages_at(stack_base, stack_pages).expect("Stack Map Fail");
+    // init's stack is data: NX, same as every other user stack.
+    crate::memory::allocate_user_pages_at(stack_base, stack_pages, false).expect("Stack Map Fail");
     let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8;
 
     // B2: hand init a proper SysV entry stack (argc/argv/envp/auxv) so a std runtime can start.

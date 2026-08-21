@@ -974,9 +974,11 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     next_addr
                 } else { addr };
 
-                match crate::memory::allocate_user_pages_at(target_addr, num_pages) {
+                // Anonymous memory is data: NX. Anything wanting to execute here has to ask for it
+                // through mprotect, which is the whole point of W^X.
+                match crate::memory::allocate_user_pages_at(target_addr, num_pages, false) {
                     Ok(mapped_addr) => frame.rax = mapped_addr,
-                    Err(_) => frame.rax = ENOMEM as u64, 
+                    Err(_) => frame.rax = ENOMEM as u64,
                 }
             } else {
                 if fd >= 0 && fd < 32 {
@@ -1628,7 +1630,8 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
                     let entry_point = loaded.entry;
                     let stack_base = 0x7FFF_0000_0000;
                     let stack_pages = 32;
-                    if crate::memory::allocate_user_pages_at(stack_base, stack_pages).is_ok() {
+                    // A stack holding executable code is the classic overflow target; NX it.
+                    if crate::memory::allocate_user_pages_at(stack_base, stack_pages, false).is_ok() {
                         let stack_top = ((stack_base + (stack_pages as u64 * 4096)) & !0xF) - 8;
 
                         // B2: build the SysV entry stack (argc/argv/envp/auxv) in the freshly loaded
@@ -2852,9 +2855,10 @@ pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
             let target_addr = task.mmap_bump;
             task.mmap_bump += (num_pages as u64) * 0x1000;
 
-            match crate::memory::allocate_user_pages_at(target_addr, num_pages) {
+            // Anonymous memory is data: NX. See the mmap arm above.
+            match crate::memory::allocate_user_pages_at(target_addr, num_pages, false) {
                 Ok(mapped_addr) => frame.rax = mapped_addr,
-                Err(_) => frame.rax = 0, 
+                Err(_) => frame.rax = 0,
             }
         },
 
