@@ -1668,7 +1668,19 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 None => { frame.rax = EFAULT as u64; return; }
             };
             if crate::vfs::VFS.stat(from).is_none() { frame.rax = ENOENT as u64; return; }
-            frame.rax = if crate::vfs::VFS.rename(from, to) { 0 } else { EACCES as u64 };
+            let ok = crate::vfs::VFS.rename(from, to);
+            // Instrumented because the probe reports "returned success but the file did not move",
+            // and that is indistinguishable from the outside between ext4_frename lying and the
+            // probe's own check being wrong. stat() BOTH paths afterwards: that is the ground truth
+            // and it costs one line.
+            let (src_left, dst_here) = (
+                crate::vfs::VFS.stat(from).is_some(),
+                crate::vfs::VFS.stat(to).is_some(),
+            );
+            crate::serial_println!(
+                "[FS] rename \"{}\" -> \"{}\": ok={} old_still_there={} new_present={}",
+                from, to, ok, src_left, dst_here);
+            frame.rax = if ok { 0 } else { EACCES as u64 };
         },
 
         88 => { // SYS_SYMLINK(target_ptr, target_len, path_ptr, path_len)

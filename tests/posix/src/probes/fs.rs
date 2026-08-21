@@ -332,21 +332,25 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
             renamed.len(),
         )
     };
-    // Verified by the new name being openable and the old one not — a rename that "succeeds" by
-    // doing nothing looks identical at the return value.
-    let moved = {
-        let old = unsafe { nyx_open(&file, O_RDONLY) };
-        if old >= 0 {
-            unsafe { raw::sys1(raw::SYS_CLOSE, old as usize) };
-        }
-        let new = unsafe { nyx_open(&renamed, O_RDONLY) };
-        if new >= 0 {
-            unsafe { raw::sys1(raw::SYS_CLOSE, new as usize) };
-        }
-        old < 0 && new >= 0
-    };
+    // Verified with access(2), the same way mkdir/symlink/unlink are checked. It used to use
+    // open(2), which made this the ONLY row whose verdict depended on open failing for a missing
+    // path — so an `open` that wrongly succeeds on a missing file would report a perfectly good
+    // rename as a STUB, and send the reader to debug ext4 instead of open. Both signals are kept
+    // below so the two causes stay distinguishable.
+    let old_gone = !exists(&file);
+    let new_there = exists(&renamed);
+    let moved = old_gone && new_there;
+    let old_open = unsafe { nyx_open(&file, O_RDONLY) };
+    if old_open >= 0 {
+        unsafe { raw::sys1(raw::SYS_CLOSE, old_open as usize) };
+    }
     let mut row = Row::new(82, "rename");
-    row.raw = render_ret(r);
+    // The extra fields are the diagnosis: if `old_gone` is true but the old path still OPENS, the
+    // bug is in open(2), not in rename.
+    row.raw = format!(
+        "{} old_gone={} new={} old_open={}",
+        render_ret(r), old_gone as u8, new_there as u8, old_open as i32
+    );
     // Give std a real subject rather than a missing one — renaming a nonexistent file would
     // exercise the error path and say nothing about whether the PAL can rename.
     row.std_api = {
