@@ -36,9 +36,10 @@ struct MenuEntry {
 /// text pass, an identical one for the CPU fallback, and a chain of `else if rel_y < N` for the
 /// clicks — so adding an app meant editing three places and a wrong threshold silently launched the
 /// neighbouring entry. Now the renderer and the hit-test both iterate this.
-const MENU: [MenuEntry; 14] = [
+const MENU: [MenuEntry; 15] = [
     MenuEntry { label: "Browser",        icon: "/mnt/nvme/apps/Browser.nyx/icon.png", exec: "/mnt/nvme/apps/Browser.nyx/run.bin\0" },
     MenuEntry { label: "Terminal",       icon: "/mnt/nvme/apps/Terminal.nyx/icon.png", exec: "/mnt/nvme/apps/Terminal.nyx/run.bin\0" },
+    MenuEntry { label: "Hello C (musl)", icon: "/mnt/nvme/apps/HelloC.nyx/icon.png", exec: "/mnt/nvme/apps/HelloC.nyx/run.bin\0" },
     MenuEntry { label: "Settings",       icon: "/mnt/nvme/apps/Settings.nyx/icon.png", exec: "/mnt/nvme/apps/Settings.nyx/run.bin\0" },
     MenuEntry { label: "Explorer",       icon: "/mnt/nvme/apps/Explorer.nyx/icon.png", exec: "/mnt/nvme/apps/Explorer.nyx/run.bin\0" },
     MenuEntry { label: "Network Suite",  icon: "/mnt/nvme/apps/Network.nyx/icon.png", exec: "/mnt/nvme/apps/Network.nyx/run.bin\0" },

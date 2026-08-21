@@ -104,6 +104,7 @@ mkdir -p build_initrd/apps/WifiAgent.nyx
 # The harness writes ONLY inside this scratch directory (probes/mod.rs panics on any path that
 # escapes it). It has to exist up front — mkdir(2) is one of the things being probed.
 mkdir -p build_initrd/apps/PosixProbe.nyx/scratch
+mkdir -p build_initrd/apps/HelloC.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 # Notice the binary name for WindowServer is now 'compositor'
@@ -148,6 +149,15 @@ cp apps/browser/target/x86_64-unknown-nyx/release/browser build_initrd/apps/Brow
 cp tests/posix/target/x86_64-unknown-nyx/release/posixprobe build_initrd/apps/PosixProbe.nyx/run.bin 2>/dev/null || true
 cp tests/posix/probe.txt build_initrd/apps/PosixProbe.nyx/probe.txt 2>/dev/null || true
 
+# C hello-world against musl. Skipped rather than fatal when libc.a is absent: musl is built by
+# ./Build-musl.sh, which is deliberately NOT part of this script (it takes ~90s and changes rarely).
+if [ -f vendor/musl/lib/libc.a ]; then
+  echo "[9j] Building C hello-world (musl)..."
+  ./tests/helloc/build.sh >/dev/null 2>&1 && cp tests/helloc/hello build_initrd/apps/HelloC.nyx/run.bin || echo "  (helloc build failed)"
+else
+  echo "[9j] helloc skipped - run ./Build-musl.sh to build libc.a first"
+fi
+
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true
 cp apps/compositor/*.json build_initrd/apps/WindowServer.nyx/ 2>/dev/null || true
@@ -186,6 +196,9 @@ install_icon notepad     Notepad
 install_icon wifi        Wifi
 install_icon browser     Browser
 install_icon posixprobe  PosixProbe
+# Borrows the terminal glyph: it is a console program, and a bespoke icon is not worth a new drawing
+# routine for a test binary.
+install_icon terminal    HelloC
 # The shell's own mark, in the compositor's bundle.
 install_icon nyx         WindowServer
 
