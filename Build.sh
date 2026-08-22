@@ -162,16 +162,22 @@ if [ -f vendor/musl/lib/libc.a ]; then
   # Output is NOT silenced and the destination is cleared first. Previously a failed build only
   # printed a note while leaving the PREVIOUS run.bin in place — so the next boot silently tested
   # a stale binary under the new binary's name, which is the most expensive kind of wrong.
-  rm -f build_initrd/apps/HelloC.nyx/run.bin \
-        build_initrd/apps/HelloC.nyx/hello_lo \
-        build_initrd/apps/HelloC.nyx/smoke \
-        build_initrd/apps/HelloC.nyx/bare
+  # ★ cpptest was being copied WITHOUT being cleared first — precisely the hazard the note above
+  # describes, reintroduced for one binary. Clearing is now driven off the same list as copying,
+  # so the two cannot drift apart again.
+  HELLOC_BINS="hello:run.bin hello_lo:hello_lo smoke:smoke bare:bare cpptest:cpptest cxxtest:cxxtest"
+  for pair in $HELLOC_BINS; do
+    rm -f "build_initrd/apps/HelloC.nyx/${pair#*:}"
+  done
   if ./tests/helloc/build.sh; then
-    cp tests/helloc/hello    build_initrd/apps/HelloC.nyx/run.bin
-    cp tests/helloc/hello_lo build_initrd/apps/HelloC.nyx/hello_lo
-    cp tests/helloc/smoke    build_initrd/apps/HelloC.nyx/smoke
-    cp tests/helloc/bare     build_initrd/apps/HelloC.nyx/bare
-    cp tests/helloc/cpptest  build_initrd/apps/HelloC.nyx/cpptest
+    for pair in $HELLOC_BINS; do
+      src="tests/helloc/${pair%%:*}"
+      # cxxtest is absent unless ./Build-libcxx.sh has been run. Note it rather than failing the
+      # image build — but never silently, because a missing test binary nobody mentions is how a
+      # boot gets spent running something that was never there.
+      if [ -f "$src" ]; then cp "$src" "build_initrd/apps/HelloC.nyx/${pair#*:}"
+      else echo "  (note: $src not built — not shipped)"; fi
+    done
   else
     echo "  (helloc build FAILED — HelloC.nyx ships with no binaries)"
   fi
