@@ -179,6 +179,26 @@ struct SigFrame {
     rip: u64, rflags: u64, rsp: u64, oldmask: u64,
 }
 
+/// What SIG_DFL means for a given signal.
+enum SigDefault { Terminate, Ignore, Stop }
+
+/// POSIX default dispositions. Only the three outcomes Nyx can distinguish are modelled: the
+/// core-dumping signals (SIGQUIT/SIGILL/SIGABRT/SIGFPE/SIGSEGV/SIGBUS/SIGSYS/SIGTRAP/SIGXCPU/
+/// SIGXFSZ) terminate like the rest, since there is no core file to write.
+///
+/// ★ The default for an UNKNOWN signal must be Terminate, not Ignore. Getting that backwards makes
+/// an unimplemented signal look like a working one — the program keeps running as though it had
+/// been handled, and the divergence surfaces arbitrarily far away.
+fn sig_default_action(sig: usize) -> SigDefault {
+    match sig {
+        // SIGCHLD, SIGURG, SIGWINCH, SIGCONT — the only signals a process ignores by default.
+        17 | 23 | 28 | 18 => SigDefault::Ignore,
+        // SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU.
+        19 | 20 | 21 | 22 => SigDefault::Stop,
+        _ => SigDefault::Terminate,
+    }
+}
+
 /// Deliver one pending, unblocked signal by redirecting the return-to-user.
 ///
 /// Called on the way OUT of the dispatcher, after the syscall's result is already in `frame.rax`,
@@ -209,11 +229,40 @@ unsafe fn deliver_pending_signal(frame: &mut SyscallStackFrame) {
         let handler = act[0];
         if handler == 1 { continue; }            // SIG_IGN
         if handler == 0 {
-            // SIG_DFL. Default actions (terminate, stop, core) are NOT implemented yet. Logged
-            // rather than dropped silently, because otherwise "kill did nothing" is unattributable.
-            crate::serial_println!("[SIG] {} SIG_DFL — default actions not implemented, ignored",
-                sig as u32);
-            continue;
+            match sig_default_action(sig) {
+                SigDefault::Ignore => continue,
+                SigDefault::Stop => {
+                    // No job control on Nyx: nothing can ever send SIGCONT, so actually stopping
+                    // would be an unrecoverable hang dressed up as correctness. Ignoring is the
+                    // lesser wrong, and it is logged so it is never a silent no-op.
+                    crate::serial_println!("[SIG] {} default=STOP — no job control, ignored",
+                        sig as u32);
+                    continue;
+                }
+                SigDefault::Terminate => {
+                    crate::serial_println!("[SIG] {} default=TERMINATE — killing pid {}",
+                        sig as u32, percpu.scheduler.tasks[curr_idx].pid);
+
+                    // ★ Re-enter the dispatcher as exit_group rather than duplicating its
+                    // teardown. That teardown is ~100 lines of fd/socket reclamation, the
+                    // shared-address-space sibling scan, clear_child_tid + futex wake, and the
+                    // Zombie/Empty decision — every app exit on this system goes through it, and
+                    // a second copy would rot out of sync with no test that could tell. This path
+                    // is also the FIRST caller that is not a userspace `exit()`, so the risk of
+                    // getting a hand-rolled copy subtly wrong is highest exactly here.
+                    //
+                    // The arm disables interrupts, tears down, and ends in `hlt` forever — it
+                    // never returns, so nothing below runs.
+                    frame.rax = 231;                        // SYS_EXIT_GROUP
+                    // 128+signum is the shell's convention for "died from signal N" and cannot be
+                    // confused with a normal small exit status. Nyx's wait4 reports exit_code
+                    // directly rather than a Linux wstatus, so an encoded W_IFSIGNALED would be
+                    // decoded by nobody.
+                    frame.rdi = 128 + sig as u64;
+                    syscall_dispatch_inner(frame);
+                    return;                                 // defensive; unreachable
+                }
+            }
         }
         if act[1] & SA_RESTORER == 0 {
             // Linux x86-64 has no kernel-provided trampoline; libc supplies one via sa_restorer.
@@ -1410,7 +1459,37 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
             frame.rax = if found { 0 } else { ESRCH as u64 };
         },
-        
+
+        200 | 234 => { // SYS_TKILL(tid, sig) / SYS_TGKILL(tgid, tid, sig)
+            // ★ This is the syscall musl's raise() issues, and therefore the one abort() depends
+            // on. Without it abort() got ENOSYS and fell through to a_crash() = `hlt`, which is
+            // privileged — so every failed assert surfaced as a #GP at an address inside abort()
+            // with nothing anywhere pointing at the actual cause. That cost two rounds on the C++
+            // gate; libc++ and Ladybird assert constantly, so it would have kept costing.
+            //
+            // Nyx gives every task its own unique `pid` and has no separate tgid (see getpid/gettid,
+            // which return the same value), so a tid IS a pid here and tgkill's first argument has
+            // nothing to check against. It is accepted and ignored rather than validated against a
+            // thread-group field that does not exist.
+            let (tid, sig) = if id == 200 { (arg1, arg2 as usize) } else { (arg2, arg3 as usize) };
+            if sig > 64 { frame.rax = EINVAL as u64; return; }
+
+            // Unlike kill(2) this targets exactly ONE task: tids are unique, so a loop that
+            // signalled every match would be masking a duplicate-pid bug rather than working.
+            let mut found = false;
+            for t in percpu.scheduler.tasks.iter_mut() {
+                if t.pid == tid && t.state != crate::scheduler::TaskState::Empty {
+                    found = true;
+                    if sig != 0 { t.sigpending |= 1u64 << (sig - 1); }
+                    break;
+                }
+            }
+            frame.rax = if found { 0 } else { ESRCH as u64 };
+            // Delivery happens at syscall return (deliver_pending_signal), which is what makes
+            // this work for abort(): musl blocks all signals around raise(), so SIGABRT is masked
+            // here and lands on the return from the following rt_sigprocmask instead.
+        },
+
         16 => { // SYS_IOCTL 
             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
             if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }

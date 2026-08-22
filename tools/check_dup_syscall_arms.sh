@@ -11,9 +11,22 @@ set -uo pipefail
 
 F="${1:-nyx-kernel/src/interrupts.rs}"
 
+# ★ Scope to syscall_dispatch_inner's body FIRST. The check used to scan the whole file for
+# 8-space-indented numeric arms, so ANY other numeric match in interrupts.rs tripped it — adding
+# a signal-disposition table (`17 | 23 | 28 => ...`) reported five bogus duplicates. That matters
+# more than it sounds: this script exists because a shadowed arm is invisible to the compiler, and
+# a checker that cries wolf is one people start passing over. Narrowing it loses nothing, because
+# only arms of THIS match can shadow each other.
+#
+# The function ends at the first column-0 `}`, which is unambiguous in rustfmt'd code. Line numbers
+# are preserved so the failure message still points at real lines.
+# `NR":"$0` reproduces grep -n's exact format, which the parsing below already expects.
+BODY="$(awk '/^fn syscall_dispatch_inner/{f=1} f{print NR":"$0; if (seen && /^}/) exit; seen=1}' "$F")"
+[ -n "$BODY" ] || { echo "[dup-arms] ✗ could not locate syscall_dispatch_inner in $F" >&2; exit 1; }
+
 # Arms of the dispatcher's `match id`, which are indented 8 spaces. Handles both `59 =>` and
 # multi-key arms like `22 | 293 =>`.
-mapfile -t ARMS < <(grep -nE '^        [0-9]+( *\| *[0-9]+)* *=>' "$F")
+mapfile -t ARMS < <(grep -E '^[0-9]+: {8}[0-9]+( *\| *[0-9]+)* *=>' <<<"$BODY")
 
 echo "[dup-arms] $F: ${#ARMS[@]} numeric dispatcher arms"
 
