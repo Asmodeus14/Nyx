@@ -49,6 +49,9 @@ pub fn run_all() -> Report {
     fs::probe_destructive(baseline, &mut rows);
     mem::probe(baseline, &mut rows);
     signals::probe(baseline, &mut rows);
+    // After signals::probe, which establishes that delivery works at all — EINTR is meaningless
+    // to read if plain delivery is broken, and this ordering makes the two rows a ladder.
+    signals::probe_eintr(baseline, &mut rows);
     misc::probe_presence_only(baseline, &mut rows);
 
     let report = Report { rows, baseline };

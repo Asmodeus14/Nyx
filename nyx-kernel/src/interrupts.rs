@@ -24,6 +24,7 @@ static NEXT_LOCAL_PORT: AtomicU16 = AtomicU16::new(49152);
 
 const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
+const EINTR: i64 = -4;
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
@@ -550,6 +551,47 @@ unsafe fn readiness_yield() {
     x86_64::instructions::interrupts::enable();
     core::arch::asm!("int 0x41");
     x86_64::instructions::interrupts::disable();
+}
+
+/// Is a signal waiting that would actually run code (or kill us) if we returned right now?
+///
+/// ★★★ This is the second legal exit from any blocking loop, and without it there is no `EINTR`
+/// on Nyx at all. Signal delivery happens in `syscall_dispatcher` AFTER `syscall_dispatch_inner`
+/// returns, so a loop that only ends on "the I/O completed" is a loop **no signal can ever
+/// interrupt** — `kill` a process parked in `poll` and nothing happens until the fd wakes up.
+/// An event loop is built precisely on being woken by a signal, so this is a prerequisite for one.
+///
+/// ★ Disposition matters, and checking only `sigpending & !sigmask` is the trap. POSIX interrupts
+/// a syscall when a signal is *caught* — an IGNORED signal must not. `SIGCHLD` defaults to ignore
+/// and arrives every time a child exits, so the naive test would make every blocking `poll` return
+/// a spurious `EINTR` in any program that spawns processes. That reads as random I/O failure.
+///
+/// Terminating defaults DO interrupt: returning lets the dispatcher run the kill, which is the
+/// only way a `SIGTERM` reaches a process parked in `poll`.
+unsafe fn signal_would_interrupt() -> bool {
+    // Same two guards `deliver_pending_signal` opens with: before percpu is live there is no task
+    // to have signals, and reading GsBase-relative state then would fault.
+    if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return false; }
+    if GsBase::read().as_u64() == 0 { return false; }
+    let percpu = crate::percpu::current();
+    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if curr_idx >= percpu.scheduler.tasks.len() { return false; }
+    let t = &percpu.scheduler.tasks[curr_idx];
+
+    let mut deliverable = t.sigpending & !t.sigmask;
+    while deliverable != 0 {
+        let sig = deliverable.trailing_zeros() as usize + 1;
+        deliverable &= !(1u64 << (sig - 1));
+        match t.sigactions[sig][0] {
+            1 => {}                                   // SIG_IGN — never interrupts
+            0 => match sig_default_action(sig) {      // SIG_DFL
+                SigDefault::Ignore => {}
+                _ => return true,                     // Terminate or Stop
+            },
+            _ => return true,                         // a real handler will run
+        }
+    }
+    false
 }
 
 pub fn is_valid_user_ptr(ptr: *const u8, len: usize) -> bool {
@@ -2846,6 +2888,15 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     frame.rax = ready as u64;
                     return;
                 }
+                // ★ Readiness is checked FIRST and wins. A pass that found live fds reports them
+                // even if a signal is also pending: the work is already done, and throwing it away
+                // for EINTR would lose edge-triggered readiness the caller cannot ask for again.
+                // POSIX agrees — EINTR is for a call that accomplished nothing.
+                if unsafe { signal_would_interrupt() } {
+                    // revents are deliberately NOT written back: EINTR means "nothing happened".
+                    frame.rax = EINTR as u64;
+                    return;
+                }
                 unsafe { readiness_yield(); }
             }
         },
@@ -2911,6 +2962,14 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         if !ep.is_null() { ep.write_unaligned(0); }
                     }
                     frame.rax = count as u64;
+                    return;
+                }
+                // See the poll arm: readiness wins over a pending signal, and on EINTR the three
+                // fd_sets are left untouched rather than cleared — POSIX leaves them unspecified,
+                // and a caller that retries after its handler must not be told "nothing is ready"
+                // by a call that never looked.
+                if unsafe { signal_would_interrupt() } {
+                    frame.rax = EINTR as u64;
                     return;
                 }
                 unsafe { readiness_yield(); }

@@ -206,15 +206,12 @@ pub fn probe_presence_only(base: Baseline, rows: &mut Vec<Row>) {
         rows.push(row);
     }
 
-    // Worth stating outright rather than leaving to be inferred from four STUB rows: the signal
-    // syscalls above return 0 because they are `frame.rax = 0` and nothing more. There is no pending
-    // mask, no delivery on return-to-user, no signal frame. musl does not work without those, which
-    // makes this the largest single item on the road to a libc.
-    let mut row = Row::new(0, "signal delivery");
-    row.raw = String::from("absent");
-    row.verdict = Verdict::Stub;
-    row.note = String::from("no pending mask, no delivery path, no rt_sigreturn — the big one");
-    rows.push(row);
+    // (A hardcoded `signal delivery = Stub` row used to sit here, asserting there was no pending
+    // mask, no delivery path and no rt_sigreturn. All three now exist, so it had become a fixed
+    // verdict contradicting the MEASURED rows in the same report — `signals::probe` raises a real
+    // SIGUSR1 and watches the handler run, and `signals::probe_eintr` breaks a blocking poll with
+    // one. A harness that states conclusions it does not measure is the same failure that let the
+    // path-syscall ABI bug pass 39 rows; deleted rather than updated, since the real rows say it.)
 }
 
 fn classify_simple(base: Baseline, ret: isize) -> Verdict {

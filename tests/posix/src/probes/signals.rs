@@ -101,3 +101,115 @@ pub fn probe(_base: Baseline, rows: &mut Vec<Row>) {
 
     rows.push(row);
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x001;
+
+/// Does a signal BREAK a blocking `poll`? (EINTR)
+///
+/// The one row that matters for an event loop. Everything else about signals can be true while
+/// this is false: delivery only happens on the way *out* of a syscall, so a `poll` that only ends
+/// when an fd becomes ready is a `poll` no signal can reach. `kill` a process parked in it and
+/// nothing happens — the handler runs whenever the I/O eventually completes, which may be never.
+///
+/// ★ Structured so it CANNOT hang the machine, because Nyx is tested on bare metal and a wedged
+/// probe costs a power cycle. `poll` gets a finite 500 ms timeout, so both outcomes terminate and
+/// are told apart by the return value rather than by whether we come back:
+///   - `-EINTR` → the signal broke in (PASS)
+///   - `0`      → it timed out, meaning nothing interrupted it (the pre-fix behaviour)
+/// The budget is deliberate: `run_isolated_reporting` gives up after 40 × 25 ms = 1 s and would
+/// report a slower probe as "child died", turning the exact failure under test into the wrong
+/// diagnosis.
+pub fn probe_eintr(_base: Baseline, rows: &mut Vec<Row>) {
+    announce("poll interrupted by signal (EINTR)");
+    let mut row = Row::new(7, "poll EINTR");
+
+    let got = crate::sandbox::run_isolated_reporting(|| {
+        // A handler is REQUIRED, not incidental: SIGUSR1's default action is Terminate, so with no
+        // handler the correct kernel kills us and the row cannot distinguish that from a crash.
+        let act: [u64; 4] = [
+            on_signal as *const () as u64,
+            SA_RESTORER,
+            __nyx_sigrestorer as *const () as u64,
+            0,
+        ];
+        if unsafe { raw::sys4(raw::SYS_RT_SIGACTION, SIGUSR1, act.as_ptr() as usize, 0, 8) } < 0 {
+            return b'A';
+        }
+
+        // A pipe nobody ever writes to: a descriptor guaranteed to stay un-ready, so the only ways
+        // out of the poll below are the signal or the timeout.
+        let mut fds = [0i32; 2];
+        if unsafe { raw::sys1(raw::SYS_PIPE, fds.as_mut_ptr() as usize) } < 0 {
+            return b'P';
+        }
+
+        let target = unsafe { raw::sys0(raw::SYS_GETPID) };
+        let helper = unsafe { raw::sys0(raw::SYS_FORK) };
+        if helper < 0 {
+            return b'F';
+        }
+        if helper == 0 {
+            // ★ The delay is load-bearing. Signalling immediately would race the parent into
+            // `poll`: the signal would be delivered on the way out of some earlier syscall, the
+            // handler would run, sigpending would clear, and the poll would then time out — a
+            // FAIL for a kernel that is working correctly.
+            crate::sandbox::sleep_ms(120);
+            unsafe {
+                raw::sys2(raw::SYS_KILL, target as usize, SIGUSR1);
+                raw::raw_exit(0);
+            }
+        }
+
+        let mut pfd = PollFd { fd: fds[0], events: POLLIN, revents: 0 };
+        let r = unsafe {
+            raw::sys3(raw::SYS_POLL, &mut pfd as *mut PollFd as usize, 1, 500)
+        };
+
+        unsafe {
+            raw::sys1(raw::SYS_CLOSE, fds[0] as usize);
+            raw::sys1(raw::SYS_CLOSE, fds[1] as usize);
+        }
+
+        match r {
+            -4 => b'I',           // EINTR
+            0 => b'T',            // timed out: the signal never broke in
+            n if n > 0 => b'R',   // a pipe nobody wrote to came back readable
+            _ => b'E',
+        }
+    });
+
+    row.raw = String::from(match got {
+        Some(b'I') => "poll returned EINTR",
+        Some(b'T') => "poll ran to its timeout, uninterrupted",
+        Some(b'R') => "poll reported readiness on an unwritten pipe",
+        Some(b'A') => "rt_sigaction refused the handler",
+        Some(b'P') => "pipe failed",
+        Some(b'F') => "fork failed",
+        Some(b'E') => "poll failed with an unexpected errno",
+        Some(_) => "unexpected report byte",
+        None => "child never reported",
+    });
+
+    row.verdict = match got {
+        Some(b'I') => Verdict::Pass,
+        // Not Fail-by-crash: the call SUCCEEDED, it just could not be interrupted. That is the
+        // state an event loop silently hangs in, so it deserves its own name.
+        Some(b'T') => Verdict::Stub,
+        _ => Verdict::Fail,
+    };
+
+    row.note = String::from(match got {
+        Some(b'T') => "a signal cannot break a blocking poll — an event loop would never wake",
+        _ => "child polls an unwritten pipe while a helper signals it after 120 ms",
+    });
+
+    rows.push(row);
+}
