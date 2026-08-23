@@ -41,6 +41,8 @@ const ESRCH: i64 = -3;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const ENOTEMPTY: i64 = -39;
+const EPIPE: i64 = -32;
+const EAFNOSUPPORT: i64 = -97;
 
 #[repr(C)]
 pub struct SockAddrIn {
@@ -514,6 +516,16 @@ fn fd_readiness(fd: &FileDescriptor) -> (bool, bool, bool) {
         FileDescriptor::PipeWrite(q) => {
             let hup = alloc::sync::Arc::strong_count(q) == 1;
             (false, !hup, hup)
+        }
+
+        // Bidirectional, so unlike a pipe end this reports BOTH directions. Readability is decided
+        // by `rx` and hangup by `tx`: the peer holds our `tx` as its own `rx`, so `tx` dropping to
+        // one reference is what "the peer is gone" means. Reading the wrong queue here would make a
+        // half-closed connection look alive, which an IPC event loop would spin on forever.
+        FileDescriptor::UnixStream { rx, tx } => {
+            let has_data = !rx.lock().is_empty();
+            let hup = alloc::sync::Arc::strong_count(tx) == 1;
+            (has_data || hup, !hup, hup)
         }
 
         FileDescriptor::Socket(sock_mtx) => {
@@ -1712,6 +1724,46 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = total_written as u64;
         },
         
+        53 => { // SYS_SOCKETPAIR(domain, type, protocol, sv)
+            // The IPC primitive every multi-process program uses: make a connected pair, then fork
+            // so each side inherits one end. Ladybird's chrome/WebContent split is exactly this.
+            const AF_UNIX: u64 = 1;
+            if arg1 != AF_UNIX {
+                // Only AF_UNIX pairs exist here. Refusing loudly matters: `sys_socket` used to
+                // ignore its domain entirely and hand back a TCP socket for ANY family, so an
+                // AF_UNIX request silently became a network socket that never connected.
+                frame.rax = EAFNOSUPPORT as u64;
+                return;
+            }
+            let sv = arg4 as *mut i32;
+            if !is_valid_user_ptr(sv as *const u8, 8) { frame.rax = EFAULT as u64; return; }
+
+            let q_a = alloc::sync::Arc::new(spin::Mutex::new(alloc::collections::VecDeque::<u8>::new()));
+            let q_b = alloc::sync::Arc::new(spin::Mutex::new(alloc::collections::VecDeque::<u8>::new()));
+
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            let task = &mut percpu.scheduler.tasks[curr_idx];
+
+            let (mut fd0, mut fd1) = (-1i32, -1i32);
+            for i in 3..FD_MAX {
+                if task.fd_table[i].is_none() {
+                    if fd0 == -1 { fd0 = i as i32; } else { fd1 = i as i32; break; }
+                }
+            }
+            if fd0 == -1 || fd1 == -1 { frame.rax = EMFILE as u64; return; }
+
+            // ★ The SWAP is the connection: what one end writes, the other reads.
+            task.fd_table[fd0 as usize] = Some(FileDescriptor::UnixStream {
+                rx: q_a.clone(), tx: q_b.clone(),
+            });
+            task.fd_table[fd1 as usize] = Some(FileDescriptor::UnixStream {
+                rx: q_b, tx: q_a,
+            });
+            unsafe { *sv.add(0) = fd0; *sv.add(1) = fd1; }
+            frame.rax = 0;
+        },
+
         22 | 293 => { // SYS_PIPE / SYS_PIPE2
             // pipe2's flags (O_CLOEXEC, O_NONBLOCK) are accepted and ignored: Nyx has no exec-time
             // fd closing and pipes are already non-blocking on the read side. Refusing the call
@@ -4332,9 +4384,28 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                 return bytes_read as isize;
             },
             FileDescriptor::PipeWrite(_) => return EBADF as isize,
+            FileDescriptor::UnixStream { rx, .. } => {
+                let mut q = rx.lock();
+                let mut n = 0;
+                while n < len {
+                    match q.pop_front() {
+                        Some(b) => { unsafe { *buf_ptr.add(n) = b; } n += 1; }
+                        None => break,
+                    }
+                }
+                if n == 0 {
+                    // ★ Same rule as the pipe arm, and the reason `rx` must be BORROWED from the
+                    // fd table rather than cloned: a count of 1 means we are the only holder, so
+                    // the peer's `tx` is gone and no more data can ever arrive — EOF. Any extra
+                    // reference makes that unreachable and the reader hangs forever instead.
+                    if alloc::sync::Arc::strong_count(rx) == 1 { return 0; }
+                    return EAGAIN as isize;
+                }
+                return n as isize;
+            }
         }
     }
-    EBADF as isize 
+    EBADF as isize
 }
 
 fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
@@ -4416,6 +4487,16 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
                 return len as isize;
             },
             FileDescriptor::PipeRead(_) => return EBADF as isize,
+            FileDescriptor::UnixStream { tx, .. } => {
+                // A write with no reader left should be EPIPE (and SIGPIPE) on a real system.
+                // Reported as EPIPE rather than silently succeeding, because an IPC peer that
+                // died is exactly the case the caller must notice; buffering into a queue nobody
+                // will ever drain would present as a hang instead.
+                if alloc::sync::Arc::strong_count(tx) == 1 { return EPIPE as isize; }
+                let mut q = tx.lock();
+                for &b in buf_slice { q.push_back(b); }
+                return len as isize;
+            }
         }
     }
 
@@ -4444,6 +4525,14 @@ fn destroy_socket(stack: crate::drivers::net::NetStack, gen: u64, kind: SocketKi
 
 #[no_mangle]
 pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
+    // ★ The domain used to be ignored outright, so socket(AF_UNIX, ...) returned a TCP socket
+    // that would never connect to anything — a silent wrong answer rather than an error, and the
+    // worst possible failure for IPC code, which then blocks on a descriptor that cannot work.
+    // AF_INET(2) is what the stack below actually implements; AF_UNIX(1) has no named sockets
+    // here, so it is refused and callers are expected to use socketpair(2), which does exist.
+    const AF_INET: u64 = 2;
+    if _domain != AF_INET { return EAFNOSUPPORT; }
+
     // Route to whichever stack actually has a link. Chosen ONCE, here, and remembered on the socket:
     // the handle below is an index into this stack's SocketSet and is meaningless in the other one.
     let (stack, gen) = crate::drivers::net::active_stack();

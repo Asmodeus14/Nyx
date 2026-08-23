@@ -44,6 +44,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static int n_pass = 0, n_fail = 0;
@@ -465,6 +466,45 @@ int main() {
             no("TMPDIR names a directory that does not exist");
         else
             ok();
+    }
+
+    // --- 13. socketpair ------------------------------------------------------------------------
+    // The IPC primitive a multi-process browser is built on: Ladybird's chrome talks to WebContent
+    // over one of these. Unlike a pipe it is BIDIRECTIONAL, so the test that matters is traffic in
+    // BOTH directions on the SAME descriptors -- a pipe-backed fake passes a one-way check.
+    // Hangup is checked too, because an IPC event loop that cannot see its peer die spins forever.
+    announce("socketpair (IPC transport)");
+    {
+        int sv[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            no("socketpair() failed");
+        } else {
+            char buf[16] = {0};
+            bool fwd = (::write(sv[0], "ping", 4) == 4)
+                    && (::read(sv[1], buf, 4) == 4)
+                    && std::strncmp(buf, "ping", 4) == 0;
+            std::memset(buf, 0, sizeof buf);
+            bool rev = (::write(sv[1], "pong", 4) == 4)
+                    && (::read(sv[0], buf, 4) == 4)
+                    && std::strncmp(buf, "pong", 4) == 0;
+            // Readiness must work too, or the fd is useless inside an event loop.
+            ssize_t w = ::write(sv[0], "z", 1); (void)w;
+            struct pollfd pf = {sv[1], POLLIN, 0};
+            bool pollable = (poll_retrying(&pf, 1, 200, nullptr) == 1) && (pf.revents & POLLIN);
+            char drain; ssize_t d = ::read(sv[1], &drain, 1); (void)d;
+            // Closing one end must surface on the other as EOF/HUP rather than as a live-but-idle fd.
+            ::close(sv[0]);
+            struct pollfd hp = {sv[1], POLLIN, 0};
+            ::poll(&hp, 1, 100);
+            char eof_buf[4];
+            ssize_t eof_n = ::read(sv[1], eof_buf, sizeof eof_buf);
+            ::close(sv[1]);
+            if (!fwd)           no("write A -> read B failed");
+            else if (!rev)      no("write B -> read A failed (not bidirectional)");
+            else if (!pollable) no("poll did not report the pair readable");
+            else if (eof_n != 0) no("closing one end did not give the other EOF");
+            else                ok();
+        }
     }
 
     ::close(p[0]); ::close(p[1]);

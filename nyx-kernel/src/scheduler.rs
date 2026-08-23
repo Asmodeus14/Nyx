@@ -48,6 +48,20 @@ pub enum FileDescriptor {
     Socket(alloc::sync::Arc<spin::Mutex<KernelSocket>>),
     PipeRead(alloc::sync::Arc<spin::Mutex<alloc::collections::VecDeque<u8>>>),
     PipeWrite(alloc::sync::Arc<spin::Mutex<alloc::collections::VecDeque<u8>>>),
+    /// One end of a `socketpair(AF_UNIX, ...)`.
+    ///
+    /// ★ It cannot reuse PipeRead/PipeWrite, because a socketpair endpoint is BIDIRECTIONAL: one
+    /// descriptor that is both readable and writable. `rx` is the queue this end drains, `tx` the
+    /// queue it fills. The peer holds the same two queues with the fields SWAPPED — that swap IS
+    /// the connection; there is no shared "socket" object to own.
+    ///
+    /// Needed because multi-process programs use this for IPC (Ladybird's chrome talks to
+    /// WebContent over exactly one), and `socket(AF_UNIX)` cannot substitute: at fork time there
+    /// is no name to bind and no listener to connect to.
+    UnixStream {
+        rx: alloc::sync::Arc<spin::Mutex<alloc::collections::VecDeque<u8>>>,
+        tx: alloc::sync::Arc<spin::Mutex<alloc::collections::VecDeque<u8>>>,
+    },
 }
 
 pub fn generate_pid() -> u64 {
