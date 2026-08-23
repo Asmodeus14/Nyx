@@ -77,8 +77,16 @@ echo "[9h] Building browser (std target_os=nyx)..."
 ./Build-std.sh apps/browser browser
 # The POSIX conformance harness (Phase 0 of the libc work). Every estimate for that work is a guess
 # until this has been run on hardware, so it ships with every image.
+#
+# ★★ Must SUCCEED, and the previous artifact is deleted FIRST. This used to end in
+# `|| echo "(skipped/failed — continuing)"`, which is uniquely dangerous for THIS binary: the probe
+# is the regression floor, so a stale one does not fail — it reports `pass=39 fail=0` about a kernel
+# that no longer exists. `rm -rf build_initrd` above does not protect against this, because the
+# stale copy lives in tests/posix/target/, not in the initrd. Deleting it means a failed build can
+# only produce a MISSING probe, never a lying one.
 echo "[9i] Building posixprobe (std target_os=nyx)..."
-./Build-std.sh tests/posix posixprobe || echo "  (posixprobe build skipped/failed — continuing)"
+rm -f tests/posix/target/x86_64-unknown-nyx/release/posixprobe
+./Build-std.sh tests/posix posixprobe
 
 echo "[10/10] Generating App Tarball..."
 rm -rf build_initrd
@@ -146,8 +154,10 @@ cp apps/notepad/target/x86_64-unknown-nyx/release/notepad build_initrd/apps/Note
 cp apps/browser/target/x86_64-unknown-nyx/release/browser build_initrd/apps/Browser.nyx/run.bin
 # POSIX conformance harness + the fixed-content file its read-only probes measure themselves against
 # (its size is cross-checked with syscall 541, which already works, so a wrong `read` is detectable).
-cp tests/posix/target/x86_64-unknown-nyx/release/posixprobe build_initrd/apps/PosixProbe.nyx/run.bin 2>/dev/null || true
-cp tests/posix/probe.txt build_initrd/apps/PosixProbe.nyx/probe.txt 2>/dev/null || true
+# Not `|| true`: see [9i]. A probe that fails to ship is a missing row; a probe that ships stale is
+# a false pass, and this harness exists precisely to be believed.
+cp tests/posix/target/x86_64-unknown-nyx/release/posixprobe build_initrd/apps/PosixProbe.nyx/run.bin
+cp tests/posix/probe.txt build_initrd/apps/PosixProbe.nyx/probe.txt
 
 # C test binaries. Skipped rather than fatal when libc.a is absent: musl is built by
 # ./Build-musl.sh, which is deliberately NOT part of this script (it takes ~90s and changes rarely).
