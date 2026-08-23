@@ -34,6 +34,8 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -350,6 +352,87 @@ int main() {
             }
             ::close(a[0]); ::close(a[1]); ::close(b[0]); ::close(b[1]);
             if (good && served == 200) ok(); else no("loop degraded before 200 iterations");
+        }
+    }
+
+    // --- 10. positional I/O -------------------------------------------------------------------
+    // pread/pwrite read and write at an explicit offset WITHOUT moving the descriptor's own. That
+    // guarantee is the point: it is what lets a file be read in chunks from more than one place
+    // without an lseek race. So the check is not just "the bytes are right" but "the sequential
+    // offset did not move" -- an implementation built from lseek+read would pass the first and
+    // fail the second, and only the second distinguishes it from a genuine pread.
+    announce("pread/pwrite keep offset");
+    {
+        const char *path = (::access("/mnt/nvme", F_OK) == 0)
+                         ? "/mnt/nvme/apps/HelloC.nyx/pread.tmp" : "/tmp/pread.tmp";
+        int fd = ::open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            no("could not create the scratch file");
+        } else {
+            ssize_t w = ::write(fd, "ABCDEFGHIJ", 10);
+            ::lseek(fd, 0, SEEK_SET);
+            char first[4] = {0};
+            ssize_t r1 = ::read(fd, first, 3);          // sequential: offset -> 3
+            char mid[4] = {0};
+            ssize_t pr = ::pread(fd, mid, 3, 5);        // positional: must NOT move the offset
+            off_t after = ::lseek(fd, 0, SEEK_CUR);
+            ssize_t pw = ::pwrite(fd, "xy", 2, 8);
+            char tail[4] = {0};
+            ssize_t pr2 = ::pread(fd, tail, 2, 8);
+            ::close(fd);
+            ::unlink(path);
+            if (w != 10 || r1 != 3 || pr != 3 || pw != 2 || pr2 != 2)
+                no("a positional call returned the wrong length");
+            else if (std::strncmp(first, "ABC", 3) != 0)
+                no("sequential read returned the wrong bytes");
+            else if (std::strncmp(mid, "FGH", 3) != 0)
+                no("pread returned the wrong bytes");
+            else if (after != 3)
+                no("pread moved the file offset -- it must not");
+            else if (std::strncmp(tail, "xy", 2) != 0)
+                no("pwrite did not land at the given offset");
+            else
+                ok();
+        }
+    }
+
+    // --- 11. /tmp ------------------------------------------------------------------------------
+    // temp_directory_path() is what C++ libraries reach for by default, so /tmp not existing is
+    // not a missing nicety -- it is every such call failing. Exercised through <filesystem> rather
+    // than raw syscalls, because that is the layer the real consumers use.
+    announce("/tmp usable");
+    {
+        std::error_code ec;
+        auto tmp = std::filesystem::temp_directory_path(ec);
+        if (ec || tmp.empty()) {
+            no("temp_directory_path() failed");
+        } else {
+            auto dir = tmp / "nyx_evt_dir";
+            std::filesystem::remove_all(dir, ec);
+            ec.clear();
+            bool made = std::filesystem::create_directories(dir, ec);
+            auto f = dir / "scratch.txt";
+            bool wrote = false, read_back = false;
+            if (made && !ec) {
+                std::ofstream os(f);
+                os << "tmpfs round trip";
+                os.close();
+                wrote = std::filesystem::exists(f, ec) && std::filesystem::file_size(f, ec) == 16;
+                std::ifstream is(f);
+                std::string got;
+                std::getline(is, got);
+                read_back = (got == "tmpfs round trip");
+            }
+            int entries = 0;
+            if (wrote) for (auto &e : std::filesystem::directory_iterator(dir, ec)) { (void)e; entries++; }
+            std::filesystem::remove_all(dir, ec);
+            bool gone = !std::filesystem::exists(dir, ec);
+            if (!made)          no("create_directories under /tmp failed");
+            else if (!wrote)    no("write to /tmp did not land");
+            else if (!read_back) no("read back from /tmp gave the wrong bytes");
+            else if (entries != 1) no("directory_iterator saw the wrong entry count");
+            else if (!gone)     no("remove_all left /tmp populated");
+            else                ok();
         }
     }
 

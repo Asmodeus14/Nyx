@@ -21,4 +21,5 @@ tests/helloc/bare
 tests/helloc/smoke
 tests/helloc/cpptest
 tests/helloc/cxxtest
+tests/helloc/eventloop
 tests/helloc/nostdlib_rt.o

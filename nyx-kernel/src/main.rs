@@ -29,6 +29,7 @@ pub mod pci;
 pub mod drivers;
 pub mod fs;
 pub mod vfs;
+pub mod tmpfs;
 pub mod process;
 pub mod gui;
 pub mod mouse;
@@ -224,6 +225,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         crate::entity::awaken_entity(&mut crate::fs::GLOBAL_NVME);
     }
+
+    // ==========================================
+    // /tmp — in-memory scratch
+    // ==========================================
+    // Mounted BEFORE the NVMe, and unconditionally: it depends on no hardware, so a machine that
+    // fails to find a disk still has a working /tmp. `std::filesystem::temp_directory_path()`
+    // returns /tmp and every C++ library reaches for it, so its absence is not a missing feature
+    // but a failing call against a path that does not exist.
+    crate::vfs::VFS.mount("/tmp", Box::new(crate::tmpfs::TmpFs::new()));
+    crate::vga_println!("[BOOT] tmpfs mounted at /tmp (8 MiB cap, kernel heap)");
 
     // ==========================================
     // PHYSICAL NVME VFS MOUNT POINT

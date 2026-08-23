@@ -176,7 +176,15 @@ impl VirtualFileSystem {
         };
 
         for (mount_path, _fs) in mounts.iter().rev() {
-            if search_path.starts_with(mount_path) {
+            // ★ The match must end on a COMPONENT boundary. A bare `starts_with` makes "/tmpfoo"
+            // match the "/tmp" mount and resolve to a relative path of "foo" inside it — a real
+            // file silently routed to the wrong filesystem. It was unreachable in practice while
+            // "/mnt/nvme" was the only mount; adding "/tmp" makes short, collidable prefixes
+            // ordinary, so the boundary is checked rather than left to luck.
+            let boundary_ok = mount_path == "/"
+                || search_path.len() == mount_path.len()
+                || search_path.as_bytes().get(mount_path.len()) == Some(&b'/');
+            if search_path.starts_with(mount_path.as_str()) && boundary_ok {
                 let relative_path = if mount_path == "/" {
                     search_path.clone()
                 } else {
@@ -421,6 +429,38 @@ impl OpenFile {
                 if let Ok(bytes_written) = driver.write_file(&rel_path, *off, buf) {
                     *off += bytes_written;
                     return bytes_written;
+                }
+            }
+        }
+        0
+    }
+
+    /// Read at an EXPLICIT offset, leaving the descriptor's own offset untouched.
+    ///
+    /// ★ "Leaving it untouched" is the entire point of `pread(2)`, and the reason it cannot be
+    /// emulated as lseek+read+lseek: two threads sharing one descriptor would interleave between
+    /// the seek and the read and each would get the other's data. libc++'s file handling and
+    /// anything mapping a file in chunks relies on that guarantee. Note it does NOT take
+    /// `self.offset` at all — not even to restore it — so there is nothing to race on.
+    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize {
+        if let Some((mount_point, rel_path)) = VFS.resolve_mount(&self.path) {
+            let mounts = VFS.mounts.lock();
+            if let Some(driver) = mounts.get(&mount_point) {
+                if let Ok(n) = driver.read_file(&rel_path, off, buf) {
+                    return n;
+                }
+            }
+        }
+        0
+    }
+
+    /// Write at an explicit offset. Same contract as `read_at`.
+    pub fn write_at(&self, off: usize, buf: &[u8]) -> usize {
+        if let Some((mount_point, rel_path)) = VFS.resolve_mount(&self.path) {
+            let mut mounts = VFS.mounts.lock();
+            if let Some(driver) = mounts.get_mut(&mount_point) {
+                if let Ok(n) = driver.write_file(&rel_path, off, buf) {
+                    return n;
                 }
             }
         }

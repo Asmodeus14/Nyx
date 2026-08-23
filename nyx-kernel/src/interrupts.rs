@@ -1623,6 +1623,35 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = 0;
         },
 
+        17 | 18 => { // SYS_PREAD64 / SYS_PWRITE64(fd, buf, count, offset)
+            // Positional I/O. Only meaningful for a real file: a pipe or socket has no offset to
+            // seek to, and POSIX says ESPIPE for exactly that — the same answer lseek already
+            // gives them, rather than pretending offset 0 was intended.
+            let (fd, buf_ptr, len, off) = (arg1 as usize, arg2, arg3 as usize, arg4 as i64);
+            if fd >= FD_MAX { frame.rax = EBADF as u64; return; }
+            if off < 0 { frame.rax = EINVAL as u64; return; }
+            if !is_valid_user_ptr(buf_ptr as *const u8, len) { frame.rax = EFAULT as u64; return; }
+            if len == 0 { frame.rax = 0; return; }
+
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx >= percpu.scheduler.tasks.len() { frame.rax = EBADF as u64; return; }
+            // Clone the Arc out before touching the VFS: the same rule fstat documents, since the
+            // VFS takes the mount lock and the scheduler's task Vec can move under a live borrow.
+            let file = match &percpu.scheduler.tasks[curr_idx].fd_table[fd] {
+                Some(FileDescriptor::File(f)) => f.clone(),
+                Some(_) => { frame.rax = ESPIPE as u64; return; }
+                None => { frame.rax = EBADF as u64; return; }
+            };
+
+            frame.rax = if id == 17 {
+                let dst = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+                file.read_at(off as usize, dst) as u64
+            } else {
+                let src = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+                file.write_at(off as usize, src) as u64
+            };
+        },
+
         19 => { // SYS_READV(fd, iov, iovcnt)
             // musl's __stdio_read issues readv, so WITHOUT this every buffered read fails while
             // writes work (writev was implemented) — which presents as "the file contents differ"
