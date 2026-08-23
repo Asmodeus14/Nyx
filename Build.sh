@@ -175,7 +175,7 @@ if [ -f vendor/musl/lib/libc.a ]; then
   # ★ cpptest was being copied WITHOUT being cleared first — precisely the hazard the note above
   # describes, reintroduced for one binary. Clearing is now driven off the same list as copying,
   # so the two cannot drift apart again.
-  HELLOC_BINS="hello:run.bin hello_lo:hello_lo smoke:smoke bare:bare cpptest:cpptest cxxtest:cxxtest"
+  HELLOC_BINS="hello:run.bin hello_lo:hello_lo smoke:smoke bare:bare cpptest:cpptest cxxtest:cxxtest eventloop:eventloop"
   for pair in $HELLOC_BINS; do
     rm -f "build_initrd/apps/HelloC.nyx/${pair#*:}"
   done

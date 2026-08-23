@@ -33,7 +33,8 @@ NYX_BASE=0x40000000
 
 # Stale artifacts are worse than missing ones: a variant that fails to build would otherwise be
 # shipped as whatever the previous run left behind, and get tested under the wrong name.
-rm -f "$OUT/hello" "$OUT/hello_lo" "$OUT/bare" "$OUT/smoke" "$OUT/cpptest" "$OUT/cxxtest"
+rm -f "$OUT/hello" "$OUT/hello_lo" "$OUT/bare" "$OUT/smoke" "$OUT/cpptest" "$OUT/cxxtest" \
+      "$OUT/eventloop"
 
 build_musl() {  # $1 = output name, $2 = source file, $3... = extra linker flags
   local out="$1" src="$2"; shift 2
@@ -146,12 +147,15 @@ build_musl smoke    smoke.c "-Wl,-Ttext-segment=$NYX_BASE"
 build_bare bare     "-Wl,-Ttext-segment=$NYX_BASE"
 build_cpp    cpptest cpptest.cpp "-Wl,-Ttext-segment=$NYX_BASE"
 build_libcxx cxxtest cxxtest.cpp "-Wl,-Ttext-segment=$NYX_BASE"
+# Gate 3: poll + signals + timers + threads + file I/O TOGETHER, which is the combination an event
+# loop depends on and which every earlier probe tests one at a time.
+build_libcxx eventloop eventloop.cpp "-Wl,-Ttext-segment=$NYX_BASE"
 
 # Print the entry point and every LOAD for each. This is a build-time check on purpose: a
 # -Ttext-segment that silently did nothing would make the whole experiment a null result, and
 # finding that out from the serial log costs a power cycle. Read these before booting.
 echo "[helloc] built binaries:"
-for f in hello hello_lo smoke bare cpptest cxxtest; do
+for f in hello hello_lo smoke bare cpptest cxxtest eventloop; do
   [ -f "$OUT/$f" ] || continue
   echo "----- $f -----"
   readelf -hl "$OUT/$f" | grep -E 'Type:|Entry point|LOAD|INTERP|TLS' || true
