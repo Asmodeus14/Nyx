@@ -33,6 +33,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -434,6 +435,36 @@ int main() {
             else if (!gone)     no("remove_all left /tmp populated");
             else                ok();
         }
+    }
+
+    // --- 12. environment ----------------------------------------------------------------------
+    // getenv returned null for everything until the kernel started building a real envp. Checked
+    // here because an environment is a set of PROMISES about the filesystem -- a HOME that does
+    // not exist surfaces later as a permission-shaped failure a long way from the cause -- so the
+    // probe verifies the directory each path variable names is really there, not just that the
+    // string is set. Skipped rather than failed off-Nyx, where the host's own values are correct
+    // and different.
+    announce("environment");
+    {
+        const char *home = std::getenv("HOME");
+        const char *tmpd = std::getenv("TMPDIR");
+        const char *path = std::getenv("PATH");
+        // ★ TMPDIR is required on NYX but not on the host: a login shell does not normally set it
+        // (the first host run failed here for exactly that reason). Demanding it everywhere would
+        // make the probe fail off-Nyx and cost the free host verification that catches the real
+        // bugs -- so the requirement is the KERNEL'S promise, checked where the kernel made it.
+        bool on_nyx = std::filesystem::exists("/mnt/nvme");
+        std::error_code ec;
+        if (!home || !path)
+            no("HOME or PATH is unset");
+        else if (on_nyx && !tmpd)
+            no("TMPDIR unset -- the kernel did not build it");
+        else if (!std::filesystem::is_directory(home, ec))
+            no("HOME names a directory that does not exist");
+        else if (tmpd && !std::filesystem::is_directory(tmpd, ec))
+            no("TMPDIR names a directory that does not exist");
+        else
+            ok();
     }
 
     ::close(p[0]); ::close(p[1]);

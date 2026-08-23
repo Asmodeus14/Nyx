@@ -295,7 +295,7 @@ const AT_NYX_TLS_ALIGN: u64 = 0x7000_0004;
 /// apps that ignore all of this still work: they simply treat RSP as their stack top and grow down.
 ///
 /// `stack_top` is the highest usable stack address (already page-mapped). `argv0` is the program
-/// path (becomes argv[0]); we keep envp empty for now.
+/// path (becomes argv[0]).
 pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) -> u64 {
     // A small bump area growing DOWN from the top holds the string/aux data the pointers reference.
     let mut p = stack_top & !0xF;
@@ -306,6 +306,34 @@ pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) 
     let argv0_ptr = p;
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), argv0_ptr as *mut u8, bytes.len());
     *((argv0_ptr + bytes.len() as u64) as *mut u8) = 0;
+
+    // 1b. The environment. This used to be a bare NULL, so `getenv` returned null for everything.
+    //
+    // Deliberately SHORT, and every value points somewhere that actually exists. An environment is
+    // a set of promises about the filesystem: a program told `HOME=/home/nyx` will try to write
+    // there, and on a system with no such directory that surfaces as a permission-shaped failure
+    // far from the cause. `/mnt/nvme` is the real writable root, so `$HOME/.config` resolves to a
+    // path whose parent exists and which the app can mkdir for itself.
+    //
+    // TMPDIR is stated rather than left implicit even though libc++ falls back to /tmp on its own:
+    // the fallback order (TMPDIR, TMP, TEMP, TEMPDIR, /tmp) is a libc++ detail, and other
+    // libraries stop at the first variable.
+    const ENVIRON: [&str; 6] = [
+        "HOME=/mnt/nvme",
+        "PATH=/mnt/nvme/apps",
+        "TMPDIR=/tmp",
+        "LANG=C.UTF-8",
+        "TZ=UTC",
+        "USER=nyx",
+    ];
+    let mut env_ptrs = [0u64; ENVIRON.len()];
+    for (i, s) in ENVIRON.iter().enumerate() {
+        let b = s.as_bytes();
+        p -= (b.len() + 1) as u64;
+        core::ptr::copy_nonoverlapping(b.as_ptr(), p as *mut u8, b.len());
+        *((p + b.len() as u64) as *mut u8) = 0;
+        env_ptrs[i] = p;
+    }
 
     // 2. 16 random bytes for AT_RANDOM (std/libc stack-guard + HashMap seed source).
     p -= 16;
@@ -351,6 +379,7 @@ pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) 
     let words: u64 = 1               // argc
         + 1                          // argv[0]
         + 1                          // argv NULL terminator
+        + ENVIRON.len() as u64       // envp entries
         + 1                          // envp NULL terminator
         + (auxv.len() as u64) * 2;   // auxv pairs (incl. AT_NULL pair)
     let mut sp = p - words * 8;
@@ -361,6 +390,7 @@ pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) 
     *w = 1; w = w.add(1);            // argc = 1
     *w = argv0_ptr; w = w.add(1);   // argv[0]
     *w = 0; w = w.add(1);           // argv NULL
+    for e in env_ptrs.iter() { *w = *e; w = w.add(1); }
     *w = 0; w = w.add(1);           // envp NULL
     for (tag, val) in auxv.iter() {
         *w = *tag; w = w.add(1);
