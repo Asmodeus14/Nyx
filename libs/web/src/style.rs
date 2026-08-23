@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
-use crate::css::{AttrOp, Combinator, Compound, PseudoClass, Selector, StyleRule, Stylesheet};
+use crate::css::{
+    AttrOp, Combinator, Compound, MediaContext, PseudoClass, Selector, StyleRule, Stylesheet,
+};
 use crate::dom::{Dom, NodeId, NodeKind};
 
 /// 0xAARRGGBB, matching `nyx_gui::Canvas`.
@@ -195,9 +197,17 @@ struct Winner<'a> {
 ///
 /// `author` is the page's CSS (concatenated `<style>` blocks). The UA sheet is parsed once here.
 pub fn compute(dom: &Dom, author: &Stylesheet) -> StyleTree {
+    compute_media(dom, author, &MediaContext::default())
+}
+
+/// The cascade, with a real viewport for `@media` to resolve against.
+///
+/// Separate from `compute` so the existing callers and tests keep a stable signature; the browser
+/// uses this one and re-runs it on resize, since a width change can flip which rules apply.
+pub fn compute_media(dom: &Dom, author: &Stylesheet, ctx: &MediaContext) -> StyleTree {
     let ua = Stylesheet::parse(UA_CSS);
-    let ua_index = RuleIndex::build(&ua);
-    let author_index = RuleIndex::build(author);
+    let ua_index = RuleIndex::build(&ua, ctx);
+    let author_index = RuleIndex::build(author, ctx);
     let mut styles = vec![ComputedStyle::default(); dom.nodes.len()];
 
     // Document order matters: a child's inherited values must come from an already-computed parent.
@@ -284,7 +294,7 @@ struct RuleIndex<'a> {
 }
 
 impl<'a> RuleIndex<'a> {
-    fn build(sheet: &'a Stylesheet) -> RuleIndex<'a> {
+    fn build(sheet: &'a Stylesheet, ctx: &MediaContext) -> RuleIndex<'a> {
         let mut index = RuleIndex {
             by_id: HashMap::new(),
             by_class: HashMap::new(),
@@ -297,7 +307,17 @@ impl<'a> RuleIndex<'a> {
         let mut declarations = 0usize;
         for (i, rule) in sheet.rules.iter().enumerate() {
             index.base.push(declarations);
+            // ★ `declarations` advances for EVERY rule, including ones filtered out by media.
+            // Source order breaks cascade ties and is defined over the whole sheet, so skipping
+            // the count for a non-matching rule would shift every later rule's order and change
+            // which declaration wins — a bug that only appears on pages that use @media.
             declarations += rule.declarations.len();
+
+            // A rule inside a non-matching @media is simply not bucketed, so the matcher never
+            // sees it. Filtering here rather than at match time keeps it off the hot path.
+            if !rule.applies(ctx) {
+                continue;
+            }
 
             for selector in &rule.selectors {
                 let candidate = Candidate { rule: i, selector };

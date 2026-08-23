@@ -116,10 +116,96 @@ pub struct Declaration {
     pub important: bool,
 }
 
+/// What a media query is evaluated against.
+///
+/// Kept separate from the stylesheet so queries are resolved at CASCADE time, not parse time: the
+/// viewport changes on every resize, and re-parsing 200 KB of CSS to answer "is it still wider than
+/// 600px" would make resizing cost more than loading.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaContext {
+    pub width_px: f32,
+}
+
+impl Default for MediaContext {
+    /// A desktop-ish viewport. Used by callers that do not care about media queries (most tests);
+    /// the browser passes the real window width.
+    fn default() -> Self {
+        Self { width_px: 1280.0 }
+    }
+}
+
+/// One `(feature: value)` test.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MediaCondition {
+    MinWidth(f32),
+    MaxWidth(f32),
+}
+
+impl MediaCondition {
+    fn matches(&self, ctx: &MediaContext) -> bool {
+        match *self {
+            MediaCondition::MinWidth(px) => ctx.width_px >= px,
+            MediaCondition::MaxWidth(px) => ctx.width_px <= px,
+        }
+    }
+}
+
+/// One query in a comma-separated list: an optional media type plus `and`-joined conditions.
+#[derive(Debug, Clone)]
+pub struct MediaQuery {
+    /// `screen`, `print`, `all`, … `None` means none was written, which implies `all`.
+    pub media_type: Option<String>,
+    pub conditions: Vec<MediaCondition>,
+    pub negated: bool,
+    /// ★ False when the query contained something we do not understand. The spec says an unknown
+    /// feature makes the query FALSE, and that is also the safe direction here: treating an
+    /// unrecognised query as a match would apply a print or narrow-screen sheet to the window.
+    pub understood: bool,
+}
+
+impl MediaQuery {
+    fn matches(&self, ctx: &MediaContext) -> bool {
+        if !self.understood {
+            return false;
+        }
+        let type_ok = match self.media_type.as_deref() {
+            // Nyx paints to a screen. `print` and the rest never match.
+            None | Some("all") | Some("screen") => true,
+            _ => false,
+        };
+        let r = type_ok && self.conditions.iter().all(|c| c.matches(ctx));
+        if self.negated { !r } else { r }
+    }
+}
+
+/// A comma-separated media list. Commas are OR.
+#[derive(Debug, Clone, Default)]
+pub struct MediaList {
+    pub queries: Vec<MediaQuery>,
+}
+
+impl MediaList {
+    /// An empty list matches — that is a bare `@media { }` and, more usefully, the "no media
+    /// constraints at all" case for top-level rules.
+    pub fn matches(&self, ctx: &MediaContext) -> bool {
+        self.queries.is_empty() || self.queries.iter().any(|q| q.matches(ctx))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StyleRule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
+    /// Every enclosing `@media` list. ALL must match, which is what nesting means; the common case
+    /// is empty. A `Vec` rather than an `Option` so nested `@media` composes without the list
+    /// having to be flattened into one condition (comma-OR does not distribute over AND).
+    pub media: Vec<MediaList>,
+}
+
+impl StyleRule {
+    pub fn applies(&self, ctx: &MediaContext) -> bool {
+        self.media.iter().all(|m| m.matches(ctx))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,24 +220,60 @@ impl Stylesheet {
         let mut input = ParserInput::new(css);
         let mut parser = Parser::new(&mut input);
         let mut sheet = Stylesheet::default();
+        parse_rules_into(&mut parser, &mut sheet, &[]);
+        sheet
+    }
+}
 
-        loop {
-            parser.skip_whitespace();
-            if parser.is_exhausted() {
-                break;
-            }
+/// Parse rules from `parser` into `sheet`, tagging each with the enclosing `@media` lists.
+///
+/// Recursive so a nested `@media` composes rather than being flattened.
+fn parse_rules_into(parser: &mut Parser, sheet: &mut Stylesheet, media: &[MediaList]) {
+    loop {
+        parser.skip_whitespace();
+        if parser.is_exhausted() {
+            break;
+        }
 
-            // Look at the first token to decide rule vs at-rule, then rewind so the prelude parse
-            // sees the whole thing.
-            let state = parser.state();
-            let is_at_rule = matches!(parser.next(), Ok(Token::AtKeyword(_)));
-            parser.reset(&state);
+        // Look at the first token to decide rule vs at-rule, then rewind so the prelude parse
+        // sees the whole thing.
+        let state = parser.state();
+        let at_name = match parser.next() {
+            Ok(Token::AtKeyword(name)) => Some(name.to_string()),
+            _ => None,
+        };
+        parser.reset(&state);
 
-            if is_at_rule {
-                skip_at_rule(&mut parser);
+        if let Some(name) = at_name {
+            if name.eq_ignore_ascii_case("media") {
+                // Consume the `@media` token itself, then the prelude up to the block.
+                let _ = parser.next();
+                let list = parser
+                    .parse_until_before(Delimiter::CurlyBracketBlock, |p| {
+                        Ok::<MediaList, ParseError<()>>(parse_media_list(p))
+                    })
+                    .unwrap_or_default();
+
+                match parser.next() {
+                    Ok(Token::CurlyBracketBlock) => {
+                        let mut nested = media.to_vec();
+                        nested.push(list);
+                        // The block is parsed as a rule list. Errors inside must not abort the
+                        // outer sheet, which is why this returns Ok unconditionally.
+                        let _: Result<(), ParseError<()>> = parser.parse_nested_block(|p| {
+                            parse_rules_into(p, sheet, &nested);
+                            Ok(())
+                        });
+                    }
+                    // `@media` with no block: malformed, and already consumed.
+                    _ => {}
+                }
                 continue;
             }
-
+            skip_at_rule(parser);
+            continue;
+        }
+        {
             // Prelude = everything up to the `{`.
             let selectors: Result<Vec<Selector>, ParseError<()>> = parser
                 .parse_until_before(Delimiter::CurlyBracketBlock, |p| Ok(parse_selector_list(p)));
@@ -168,18 +290,126 @@ impl Stylesheet {
 
             if let (Ok(selectors), Ok(declarations)) = (selectors, block) {
                 if !selectors.is_empty() && !declarations.is_empty() {
-                    sheet.rules.push(StyleRule { selectors, declarations });
+                    sheet.rules.push(StyleRule {
+                        selectors,
+                        declarations,
+                        media: media.to_vec(),
+                    });
                 }
             }
         }
-        sheet
+    }
+}
+
+/// Parse a media prelude: `screen and (min-width: 600px), print`.
+///
+/// Token-driven rather than grammar-driven because the prelude is small and the failure mode we
+/// care about is "did not understand it", which every branch can set directly.
+fn parse_media_list(parser: &mut Parser) -> MediaList {
+    let mut list = MediaList::default();
+    let mut cur = MediaQuery {
+        media_type: None,
+        conditions: Vec::new(),
+        negated: false,
+        understood: true,
+    };
+    let mut any_token = false;
+
+    loop {
+        parser.skip_whitespace();
+        let token = match parser.next() {
+            Ok(t) => t.clone(),
+            Err(_) => break,
+        };
+        any_token = true;
+        match token {
+            Token::Comma => {
+                list.queries.push(core::mem::replace(
+                    &mut cur,
+                    MediaQuery {
+                        media_type: None,
+                        conditions: Vec::new(),
+                        negated: false,
+                        understood: true,
+                    },
+                ));
+            }
+            Token::Ident(name) => {
+                let n = name.to_ascii_lowercase();
+                match n.as_str() {
+                    // `only` exists purely to hide the query from CSS2 parsers; it has no effect.
+                    "only" | "and" => {}
+                    "not" => cur.negated = true,
+                    _ => {
+                        if cur.media_type.is_none() {
+                            cur.media_type = Some(n);
+                        } else {
+                            cur.understood = false;
+                        }
+                    }
+                }
+            }
+            Token::ParenthesisBlock => {
+                let parsed = parser.parse_nested_block(|p| {
+                    Ok::<Option<MediaCondition>, ParseError<()>>(parse_media_feature(p))
+                });
+                match parsed {
+                    Ok(Some(c)) => cur.conditions.push(c),
+                    // An unparsable or unsupported feature makes the whole query false, per spec.
+                    _ => cur.understood = false,
+                }
+            }
+            // Anything else in a prelude is something we do not model.
+            _ => cur.understood = false,
+        }
+    }
+
+    if any_token {
+        list.queries.push(cur);
+    }
+    list
+}
+
+/// Parse one `(feature: value)`, already inside the parentheses.
+fn parse_media_feature(parser: &mut Parser) -> Option<MediaCondition> {
+    parser.skip_whitespace();
+    let name = match parser.next() {
+        Ok(Token::Ident(n)) => n.to_ascii_lowercase(),
+        _ => return None,
+    };
+    parser.skip_whitespace();
+    if !matches!(parser.next(), Ok(Token::Colon)) {
+        // A boolean feature like `(color)`. We model none of them, so it is not understood.
+        return None;
+    }
+    parser.skip_whitespace();
+    let px = match parser.next() {
+        Ok(Token::Dimension { value, unit, .. }) => {
+            let v = *value;
+            match unit.to_ascii_lowercase().as_str() {
+                "px" => v,
+                // 1em/1rem is the initial 16px here: media queries resolve em against the INITIAL
+                // font size, never the element's, so there is no cascade dependency to chase.
+                "em" | "rem" => v * 16.0,
+                _ => return None,
+            }
+        }
+        // A bare `0` is legal and unitless.
+        Ok(Token::Number { value, .. }) if *value == 0.0 => 0.0,
+        _ => return None,
+    };
+    match name.as_str() {
+        // `device-width` is the legacy spelling; on a single-window system it is the same number.
+        "min-width" | "min-device-width" => Some(MediaCondition::MinWidth(px)),
+        "max-width" | "max-device-width" => Some(MediaCondition::MaxWidth(px)),
+        _ => None,
     }
 }
 
 /// Consume an at-rule without interpreting it: prelude up to `;` or `{`, then the block if present.
 ///
-/// `@media` etc. are not evaluated yet, but they must be *skipped correctly* — mis-consuming one
-/// would drop every rule that follows.
+/// `@media` is handled properly above; `@import`, `@font-face`, `@supports` and the rest still land
+/// here and must be *skipped correctly* — mis-consuming one would drop every rule that follows.
 fn skip_at_rule(parser: &mut Parser) {
     let _: Result<(), ParseError<()>> = parser.parse_until_before(
         Delimiter::Semicolon | Delimiter::CurlyBracketBlock,
@@ -555,13 +785,20 @@ mod tests {
 
     #[test]
     fn at_rules_are_skipped_without_eating_what_follows() {
-        // The rule AFTER the @media block must survive — that is the whole point.
+        // Updated when @media stopped being skipped and started being EVALUATED: this used to
+        // assert the `p` inside the block was dropped. The property still being tested — and the
+        // one that mattered all along — is that the rule AFTER an at-rule survives it.
         let s = Stylesheet::parse("@media screen { p { color: red } } h1 { color: blue }");
-        assert_eq!(s.rules.len(), 1);
-        assert_eq!(s.rules[0].selectors[0].parts[0].1.tag.as_deref(), Some("h1"));
+        assert_eq!(s.rules.len(), 2);
+        assert_eq!(s.rules[1].selectors[0].parts[0].1.tag.as_deref(), Some("h1"));
 
         let s = Stylesheet::parse("@import url(x.css); h1 { color: blue }");
         assert_eq!(s.rules.len(), 1, "a ;-terminated at-rule must not swallow the next rule");
+
+        // An at-rule we still skip wholesale must behave as it always did.
+        let s = Stylesheet::parse("@supports (display: grid) { p { color: red } } h1 { color: blue }");
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].selectors[0].parts[0].1.tag.as_deref(), Some("h1"));
     }
 
     #[test]
@@ -590,5 +827,119 @@ mod tests {
         let r = one("p { margin: 10px 20px; font-family: \"Times New Roman\", serif }");
         assert_eq!(r.declarations[0].value, "10px 20px");
         assert!(r.declarations[1].value.contains("Times New Roman"));
+    }
+
+    // ---- @media ---------------------------------------------------------------------------
+
+    fn wide() -> MediaContext { MediaContext { width_px: 1200.0 } }
+    fn narrow() -> MediaContext { MediaContext { width_px: 400.0 } }
+
+    /// The regression this whole feature exists for: rules inside `@media` used to be DROPPED, so
+    /// a page whose layout lives in media blocks rendered unstyled.
+    #[test]
+    fn media_rules_are_kept_not_skipped() {
+        let s = Stylesheet::parse("@media screen { p { color: red } }");
+        assert_eq!(s.rules.len(), 1);
+        assert!(s.rules[0].applies(&wide()));
+    }
+
+    #[test]
+    fn min_width_gates_on_the_viewport() {
+        let s = Stylesheet::parse("@media (min-width: 600px) { p { color: red } }");
+        assert!(s.rules[0].applies(&wide()));
+        assert!(!s.rules[0].applies(&narrow()));
+    }
+
+    #[test]
+    fn max_width_gates_the_other_way() {
+        let s = Stylesheet::parse("@media (max-width: 600px) { p { color: red } }");
+        assert!(!s.rules[0].applies(&wide()));
+        assert!(s.rules[0].applies(&narrow()));
+    }
+
+    #[test]
+    fn and_requires_both() {
+        let s = Stylesheet::parse(
+            "@media screen and (min-width: 300px) and (max-width: 500px) { p { color: red } }",
+        );
+        assert!(s.rules[0].applies(&narrow()));
+        assert!(!s.rules[0].applies(&wide()));
+    }
+
+    /// Commas are OR, and getting this backwards silently halves what a page applies.
+    #[test]
+    fn comma_is_or() {
+        let s = Stylesheet::parse("@media (max-width: 100px), (min-width: 1000px) { p { color: red } }");
+        assert!(s.rules[0].applies(&wide()));
+        assert!(!s.rules[0].applies(&narrow()));
+    }
+
+    #[test]
+    fn print_never_matches_a_screen() {
+        let s = Stylesheet::parse("@media print { p { color: red } }");
+        assert!(!s.rules[0].applies(&wide()));
+    }
+
+    #[test]
+    fn only_screen_is_the_same_as_screen() {
+        let s = Stylesheet::parse("@media only screen and (min-width: 600px) { p { color: red } }");
+        assert!(s.rules[0].applies(&wide()));
+    }
+
+    #[test]
+    fn not_inverts() {
+        let s = Stylesheet::parse("@media not screen { p { color: red } }");
+        assert!(!s.rules[0].applies(&wide()));
+    }
+
+    /// Per spec an unknown feature makes the query false. The safe direction too: matching it would
+    /// apply a sheet meant for hardware we cannot detect.
+    #[test]
+    fn unknown_features_never_match() {
+        let s = Stylesheet::parse("@media (orientation: landscape) { p { color: red } }");
+        assert_eq!(s.rules.len(), 1);
+        assert!(!s.rules[0].applies(&wide()));
+    }
+
+    #[test]
+    fn em_resolves_against_the_initial_font_size() {
+        // 40em = 640px.
+        let s = Stylesheet::parse("@media (min-width: 40em) { p { color: red } }");
+        assert!(s.rules[0].applies(&MediaContext { width_px: 700.0 }));
+        assert!(!s.rules[0].applies(&MediaContext { width_px: 600.0 }));
+    }
+
+    #[test]
+    fn nested_media_requires_both() {
+        let s = Stylesheet::parse(
+            "@media (min-width: 300px) { @media (max-width: 500px) { p { color: red } } }",
+        );
+        assert_eq!(s.rules[0].media.len(), 2);
+        assert!(s.rules[0].applies(&narrow()));
+        assert!(!s.rules[0].applies(&wide()));
+    }
+
+    /// The block must be consumed exactly, or everything after it is read as garbage — the same
+    /// failure the old `skip_at_rule` was written to avoid.
+    #[test]
+    fn rules_after_a_media_block_still_parse() {
+        let s = Stylesheet::parse("@media screen { p { color: red } } h1 { color: blue }");
+        assert_eq!(s.rules.len(), 2);
+        assert!(s.rules[1].media.is_empty());
+    }
+
+    #[test]
+    fn a_top_level_rule_has_no_media_and_always_applies() {
+        let s = Stylesheet::parse("p { color: red }");
+        assert!(s.rules[0].media.is_empty());
+        assert!(s.rules[0].applies(&narrow()));
+    }
+
+    /// Other at-rules must still be skipped whole, not misread as media.
+    #[test]
+    fn font_face_is_still_skipped() {
+        let s = Stylesheet::parse("@font-face { font-family: x } p { color: red }");
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].selectors[0].parts[0].1.tag.as_deref(), Some("p"));
     }
 }
