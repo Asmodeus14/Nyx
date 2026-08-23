@@ -20,6 +20,11 @@ tests/helloc/bare
 
 tests/helloc/smoke
 tests/helloc/cpptest
+# A literal `~` directory. `git clone ... ~/foo` run from a shell that does NOT expand `~`
+# (the Windows session shell) creates one INSIDE the repo, and `git add -A` then commits it as a
+# stray gitlink. Ignored so that cannot happen again.
+~/
+
 tests/helloc/cxxtest
 tests/helloc/eventloop
 tests/helloc/nostdlib_rt.o
