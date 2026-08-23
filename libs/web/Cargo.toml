@@ -19,3 +19,10 @@ html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 # Servo's CSS tokenizer — handles strings, escapes, comments, at-rules and error recovery.
 cssparser = "0.34"
+# JavaScript. Verified to build for x86_64-unknown-nyx in the Phase 0 spike.
+#
+# `default-features = false` on purpose: boa's defaults include `intl`, which drags in ICU and its
+# locale data. The browser binary is already 3.4 MB and Nyx has no OOM killer, so paying tens of MB
+# for Intl.* before a single page script runs is the wrong trade. Enable it the day something
+# actually needs locale-aware formatting.
+boa_engine = { version = "0.19", default-features = false }

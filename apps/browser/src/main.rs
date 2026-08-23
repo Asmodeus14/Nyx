@@ -471,6 +471,7 @@ impl Browser {
                 self.scroll = 0;
 
                 self.dom = Dom::parse(&self.html);
+                self.run_scripts();
                 self.title = self.dom.title().unwrap_or_else(|| self.current.clone());
                 self.loader.base = Some(resp.url.clone());
 
@@ -596,6 +597,33 @@ impl Browser {
             }
         }
         sources
+    }
+
+    /// Run the page's inline scripts, then adopt whatever DOM they left behind.
+    ///
+    /// ★ Called BEFORE the first cascade, because a script that rewrites text or flips a class
+    /// changes what the selectors match. Cascading first would style the pre-script document and
+    /// then paint the post-script one, which shows up as a page that is styled almost right.
+    ///
+    /// `title` is re-read by the caller afterwards for the same reason — a script may set it.
+    ///
+    /// Errors are logged to the serial console, never surfaced as the modal error dialog: a page
+    /// whose analytics script throws is not a page that failed to load, and a browser that says
+    /// otherwise trains you to dismiss the dialog that matters.
+    fn run_scripts(&mut self) {
+        // The DOM has to be moved out and back: a script can restructure the tree, so nyx_web
+        // takes it by value rather than holding a borrow across arbitrary JS.
+        let dom = core::mem::replace(&mut self.dom, Dom::parse(""));
+        let outcome = nyx_web::js::run(dom);
+        self.dom = outcome.dom;
+        if outcome.ran_any {
+            for line in &outcome.console {
+                eprintln!("[js] {}", line);
+            }
+            for e in &outcome.errors {
+                eprintln!("[js] uncaught: {}", e);
+            }
+        }
     }
 
     /// Re-run the cascade over whatever CSS has arrived so far.
