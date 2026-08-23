@@ -23,21 +23,30 @@ unsafe fn nyx_open(path: &str, flags: usize) -> isize {
     unsafe { raw::sys3(raw::SYS_OPEN, path.as_ptr() as usize, path.len(), flags) }
 }
 
-/// **Path shape.**
+/// **Path shape.** ★ Linux-numbered path syscalls take a NUL-terminated C string. Use `cpath`.
 ///
-/// Every path syscall here is `(ptr, len)` — a slice, not a NUL-terminated C string. That is Nyx's
-/// convention: `open(2)` has always worked this way, and Phase 1 deliberately followed it for the
-/// whole new fs block rather than introducing a second convention alongside it. Converting the
-/// kernel to C strings is a single atomic change owed to the musl port.
+/// This block used to pass `(ptr, len)` to stat/access/chdir/mkdir/rename/symlink/unlink/rmdir,
+/// matching what the kernel then implemented, and noted that "converting the kernel to C strings
+/// is a single atomic change owed to the musl port". That debt came due: musl sends the real
+/// shape, so the kernel read `stat`'s statbuf pointer as a path length and returned EFAULT, and
+/// read `mkdir`'s 0o777 mode as a 511-byte path.
 ///
-/// This is a divergence from Linux and it is what a libc collides with first, so the `open` row
-/// carries it as a visible note rather than leaving it to be rediscovered.
+/// The lesson is about this harness, not the kernel. A conformance probe that adopts the
+/// implementation's convention cannot detect that the convention is wrong — these rows reported
+/// pass=39 the whole time. Probes here must encode what LINUX specifies, so a divergence shows up
+/// as a failing row rather than as a matched pair of mistakes. Where Nyx genuinely diverges on
+/// purpose (`open`, number 2, which the vendored musl cannot reach because it has no `__NR_open`)
+/// the row says so in its note.
 ///
 /// (Before these calls existed, the probes deliberately passed pointers in every slot *either*
 /// convention could dereference, because a length landing in a pointer slot against a Linux-shaped
 /// implementation would have read a string from address ~40 — and `is_valid_user_ptr` only
-/// range-checks, so a kernel-mode fault there panics the machine. Now that the kernel side is
-/// written rather than guessed at, the calls match it exactly.)
+/// range-checks, so a kernel-mode fault there panics the machine.)
+fn cpath(p: &str) -> String {
+    let mut s = String::from(p);
+    s.push('\0');
+    s
+}
 
 pub fn probe_readonly(base: Baseline, rows: &mut Vec<Row>) {
     // --- the oracle ------------------------------------------------------------------------
@@ -133,7 +142,8 @@ pub fn probe_readonly(base: Baseline, rows: &mut Vec<Row>) {
     announce("stat");
     let mut statbuf = [0u8; 144];
     let sb = statbuf.as_mut_ptr() as usize;
-    let r = unsafe { raw::sys3(raw::SYS_STAT, ASSET.as_ptr() as usize, ASSET.len(), sb) };
+    let c_asset = cpath(ASSET);
+    let r = unsafe { raw::sys2(raw::SYS_STAT, c_asset.as_ptr() as usize, sb) };
     let mut row = Row::new(4, "stat");
     row.raw = render_ret(r);
     row.std_api = render_std(&std::fs::metadata(ASSET));
@@ -147,9 +157,9 @@ pub fn probe_readonly(base: Baseline, rows: &mut Vec<Row>) {
             raw::SYS_NEWFSTATAT,
             (-100isize) as usize, // AT_FDCWD — accepted and ignored until Process has a cwd
             // (Phase 4), but it is the value a libc actually passes, so it is what gets measured.
-            ASSET.as_ptr() as usize,
-            ASSET.len(),
+            c_asset.as_ptr() as usize,
             statbuf.as_mut_ptr() as usize,
+            0, // flags: not AT_SYMLINK_NOFOLLOW — the kernel ignores them either way
         )
     };
     let mut row = Row::new(262, "newfstatat");
@@ -185,7 +195,7 @@ pub fn probe_readonly(base: Baseline, rows: &mut Vec<Row>) {
 
     // --- access / dup / dup2 / fcntl / pipe2 -----------------------------------------------
     announce("access");
-    let r = unsafe { raw::sys3(raw::SYS_ACCESS, ASSET.as_ptr() as usize, ASSET.len(), 0) };
+    let r = unsafe { raw::sys2(raw::SYS_ACCESS, cpath(ASSET).as_ptr() as usize, 0) };
     let mut row = Row::new(21, "access");
     row.raw = render_ret(r);
     row.std_api = format!("exists={}", std::path::Path::new(ASSET).exists());
@@ -254,8 +264,7 @@ pub fn probe_cwd(base: Baseline, rows: &mut Vec<Row>) {
     rows.push(row);
 
     announce("chdir");
-    let target = KNOWN_DIR;
-    let r = unsafe { raw::sys2(raw::SYS_CHDIR, target.as_ptr() as usize, target.len()) };
+    let r = unsafe { raw::sys1(raw::SYS_CHDIR, cpath(KNOWN_DIR).as_ptr() as usize) };
     let mut row = Row::new(80, "chdir");
     row.raw = render_ret(r);
     row.verdict = simple(base, r);
@@ -267,7 +276,7 @@ pub fn probe_cwd(base: Baseline, rows: &mut Vec<Row>) {
 /// `access(2)` rather than `open(2)`: a symlink or a directory is not necessarily openable, and
 /// "could not open it" is not the same claim as "it is not there".
 fn exists(path: &str) -> bool {
-    unsafe { raw::sys3(raw::SYS_ACCESS, path.as_ptr() as usize, path.len(), 0) >= 0 }
+    unsafe { raw::sys2(raw::SYS_ACCESS, cpath(path).as_ptr() as usize, 0) >= 0 }
 }
 
 pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
@@ -303,7 +312,7 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
     rows.push(row);
 
     announce("mkdir");
-    let r = unsafe { raw::sys3(raw::SYS_MKDIR, dir.as_ptr() as usize, dir.len(), 0o755) };
+    let r = unsafe { raw::sys2(raw::SYS_MKDIR, cpath(&dir).as_ptr() as usize, 0o755) };
     let made = exists(&dir);
     let mut row = Row::new(83, "mkdir");
     row.raw = render_ret(r);
@@ -373,7 +382,7 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
     // path, so `resolve_path` could be a no-op and the whole grid would still be green.
     announce("relative open (after chdir)");
     let mut row = Row::new(2, "relative open");
-    let cd = unsafe { raw::sys2(raw::SYS_CHDIR, SCRATCH.as_ptr() as usize, SCRATCH.len()) };
+    let cd = unsafe { raw::sys1(raw::SYS_CHDIR, cpath(SCRATCH).as_ptr() as usize) };
     if cd < 0 {
         row.raw = format!("chdir={}", cd as i32);
         row.verdict = Verdict::Fail;
@@ -390,18 +399,16 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
         // ★ Restore cwd unconditionally. Leaving it inside SCRATCH would make every later probe
         // resolve relative paths somewhere unintended, and the cleanup below would miss its
         // targets — one row's side effect quietly corrupting the rest of the run.
-        unsafe { raw::sys2(raw::SYS_CHDIR, "/".as_ptr() as usize, 1) };
+        unsafe { raw::sys1(raw::SYS_CHDIR, "/\0".as_ptr() as usize) };
     }
     rows.push(row);
 
     announce("rename");
     let r = unsafe {
-        raw::sys4(
+        raw::sys2(
             raw::SYS_RENAME,
-            file.as_ptr() as usize,
-            file.len(),
-            renamed.as_ptr() as usize,
-            renamed.len(),
+            cpath(&file).as_ptr() as usize,
+            cpath(&renamed).as_ptr() as usize,
         )
     };
     // Verified with access(2), the same way mkdir/symlink/unlink are checked. It used to use
@@ -439,12 +446,10 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
 
     announce("symlink");
     let r = unsafe {
-        raw::sys4(
+        raw::sys2(
             raw::SYS_SYMLINK,
-            renamed.as_ptr() as usize,
-            renamed.len(),
-            link.as_ptr() as usize,
-            link.len(),
+            cpath(&renamed).as_ptr() as usize,
+            cpath(&link).as_ptr() as usize,
         )
     };
     let linked = exists(&link);
@@ -462,7 +467,7 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
     // Target is `renamed`, not `file` — after a working rename, `file` no longer exists and
     // unlinking it would measure ENOENT rather than unlink.
     announce("unlink");
-    let r = unsafe { raw::sys2(raw::SYS_UNLINK, renamed.as_ptr() as usize, renamed.len()) };
+    let r = unsafe { raw::sys1(raw::SYS_UNLINK, cpath(&renamed).as_ptr() as usize) };
     let still_there = exists(&renamed);
     let mut row = Row::new(87, "unlink");
     row.raw = render_ret(r);
@@ -478,7 +483,7 @@ pub fn probe_destructive(base: Baseline, rows: &mut Vec<Row>) {
     rows.push(row);
 
     announce("rmdir");
-    let r = unsafe { raw::sys2(raw::SYS_RMDIR, dir.as_ptr() as usize, dir.len()) };
+    let r = unsafe { raw::sys1(raw::SYS_RMDIR, cpath(&dir).as_ptr() as usize) };
     let gone = !exists(&dir);
     let mut row = Row::new(84, "rmdir");
     row.raw = render_ret(r);

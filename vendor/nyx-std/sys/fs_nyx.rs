@@ -79,6 +79,9 @@ unsafe fn sys3(n: usize, a1: usize, a2: usize, a3: usize) -> isize {
     ret
 }
 
+// Unused since the path syscalls moved to C strings (a Linux path call takes at most two
+// pointers). Kept because the next Linux-shaped 4-argument call will want it back.
+#[allow(dead_code)]
 #[inline]
 unsafe fn sys4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
     let ret: isize;
@@ -103,10 +106,34 @@ fn check(ret: isize) -> io::Result<usize> {
     if ret < 0 { Err(io::Error::from_raw_os_error((-ret) as i32)) } else { Ok(ret as usize) }
 }
 
-/// Borrow a `Path` as the UTF-8 slice the kernel expects.
+/// Borrow a `Path` as a UTF-8 slice. Only `open`/`readdir` want this now — see `path_cstr`.
 fn path_str(p: &Path) -> io::Result<&str> {
     p.to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8"))
+}
+
+/// A NUL-terminated copy of `p`, for the Linux-numbered path syscalls.
+///
+/// stat/lstat/access/mkdir/rmdir/unlink/rename/symlink are Linux syscall NUMBERS, so they must
+/// take Linux's ARGUMENTS: a C string, with no length. They previously got `(ptr, len)`, which
+/// shifted every later argument by one — `stat`'s statbuf landed where the kernel read a length,
+/// and mkdir's 0o777 mode was read as a 511-byte path. Nyx's own std and the kernel agreed with
+/// each other, so everything here passed while musl (which sends the real shape) got EFAULT.
+///
+/// `open` keeps `(ptr, len, flags)`: it is Nyx-native, number 2, and the vendored musl has no
+/// `__NR_open`, so no C library can reach it.
+fn path_cstr(p: &Path) -> io::Result<crate::vec::Vec<u8>> {
+    let s = path_str(p)?;
+    // An interior NUL makes the kernel act on a SHORTER path than the caller wrote. Truncating
+    // silently is the poison-NUL bug: a name checked as "/safe/x\0/../../etc" is used as
+    // "/safe/x". Reject it — a path with a NUL in it was never valid anyway.
+    if s.as_bytes().contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"));
+    }
+    let mut v = crate::vec::Vec::with_capacity(s.len() + 1);
+    v.extend_from_slice(s.as_bytes());
+    v.push(0);
+    Ok(v)
 }
 
 pub struct File {
@@ -510,8 +537,8 @@ impl DirBuilder {
     }
 
     pub fn mkdir(&self, p: &Path) -> io::Result<()> {
-        let s = path_str(p)?;
-        check(unsafe { sys3(SYS_MKDIR, s.as_ptr() as usize, s.len(), 0o777) })?;
+        let s = path_cstr(p)?;
+        check(unsafe { sys3(SYS_MKDIR, s.as_ptr() as usize, 0o777, 0) })?;
         Ok(())
     }
 }
@@ -564,17 +591,15 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 }
 
 pub fn unlink(p: &Path) -> io::Result<()> {
-    let s = path_str(p)?;
-    check(unsafe { sys3(SYS_UNLINK, s.as_ptr() as usize, s.len(), 0) })?;
+    let s = path_cstr(p)?;
+    check(unsafe { sys3(SYS_UNLINK, s.as_ptr() as usize, 0, 0) })?;
     Ok(())
 }
 
 pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
-    let a = path_str(old)?;
-    let b = path_str(new)?;
-    check(unsafe {
-        sys4(SYS_RENAME, a.as_ptr() as usize, a.len(), b.as_ptr() as usize, b.len())
-    })?;
+    let a = path_cstr(old)?;
+    let b = path_cstr(new)?;
+    check(unsafe { sys3(SYS_RENAME, a.as_ptr() as usize, b.as_ptr() as usize, 0) })?;
     Ok(())
 }
 
@@ -594,8 +619,8 @@ pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
 }
 
 pub fn rmdir(p: &Path) -> io::Result<()> {
-    let s = path_str(p)?;
-    check(unsafe { sys3(SYS_RMDIR, s.as_ptr() as usize, s.len(), 0) })?;
+    let s = path_cstr(p)?;
+    check(unsafe { sys3(SYS_RMDIR, s.as_ptr() as usize, 0, 0) })?;
     Ok(())
 }
 
@@ -613,10 +638,10 @@ pub fn remove_dir_all(path: &Path) -> io::Result<()> {
 }
 
 pub fn exists(path: &Path) -> io::Result<bool> {
-    let s = path_str(path)?;
+    let s = path_cstr(path)?;
     // access(2), not open(2). Opening to test existence used to report `false` for directories and
     // left a descriptor to be reclaimed for every probe.
-    Ok(unsafe { sys3(SYS_ACCESS, s.as_ptr() as usize, s.len(), 0) } >= 0)
+    Ok(unsafe { sys3(SYS_ACCESS, s.as_ptr() as usize, 0, 0) } >= 0)
 }
 
 /// No `readlink(2)` in the kernel yet: symlinks can be *created* (lwext4 does it) but not read back.
@@ -626,11 +651,9 @@ pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
-    let target = path_str(original)?;
-    let path = path_str(link)?;
-    check(unsafe {
-        sys4(SYS_SYMLINK, target.as_ptr() as usize, target.len(), path.as_ptr() as usize, path.len())
-    })?;
+    let target = path_cstr(original)?;
+    let path = path_cstr(link)?;
+    check(unsafe { sys3(SYS_SYMLINK, target.as_ptr() as usize, path.as_ptr() as usize, 0) })?;
     Ok(())
 }
 
@@ -640,11 +663,9 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
 }
 
 pub fn stat(p: &Path) -> io::Result<FileAttr> {
-    let s = path_str(p)?;
+    let s = path_cstr(p)?;
     let mut buf = [0u8; STAT_SIZE];
-    check(unsafe {
-        sys3(SYS_STAT, s.as_ptr() as usize, s.len(), buf.as_mut_ptr() as usize)
-    })?;
+    check(unsafe { sys3(SYS_STAT, s.as_ptr() as usize, buf.as_mut_ptr() as usize, 0) })?;
     Ok(FileAttr::from_stat(&buf))
 }
 

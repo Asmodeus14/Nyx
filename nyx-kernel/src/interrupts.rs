@@ -78,42 +78,44 @@ use crate::process::FD_MAX;
 const STAT_SIZE: usize = 144;
 const DIRENT_HEADER: usize = 19; // u64 d_ino + i64 d_off + u16 d_reclen + u8 d_type
 
-/// Borrow a userspace path argument as a `&str`.
-///
-/// Nyx passes paths as `(ptr, len)` rather than as NUL-terminated C strings — see the Phase 1 block
-/// in the dispatcher for why that convention is kept for now. The `PATH_MAX` cap is not cosmetic:
-/// `is_valid_user_ptr` only range-checks and cannot tell a mapped page from an unmapped one, so
-/// bounding the length is what keeps a bogus `len` from walking into unmapped memory and taking the
-/// machine down with a kernel-mode fault.
-///
-/// # Safety
-/// The caller must not hold the returned borrow across anything that could unmap the pages.
-unsafe fn user_path(ptr: u64, len: u64) -> Option<alloc::string::String> {
-    const PATH_MAX: u64 = 4096;
-    if len == 0 || len > PATH_MAX { return None; }
-    if !is_valid_user_ptr(ptr as *const u8, len as usize) { return None; }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    let s = core::str::from_utf8(bytes).ok()?;
-    // ★ Relative paths are resolved HERE — the single choke point every path syscall funnels
-    // through — rather than in individual arms. Resolution used to live only in `open`, so a
-    // relative path worked for open() and silently failed for stat/mkdir/unlink/rename. That
-    // inconsistency is worse for a libc than either extreme: whether a path works depends on which
-    // call you happen to make, which is undebuggable from the outside.
-    //
-    // Returns an owned String because the resolved path is built, not borrowed. That is also why
-    // callers take `&path` — the borrow has to outlive nothing.
-    Some(unsafe { resolve_path(s) })
-}
-
 /// Read a NUL-terminated C string from userspace, resolved like any other path.
 ///
-/// This is the primitive a libc needs: musl passes C strings, not `(ptr, len)` pairs.
+/// ★★★ This is the ONLY way a Linux-numbered path syscall may read its path argument.
+///
+/// There used to be a sibling, `user_path(ptr, len)`, reflecting Nyx's native `(ptr, len)`
+/// convention, and the Linux-numbered arms used it. That is not a stylistic difference — it
+/// silently changes what every LATER argument means. `stat(path, statbuf)` became
+/// `stat(path, len, statbuf)`, so musl's `statbuf` pointer was read as a length and every
+/// `stat` from a C program returned EFAULT; `mkdir(path, mode)` read 0o777 as a 511-byte path.
+/// The failure surfaces as `std::filesystem` reporting "Bad address" for operations that never
+/// touched a bad address, which points the investigation at the filesystem instead of the ABI.
+///
+/// The two shapes cannot be told apart at runtime — for mkdir, a mode of 0o777 and a length of
+/// 511 are the same 64 bits — so there is no compatibility shim, only one convention. Nyx's own
+/// std was moved to this one. `open` (arm 2) is the single deliberate exception; see the note there.
+///
+/// ★ Relative paths are resolved HERE — the single choke point every path syscall funnels through
+/// — rather than in individual arms. Resolution used to live only in `open`, so a relative path
+/// worked for open() and silently failed for stat/mkdir/unlink/rename. Whether a path works
+/// depending on which call you happen to make is undebuggable from the outside.
+///
+/// Returns an owned String because the resolved path is built, not borrowed.
 ///
 /// ★ Walking to a NUL is precisely the operation that can run off the end of a mapping, and a
 /// kernel-mode read of an unmapped user address panics the MACHINE. So it is bounded by PATH_MAX
 /// *and* re-checks that the page is present every time it crosses a page boundary — a string
 /// starting three bytes before the end of a mapped page is otherwise a one-instruction machine kill.
 unsafe fn user_cstr(ptr: u64) -> Option<alloc::string::String> {
+    let raw = unsafe { user_cstr_raw(ptr) }?;
+    Some(unsafe { resolve_path(&raw) })
+}
+
+/// The same read, but WITHOUT cwd resolution.
+///
+/// Only the `*at()` calls want this. A dirfd-relative path must be joined to the DIRECTORY'S path,
+/// so resolving it against the cwd first would silently produce a valid-looking path to the wrong
+/// file — the failure mode that made `openat` refuse a real dirfd outright until now.
+unsafe fn user_cstr_raw(ptr: u64) -> Option<alloc::string::String> {
     const PATH_MAX: usize = 4096;
     if ptr == 0 { return None; }
     let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64);
@@ -125,12 +127,63 @@ unsafe fn user_cstr(ptr: u64) -> Option<alloc::string::String> {
         }
         let b = unsafe { (a as *const u8).read_volatile() };
         if b == 0 {
-            let s = core::str::from_utf8(&buf).ok()?;
-            return Some(unsafe { resolve_path(s) });
+            return Some(alloc::string::String::from(core::str::from_utf8(&buf).ok()?));
         }
         buf.push(b);
     }
     None // no terminator within PATH_MAX: refuse rather than keep walking
+}
+
+/// `AT_FDCWD`, as every `*at()` syscall spells it.
+const AT_FDCWD: i64 = -100;
+
+/// Resolve an `*at()` pair `(dirfd, path)` to one absolute path.
+///
+/// POSIX order, and the order matters: an ABSOLUTE path ignores `dirfd` entirely (even a nonsense
+/// one), `AT_FDCWD` means resolve against the cwd, and only a relative path with a real `dirfd`
+/// consults the descriptor. Checking `dirfd` first would make `openat(-1, "/etc/x")` fail, which
+/// is legal and which libc++ relies on.
+///
+/// Returns `None` if `dirfd` names no open file — the caller turns that into EBADF, not EFAULT.
+unsafe fn resolve_at(dirfd: i64, raw: &str) -> Option<alloc::string::String> {
+    if raw.starts_with('/') || dirfd == AT_FDCWD {
+        return Some(unsafe { resolve_path(raw) });
+    }
+    // ★ Clone the directory's path out of the fd table BEFORE touching anything else: the same
+    // rule fstat documents, since holding a borrow of `tasks` across a VFS call is how the Vec
+    // gets reallocated under a live reference.
+    let percpu = crate::percpu::current();
+    let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if curr_idx >= percpu.scheduler.tasks.len() { return None; }
+    if dirfd < 0 || dirfd as usize >= FD_MAX { return None; }
+    let dir = match &percpu.scheduler.tasks[curr_idx].fd_table[dirfd as usize] {
+        Some(FileDescriptor::File(f)) => f.path.clone(),
+        _ => return None, // a pipe or socket is not a directory
+    };
+    let mut joined = dir;
+    if !joined.ends_with('/') { joined.push('/'); }
+    joined.push_str(raw);
+    // Normalise here rather than leaning on resolve_path: its absolute fast-path returns the
+    // string untouched, so "/a/b/../c" would survive as-is.
+    Some(normalize_abs(&joined))
+}
+
+/// Collapse `.`, `..` and empty components in an already-absolute path.
+fn normalize_abs(path: &str) -> alloc::string::String {
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => { parts.pop(); } // `..` at the root pops nothing: / is its own parent
+            other => parts.push(other),
+        }
+    }
+    let mut out = alloc::string::String::from("/");
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 { out.push('/'); }
+        out.push_str(p);
+    }
+    out
 }
 
 /// Write an x86_64 `struct stat` into userspace.
@@ -1246,14 +1299,15 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
 
             let path_slice = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
             if let Ok(raw_path) = core::str::from_utf8(path_slice) {
-                // Phase 4: relative paths resolve against the task's cwd. NOTE: open is the only
-                // path syscall doing this today — stat/mkdir/unlink and friends still require an
-                // absolute path. Inconsistent, and named here rather than left to be discovered,
-                // because a libc port hits it immediately.
+                // Phase 4: relative paths resolve against the task's cwd, as they now do in every
+                // path syscall (user_cstr calls resolve_path too).
                 let resolved = unsafe { resolve_path(raw_path) };
                 let path = resolved.as_str();
-                // B-γ.2: honor Linux-style open flags in arg3 (previously ignored). Nyx's open takes
-                // (ptr, len, flags) — the path stays a (ptr,len) slice, not a C string.
+                // ★ This is the ONE surviving path syscall on Nyx's native (ptr, len, flags) shape,
+                // and it is safe only because the vendored musl has no __NR_open — arch/x86_64
+                // omits number 2 deliberately, so musl lowers open() to openat (arm 257) and can
+                // never reach here. Restore that line to musl's table and this arm silently reads
+                // a `struct stat`-shaped pointer as a length. Everything else moved to user_cstr.
                 const O_CREAT: u64 = 0x40;
                 const O_TRUNC: u64 = 0x200;
                 let flags = arg3;
@@ -1685,13 +1739,20 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
         },
 
-        4 => { // SYS_STAT(path_ptr, path_len, statbuf)
-            let path = match unsafe { user_path(arg1, arg2) } {
+        4 | 6 => { // SYS_STAT / SYS_LSTAT(path_cstr, statbuf)
+            // lstat is an ALIAS, not an implementation: the VFS resolves symlinks down in the
+            // driver and exposes no no-follow variant, so there is nothing to distinguish. The
+            // alternative — ENOSYS — makes std::filesystem unusable, because remove_all and
+            // directory_iterator reach for symlink_status on every entry they touch. That is the
+            // same choice arm 262 already makes by ignoring AT_SYMLINK_NOFOLLOW, so aliasing here
+            // is consistency rather than a new lie. It IS a lie for a tree containing symlinks:
+            // a walker relying on not following one will follow it.
+            let path = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
             let path = path.as_str();
-            let buf = arg3 as *mut u8;
+            let buf = arg2 as *mut u8;
             if !is_valid_user_ptr(buf, STAT_SIZE) { frame.rax = EFAULT as u64; return; }
             match crate::vfs::VFS.stat(path) {
                 Some(st) => { unsafe { write_stat(buf, &st) }; frame.rax = 0; }
@@ -1731,17 +1792,22 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
         },
 
-        262 => { // SYS_NEWFSTATAT(dirfd, path_ptr, path_len, statbuf)
-            // `dirfd` is accepted and ignored: Process has no cwd yet (Phase 4), so every path is
-            // treated as absolute. AT_FDCWD with an absolute path — which is what a libc emits for
-            // `stat("/x")` — is therefore already correct; a relative path silently resolves from
-            // the root, which is the honest limit of this until Phase 4 lands.
-            let path = match unsafe { user_path(arg2, arg3) } {
+        262 => { // SYS_NEWFSTATAT(dirfd, path_cstr, statbuf, flags)
+            // `dirfd` is now honoured via resolve_at. It used to be accepted and IGNORED, which
+            // meant a relative path resolved against the cwd instead of the named directory —
+            // stat succeeding on the wrong file, which is worse than failing.
+            // AT_SYMLINK_NOFOLLOW in arg4 is still ignored; the VFS resolves links in the driver
+            // and has no no-follow variant (same limitation as the lstat alias on arm 6).
+            let raw = match unsafe { user_cstr_raw(arg2) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = match unsafe { resolve_at(arg1 as i64, &raw) } {
+                Some(p) => p,
+                None => { frame.rax = EBADF as u64; return; }
+            };
             let path = path.as_str();
-            let buf = arg4 as *mut u8;
+            let buf = arg3 as *mut u8;
             if !is_valid_user_ptr(buf, STAT_SIZE) { frame.rax = EFAULT as u64; return; }
             match crate::vfs::VFS.stat(path) {
                 Some(st) => { unsafe { write_stat(buf, &st) }; frame.rax = 0; }
@@ -1817,10 +1883,10 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = written as u64;
         },
 
-        21 => { // SYS_ACCESS(path_ptr, path_len, mode)
+        21 => { // SYS_ACCESS(path_cstr, mode)
             // Nyx has no permission model, so this answers the only question it can answer
             // truthfully: does the path exist? R_OK/W_OK/X_OK all resolve to that.
-            let path = match unsafe { user_path(arg1, arg2) } {
+            let path = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
@@ -1886,8 +1952,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
         },
 
-        83 => { // SYS_MKDIR(path_ptr, path_len, mode)
-            let path = match unsafe { user_path(arg1, arg2) } {
+        83 => { // SYS_MKDIR(path_cstr, mode)
+            let path = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
@@ -1898,8 +1964,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = if crate::vfs::VFS.create_dir(path) { 0 } else { EACCES as u64 };
         },
 
-        84 => { // SYS_RMDIR(path_ptr, path_len)
-            let path = match unsafe { user_path(arg1, arg2) } {
+        84 => { // SYS_RMDIR(path_cstr)
+            let path = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
@@ -1914,8 +1980,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = if crate::vfs::VFS.remove_dir(path) { 0 } else { ENOTEMPTY as u64 };
         },
 
-        87 => { // SYS_UNLINK(path_ptr, path_len)
-            let path = match unsafe { user_path(arg1, arg2) } {
+        87 => { // SYS_UNLINK(path_cstr)
+            let path = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
@@ -1930,13 +1996,42 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = if crate::vfs::VFS.delete_file(path) { 0 } else { EACCES as u64 };
         },
 
-        82 => { // SYS_RENAME(old_ptr, old_len, new_ptr, new_len)
-            let from = match unsafe { user_path(arg1, arg2) } {
+        263 => { // SYS_UNLINKAT(dirfd, path_cstr, flags)
+            // The only remover std::filesystem::remove_all uses. Its absence is why remove_all
+            // reported success-shaped failure ("directory still exists"): it walks a tree with
+            // openat + unlinkat and has no unlink/rmdir fallback path.
+            const AT_REMOVEDIR: u64 = 0x200;
+            let raw = match unsafe { user_cstr_raw(arg2) } {
+                Some(p) => p,
+                None => { frame.rax = EFAULT as u64; return; }
+            };
+            let path = match unsafe { resolve_at(arg1 as i64, &raw) } {
+                Some(p) => p,
+                None => { frame.rax = EBADF as u64; return; }
+            };
+            let path = path.as_str();
+            let st = match crate::vfs::VFS.stat(path) {
+                Some(st) => st,
+                None => { frame.rax = ENOENT as u64; return; }
+            };
+            // The flag picks the operation, and getting it backwards is silently destructive, so
+            // the type is checked against it rather than inferred from the path.
+            if arg3 & AT_REMOVEDIR != 0 {
+                if !st.is_dir() { frame.rax = ENOTDIR as u64; return; }
+                frame.rax = if crate::vfs::VFS.remove_dir(path) { 0 } else { ENOTEMPTY as u64 };
+            } else {
+                if st.is_dir() { frame.rax = EISDIR as u64; return; }
+                frame.rax = if crate::vfs::VFS.delete_file(path) { 0 } else { EACCES as u64 };
+            }
+        },
+
+        82 => { // SYS_RENAME(old_cstr, new_cstr)
+            let from = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
             let from = from.as_str();
-            let to = match unsafe { user_path(arg3, arg4) } {
+            let to = match unsafe { user_cstr(arg2) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
@@ -1957,13 +2052,13 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = if ok { 0 } else { EACCES as u64 };
         },
 
-        88 => { // SYS_SYMLINK(target_ptr, target_len, path_ptr, path_len)
-            let target = match unsafe { user_path(arg1, arg2) } {
+        88 => { // SYS_SYMLINK(target_cstr, linkpath_cstr)
+            let target = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
             let target = target.as_str();
-            let path = match unsafe { user_path(arg3, arg4) } {
+            let path = match unsafe { user_cstr(arg2) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
@@ -2593,21 +2688,32 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             // library will ever produce — so rather than break every existing caller, the POSIX
             // shape lands here. musl already prefers openat on architectures that lack SYS_open,
             // so pointing its open at this is a one-line arch decision rather than a port.
-            const AT_FDCWD: i64 = -100;
-            if (arg1 as i64) != AT_FDCWD {
-                // Real dirfd-relative resolution needs a per-fd path, which fds do not carry yet.
-                // ENOSYS rather than silently resolving against cwd: quietly treating "relative to
-                // THIS directory" as "relative to the current one" corrupts whatever it touches.
-                frame.rax = ENOSYS as u64;
-                return;
-            }
-            let path = match unsafe { user_cstr(arg2) } {
+            // Real dirfd-relative resolution now works: fds carry their path, so `resolve_at` can
+            // join against it. This used to be ENOSYS, which broke std::filesystem's `remove_all`
+            // — it recurses with `openat(dirfd, name, ...)` and cannot fall back to anything.
+            let raw = match unsafe { user_cstr_raw(arg2) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
+            let path = match unsafe { resolve_at(arg1 as i64, &raw) } {
+                Some(p) => p,
+                None => { frame.rax = EBADF as u64; return; }
+            };
             const O_CREAT: u64 = 0x40;
             const O_TRUNC: u64 = 0x200;
+            const O_DIRECTORY: u64 = 0o200000;
             let flags = arg3;
+            // ★ O_DIRECTORY must be honoured, not ignored. `remove_all` opens every entry with it
+            // to ASK "is this a directory?", and treats ENOTDIR as "it is a file, unlink it". Let
+            // a regular file open here and libc++ hands it to fdopendir instead, and the file is
+            // never removed — a silent wrong answer rather than an error.
+            if flags & O_DIRECTORY != 0 {
+                match crate::vfs::VFS.stat(&path) {
+                    Some(st) if st.is_dir() => {}
+                    Some(_) => { frame.rax = ENOTDIR as u64; return; }
+                    None => { frame.rax = ENOENT as u64; return; }
+                }
+            }
             if flags & O_TRUNC != 0 {
                 crate::vfs::VFS.delete_file(&path);
                 crate::vfs::VFS.create_file(&path);
@@ -2653,13 +2759,13 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = need as u64;
         },
 
-        80 => { // SYS_CHDIR(path_ptr, path_len)
-            let path = match unsafe { user_path(arg1, arg2) } {
+        80 => { // SYS_CHDIR(path_cstr)
+            let path = match unsafe { user_cstr(arg1) } {
                 Some(p) => p,
                 None => { frame.rax = EFAULT as u64; return; }
             };
             let path = path.as_str();
-            // Already absolute: user_path resolves against cwd for EVERY path syscall now, so
+            // Already absolute: user_cstr resolves against cwd for EVERY path syscall now, so
             // resolving again here would be a no-op that implies the opposite.
             let target = alloc::string::String::from(path);
             // It must exist AND be a directory. Letting chdir into a regular file "succeed" would
