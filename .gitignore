@@ -7,6 +7,13 @@
 build_initrd/
 .claude/
 nyx_build_last.log
+# Build.sh / Build-std.sh output when redirected here.
+build_*.log
+
+# A LITERAL `~` directory. A shell that does not expand `~` (PowerShell, cmd) turns
+# `git clone … ~/foo` into a real folder named `~` inside the repo — and `git add -A` then stages it
+# as an embedded git repository. This has now happened twice.
+~/
 
 # musl build outputs (reproducible via ./Build-musl.sh in ~90s)
 vendor/musl/obj/

@@ -283,8 +283,8 @@ pub fn with_stack<R>(
             // Same order poll_wifi uses (iface before sockets); it only ever try_locks, but keeping
             // one global order means a future blocking caller can't invert it into a cycle.
             let out = {
-                let mut iface_lock = WIFI_IFACE.lock();
-                let mut sockets_lock = WIFI_SOCKETS.lock();
+                let mut iface_lock = crate::postmortem::lock_watched(&WIFI_IFACE, crate::postmortem::LOCK_WIFI_IFACE);
+                let mut sockets_lock = crate::postmortem::lock_watched(&WIFI_SOCKETS, crate::postmortem::LOCK_WIFI_SOCKETS);
                 match (sockets_lock.as_mut(), iface_lock.as_mut()) {
                     (Some(s), Some(i)) => Some(f(s, i)),
                     _ => None,
@@ -325,7 +325,8 @@ pub fn with_sockets<R>(
             if !had {
                 x86_64::instructions::interrupts::enable();
             }
-            let out = WIFI_SOCKETS.lock().as_mut().map(f);
+            let out = crate::postmortem::lock_watched(&WIFI_SOCKETS, crate::postmortem::LOCK_WIFI_SOCKETS)
+                .as_mut().map(f);
             if !had {
                 x86_64::instructions::interrupts::disable();
             }
@@ -661,11 +662,13 @@ pub fn poll_network() {
 fn poll_network_locked() {
     let was_pending = NETWORK_PENDING.swap(false, Ordering::Acquire);
 
-    let mut driver_lock = NET_DRIVER.lock();
-    let mut iface_lock = NET_IFACE.lock();
-    let mut sockets_lock = GLOBAL_SOCKETS.lock();
-    let mut dhcp_lock = DHCP_HANDLE.lock();
-    let mut dns_lock = DNS_HANDLE.lock();
+    // Instrumented: these five run with interrupts MASKED, so a core stuck on any of them stops
+    // taking timer interrupts entirely — which is exactly what `cores alive: 0b11111110` showed.
+    let mut driver_lock  = crate::postmortem::lock_watched(&NET_DRIVER, crate::postmortem::LOCK_NET_DRIVER);
+    let mut iface_lock   = crate::postmortem::lock_watched(&NET_IFACE, crate::postmortem::LOCK_NET_IFACE);
+    let mut sockets_lock = crate::postmortem::lock_watched(&GLOBAL_SOCKETS, crate::postmortem::LOCK_GLOBAL_SOCKETS);
+    let mut dhcp_lock    = crate::postmortem::lock_watched(&DHCP_HANDLE, crate::postmortem::LOCK_DHCP_HANDLE);
+    let mut dns_lock     = crate::postmortem::lock_watched(&DNS_HANDLE, crate::postmortem::LOCK_DNS_HANDLE);
     
     if sockets_lock.is_none() {
         let mut sockets = SocketSet::new(alloc::vec![]);

@@ -1,0 +1,12 @@
+[package]
+name = "nyx-htmltext"
+version = "0.1.0"
+edition = "2021"
+description = "HTML to readable plain text, plus the links found on the way — the render half of the text browser"
+
+[lib]
+name = "nyx_htmltext"
+path = "src/lib.rs"
+
+# Deliberately no dependencies. `libs/web` already parses HTML properly with html5ever, but pulling
+# that into the terminal would drag in the whole cascade/layout stack for a job that is a tag strip.

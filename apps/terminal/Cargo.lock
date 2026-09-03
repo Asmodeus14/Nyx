@@ -532,6 +532,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-htmltext"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-net"
 version = "0.1.0"
 dependencies = [
@@ -547,6 +551,7 @@ version = "0.1.0"
 dependencies = [
  "nyx-api",
  "nyx-gui",
+ "nyx-htmltext",
  "nyx-net",
  "nyx-toolchains",
 ]

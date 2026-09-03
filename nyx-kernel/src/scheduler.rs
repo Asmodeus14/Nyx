@@ -69,6 +69,29 @@ pub fn generate_pid() -> u64 {
     NEXT_PID.fetch_add(1, Ordering::Relaxed)
 }
 
+// Liveness heartbeat state. See `postmortem::heartbeat` — these three exist so that a boot AFTER a
+// freeze can say whether the kernel was still scheduling, which is otherwise unknowable on a
+// machine with no serial port and a GPU-owned framebuffer.
+/// Uptime at the last beat written to CMOS.
+static HB_LAST_MS: AtomicU64 = AtomicU64::new(0);
+/// Uptime at the last time a NON-idle task was actually picked to run.
+static HB_LAST_USER_MS: AtomicU64 = AtomicU64::new(0);
+/// Rolling beat counter, so a stalled heartbeat is distinguishable from a repeated one.
+static HB_TICK: AtomicU64 = AtomicU64::new(0);
+/// Uptime at the last time each core ran `schedule()`.
+///
+/// ★★★ This is the value the first version of the heartbeat needed and did not have. `PerCpu` owns
+/// its `Scheduler` BY VALUE (percpu.rs), so every core has an independent task list — which makes
+/// `tasks`/`runnable`/`current` describe only whichever core happened to write the beat. The first
+/// report said `tasks=1 runnable=0` and confidently concluded "every userspace task was Blocked",
+/// when all it actually meant was "the core that wrote this had nothing but its idle task" — which
+/// is the normal state of a secondary core.
+///
+/// A core that wedges with interrupts masked takes no timer, so it never reaches `schedule()` and
+/// its entry stops advancing, while other cores keep beating. That is precisely the signature to
+/// look for, and it is invisible to a per-core snapshot.
+static HB_CORE_LAST_MS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
 pub struct Scheduler {
     pub tasks: Vec<Process>,
     pub core_task_idx: [usize; 32],
@@ -127,6 +150,54 @@ impl Scheduler {
             }
         }
 
+        // --- 2b. LIVENESS HEARTBEAT (once a second, into CMOS) ---
+        //
+        // Written from here because this is the only place that knows both the task states and
+        // whether a real task actually got the CPU. See `postmortem::heartbeat` for why NVRAM is
+        // the only channel that survives the freeze this exists to explain.
+        {
+            // Stamp THIS core first, every pass — a core that stops reaching here is the thing we
+            // are hunting, and it must be recorded even when another core writes the beat.
+            HB_CORE_LAST_MS[logical_id].store(current_ms, Ordering::Relaxed);
+
+            let last = HB_LAST_MS.load(Ordering::Relaxed);
+            if current_ms >= last.saturating_add(1000) {
+                HB_LAST_MS.store(current_ms, Ordering::Relaxed);
+                let runnable = self
+                    .tasks
+                    .iter()
+                    .filter(|t| {
+                        !t.is_idle
+                            && (t.state == TaskState::Ready || t.state == TaskState::Running)
+                    })
+                    .count();
+                let idle_ms =
+                    current_ms.saturating_sub(HB_LAST_USER_MS.load(Ordering::Relaxed));
+
+                // One bit per core, set if that core reached `schedule()` in the last 2 s. A core
+                // spinning with interrupts masked takes no timer, so its bit goes dark while the
+                // rest keep beating — which is the difference between "the kernel died" and "ONE
+                // core wedged and the tasks it owned never ran again".
+                let mut alive: u8 = 0;
+                for c in 0..8 {
+                    let seen = HB_CORE_LAST_MS[c].load(Ordering::Relaxed);
+                    if seen != 0 && current_ms.saturating_sub(seen) < 2000 {
+                        alive |= 1 << c;
+                    }
+                }
+
+                crate::postmortem::heartbeat(
+                    HB_TICK.fetch_add(1, Ordering::Relaxed) as u8,
+                    self.tasks.len().min(255) as u8,
+                    runnable.min(255) as u8,
+                    curr_idx.min(255) as u8,
+                    (idle_ms / 1000).min(255) as u8,
+                    alive,
+                    logical_id.min(255) as u8,
+                );
+            }
+        }
+
         // --- 3. SMART PRIORITY ROUND-ROBIN ---
         let mut next_idx = (curr_idx + 1) % self.tasks.len();
         let mut fallback_idle_idx = None;
@@ -146,6 +217,13 @@ impl Scheduler {
                 }
             }
             next_idx = (next_idx + 1) % self.tasks.len();
+        }
+
+        // `found` means a NON-idle task is about to run, which is the definition of "userspace is
+        // still being scheduled". Stamped here rather than at the top, because the wake pass above
+        // can mark tasks Ready without any of them actually reaching the CPU.
+        if found {
+            HB_LAST_USER_MS.store(current_ms, Ordering::Relaxed);
         }
 
         if !found {

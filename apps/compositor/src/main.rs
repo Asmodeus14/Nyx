@@ -17,9 +17,11 @@ use nyx_gui::ui::{draw_taskbar, draw_window_rounded, draw_window_chrome, round_w
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-/// Whole-hour offset applied to the raw hardware RTC before display. 0 = show the RTC verbatim
-/// (the machine's CMOS holds local time). Bump this if the panel clock is off by whole hours.
-const TZ_OFFSET_HOURS: i32 = 0;
+// The panel clock's timezone is no longer a constant here. It comes from `sys_get_rtc_local()`,
+// which reads the offset the user set with `tz` in the terminal (persisted in CMOS). The old
+// `TZ_OFFSET_HOURS` was a recompile-to-change whole-hour constant, so it could not express +5:30 at
+// all, and it shifted only `hour` — leaving the DATE a day behind for every hour the shift crossed
+// midnight.
 
 // ─────────────────────────────── Launcher ───────────────────────────────
 
@@ -36,13 +38,14 @@ struct MenuEntry {
 /// text pass, an identical one for the CPU fallback, and a chain of `else if rel_y < N` for the
 /// clicks — so adding an app meant editing three places and a wrong threshold silently launched the
 /// neighbouring entry. Now the renderer and the hit-test both iterate this.
-const MENU: [MenuEntry; 15] = [
-    MenuEntry { label: "Browser",        icon: "/mnt/nvme/apps/Browser.nyx/icon.png", exec: "/mnt/nvme/apps/Browser.nyx/run.bin\0" },
+// ★ Browser and Network Suite rows are gone — both apps were deleted, and browsing plus the DNS/
+// fetch tools are now text commands in the Terminal (`get`/`links`/`open`/`dns`). The rows had to go
+// with the binaries: a tile whose exec path is not on the image launches nothing and reads as a hang.
+const MENU: [MenuEntry; 13] = [
     MenuEntry { label: "Terminal",       icon: "/mnt/nvme/apps/Terminal.nyx/icon.png", exec: "/mnt/nvme/apps/Terminal.nyx/run.bin\0" },
     MenuEntry { label: "Hello C (musl)", icon: "/mnt/nvme/apps/HelloC.nyx/icon.png", exec: "/mnt/nvme/apps/HelloC.nyx/run.bin\0" },
     MenuEntry { label: "Settings",       icon: "/mnt/nvme/apps/Settings.nyx/icon.png", exec: "/mnt/nvme/apps/Settings.nyx/run.bin\0" },
     MenuEntry { label: "Explorer",       icon: "/mnt/nvme/apps/Explorer.nyx/icon.png", exec: "/mnt/nvme/apps/Explorer.nyx/run.bin\0" },
-    MenuEntry { label: "Network Suite",  icon: "/mnt/nvme/apps/Network.nyx/icon.png", exec: "/mnt/nvme/apps/Network.nyx/run.bin\0" },
     MenuEntry { label: "System Monitor", icon: "/mnt/nvme/apps/SystemMonitor.nyx/icon.png", exec: "/mnt/nvme/apps/SystemMonitor.nyx/run.bin\0" },
     MenuEntry { label: "GL Cube (3D)",   icon: "/mnt/nvme/apps/GlCube.nyx/icon.png", exec: "/mnt/nvme/apps/GlCube.nyx/run.bin\0" },
     MenuEntry { label: "Image Viewer",   icon: "/mnt/nvme/apps/ImageViewer.nyx/icon.png", exec: "/mnt/nvme/apps/ImageViewer.nyx/run.bin\0" },
@@ -1529,12 +1532,11 @@ pub extern "C" fn _start() -> ! {
             ov[op] = b'm'; op += 1; ov[op] = b's'; op += 1;
             let ov_str = core::str::from_utf8(&ov[..op]).unwrap_or("FPS ?");
 
-            // Taskbar clock: HH:MM:SS over "DD Mon YYYY", both from the hardware RTC.
-            let rtc = sys_get_rtc();
-            let mut disp_hour = rtc.hour as i32 + TZ_OFFSET_HOURS;
-            disp_hour = ((disp_hour % 24) + 24) % 24;
+            // Taskbar clock: HH:MM:SS over "DD Mon YYYY". `_local` applies the user's timezone to
+            // the whole date, so the day rolls with the hour instead of lagging across midnight.
+            let rtc = sys_get_rtc_local();
             let mut clk = [0u8; 8];
-            let mut cp = push_2d(&mut clk, 0, disp_hour as u8);
+            let mut cp = push_2d(&mut clk, 0, rtc.hour);
             clk[cp] = b':'; cp += 1;
             cp = push_2d(&mut clk, cp, rtc.min);
             clk[cp] = b':'; cp += 1;

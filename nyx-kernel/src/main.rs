@@ -385,7 +385,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // lock-free, allocation-free line is the difference between "the kernel panicked" and a
     // week of bisecting.
     crate::serial::bc("\n!!PANIC\n");
-    crate::postmortem::mark_why(crate::postmortem::WHY_PANIC, 0);
+    // Record WHERE, not just THAT. Detail 0 made every panic look alike in the boot report, so a
+    // freeze could be confirmed as "a panic" and then still cost a boot to locate. `location()` is
+    // a `&'static str` and an integer — no allocation, safe here. `mark_why` keeps the FIRST cause,
+    // so a page fault that falls through to panic! still reports the fault, not this.
+    let loc = match info.location() {
+        Some(l) => crate::postmortem::pack_location(l.file(), l.line()),
+        None => 0,
+    };
+    crate::postmortem::mark_why(crate::postmortem::WHY_PANIC, loc);
 
     // ★★★ DO NOT ALLOCATE. This used to be `let msg = alloc::format!("{}", info);` before
     // anything was printed or painted — so a panic raised while the kernel heap lock was held,
@@ -426,5 +434,14 @@ pub fn trigger_rsod(msg: &str) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
+    // ★ Claim the cause BEFORE panicking. `panic!` records WHY_PANIC, and `mark_why` keeps the
+    // first cause it is given — so without this line an out-of-memory death is filed as a generic
+    // panic with no size, and "did the kernel run out of memory?" becomes unanswerable after the
+    // fact. There is no serial console on this machine and the freeze wipes BOOT_LOG, so this CMOS
+    // byte is the only place that answer can survive a power cycle.
+    crate::serial::bc("\n!!KERNEL HEAP OOM size=");
+    crate::serial::bc_hex(layout.size() as u64);
+    crate::serial::bc("\n");
+    crate::postmortem::mark_why(crate::postmortem::WHY_KERNEL_OOM, layout.size() as u64);
     panic!("Alloc Error: {:?}", layout);
 }
