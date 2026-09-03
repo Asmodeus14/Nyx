@@ -82,6 +82,34 @@ const REG_HB_CORES_ALIVE: u8 = 0x69;
 /// Which core wrote the beat — without it, `tasks`/`runnable`/`current` are unattributed, and each
 /// core has its OWN task list (`PerCpu` owns its `Scheduler` by value).
 const REG_HB_WRITER: u8 = 0x6A;
+/// The blocking lock that seized first. See `stuck_lock` and `LOCK_SITE_*`.
+const REG_STUCK_LOCK: u8 = 0x6D;
+
+// Lock sites, for `stuck_lock`. These are the blocking acquisitions reachable from the network
+// path with interrupts masked — i.e. the ones that can wedge a core so hard it stops taking timer
+// interrupts, which is precisely what `cores alive` showed happening to core 0.
+pub const LOCK_NET_DRIVER: u8 = 1;
+pub const LOCK_NET_IFACE: u8 = 2;
+pub const LOCK_GLOBAL_SOCKETS: u8 = 3;
+pub const LOCK_DHCP_HANDLE: u8 = 4;
+pub const LOCK_DNS_HANDLE: u8 = 5;
+pub const LOCK_MEMORY_MANAGER_V2P: u8 = 6;
+pub const LOCK_WIFI_SOCKETS: u8 = 7;
+pub const LOCK_WIFI_IFACE: u8 = 8;
+
+fn lock_site_name(s: u8) -> &'static str {
+    match s {
+        LOCK_NET_DRIVER => "NET_DRIVER (poll_network_locked, interrupts masked)",
+        LOCK_NET_IFACE => "NET_IFACE (poll_network_locked, interrupts masked)",
+        LOCK_GLOBAL_SOCKETS => "GLOBAL_SOCKETS (poll_network_locked, interrupts masked)",
+        LOCK_DHCP_HANDLE => "DHCP_HANDLE (poll_network_locked, interrupts masked)",
+        LOCK_DNS_HANDLE => "DNS_HANDLE (poll_network_locked, interrupts masked)",
+        LOCK_MEMORY_MANAGER_V2P => "MEMORY_MANAGER via virt_to_phys (bare spin lock, no masking)",
+        LOCK_WIFI_SOCKETS => "WIFI_SOCKETS (with_sockets)",
+        LOCK_WIFI_IFACE => "WIFI_IFACE (with_stack)",
+        _ => "unknown lock",
+    }
+}
 
 /// A breadcrumb USERSPACE can drop, via syscall 551.
 ///
@@ -260,6 +288,47 @@ pub fn mark_at(stage: u8, addr: u64) {
     });
 }
 
+/// Name a lock acquisition that has been spinning far too long — WITHOUT changing control flow.
+///
+/// ★★★ This is the corrected version of a mistake worth not repeating. An earlier attempt gave
+/// fifteen `MEMORY_MANAGER` acquisitions a watchdog that ended in `loop { hlt() }`, which turned
+/// "spin until the other core releases" into "kill the machine if the holder takes longer than half
+/// a second" — and several of those acquisitions legitimately run long (page-table walks, zeroing
+/// SHM frames) or are reached from IRQ context. It hard-froze the machine at boot.
+///
+/// The diagnosis was right; the remedy was not. So this only ever WRITES A BYTE and returns. The
+/// caller keeps spinning exactly as it did before, so a slow-but-healthy acquire is unaffected and
+/// nothing new can wedge — but a genuine deadlock leaves its name in NVRAM for the next boot.
+///
+/// First writer wins, so the report names the lock that seized first rather than whichever core
+/// piled on last.
+pub fn stuck_lock(site: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        if read_reg(REG_STUCK_LOCK) == 0 {
+            write_reg(REG_STUCK_LOCK, site);
+        }
+    });
+}
+
+/// Take a blocking lock, and if it spins far too long, RECORD WHICH ONE — then carry on spinning.
+///
+/// Control flow is deliberately unchanged; see `stuck_lock` for why that matters. ~20M spins is
+/// well under a second and orders of magnitude beyond honest contention on any lock this is used
+/// for, all of which are held for a single bounded operation.
+pub fn lock_watched<T>(m: &spin::Mutex<T>, site: u8) -> spin::MutexGuard<'_, T> {
+    let mut spins: u64 = 0;
+    loop {
+        if let Some(g) = m.try_lock() {
+            return g;
+        }
+        spins += 1;
+        if spins == 20_000_000 {
+            stuck_lock(site);
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Drop a userspace breadcrumb (syscall 551). `0` clears it.
 pub fn user_mark(v: u8) {
     x86_64::instructions::interrupts::without_interrupts(|| unsafe {
@@ -295,6 +364,7 @@ pub fn clear() {
         // The userspace breadcrumb too, or a run that ends cleanly still reports the last stage a
         // previous run reached — a stale breadcrumb reads exactly like a fresh one.
         write_reg(REG_USER_MARK, 0);
+        write_reg(REG_STUCK_LOCK, 0);
         write_reg(REG_WHY, WHY_NONE);
         // Both detail fields too. `clear()` used to leave them behind, so a later run could pair
         // a fresh cause with a stale address and read as a coherent report.
@@ -367,6 +437,17 @@ pub fn report_and_clear() {
                 read_reg(REG_HB_WRITER),
             )
         });
+
+    let stuck = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        read_reg(REG_STUCK_LOCK)
+    });
+    if stuck != 0 {
+        say!("[STUCKLOCK] ***** a blocking lock spun for over half a second *****");
+        say!("[STUCKLOCK]   {}", lock_site_name(stuck));
+        say!("[STUCKLOCK]   A core spinning on this with interrupts masked takes no timer, so it");
+        say!("[STUCKLOCK]   never reaches the scheduler and strands every task it owns. Compare");
+        say!("[STUCKLOCK]   with `cores alive` below: a dark bit is that core.");
+    }
 
     let user_mark_v = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         read_reg(REG_USER_MARK)
@@ -448,7 +529,7 @@ pub fn report_and_clear() {
     // compositor, which owns the framebuffer and paints straight over this, so without a pause the
     // one artifact that survived the freeze is destroyed a second later by the machine recovering.
     let had_record = magic == MAGIC && !(stage == PM_IDLE && why == WHY_NONE);
-    if had_record || hb_tasks != 0 || user_mark_v != 0 {
+    if had_record || hb_tasks != 0 || user_mark_v != 0 || stuck != 0 {
         say!("[POSTMORTEM] (holding ~10s so this can be read/photographed — boot continues after)");
         hold_for_reading();
     }

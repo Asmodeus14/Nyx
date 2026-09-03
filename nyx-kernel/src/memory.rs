@@ -158,7 +158,13 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 }
 
 pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
-    let mut lock = MEMORY_MANAGER.lock();
+    // Instrumented, NOT watchdogged. `MEMORY_MANAGER` is a bare spin lock with no interrupt
+    // masking, and this is called from the NIC, NVMe, AHCI and USB drivers — i.e. from paths that
+    // run with interrupts off. That makes it the prime remaining suspect for a core that wedges
+    // hard enough to stop taking timer interrupts. `lock_watched` only writes a byte and keeps
+    // spinning; the halting version of this idea froze the machine at boot and was reverted.
+    let mut lock = crate::postmortem::lock_watched(
+        &MEMORY_MANAGER, crate::postmortem::LOCK_MEMORY_MANAGER_V2P);
     if let Some(mm) = lock.as_mut() {
         let addr = VirtAddr::new(virt_addr);
         mm.mapper.translate_addr(addr).map(|p| p.as_u64())
