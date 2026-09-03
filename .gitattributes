@@ -1,0 +1,15 @@
+# ★ Shell scripts MUST keep LF endings, on every platform.
+#
+# Windows git defaults to core.autocrlf=true, so a plain `git checkout` on this machine rewrites
+# Build.sh with CRLF. The shebang then reads `#!/bin/bash\r`, bash reports
+#
+#     ./Build.sh: cannot execute: required file not found
+#
+# and — because the failure happens in the wrapper — the build still reports exit 0 while producing
+# a one-line log and leaving the PREVIOUS .efi.img in place. That is a stale image that looks like a
+# successful build, which is the worst possible failure on a machine where every test costs a power
+# cycle. It cost two builds in one session before the artifact timestamp gave it away.
+*.sh text eol=lf
+
+# Same reasoning for anything else executed rather than compiled.
+*.py text eol=lf
