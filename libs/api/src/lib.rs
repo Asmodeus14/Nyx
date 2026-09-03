@@ -363,6 +363,73 @@ pub fn sys_get_rtc() -> RtcTime {
     }
 }
 
+/// Minutes east of UTC, for DISPLAY only (syscall 553). The RTC itself is always UTC.
+pub const SYS_GET_TZ: u64 = 553;
+
+/// The configured display timezone, in minutes east of UTC. 0 if never set.
+pub fn sys_get_tz_minutes() -> i64 {
+    syscall(SYS_GET_TZ, 0, 0, 0, 0, 0, 0) as i64
+}
+
+/// The wall clock already shifted into the configured display timezone.
+///
+/// ★ Use this for anything a person reads; use `sys_get_rtc` only when you specifically want UTC.
+///
+/// The offset goes through a real date conversion rather than being added to `hour`, because the
+/// naive version is wrong twice over: it cannot express +5:30 (India), +5:45 (Nepal) or +12:45
+/// (Chatham), and when the shift crosses midnight it leaves the DATE on the wrong day — so for five
+/// and a half hours every night a panel clock would show yesterday.
+pub fn sys_get_rtc_local() -> RtcTime {
+    let utc = sys_get_rtc();
+    let off = sys_get_tz_minutes();
+    if off == 0 || utc.year == 0 {
+        return utc;
+    }
+    let secs = days_from_civil(utc.year as i64, utc.month as i64, utc.day as i64) * 86_400
+        + utc.hour as i64 * 3600
+        + utc.min as i64 * 60
+        + utc.sec as i64
+        + off * 60;
+    civil_from_unix(secs)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant). Matches the kernel's copy in
+/// `rtc_packed_to_unix`; they must agree or a converted time drifts by the difference.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The inverse: Unix seconds -> calendar fields.
+fn civil_from_unix(secs: i64) -> RtcTime {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    RtcTime {
+        sec: (tod % 60) as u8,
+        min: ((tod % 3600) / 60) as u8,
+        hour: (tod / 3600) as u8,
+        day: d as u8,
+        month: m as u8,
+        year: y as u16,
+    }
+}
+
 pub const SYS_CURSOR_INIT: u64 = 529;
 pub const SYS_CURSOR_SET_IMAGE: u64 = 535;
 

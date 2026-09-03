@@ -87,6 +87,137 @@ fn bcd_to_bin(v: u8) -> u8 {
     ((v & 0xF0) >> 1) + ((v & 0xF0) >> 3) + (v & 0x0F)
 }
 
+#[inline]
+fn bin_to_bcd(v: u8) -> u8 {
+    ((v / 10) << 4) | (v % 10)
+}
+
+// ---------------------------------------------------------------------------------------------
+// TIMEZONE (CMOS 0x6B..0x6C, little-endian i16 minutes east of UTC)
+//
+// ★★★ The offset is stored, and ONLY ever used, for DISPLAY. The RTC and CLOCK_REALTIME stay in
+// UTC without exception, because everything that consumes time for correctness rather than for a
+// human wants UTC: TLS certificate validity windows, HTTP `Date:` headers, file timestamps.
+// Localising the system clock is how Windows/Linux dual-boot machines end up fighting over the
+// hardware clock, and it would reintroduce exactly the "certificate not valid yet" failure this
+// whole clock effort existed to fix.
+//
+// Minutes rather than hours because India (+5:30), Nepal (+5:45), and Chatham (+12:45) are not
+// whole-hour offsets — an hours-only field is wrong for a sixth of the planet.
+//
+// CMOS rather than a file: the taskbar clock lives in the compositor, which starts before any
+// filesystem the user could put a config in, and NVRAM needs no mount.
+// ---------------------------------------------------------------------------------------------
+
+const REG_TZ_LO: u8 = 0x6B;
+const REG_TZ_HI: u8 = 0x6C;
+
+/// Widest real-world offsets: UTC-12:00 (Baker Island) to UTC+14:00 (Kiritimati).
+const TZ_MIN: i16 = -12 * 60;
+const TZ_MAX: i16 = 14 * 60;
+
+/// Minutes east of UTC, or 0 if never set / out of range.
+///
+/// The range check doubles as the validity marker: uninitialised NVRAM is arbitrary, and a wrong
+/// timezone is cosmetic, so a plausibility test is proportionate where a magic byte would not be.
+pub fn tz_offset_min() -> i16 {
+    let raw = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        (read_reg(REG_TZ_LO) as u16) | ((read_reg(REG_TZ_HI) as u16) << 8)
+    }) as i16;
+    if (TZ_MIN..=TZ_MAX).contains(&raw) { raw } else { 0 }
+}
+
+/// Persist the display timezone. Returns false if the offset is not a real one.
+pub fn set_tz_offset_min(minutes: i16) -> bool {
+    if !(TZ_MIN..=TZ_MAX).contains(&minutes) {
+        return false;
+    }
+    let v = minutes as u16;
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        write_reg(REG_TZ_LO, (v & 0xFF) as u8);
+        write_reg(REG_TZ_HI, (v >> 8) as u8);
+    });
+    true
+}
+
+/// Write a single CMOS register. Caller must hold interrupts off.
+unsafe fn write_reg(reg: u8, val: u8) {
+    let mut addr: Port<u8> = Port::new(CMOS_ADDR);
+    let mut data: Port<u8> = Port::new(CMOS_DATA);
+    addr.write(reg & 0x7F);
+    data.write(val);
+}
+
+/// Set the battery-backed wall clock. Returns false if the RTC never went quiet.
+///
+/// ★★★ This is the only function in the tree that WRITES the machine's clock, and it is the
+/// difference between a time correction that lasts a session and one that lasts. Without it the
+/// only way to fix a wrong clock is the firmware setup screen — which is a genuinely bad answer:
+/// most people do not know the key, and an OS that cannot manage its own clock is broken.
+///
+/// The sequence is the MC146818 datasheet one and every step is load-bearing:
+///
+///  1. **Set the SET bit (0x80) in Status B first.** This halts the once-per-second update cycle.
+///     Writing while the RTC is mid-update races the hardware's own carry propagation and can
+///     leave the clock somewhere neither we nor it intended.
+///  2. **Match the format the RTC is already in.** Status B advertises BCD-vs-binary and 12-vs-24
+///     hour, and writing binary into a BCD clock does not fail, it silently stores a wrong time —
+///     which then reads back as a plausible but incorrect date. That is worse than refusing.
+///  3. **Clear SET last**, so the clock starts ticking again from the value just written.
+///
+/// Interrupts stay masked throughout: the index/data pair is two ports, and `postmortem` writes
+/// CMOS from the timer interrupt, so an interrupt landing between them would write our data byte
+/// through its register index.
+pub fn set_time(year: u16, month: u8, day: u8, hour: u8, min: u8, sec: u8) -> bool {
+    // Refuse obvious nonsense rather than storing it — a bad write here is not recoverable from
+    // software, because the value we would need to fix it is the one we just destroyed.
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day)
+        || hour > 23 || min > 59 || sec > 59
+        || !(2000..=2099).contains(&year)
+    {
+        return false;
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        // Wait for any in-flight update to finish before halting the clock.
+        let mut guard = 0u32;
+        while update_in_progress() {
+            guard += 1;
+            if guard > 1_000_000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+
+        let status_b = read_reg(REG_STATUS_B);
+        let is_binary = status_b & STATUS_B_BINARY != 0;
+        let is_24h = status_b & STATUS_B_24HOUR != 0;
+
+        // 12-hour clocks need the PM flag in bit 7 and 12/24 folded to 1..=12.
+        let (hour_field, pm) = if is_24h {
+            (hour, false)
+        } else {
+            let pm = hour >= 12;
+            let h12 = match hour % 12 { 0 => 12, h => h };
+            (h12, pm)
+        };
+
+        let enc = |v: u8| if is_binary { v } else { bin_to_bcd(v) };
+
+        write_reg(REG_STATUS_B, status_b | 0x80); // SET: freeze updates
+
+        write_reg(REG_SECONDS, enc(sec));
+        write_reg(REG_MINUTES, enc(min));
+        write_reg(REG_HOURS, enc(hour_field) | if pm { 0x80 } else { 0 });
+        write_reg(REG_DAY, enc(day));
+        write_reg(REG_MONTH, enc(month));
+        write_reg(REG_YEAR, enc((year % 100) as u8));
+
+        write_reg(REG_STATUS_B, status_b & !0x80); // resume ticking
+        true
+    })
+}
+
 /// Read the wall-clock time and pack it into a u64 for the syscall ABI:
 ///   bits [7:0]  seconds   [15:8]  minutes  [23:16] hour (0..23)
 ///   bits [31:24] day      [39:32] month    [63:40] year (full, e.g. 2026)

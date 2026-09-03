@@ -13,9 +13,13 @@ nyx-gui = { path = "../../libs/gui" }
 # D4: the pluggable compiler registry. Plain std + qclang_compiler (default-features=false → logos +
 # thiserror), all proven to build for target_os=nyx. This is what makes `compile`/`toolchains` work.
 nyx-toolchains = { path = "../../libs/toolchains" }
-# HTTP/1.1 + TLS 1.3 (rustls + the RustCrypto provider). Backs `fetch`, and is the same transport
-# the browser uses — one HTTP implementation, so a bug found here is fixed for both.
+# HTTP/1.1 + TLS 1.3 (rustls + the RustCrypto provider). Backs `get`/`fetch`, and is now the ONLY
+# consumer of the transport — the graphical browser and libs/web were deleted (see Build.sh).
 nyx-net = { path = "../../libs/net" }
+# HTML -> text for `get`/`links`/`open`. Zero dependencies by design: `libs/web` parses HTML
+# properly, but linking it here would drag html5ever, cssparser and the layout engine into the
+# terminal to do a tag strip.
+nyx-htmltext = { path = "../../libs/htmltext" }
 
 [[bin]]
 name = "nyx-terminal"

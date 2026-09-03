@@ -1294,6 +1294,39 @@ syscall_handler_asm:
 /// Convert the RTC's packed wall-clock (see rtc::read_packed) into Unix epoch seconds.
 /// Packed layout: [7:0]=sec [15:8]=min [23:16]=hour [31:24]=day [39:32]=month [63:40]=year(full).
 /// Uses Howard Hinnant's days-from-civil algorithm (proleptic Gregorian, UTC — no timezone).
+/// Signed correction applied to CLOCK_REALTIME, set by syscall 550.
+///
+/// Exists because TLS is only as good as the clock: rustls checks a certificate's validity window
+/// against `SystemTime::now()`, so a machine whose RTC is in the past rejects every real
+/// certificate as "not valid yet" and no `https://` fetch can ever succeed. That failure names TLS
+/// and the network, which is why it costs an afternoon to recognise as a clock problem.
+pub static REALTIME_OFFSET_SECS: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(0);
+
+/// Unix seconds -> (year, month, day, hour, min, sec) UTC.
+///
+/// Hinnant's `civil_from_days`, the exact inverse of the `days_from_civil` in `rtc_packed_to_unix`
+/// below. They must stay inverses: this one decides what gets WRITTEN to the hardware clock and
+/// that one decides what gets read back, so any disagreement between them is a clock that drifts
+/// by a fixed amount every time it is set.
+fn unix_to_civil(secs: i64) -> (u16, u8, u8, u8, u8, u8) {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    (y as u16, m as u8, d as u8, (tod / 3600) as u8, ((tod % 3600) / 60) as u8, (tod % 60) as u8)
+}
+
 fn rtc_packed_to_unix(p: u64) -> i64 {
     let sec = (p & 0xFF) as i64;
     let min = ((p >> 8) & 0xFF) as i64;
@@ -3067,7 +3100,12 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             let ts_ptr = arg2 as *mut i64;
             if !is_valid_user_ptr(ts_ptr as *const u8, 16) { frame.rax = EFAULT as u64; return; }
             let (sec, nsec) = match clockid {
-                0 => (rtc_packed_to_unix(crate::rtc::read_packed()), 0i64), // CLOCK_REALTIME
+                // CLOCK_REALTIME, plus whatever correction `time sync` established (syscall 550).
+                0 => (
+                    rtc_packed_to_unix(crate::rtc::read_packed())
+                        + REALTIME_OFFSET_SECS.load(core::sync::atomic::Ordering::Relaxed),
+                    0i64,
+                ),
                 _ => { // CLOCK_MONOTONIC / BOOTTIME / everything else -> uptime
                     let ms = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed);
                     ((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64)
@@ -3798,6 +3836,72 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         // them to differ. Exists because the alternative is unbounded: a TLS handshake that stalls
         // mid-flight leaves the calling thread inside the kernel's blocking loop with no way out,
         // and userspace cannot time it out from the outside because it never regains control.
+        552 => { // SYS_SET_RTC(unix_secs) — write the battery-backed clock so a fix SURVIVES REBOOT.
+            // Without this the only cure for a wrong clock is the firmware setup screen, which is
+            // not something an OS should require of anyone. With it, a time sync is permanent and
+            // the correction offset (550) becomes unnecessary — so we clear it here, or the next
+            // reading would apply the correction twice: once from the RTC we just fixed, and again
+            // from the offset that fixed it.
+            let secs = arg1 as i64;
+            // Refuse a time before 2001. A zero or garbage argument would otherwise brick the clock
+            // into a state that this very syscall is the only way to repair.
+            if secs < 978_307_200 { frame.rax = EINVAL as u64; return; }
+            let (y, mo, d, h, mi, s) = unix_to_civil(secs);
+            if crate::rtc::set_time(y, mo, d, h, mi, s) {
+                REALTIME_OFFSET_SECS.store(0, Ordering::Relaxed);
+                crate::serial_println!("[TIME] RTC set to {}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                    y, mo, d, h, mi, s);
+                frame.rax = 0;
+            } else {
+                crate::serial_println!("[TIME] RTC write refused (bad value, or clock never idled)");
+                frame.rax = EINVAL as u64;
+            }
+        },
+
+        553 => { // SYS_GET_TZ() -> minutes east of UTC (signed), for DISPLAY only.
+            // Read straight from CMOS rather than cached in a static: it is two port reads, it
+            // needs no boot-order initialisation, and there is exactly one source of truth.
+            frame.rax = crate::rtc::tz_offset_min() as i64 as u64;
+        },
+
+        554 => { // SYS_SET_TZ(minutes) — persist the display timezone.
+            // ★ Deliberately does NOT touch the clock. The RTC and CLOCK_REALTIME stay in UTC; this
+            // only changes how a human-facing string is rendered. Shifting the actual clock would
+            // break TLS validity windows and every file timestamp on the disk.
+            let minutes = arg1 as i64;
+            if minutes < i16::MIN as i64 || minutes > i16::MAX as i64 {
+                frame.rax = EINVAL as u64;
+            } else if crate::rtc::set_tz_offset_min(minutes as i16) {
+                crate::serial_println!("[TIME] display timezone set to UTC{:+}:{:02}",
+                    minutes / 60, (minutes % 60).abs());
+                frame.rax = 0;
+            } else {
+                frame.rax = EINVAL as u64;
+            }
+        },
+
+        551 => { // SYS_DEBUG_MARK(byte) — userspace breadcrumb into CMOS. 0 clears it.
+            // Lets a userspace program leave evidence that survives a hard freeze plus the power
+            // cycle needed to recover from it. See `postmortem::user_mark`.
+            crate::postmortem::user_mark(arg1 as u8);
+            frame.rax = 0;
+        },
+
+        550 => { // SYS_SET_REALTIME_OFFSET(secs) — shift CLOCK_REALTIME by a signed second count.
+            // ★ Corrects a wrong hardware clock WITHOUT writing to the RTC. Writing CMOS means
+            // setting the SET bit in status register B, hand-rolling BCD into the very registers
+            // the clock is ticking in, and clearing it again — and getting that wrong corrupts the
+            // only timepiece the machine has. An offset is a pure software correction: reversible,
+            // and incapable of damaging anything.
+            //
+            // The honest cost is that it does not survive a reboot. That is deliberate: this
+            // corrects the epoch, it does not take over timekeeping — the RTC still supplies every
+            // tick, and syscall 528 still reports the hardware unmodified so `date` can show both.
+            REALTIME_OFFSET_SECS.store(arg1 as i64, Ordering::Relaxed);
+            crate::serial_println!("[TIME] CLOCK_REALTIME offset set to {} s", arg1 as i64);
+            frame.rax = 0;
+        },
+
         549 => {
             let fd = arg1 as usize;
             frame.rax = EBADF as u64;
