@@ -198,13 +198,13 @@ impl WifiApp {
 
     fn state_text(&self) -> (&'static str, u32) {
         match self.status.state {
-            WIFI_RADIO_OFF => ("Wi-Fi is off", Color::TEXT_MUTED),
+            WIFI_RADIO_OFF => ("Wi-Fi is off", Color::FG_MUTED),
             WIFI_CONNECTED => ("Connected", Color::ACCENT_GREEN),
-            WIFI_CONNECTING => ("Connecting", Color::ACCENT_PRIMARY),
+            WIFI_CONNECTING => ("Connecting", Color::ACCENT),
             WIFI_AUTH_FAILED => ("Authentication failed", 0xFF_C0392B),
             WIFI_NO_LEASE => ("No IP address", 0xFF_C0392B),
             WIFI_HW_FAILED => ("Adapter error", 0xFF_C0392B),
-            _ => ("Not connected", Color::TEXT_MUTED),
+            _ => ("Not connected", Color::FG_MUTED),
         }
     }
 
@@ -223,11 +223,11 @@ impl WifiApp {
     /// came to check. The knob's position reads at a glance from across the room; button text doesn't.
     fn draw_switch(canvas: &mut Canvas, r: Rect, on: bool, enabled: bool) {
         let track = if !enabled {
-            Color::WARM_BORDER
+            Color::LINE
         } else if on {
-            Color::ACCENT_PRIMARY
+            Color::ACCENT
         } else {
-            0xFF_B9B4AC
+            Color::LINE
         };
         canvas.fill_rect(r.0, r.1, r.2, r.3, track);
         // Knock the four corner pixels back out to the page colour: with only fill_rect to hand,
@@ -238,7 +238,7 @@ impl WifiApp {
             (r.0, r.1 + r.3 - 1),
             (r.0 + r.2 - 1, r.1 + r.3 - 1),
         ] {
-            canvas.fill_rect(cx, cy, 1, 1, Color::WARM_BG);
+            canvas.fill_rect(cx, cy, 1, 1, Color::SURFACE);
         }
 
         let k = r.3 - 6; // knob side, 3px of track showing all round
@@ -248,23 +248,23 @@ impl WifiApp {
 
     fn draw_button(canvas: &mut Canvas, r: Rect, label: &str, enabled: bool, primary: bool) {
         let bg = if !enabled {
-            Color::WARM_BORDER
+            Color::LINE
         } else if primary {
-            Color::ACCENT_PRIMARY
+            Color::ACCENT
         } else {
-            Color::WARM_SURFACE
+            Color::RAISED
         };
         canvas.fill_rect(r.0, r.1, r.2, r.3, bg);
         if enabled && !primary {
-            canvas.fill_rect(r.0, r.1, r.2, 1, Color::WARM_BORDER);
-            canvas.fill_rect(r.0, r.1 + r.3 - 1, r.2, 1, Color::WARM_BORDER);
+            canvas.fill_rect(r.0, r.1, r.2, 1, Color::LINE);
+            canvas.fill_rect(r.0, r.1 + r.3 - 1, r.2, 1, Color::LINE);
         }
         let fg = if !enabled {
-            Color::TEXT_MUTED
+            Color::FG_MUTED
         } else if primary {
             Color::WHITE
         } else {
-            Color::TEXT_DARK
+            Color::FG
         };
         let tw = Canvas::text_width(label, 1).min(r.2);
         canvas.print_str(r.0 + (r.2 - tw) / 2, r.1 + (r.3 / 2) - 8, label, fg, 1);
@@ -426,12 +426,12 @@ impl NyxApp for WifiApp {
         self.w = w;
         self.h = h;
 
-        canvas.fill_rect(0, 0, w, h, Color::WARM_BG);
+        canvas.fill_rect(0, 0, w, h, Color::SURFACE);
 
         let radio_on = self.radio_on();
 
         // ── Header ──
-        canvas.print_str(20, 16, "Wi-Fi", Color::TEXT_DARK, 2);
+        canvas.print_str(20, 16, "Wi-Fi", Color::FG, 2);
 
         let sw = self.sw_radio();
         Self::draw_switch(canvas, sw, radio_on, !self.busy);
@@ -439,7 +439,7 @@ impl NyxApp for WifiApp {
             sw.0 + sw.2 + 10,
             sw.1 + 3,
             if radio_on { "On" } else { "Off" },
-            if radio_on { Color::TEXT_DARK } else { Color::TEXT_MUTED },
+            if radio_on { Color::FG } else { Color::FG_MUTED },
             1,
         );
 
@@ -455,9 +455,9 @@ impl NyxApp for WifiApp {
                 self.status.ip[2],
                 self.status.ip[3]
             );
-            canvas.print_str(36, 50, &line, Color::TEXT_DARK, 1);
+            canvas.print_str(36, 50, &line, Color::FG, 1);
         } else {
-            canvas.print_str(36, 50, st_text, Color::TEXT_MUTED, 1);
+            canvas.print_str(36, 50, st_text, Color::FG_MUTED, 1);
         }
 
         // What this OS can actually join, stated up front. Without it a greyed-out row is a dead
@@ -466,7 +466,7 @@ impl NyxApp for WifiApp {
         let caps = "Supports WPA2-PSK (AES/CCMP)";
         let caps_w = Canvas::text_width(caps, 1);
         if w > caps_w + 260 {
-            canvas.print_str(w - caps_w - 20, 50, caps, Color::TEXT_MUTED, 1);
+            canvas.print_str(w - caps_w - 20, 50, caps, Color::FG_MUTED, 1);
         }
 
         // Rescan is refused by the kernel while associated (it retunes the radio off the AP channel
@@ -486,17 +486,17 @@ impl NyxApp for WifiApp {
         match &self.saved {
             Some(name) => {
                 let line = alloc::format!("Reconnects automatically to \"{}\"", name);
-                canvas.print_str(20, 82, &line, Color::TEXT_MUTED, 1);
+                canvas.print_str(20, 82, &line, Color::FG_MUTED, 1);
             }
             None => {
-                canvas.print_str(20, 82, "No network is remembered yet.", Color::TEXT_MUTED, 1);
+                canvas.print_str(20, 82, "No network is remembered yet.", Color::FG_MUTED, 1);
             }
         }
         if let Some(r) = self.btn_forget() {
             Self::draw_button(canvas, r, "Forget", !self.busy, false);
         }
 
-        canvas.fill_rect(20, 106, w.saturating_sub(40), 1, Color::WARM_BORDER);
+        canvas.fill_rect(20, 106, w.saturating_sub(40), 1, Color::LINE);
 
         // ── Network list ──
         let list_h = self.list_h();
@@ -509,11 +509,11 @@ impl NyxApp for WifiApp {
                 24,
                 LIST_TOP + 20,
                 "Wi-Fi is off. Turn it on to see available networks.",
-                Color::TEXT_MUTED,
+                Color::FG_MUTED,
                 1,
             );
         } else if self.nets.is_empty() {
-            canvas.print_str(24, LIST_TOP + 20, "No networks in range.", Color::TEXT_MUTED, 1);
+            canvas.print_str(24, LIST_TOP + 20, "No networks in range.", Color::FG_MUTED, 1);
         }
 
         for (i, net) in self.nets.iter().enumerate() {
@@ -528,17 +528,17 @@ impl NyxApp for WifiApp {
 
             let selected = self.sel == Some(i);
             if selected {
-                canvas.fill_rect(20, y, w.saturating_sub(40), ROW_H - 4, 0xFF_FDEBD8);
-                canvas.fill_rect(20, y, 3, ROW_H - 4, Color::ACCENT_PRIMARY);
+                canvas.fill_rect(20, y, w.saturating_sub(40), ROW_H - 4, Color::LINE);
+                canvas.fill_rect(20, y, 3, ROW_H - 4, Color::ACCENT);
             } else if net.is_current() {
-                canvas.fill_rect(20, y, w.saturating_sub(40), ROW_H - 4, Color::WARM_SURFACE);
+                canvas.fill_rect(20, y, w.saturating_sub(40), ROW_H - 4, Color::RAISED);
             }
 
             let unsupported = net.is_unsupported_security();
             let name_color = if unsupported {
-                Color::TEXT_MUTED
+                Color::FG_MUTED
             } else {
-                Color::TEXT_DARK
+                Color::FG
             };
             canvas.print_str(36, y + 9, net.name(), name_color, 1);
 
@@ -551,7 +551,7 @@ impl NyxApp for WifiApp {
                 lock_x.saturating_sub(dw + 14),
                 y + 9,
                 &detail,
-                Color::TEXT_MUTED,
+                Color::FG_MUTED,
                 1,
             );
             if net.is_secure() {
@@ -571,11 +571,11 @@ impl NyxApp for WifiApp {
                     } else {
                         "WEP or WPA1 — not supported"
                     },
-                    Color::TEXT_MUTED,
+                    Color::FG_MUTED,
                     1,
                 );
             } else if self.saved.as_deref() == Some(net.name()) {
-                canvas.print_str(36, y + 22, "Remembered", Color::TEXT_MUTED, 1);
+                canvas.print_str(36, y + 22, "Remembered", Color::FG_MUTED, 1);
             }
         }
 
@@ -587,8 +587,8 @@ impl NyxApp for WifiApp {
                 None => (false, false, false, String::new()),
             };
 
-            canvas.fill_rect(0, pt, w, h.saturating_sub(pt), Color::WARM_SURFACE);
-            canvas.fill_rect(0, pt, w, 1, Color::WARM_BORDER);
+            canvas.fill_rect(0, pt, w, h.saturating_sub(pt), Color::RAISED);
+            canvas.fill_rect(0, pt, w, 1, Color::LINE);
 
             let prompt = if tkip {
                 alloc::format!(
@@ -600,13 +600,13 @@ impl NyxApp for WifiApp {
             } else {
                 alloc::format!("\"{}\" is an open network — no password needed.", name)
             };
-            canvas.print_str(20, pt + 14, &prompt, Color::TEXT_DARK, 1);
+            canvas.print_str(20, pt + 14, &prompt, Color::FG, 1);
 
             if secure {
                 let fw = self.field_w();
-                canvas.fill_rect(20, pt + 42, fw, 30, Color::WARM_BG);
-                canvas.fill_rect(20, pt + 42, fw, 1, Color::WARM_BORDER);
-                canvas.fill_rect(20, pt + 71, fw, 1, Color::WARM_BORDER);
+                canvas.fill_rect(20, pt + 42, fw, 30, Color::SURFACE);
+                canvas.fill_rect(20, pt + 42, fw, 1, Color::LINE);
+                canvas.fill_rect(20, pt + 71, fw, 1, Color::LINE);
 
                 // Masked by default so a shoulder can't read it off the screen; Show reveals it for
                 // the one case masking actively hurts — a long passphrase typed wrong, where the
@@ -634,9 +634,9 @@ impl NyxApp for WifiApp {
                 }
                 let visible = &shown[start..];
 
-                canvas.print_str(30, pt + 50, visible, Color::TEXT_DARK, 1);
+                canvas.print_str(30, pt + 50, visible, Color::FG, 1);
                 let cw = Canvas::text_width(visible, 1);
-                canvas.fill_rect(30 + cw + 1, pt + 48, 1, 18, Color::TEXT_DARK);
+                canvas.fill_rect(30 + cw + 1, pt + 48, 1, 18, Color::FG);
 
                 Self::draw_button(
                     canvas,
@@ -652,25 +652,25 @@ impl NyxApp for WifiApp {
 
             // "Connect automatically" checkbox.
             let cb = self.box_remember();
-            canvas.fill_rect(cb.0, cb.1, cb.2, cb.3, Color::WARM_BG);
-            canvas.fill_rect(cb.0, cb.1, cb.2, 1, Color::WARM_BORDER);
-            canvas.fill_rect(cb.0, cb.1 + cb.3 - 1, cb.2, 1, Color::WARM_BORDER);
-            canvas.fill_rect(cb.0, cb.1, 1, cb.3, Color::WARM_BORDER);
-            canvas.fill_rect(cb.0 + cb.2 - 1, cb.1, 1, cb.3, Color::WARM_BORDER);
+            canvas.fill_rect(cb.0, cb.1, cb.2, cb.3, Color::SURFACE);
+            canvas.fill_rect(cb.0, cb.1, cb.2, 1, Color::LINE);
+            canvas.fill_rect(cb.0, cb.1 + cb.3 - 1, cb.2, 1, Color::LINE);
+            canvas.fill_rect(cb.0, cb.1, 1, cb.3, Color::LINE);
+            canvas.fill_rect(cb.0 + cb.2 - 1, cb.1, 1, cb.3, Color::LINE);
             if self.remember {
-                canvas.fill_rect(cb.0 + 4, cb.1 + 4, cb.2 - 8, cb.3 - 8, Color::ACCENT_PRIMARY);
+                canvas.fill_rect(cb.0 + 4, cb.1 + 4, cb.2 - 8, cb.3 - 8, Color::ACCENT);
             }
             canvas.print_str(
                 cb.0 + cb.2 + 10,
                 cb.1,
                 "Connect to this network automatically",
-                Color::TEXT_DARK,
+                Color::FG,
                 1,
             );
         }
 
         // ── Status message, bottom-left ──
-        canvas.print_str(20, h.saturating_sub(24), &self.message, Color::TEXT_MUTED, 1);
+        canvas.print_str(20, h.saturating_sub(24), &self.message, Color::FG_MUTED, 1);
     }
 
     fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {

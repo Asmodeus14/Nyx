@@ -59,6 +59,31 @@ pub const MSG_SCROLL: u64 = 9;
 /// This ACK is what makes the resize re-allocation loop reclaim memory instead of leaking every drag.
 pub const MSG_SHM_RELEASED: u64 = 10;
 
+/// Shell → app: the pointer moved inside this window, with no button held. `data1`/`data2` are
+/// window-local pixels.
+///
+/// This is what makes hover possible in an application at all. Until Meridian there was only
+/// [`MSG_MOUSE_EVENT`], which the shell sends on a *click* — so an app could learn where it had been
+/// pressed and nothing else, and `NyxApp::on_mouse`'s `clicked` argument was hardcoded `true`
+/// because it was always true. Meridian's interiors need the other half: a file row lifts under the
+/// pointer, a nav entry lightens, System Monitor shows a sparkline only on the metric being looked
+/// at.
+///
+/// Rate-limited by the shell to one per frame, and coalesced again in `nyx_gui::app`'s drain loop.
+/// Both, deliberately: the shell polls the mouse far faster than 60 Hz (`process_input` runs on
+/// every loop iteration, not every presented frame) and an app's loop wakes every 16 ms, so an
+/// un-metered drag would push several hundred messages a second into a queue nobody is emptying that
+/// fast — and the messages that got squeezed out would be the ones that matter, like close.
+pub const MSG_MOUSE_MOVE: u64 = 11;
+
+/// Shell → app: the pointer has left this window. Sent exactly once, on the transition.
+///
+/// Without it, hover is a one-way door: the last row the pointer touched stays lit after the pointer
+/// has gone somewhere else entirely, because nothing ever tells the app otherwise. Also sent when a
+/// modal shell surface (the Command, the Entity) takes the pointer, and when a shell gesture —
+/// drag, resize, scrollbar — captures it.
+pub const MSG_MOUSE_LEAVE: u64 = 12;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IpcMessage {
@@ -117,6 +142,49 @@ pub mod keys {
     /// Either Windows/Super key. The compositor consumes this to toggle the start menu, so apps
     /// never see it — it's listed here so nothing else claims the codepoint.
     pub const SUPER: char = '\u{E019}';
+    /// Panel brightness. WARNING: no PS/2 scancode exists for these on a laptop — brightness keys
+    /// are consumed by the EC/firmware and never reach the 8042. The codepoints are defined so the
+    /// shell path is complete and so nothing else claims them; whether anything ever emits one is a
+    /// property of the machine, not of this table. Nothing in the kernel emits them: they are
+    /// synthesised by the shell from whichever F-key the user has bound (see `F1`..`F12`).
+    pub const BRIGHTNESS_DOWN: char = '\u{E01A}';
+    pub const BRIGHTNESS_UP: char = '\u{E01B}';
+    /// Volume. These DO arrive: the multimedia keys are extended-set scancodes on the same PS/2
+    /// path the arrows use, and `pc_keyboard` already decodes them. The keys work; the audio
+    /// subsystem behind them does not exist, so the OSD they raise says exactly that.
+    pub const VOLUME_DOWN: char = '\u{E01C}';
+    pub const VOLUME_UP: char = '\u{E01D}';
+    pub const VOLUME_MUTE: char = '\u{E01E}';
+
+    /// The function row, F1..F12, contiguous. `pc_keyboard` has always decoded these as `RawKey`
+    /// and the kernel has always dropped them, so until now no Nyx app could see an F-key at all.
+    ///
+    /// These matter for brightness. The physical brightness keys are `Fn`+F-something, and the
+    /// embedded controller swallows that chord — it never reaches the 8042, so no decoder can
+    /// recover it. Pressing the *same key without `Fn`* does arrive, as an ordinary F-key. That is
+    /// the only route to the panel backlight on this class of machine, so the shell lets you bind
+    /// a pair (see `nyx_api::keys::fkey`).
+    pub const F1: char = '\u{E020}';
+    pub const F12: char = '\u{E02B}';
+
+    /// The 1-based F-key number for a codepoint in the `F1..=F12` block, else `None`.
+    pub const fn fkey(c: char) -> Option<u8> {
+        let c = c as u32;
+        if c >= F1 as u32 && c <= F12 as u32 {
+            Some((c - F1 as u32) as u8 + 1)
+        } else {
+            None
+        }
+    }
+
+    /// The codepoint for F`n`, `n` in `1..=12`. Inverse of [`fkey`].
+    pub const fn fkey_char(n: u8) -> Option<char> {
+        if n >= 1 && n <= 12 {
+            char::from_u32(F1 as u32 + (n - 1) as u32)
+        } else {
+            None
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -443,8 +511,292 @@ pub fn sys_cursor_init() -> bool {
 
 /// Upload a 64x64 ARGB (0xAARRGGBB) bitmap for the hardware cursor. `img` must be exactly 64*64 = 4096
 /// pixels. Returns true on success. No-op (false) if the hardware cursor isn't initialized.
-pub fn sys_cursor_set_image(img: &[u32; 64 * 64]) -> bool {
-    syscall(SYS_CURSOR_SET_IMAGE, img.as_ptr() as u64, 0, 0, 0, 0, 0) == 1
+///
+/// `hot_x`/`hot_y` are the pixel inside the bitmap that is the pointer — (0,0) for an arrow whose
+/// tip is its top-left corner, the centre for anything drawn around a point. The kernel subtracts it
+/// from the pointer position and lets CURPOS carry the sign, so a centred shape near the top-left
+/// corner of the screen hangs off the edge correctly instead of being shoved back on screen.
+///
+/// The hotspot is a required argument rather than a defaulted one on purpose: a cursor uploaded
+/// without one points 12px away from where it looks like it points, and nothing about that reads as
+/// a bug until you try to click something small.
+pub fn sys_cursor_set_image(img: &[u32; 64 * 64], hot_x: u32, hot_y: u32) -> bool {
+    syscall(SYS_CURSOR_SET_IMAGE, img.as_ptr() as u64, hot_x as u64, hot_y as u64, 0, 0, 0) == 1
+}
+
+/// ★ 557, not 555. 501..=555 were ALL taken when this was added, and 555 was already
+/// `SYS_FAULT_SELFTEST`. The duplicate arm sat earlier in the dispatch `match` and silently shadowed
+/// it, which `#![allow(warnings)]` in `interrupts.rs` hid by suppressing `unreachable_patterns`.
+/// Check `grep -oE '^\s{8}[0-9]+ =>' nyx-kernel/src/interrupts.rs | sort -n | uniq -d` before
+/// claiming a number.
+pub const SYS_BACKLIGHT: u64 = 557;
+
+/// Panel brightness, 0..=100, or `None` when this display has no PWM-driven backlight — an external
+/// panel, or firmware that drives it some other way.
+///
+/// `delta` of 0 reads without changing anything; non-zero steps by that many percent, rounded onto
+/// a 5% grid. The kernel clamps to a floor: a panel driven to invisible is indistinguishable from a
+/// hang, and on a machine with no serial console the recovery is a blind power cycle.
+pub fn sys_backlight(delta: i32) -> Option<u32> {
+    let v = syscall(SYS_BACKLIGHT, delta as i64 as u64, 0, 0, 0, 0, 0);
+    if v > 100 { None } else { Some(v as u32) }
+}
+
+/// Set panel brightness outright, for a control you drag rather than step. Same return contract and
+/// the same clamping as [`sys_backlight`] — asking for 0 gets you the floor, not a black panel.
+pub fn sys_backlight_set(percent: u32) -> Option<u32> {
+    let v = syscall(SYS_BACKLIGHT, percent as u64, 1, 0, 0, 0, 0);
+    if v > 100 { None } else { Some(v as u32) }
+}
+
+/// ★ 556, not 554 — 554 was already `SYS_SET_TZ`. See the note on [`SYS_BACKLIGHT`].
+pub const SYS_BOOT_MARK: u64 = 556;
+
+pub const SYS_PANEL_PROBE: u64 = 558;
+
+/// What the firmware says about the panel's backlight. A diagnostic — [`sys_backlight`] is the
+/// control path.
+pub struct PanelInfo {
+    /// `_BCL`'s level table. Per the ACPI spec the first two entries are the AC and battery
+    /// defaults and the rest are the selectable levels; passed through unfiltered.
+    pub levels: [u8; 64],
+    pub n_levels: usize,
+    /// `_BQC` — the level the firmware believes the panel is at, or `None` if it would not say.
+    pub current: Option<u32>,
+}
+
+/// Ask ACPI what brightness levels this panel supports. **Read-only.**
+///
+/// Empty `levels` means the LCD device or its `_BCL` method could not be evaluated, which is a
+/// different failure from "evaluated and returned nothing" — worth keeping visible, because on a
+/// machine with no serial console the shape of the failure is most of the diagnosis.
+pub fn sys_panel_probe() -> PanelInfo {
+    let mut levels = [0u8; 64];
+    let r = syscall(SYS_PANEL_PROBE, levels.as_mut_ptr() as u64, 64, 0, 0, 0, 0);
+    let n = (r & 0xFF) as usize;
+    let cur = (r >> 8) & 0xFF;
+    PanelInfo {
+        levels,
+        n_levels: n.min(64),
+        current: if cur == 0xFF { None } else { Some(cur as u32) },
+    }
+}
+
+pub const SYS_PANEL_DIAG: u64 = 559;
+
+/// Ask the kernel why panel brightness is or is not working. **Read-only.**
+///
+/// Returns a plain-text report: whether an object carrying `_BCL` exists and where, the raw status
+/// from each method, every step of ACPICA bring-up, a ladder of path lookups down to the panel, and
+/// what a full namespace walk can actually see.
+///
+/// Text rather than a struct because the interesting facts change with each round of elimination,
+/// and only the kernel can see them. Writes into `buf` and returns the number of bytes written.
+///
+/// Distinct from [`sys_panel_probe`], which reports the levels and folds every failure into an empty
+/// table. Conflating "no such device" with "the method refused to run" costs a power cycle to undo.
+pub fn sys_panel_diag(buf: &mut [u8]) -> usize {
+    let cap = buf.len().min(4096);
+    let n = syscall(SYS_PANEL_DIAG, buf.as_mut_ptr() as u64, cap as u64, 0, 0, 0, 0) as usize;
+    n.min(cap)
+}
+
+pub const SYS_ACPI_LOG: u64 = 560;
+
+/// Everything ACPICA has printed since boot. **Read-only.**
+///
+/// ACPICA reports table-load failures loudly and specifically, but its output went to an empty
+/// `AcpiOsPrintf` stub for the life of this project. This is that channel. Worth reading whenever
+/// something ACPI-shaped is missing, because `AcpiLoadTables` returning `AE_OK` does **not** mean
+/// the namespace loaded — it rewrites the any-table-failed status to success on purpose.
+pub fn sys_acpi_log(buf: &mut [u8]) -> usize {
+    let cap = buf.len();
+    let n = syscall(SYS_ACPI_LOG, buf.as_mut_ptr() as u64, cap as u64, 0, 0, 0, 0) as usize;
+    n.min(cap)
+}
+
+pub const SYS_EC_DUMP: u64 = 565;
+
+/// Raw EC register space, captured by `acpi probe 7`. Returns `(ok, data_port, cmd_port, bytes)`.
+///
+/// This is deliberately raw. ACPI's `_BIF`/`_BST` give a vendor-neutral battery layout, but they
+/// need an EmbeddedControl handler and installing one walks the namespace, which crashes this
+/// kernel. Reading the EC ports directly needs no walk — the cost is that the register map is
+/// model-specific, so the offsets have to be found by correlating against known-good values.
+/// Returns `(state, data_port, cmd_port, len)`. `state`: 0 nothing probed · 1 ok ·
+/// 2 EC did not come up · 3 EC up but reads timed out. Three causes, three answers — collapsing
+/// them into a bool is what made "not captured" unactionable.
+pub fn sys_ec_dump(out: &mut [u8; 256]) -> (u8, u16, u16, usize, i32) {
+    // 272: the 256-byte dump fills [4..260], so the port/status trailer needs room BEYOND it.
+    // At 260 they overlapped and the trailer overwrote EC offsets 0xFA-0xFF.
+    let mut buf = [0u8; 272];
+    syscall(SYS_EC_DUMP, buf.as_mut_ptr() as u64, 272, 0, 0, 0, 0);
+    // 16-bit length: a full dump is 256 bytes, which does not fit in a byte. Reading it as one
+    // made a complete, successful dump report "0 bytes".
+    let n = (u16::from_le_bytes([buf[1], buf[2]]) as usize).min(256);
+    out[..n].copy_from_slice(&buf[4..4 + n]);
+    // Ports are 16-bit and live at the tail — see the kernel note; byte-packing them truncated
+    // 0x930 to 0x30 and cost a debugging round.
+    let dp = u16::from_le_bytes([buf[264], buf[265]]);
+    let cp = u16::from_le_bytes([buf[266], buf[267]]);
+    let st = i32::from(u16::from_le_bytes([buf[268], buf[269]]));
+    (buf[0], dp, cp, n, st)
+}
+
+pub const SYS_ACPI_NS_STEP: u64 = 563;
+pub const SYS_ACPI_NS_HANDLE: u64 = 564;
+
+/// One node of the ACPI namespace.
+pub struct AcpiNode {
+    pub handle: u64,
+    pub name: [u8; 96],
+    pub name_len: usize,
+    pub obj_type: i32,
+}
+
+impl AcpiNode {
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("<non-utf8>")
+    }
+    /// ACPI object type name.
+    pub fn type_name(&self) -> &'static str {
+        match self.obj_type {
+            1 => "Integer", 2 => "String", 3 => "Buffer", 4 => "Package", 5 => "FieldUnit",
+            6 => "Device", 7 => "Event", 8 => "Method", 9 => "Mutex", 10 => "Region",
+            11 => "Power", 12 => "Processor", 13 => "Thermal", 14 => "BufferField",
+            19 => "Reference", 26 => "Scope", 0 => "Any", _ => "?",
+        }
+    }
+}
+
+/// Step to the next child of `parent`. `prev = 0` starts at the first. `None` ends the scope.
+///
+/// **Print each name before calling this again.** The point of stepping from userspace rather than
+/// walking in the kernel is that a node which kills the machine leaves its predecessor on screen —
+/// `AcpiWalkNamespace` crashes this kernel and can only report "it died", never where.
+pub fn sys_acpi_ns_step(parent: u64, prev: u64) -> Option<AcpiNode> {
+    let mut buf = [0u8; 128];
+    let ok = syscall(SYS_ACPI_NS_STEP, parent, prev, buf.as_mut_ptr() as u64, 0, 0, 0);
+    if ok != 1 { return None; }
+    let handle = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+    let obj_type = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let l = (buf[12] as usize).min(96);
+    let mut name = [0u8; 96];
+    name[..l].copy_from_slice(&buf[13..13 + l]);
+    Some(AcpiNode { handle, name, name_len: l, obj_type })
+}
+
+/// Resolve an absolute ACPI path (e.g. `\_SB.PCI0`) to a handle. 0 = not found.
+pub fn sys_acpi_ns_handle(path: &str) -> u64 {
+    syscall(SYS_ACPI_NS_HANDLE, path.as_ptr() as u64, path.len() as u64, 0, 0, 0, 0)
+}
+
+pub const SYS_ACPI_PROBE: u64 = 562;
+
+/// Ask the kernel to evaluate ONE ACPI step on the thermal governor's next tick.
+///
+/// Steps: 1 namespace walk · 2 panel diag · 3 `_BCL` · 4 `_BQC` · 5 battery · 6 `_BCM`.
+///
+/// Nothing ACPI runs automatically: three boots died inside ACPICA on the governor's first pass and
+/// each guess at which call was responsible cost a power cycle. The kernel writes the step number
+/// to its CMOS breadcrumb before making the call, so a death names the culprit on the next boot.
+/// `arg` is step-specific. For step 1 it is the **walk depth** (0 = unlimited), which lets the
+/// namespace-walk crash be bisected by depth without rebuilding the kernel for each attempt.
+pub fn sys_acpi_probe(step: u8, arg: u32) {
+    syscall(SYS_ACPI_PROBE, step as u64, arg as u64, 0, 0, 0, 0);
+}
+
+pub const SYS_BATTERY: u64 = 561;
+
+/// The ACPI control-method battery (`PNP0C0A`), from `_BIF` and `_BST`.
+#[derive(Clone, Copy, Default)]
+pub struct Battery {
+    /// False until an `acpi probe 5` has actually evaluated `_BIF`/`_BST`. Distinct from
+    /// `present`, because "nobody has asked yet" and "there is no battery" are different answers.
+    pub sampled: bool,
+    /// True once the EmbeddedControl address-space handler is registered. Battery methods are not
+    /// evaluated at all without it — doing so crashes the kernel.
+    pub ec_ok: bool,
+    pub present: bool,
+    /// 0 = capacities in mWh and rates in mW; 1 = mAh and mA. Chosen by firmware, not by us.
+    pub power_unit: i32,
+    pub design_cap: i32,
+    pub last_full_cap: i32,
+    pub design_voltage: i32,
+    /// bit0 discharging, bit1 charging, bit2 critical.
+    pub state: i32,
+    pub present_rate: i32,
+    pub remaining_cap: i32,
+    pub voltage: i32,
+    pub have_bif: bool,
+    pub have_bst: bool,
+}
+
+impl Battery {
+    /// Charge as a percentage of **last-full**, not design capacity — a worn cell should read 100%
+    /// when it is as full as it can get, which is what every other OS shows.
+    pub fn percent(&self) -> Option<u32> {
+        if !self.have_bst || self.last_full_cap <= 0 { return None; }
+        Some(((self.remaining_cap as i64 * 100) / self.last_full_cap as i64).clamp(0, 100) as u32)
+    }
+    pub fn charging(&self) -> bool { self.state & 0b10 != 0 }
+    pub fn discharging(&self) -> bool { self.state & 0b01 != 0 }
+    pub fn critical(&self) -> bool { self.state & 0b100 != 0 }
+    /// `(capacity unit, rate unit)` — `("mWh", "mW")` or `("mAh", "mA")`.
+    pub fn units(&self) -> (&'static str, &'static str) {
+        if self.power_unit == 1 { ("mAh", "mA") } else { ("mWh", "mW") }
+    }
+    /// Minutes left at the present rate. `None` unless actively discharging.
+    pub fn minutes_remaining(&self) -> Option<u32> {
+        if !self.discharging() || self.present_rate <= 0 { return None; }
+        Some(((self.remaining_cap as i64 * 60) / self.present_rate as i64).min(u32::MAX as i64) as u32)
+    }
+    /// Battery health: last-full against design capacity. This is the one that *should* use design.
+    pub fn health_percent(&self) -> Option<u32> {
+        if !self.have_bif || self.design_cap <= 0 { return None; }
+        Some(((self.last_full_cap as i64 * 100) / self.design_cap as i64).clamp(0, 200) as u32)
+    }
+}
+
+pub fn sys_battery() -> Battery {
+    let mut v = [0i32; 11];
+    // 2 = never sampled, which is NOT the same as "no battery" — see the kernel note on 561.
+    let r = syscall(SYS_BATTERY, v.as_mut_ptr() as u64, 0, 0, 0, 0, 0);
+    Battery {
+        sampled: r != 2,
+        // 3 = the EC handler was never registered, so no battery method was evaluated. Distinct
+        // from "sampled and absent" — different cause, different fix.
+        ec_ok: r != 3,
+        present: v[0] == 1,
+        power_unit: v[1],
+        design_cap: v[2],
+        last_full_cap: v[3],
+        design_voltage: v[4],
+        state: v[5],
+        present_rate: v[6],
+        remaining_cap: v[7],
+        voltage: v[8],
+        have_bif: v[9] == 1,
+        have_bst: v[10] == 1,
+    }
+}
+
+/// Where the kernel's cold-start screen last painted the Nyx mark, packed
+/// `x<<48 | y<<32 | w<<16 | h`. Zero when there was no graphical boot screen — no framebuffer,
+/// or the user asked for the log instead — in which case there is no handoff to animate and the
+/// shell should simply draw its first frame.
+///
+/// The shell asks rather than deriving it, because a second derivation of "where is the mark"
+/// would agree today and drift the first time either layout is touched. The symptom would be a
+/// jump on the very first frame of the desktop, which is the one frame this exists to remove.
+pub fn sys_boot_mark() -> (i32, i32, i32, i32) {
+    let v = syscall(SYS_BOOT_MARK, 0, 0, 0, 0, 0, 0);
+    (
+        ((v >> 48) & 0xFFFF) as i32,
+        ((v >> 32) & 0xFFFF) as i32,
+        ((v >> 16) & 0xFFFF) as i32,
+        (v & 0xFFFF) as i32,
+    )
 }
 
 pub const SYS_GPU_COMPOSITE: u64 = 536;

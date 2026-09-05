@@ -5,10 +5,25 @@ members = [
     # Tools
     "tools/compiler",
     "tools/runner",
+    # Rasterizes the Meridian icon set out of the design document into a coverage table. Host-only,
+    # run by hand — see the module docs for why it is not a build.rs.
+    "tools/icons",
     
     # Libraries
     "libs/api",
     "libs/gui",
+    # Meridian's foundation: tokens, the multi-size/multi-face glyph + icon atlas, shapes. A
+    # workspace member specifically so `cargo test -p nyx-meridian` runs on the host. Atlas packing
+    # and glyph metrics are exactly the kind of thing that looks fine and is subtly wrong, and this
+    # machine has no QEMU — a bug found here costs seconds, the same bug found on hardware costs a
+    # power cycle.
+    "libs/meridian",
+    # The Entity's creature: seed, genome, evolution, appearance. Independent of the shell and of
+    # every driver, so it is exercised entirely on the host — and it has to be, because its output is
+    # cross-checked cell for cell against the JavaScript generator in the design document. A creature
+    # that renders differently on the machine than in the document is not a rendering bug; it means
+    # the two implementations have silently forked and every Entity in existence has changed.
+    "libs/entity",
     "libs/image",
     "libs/toolchains",
     # HTTP/TLS transport. A workspace member so `cargo test -p nyx-net` can exercise the URL and
@@ -22,6 +37,10 @@ members = [
     # Applications
     "apps/init",
     "apps/compositor",
+    # The Meridian window server. Built ALONGSIDE apps/compositor, never in place of it: testing here
+    # is bare metal only, so a bad Meridian frame must not cost a working desktop. `Build.sh` picks
+    # which of the two becomes WindowServer.nyx.
+    "apps/shell",
     # apps/terminal is now a std target_os=nyx binary (D3) — built standalone via Build-std.sh, so it
     # lives in `exclude` below, not here.
     "apps/settings",

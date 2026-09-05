@@ -46,10 +46,36 @@ use nyx_toolchains::{Artifact, Registry};
 // chew on out of the box (a Bell-pair .ql — same sample qcstudio uses).
 const DEFAULT_SAMPLE: &str = "/mnt/nvme/apps/Terminal.nyx/sample.ql";
 
-const BG_COLOR: u32 = 0xFF0D0D0D;
-const FG_COLOR: u32 = 0xFF00FF66;
-const FONT_W: usize = 8;
-const FONT_H: usize = 8;
+// ── Meridian, step 11: the terminal interior ────────────────────────────────────────────────────
+//
+// From the design's `.term` rule (`design/ver3.0/parts/03-components.html:201`):
+//
+//     .term { padding: 24px 26px; font-family: "JetBrains Mono"; font-size: 13px;
+//             line-height: 22px; color: var(--fg-2); font-weight: 400; }
+//     .dark .term { background: #0B0C0E; }
+//     .term .p { color: var(--fg-4); }   /* the prompt sigil */
+//     .term .o { color: var(--fg); }     /* what you typed, echoed */
+//     .term .cur { width: 7px; height: 15px; background: var(--accent); }
+//
+// The old green-on-near-black (`0xFF00FF66`) is gone. It was the one surface in the OS still
+// claiming a "matrix terminal" identity that Meridian does not have anywhere else.
+const TERM_PX: usize = 13;
+const TERM_LINE_H: usize = 22;
+const PAD_X: usize = 26;
+const PAD_Y: usize = 24;
+const CUR_W: usize = 7;
+const CUR_H: usize = 15;
+
+/// `#0B0C0E` — the design gives the terminal its own ground, one step below `--surface`, so a
+/// console reads as a recessed well rather than another panel. Taken literally from the CSS.
+const TERM_BG_DARK: u32 = 0xFF0B_0C0E;
+
+fn theme() -> nyx_meridian::tokens::Theme {
+    nyx_meridian::tokens::Theme::dark()
+}
+
+/// JetBrains Mono's slot in `nyx_gui::font`'s registry.
+const MONO: usize = nyx_meridian::font::SLOT_MONO;
 
 /// How much of a page goes into the scrollback. The history is one `String` that the draw path
 /// walks every frame, so an unbounded paste of a 500 KB page makes the terminal itself unusable.
@@ -208,6 +234,21 @@ struct TerminalApp {
     current_url: Option<String>,
     /// Links from the last page, in document order, so `open <n>` has something to mean.
     links: Vec<nyx_htmltext::Link>,
+
+    // ── Scrollback ──────────────────────────────────────────────────────────────────────────
+    /// First visible display line. Counted in *wrapped* lines, not logical ones, so it maps
+    /// straight onto what is on screen.
+    scroll: usize,
+    /// Follow new output. True until the user scrolls up, restored when they return to the
+    /// bottom — the behaviour every terminal has, and the reason `acpi log` does not rip the view
+    /// away while you are reading the middle of it.
+    stick_bottom: bool,
+    /// Wrapped-line count and column width from the last `draw`.
+    ///
+    /// `content_height` has no canvas to measure against, so the draw pass leaves its measurements
+    /// here. One frame stale at worst, which is what `apps/notepad` does for the same reason.
+    wrapped_len: usize,
+    view_rows: usize,
 }
 
 impl TerminalApp {
@@ -219,7 +260,60 @@ impl TerminalApp {
             cursor_visible: true,
             current_url: None,
             links: Vec::new(),
+            scroll: 0,
+            stick_bottom: true,
+            wrapped_len: 0,
+            view_rows: 1,
         }
+    }
+
+    /// Split the scrollback into display lines at `cols` characters.
+    ///
+    /// JetBrains Mono is fixed-pitch, so wrapping is arithmetic on character counts rather than a
+    /// per-glyph advance lookup. That matters: the history is capped at `MAX_PAGE_CHARS` and this
+    /// runs every frame, and `advance_px_face` takes a mutex per call.
+    ///
+    /// Chunks by `chars()`, never by byte index — page text is full of curly quotes and em dashes,
+    /// so a byte cut is a routine panic here rather than an edge case (same reason `clip` exists).
+    fn wrap_into(&self, cols: usize, out: &mut Vec<String>) {
+        out.clear();
+        let cols = cols.max(1);
+        let prompt_line = format!("N> {}", self.input_buffer);
+
+        for logical in self.output_history.split('\n').chain(core::iter::once(prompt_line.as_str())) {
+            if logical.is_empty() {
+                out.push(String::new());
+                continue;
+            }
+            let mut cur = String::new();
+            let mut n = 0usize;
+            for ch in logical.chars() {
+                cur.push(ch);
+                n += 1;
+                if n == cols {
+                    out.push(core::mem::take(&mut cur));
+                    n = 0;
+                }
+            }
+            if n > 0 {
+                out.push(cur);
+            }
+        }
+    }
+
+    /// Largest first-visible line that still fills the viewport.
+    fn max_scroll(&self) -> usize {
+        self.wrapped_len.saturating_sub(self.view_rows)
+    }
+
+    /// Move the view and decide whether to keep following new output.
+    ///
+    /// Re-sticking on arrival at the bottom is deliberate: scrolling up to read then flicking back
+    /// down should resume live output without a separate gesture.
+    fn set_scroll(&mut self, want: usize) {
+        let max = self.max_scroll();
+        self.scroll = want.min(max);
+        self.stick_bottom = self.scroll >= max;
     }
 
     /// One line describing the Wi-Fi link, including the DNS server from its DHCP lease.
@@ -769,6 +863,23 @@ impl NyxApp for TerminalApp {
     fn initial_width(&self) -> usize { 640 }
     fn initial_height(&self) -> usize { 400 }
 
+    // ── Scrollback, reported to the shell ───────────────────────────────────────────────────
+    //
+    // These three are all it takes to get a window-aligned scrollbar: the shell reads `content_h`
+    // and `scroll_off` out of the already-mapped window header each frame and sends `MSG_SCROLL`
+    // when the thumb is dragged. No new IPC, no new protocol — the terminal was simply the one app
+    // that never implemented the interface, which is why its output ran off the bottom for good.
+    fn content_height(&self) -> usize {
+        self.wrapped_len * TERM_LINE_H + PAD_Y * 2
+    }
+    fn scroll_offset(&self) -> usize {
+        self.scroll * TERM_LINE_H
+    }
+    fn on_scroll(&mut self, new_offset: usize) -> bool {
+        self.set_scroll(new_offset / TERM_LINE_H);
+        true
+    }
+
     fn update(&mut self) -> bool {
         self.blink_timer += 1;
         if self.blink_timer > 30 {
@@ -780,40 +891,63 @@ impl NyxApp for TerminalApp {
     }
 
     fn draw(&mut self, canvas: &mut Canvas) {
-        canvas.fill_rect(0, 0, canvas.width, canvas.height, BG_COLOR);
+        let t = theme();
+        canvas.fill_rect(0, 0, canvas.width, canvas.height, TERM_BG_DARK);
 
-        // F1: proportional TTF metrics — advance per glyph, line height from the font. FONT_W/FONT_H
-        // remain only as a fallback caret size.
-        let line_h = nyx_gui::font::line_height(1);
-        let mut cx = 10;
-        let mut cy = 10;
+        // One advance for the whole face — JetBrains Mono is fixed-pitch, and asking per glyph would
+        // take the font mutex once per character of an 8000-character scrollback, every frame.
+        let cw = nyx_gui::font::advance_px_face(MONO, 'M', TERM_PX).max(1);
 
-        // Draw History
-        for c in self.output_history.chars() {
-            if c == '\n' { cx = 10; cy += line_h; continue; }
-            canvas.draw_char(cx, cy, c, FG_COLOR, 1);
-            cx += nyx_gui::font::advance(c, 1);
-            if cx >= canvas.width - 15 { cx = 10; cy += line_h; }
+        let inner_w = canvas.width.saturating_sub(PAD_X * 2);
+        let inner_h = canvas.height.saturating_sub(PAD_Y * 2);
+        let cols = (inner_w / cw).max(1);
+        let rows = (inner_h / TERM_LINE_H).max(1);
+
+        let mut lines: Vec<String> = Vec::new();
+        self.wrap_into(cols, &mut lines);
+
+        // Publish the measurements `content_height`/`scroll_offset` need, then re-clamp: the window
+        // may have been resized since the last frame, which changes both the wrap and the viewport.
+        self.wrapped_len = lines.len();
+        self.view_rows = rows;
+        let max = self.max_scroll();
+        if self.stick_bottom {
+            self.scroll = max;
+        } else if self.scroll > max {
+            self.scroll = max;
         }
 
-        // Draw Prompt
-        let prompt = "N> ";
-        for c in prompt.chars() {
-            canvas.draw_char(cx, cy, c, FG_COLOR, 1);
-            cx += nyx_gui::font::advance(c, 1);
-        }
+        let last_idx = lines.len().saturating_sub(1);
 
-        // Draw Input Buffer
-        for c in self.input_buffer.chars() {
-            canvas.draw_char(cx, cy, c, FG_COLOR, 1);
-            cx += nyx_gui::font::advance(c, 1);
-            if cx >= canvas.width - 15 { cx = 10; cy += line_h; }
-        }
+        for (row, idx) in (self.scroll..lines.len()).take(rows).enumerate() {
+            let text = &lines[idx];
+            let y = PAD_Y + row * TERM_LINE_H;
+            let mut x = PAD_X;
 
-        // Draw Cursor — a caret sized to a space advance × line height, at the current pen.
-        if self.cursor_visible {
-            let cw = nyx_gui::font::advance(' ', 1).max(FONT_W);
-            canvas.fill_rect(cx, cy, cw, line_h.min(FONT_H * 2), FG_COLOR);
+            // `.p` is the prompt sigil, `.o` is the echoed command, everything else is `--fg-2`
+            // output. Only a line that actually starts with the sigil gets the treatment, so a
+            // wrapped continuation of a long command is not re-coloured halfway through.
+            let (sigil, rest) = match text.strip_prefix("N> ") {
+                Some(r) => ("N> ", r),
+                None => ("", text.as_str()),
+            };
+
+            for ch in sigil.chars() {
+                canvas.draw_char_px_face(x, y, ch, t.fg_4, MONO, TERM_PX);
+                x += cw;
+            }
+            let body_color = if sigil.is_empty() { t.fg_2 } else { t.fg };
+            for ch in rest.chars() {
+                canvas.draw_char_px_face(x, y, ch, body_color, MONO, TERM_PX);
+                x += cw;
+            }
+
+            // The caret sits at the end of the live input line, and only when that line is on
+            // screen — scrolled up into history, there is nothing to blink at.
+            if idx == last_idx && self.cursor_visible {
+                let cy = y + TERM_LINE_H.saturating_sub(CUR_H) / 2;
+                canvas.fill_rect(x, cy, CUR_W, CUR_H, t.accent);
+            }
         }
     }
 
@@ -821,7 +955,30 @@ impl NyxApp for TerminalApp {
         self.cursor_visible = true;
         self.blink_timer = 0;
 
+        // Scrollback keys. Handled before anything else so they never reach the input buffer.
+        //
+        // Keyboard as well as the scrollbar because reading a long dump is the actual use case —
+        // `acpi log` is hundreds of lines, and hunting for a thumb with the mouse to page through
+        // it is worse than PageUp. A page overlaps by one line so nothing falls between screens.
+        {
+            let page = self.view_rows.saturating_sub(1).max(1);
+            let target = match key {
+                keys::PAGE_UP => Some(self.scroll.saturating_sub(page)),
+                keys::PAGE_DOWN => Some(self.scroll + page),
+                keys::HOME => Some(0),
+                keys::END => Some(usize::MAX),
+                _ => None,
+            };
+            if let Some(t) = target {
+                self.set_scroll(t);
+                return true;
+            }
+        }
+
         if key == '\n' || key == '\r' {
+            // Typing always returns you to the live end of the output — a command whose result you
+            // could not see because the view was parked in history would be baffling.
+            self.stick_bottom = true;
             // Own the command string so the dispatch below can take `&mut self` (do_compile /
             // list_toolchains) without colliding with a borrow of self.input_buffer.
             let cmd = self.input_buffer.trim().to_string();
@@ -845,6 +1002,18 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  date offset <s>   - apply a clock offset directly, no network (bisects time sync)\n");
                 self.output_history.push_str("  fetch <url>       - raw GET: status, size, first 1 KB unrendered\n");
                 self.output_history.push_str("  exec <path>       - fork+execve any binary (a bad one kills this window, not the desktop)\n");
+                self.output_history.push_str("Hardware probes:\n");
+                self.output_history.push_str("  panel             - what ACPI says about the backlight: _BCL levels and _BQC current (READ ONLY)\n");
+                self.output_history.push_str("  panel set <5-100> - drive the panel via _BCM. On this laptop that ends in a firmware SMI\n");
+                self.output_history.push_str("  acpi log          - everything ACPICA printed since boot. Read this FIRST when anything ACPI is missing\n");
+                self.output_history.push_str("  battery           - ACPI control-method battery: charge, rate, health (READ ONLY)\n");
+                self.output_history.push_str("Scrollback:\n");
+                self.output_history.push_str("  PageUp / PageDown - page through history   Home / End - jump to top / live end\n");
+                self.output_history.push_str("  (or drag the scrollbar; new output follows only when you are at the bottom)\n");
+                self.output_history.push_str("Fatal-screen self-test (proves a crash can still report itself):\n");
+                self.output_history.push_str("  fault segv        - child derefs null   -> amber banner, desktop survives\n");
+                self.output_history.push_str("  fault ud          - child runs ud2      -> amber banner, desktop survives\n");
+                self.output_history.push_str("  fault panic       - KILLS THE MACHINE   -> full red screen, then power cycle\n");
             } else if cmd == "clear" {
                 self.output_history.clear();
             } else if cmd == "toolchains" {
@@ -887,6 +1056,432 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str(path);
                 self.output_history.push('\n');
                 if sys_fork() == 0 { sys_execve(path); sys_exit(1); }
+            } else if let Some(arg) = cmd.strip_prefix("fault ") {
+                // Drive each fatal-reporting path on purpose. Every one of these used to be
+                // invisible: a userspace fault printed to a serial port this laptop has no cable
+                // for, and a kernel panic painted the firmware framebuffer, which stopped being
+                // scanned out the moment the GPU driver armed its own plane. Testing that from an
+                // organic crash means waiting for one and then not being sure what you saw.
+                //
+                // The two user faults happen in a FORKED CHILD, so they cost this terminal window
+                // nothing — same reasoning as `exec` above.
+                match arg.trim() {
+                    "segv" => {
+                        self.output_history.push_str("Forking a child to dereference null...\n");
+                        if sys_fork() == 0 {
+                            unsafe { core::ptr::read_volatile(0usize as *const u8) };
+                            sys_exit(1);
+                        }
+                    }
+                    "ud" => {
+                        self.output_history.push_str("Forking a child to execute ud2...\n");
+                        if sys_fork() == 0 {
+                            unsafe { core::arch::asm!("ud2", options(noreturn)) };
+                        }
+                    }
+                    "panic" => {
+                        // No fork: the point is to kill the KERNEL and see the red screen.
+                        self.output_history.push_str("Panicking the kernel. Power cycle after.\n");
+                        syscall(555, 0x4E59_5846, 0, 0, 0, 0, 0);
+                        self.output_history.push_str("  ...syscall returned: self-test rejected.\n");
+                    }
+                    other => {
+                        self.output_history.push_str("Unknown fault kind '");
+                        self.output_history.push_str(other);
+                        self.output_history.push_str("'. Try: segv, ud, panic\n");
+                    }
+                }
+            } else if cmd == "panel" || cmd.starts_with("panel ") {
+                // What ACPI says about the backlight, and optionally a set.
+                //
+                // On this laptop the PCH PWM register reports nothing, because firmware owns the
+                // panel: `_BCM` in the DSDT ends in an SMI. Hand-rolling that mailbox was tried and
+                // the firmware ignored it. Going through ACPICA is the supported path — it runs the
+                // ASL as written, including the OS-identification handshake the SMM handler wants.
+                //
+                // The header reports the path the kernel *resolved*, not the one it hoped for. The
+                // first version printed the hardcoded path as though it were a finding, so when the
+                // lookup failed the screen still asserted where the device was — while the actual
+                // fault was that the path string had never been a path at all (a `\_` escape in C
+                // silently made it relative, which AcpiGetHandle rejects outright).
+                let info = sys_panel_probe();
+                self.output_history.push_str("Panel:\n");
+
+                // ★ The PWM duty register — the real measurement, and the control path.
+                //
+                // Printed FIRST because everything below it comes from the ACPI cache, which only
+                // fills when you run `acpi probe`. This line needs no probe: it is a plain MMIO
+                // read. If it shows a percentage, brightness works and `panel set` will move it.
+                match sys_backlight(0) {
+                    Some(p) => self.output_history.push_str(&format!(
+                        "  PWM: {}%  (live read of BXT_BLC_PWM_DUTY — this is the control path)\n",
+                        p
+                    )),
+                    None => self.output_history.push_str(
+                        "  PWM: unavailable — no PWM backlight found at 0xC8250/54/58\n",
+                    ),
+                }
+                if info.n_levels > 0 {
+                    self.output_history.push_str("  _BCL:");
+                    for b in info.levels[..info.n_levels].iter() {
+                        self.output_history.push_str(&format!(" {}", b));
+                    }
+                    self.output_history.push('\n');
+                    if info.n_levels == 64 {
+                        // The DSDT declares `Package (0x67)` — 103 levels. The transport caps at 64,
+                        // so the list above stops early and its last value is NOT the panel maximum.
+                        self.output_history.push_str(
+                            "  (truncated at 64 of 103 levels — the last value is not the maximum)\n",
+                        );
+                    }
+                }
+                // ⚠️ `_BQC` on this machine is a cache, not a measurement: the ASL returns the Name
+                // `BRT0`, which is initialised to 100 and only ever written by `_BCM`. Expect 100
+                // until something sets the brightness this boot, regardless of where the panel is.
+                if let Some(p) = info.current {
+                    self.output_history
+                        .push_str(&format!("  _BQC: {}%  (cached value, not a panel read)\n", p));
+                }
+
+                // The kernel's own report. It is the only thing that can see the namespace, so it
+                // formats the findings and userspace prints them verbatim — no second wording of
+                // the same fact to drift out of sync.
+                let mut dbuf = [0u8; 2048];
+                let n = sys_panel_diag(&mut dbuf);
+                self.output_history
+                    .push_str(core::str::from_utf8(&dbuf[..n]).unwrap_or("  <diag: non-utf8>\n"));
+                self.output_history
+                    .push_str("  (run `acpi log` for ACPICA's own account of the table load)\n");
+
+                // `panel set <n>` is the only thing here that touches hardware, and it is a separate
+                // word on purpose: on this machine it ends in an SMI, and an SMI should never be
+                // something you trigger by typing a bare noun.
+                let arg = if cmd.len() > 6 { cmd[6..].trim() } else { "" };
+                if let Some(v) = arg.strip_prefix("set ") {
+                    match v.trim().parse::<u32>() {
+                        Ok(want) => {
+                            self.output_history.push_str(&match sys_backlight_set(want) {
+                                Some(got) => format!(
+                                    "  _BCM {} queued -> governor applies {}% within ~1s.\n\
+                                     \x20 This is the one call that reaches hardware: it ends in a \
+                                     firmware SMI.\n\
+                                     \x20 If the screen goes dark or the machine dies, the NEXT \
+                                     boot's [USERMARK]\n\
+                                     \x20 will read 6 (entered _BCM, never returned) or 106 \
+                                     (completed).\n",
+                                    want, got
+                                ),
+                                None => format!("  _BCM {} -> refused\n", want),
+                            });
+                        }
+                        Err(_) => self.output_history.push_str("  usage: panel set <5-100>\n"),
+                    }
+                } else if !arg.is_empty() {
+                    self.output_history.push_str("  usage: panel [set <5-100>]\n");
+                }
+            } else if cmd == "acpi" || cmd.starts_with("acpi ") {
+                // ACPICA's own log. Everything it printed since boot, verbatim.
+                //
+                // This is the channel that was stubbed out empty for the life of the project, which
+                // is why an empty namespace looked like a missing device for three power cycles.
+                // Printed raw and unfiltered — the whole point is to see what ACPICA actually said,
+                // not a summary of it written by someone who already had a theory.
+                let arg = if cmd.len() > 4 { cmd[4..].trim() } else { "" };
+                if arg.is_empty() || arg == "log" {
+                    // Heap, not stack: the log is 16 KB and this is a std binary.
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sys_acpi_log(&mut buf);
+                    if n == 0 {
+                        self.output_history.push_str("ACPICA log is empty.\n");
+                    } else {
+                        self.output_history.push_str("ACPICA log:\n");
+                        self.output_history
+                            .push_str(core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>\n"));
+                        if !self.output_history.ends_with('\n') { self.output_history.push('\n'); }
+                    }
+                } else if let Some(n) = arg.strip_prefix("probe ") {
+                    // One ACPI evaluation, on the governor's next tick. See sys_acpi_probe.
+                    // `acpi probe 1 3` = step 1 at walk depth 3. Depth only applies to step 1.
+                    let mut it = n.trim().split_whitespace();
+                    let step_txt = it.next().unwrap_or("");
+                    let depth: u32 = it.next().and_then(|d| d.parse().ok()).unwrap_or(0);
+                    match step_txt.parse::<u8>() {
+                        // 7 is the EC dump — added after this range check was written, so
+                        // `acpi probe 7` was silently rejected and the dump never ran.
+                        Ok(s) if (1..=7).contains(&s) => {
+                            sys_acpi_probe(s, depth);
+                            if s == 1 {
+                                self.output_history.push_str(&format!(
+                                    "Walk depth {}. Breadcrumbs: {} = entered at this depth, \
+                                     {} = returned.\n",
+                                    if depth == 0 { "unlimited".to_string() } else { depth.to_string() },
+                                    60 + if depth < 16 { depth } else { 0 },
+                                    80 + if depth < 16 { depth } else { 0 },
+                                ));
+                            }
+                            self.output_history.push_str(&format!(
+                                "Queued ACPI step {} for the next governor tick (~1s).\n\
+                                 \x20 If the machine dies, the NEXT boot's [USERMARK] names it:\n\
+                                 \x20   {} = entered step {}, never returned\n\
+                                 \x20   {} = step {} completed\n\
+                                 {}Then run `panel` / `battery` to see what it captured.\n",
+                                s, s, s, 100 + s as u32, s,
+                                if s == 5 {
+                                    " Step 5 also leaves finer marks:\n\
+                                     \x20   50 = entering EC install   51 = EC up, ports known\n\
+                                     \x20   52 = entering _STA/_BIF/_BST (first real EC traffic)\n"
+                                } else { "" }
+                            ));
+                        }
+                        _ => self.output_history.push_str(
+                            "  usage: acpi probe <1-7>\n\
+                             \x20   1 namespace walk   2 panel diag   3 _BCL\n\
+                             \x20   4 _BQC             5 battery      6 _BCM (apply brightness)\n\
+                             \x20   7 EC raw dump      (then `ec` / `ec find <n>`)\n\
+                             \x20 NOTE 1 and 5 are known to crash: walks #GP this kernel.\n",
+                        ),
+                    }
+                } else if arg == "ls" || arg.starts_with("ls ") {
+                    // The namespace browser — one node per syscall.
+                    //
+                    // Each name is appended to the scrollback BEFORE the next step is requested, so
+                    // if a node takes the machine down its predecessor is already on screen. That is
+                    // the whole reason this steps instead of walking: `AcpiWalkNamespace` crashes
+                    // this kernel and can only report "it died", never where.
+                    let path = arg.strip_prefix("ls").unwrap_or("").trim();
+                    let parent = if path.is_empty() { 0 } else { sys_acpi_ns_handle(path) };
+                    if !path.is_empty() && parent == 0 {
+                        self.output_history
+                            .push_str(&format!("  no such ACPI path: {}\n", path));
+                    } else {
+                        self.output_history.push_str(&format!(
+                            "{}:\n",
+                            if path.is_empty() { "\\ (root)" } else { path }
+                        ));
+                        let mut prev = 0u64;
+                        let mut n = 0usize;
+                        // Handles seen so far, so a chain that never terminates can be characterised
+                        // rather than just truncated. The root should have ~9 children; anything
+                        // near the cap means the sibling chain is not ending, and WHY matters:
+                        //   same handle repeating  -> AcpiGetNextObject is not advancing
+                        //   handles cycling        -> the Peer chain is circular (real corruption)
+                        //   all distinct           -> the tree is genuinely that wide
+                        let mut seen: Vec<u64> = Vec::new();
+                        let mut verdict = String::new();
+                        while n < 512 {
+                            match sys_acpi_ns_step(parent, prev) {
+                                Some(node) => {
+                                    if let Some(i) = seen.iter().position(|&h| h == node.handle) {
+                                        verdict = format!(
+                                            "  ★ CHAIN REPEATS: handle {:#x} already seen at index \
+                                             {} (after {} nodes)\n\
+                                             \x20   {}\n",
+                                            node.handle, i, n,
+                                            if i + 1 == n {
+                                                "same handle twice in a row — AcpiGetNextObject is \
+                                                 not advancing"
+                                            } else {
+                                                "the sibling chain is CIRCULAR — this is namespace \
+                                                 corruption, and it is why walks never terminate"
+                                            }
+                                        );
+                                        break;
+                                    }
+                                    // Handle printed too: names can collide, handles cannot.
+                                    self.output_history.push_str(&format!(
+                                        "  {:<10} {:#012x}  {}\n",
+                                        node.type_name(),
+                                        node.handle,
+                                        node.name_str()
+                                    ));
+                                    seen.push(node.handle);
+                                    prev = node.handle;
+                                    n += 1;
+                                }
+                                None => break,
+                            }
+                        }
+                        if !verdict.is_empty() {
+                            self.output_history.push_str(&verdict);
+                        } else if n >= 512 {
+                            self.output_history.push_str(
+                                "  ★ hit the 512 cap with NO repeated handle — the chain is long \
+                                 but not looping.\n",
+                            );
+                        }
+                        self.output_history.push_str(&format!("  {} node(s)\n", n));
+                    }
+                } else {
+                    self.output_history.push_str(
+                        "  usage: acpi [log | ls [path] | probe <1-6> [depth]]\n\
+                         \x20   acpi ls              list the root's children\n\
+                         \x20   acpi ls \\_SB.PCI0    list a scope (one node per syscall — the last\n\
+                         \x20                        line printed is the last node that was safe)\n",
+                    );
+                }
+            } else if cmd.starts_with("ec find ") {
+                // Search EC space for a known 16-bit value.
+                //
+                // Fedora's ec_sys debugfs interface is gone from modern kernels, so the EC cannot be
+                // dumped there and diffed against ours. It does not need to be: some BAT0 fields are
+                // STATIC across boots, so they can be searched for here directly.
+                //   charge_full  2131 mAh -> 0x0853
+                //   design       4474 mAh -> 0x117A
+                // Those two are the anchors. Once located, the live fields (charge_now, voltage,
+                // current) are almost always in the same struct a few bytes away.
+                let want: u32 = cmd[8..].trim().parse().unwrap_or(0);
+                let mut ec = [0u8; 256];
+                let (state, _, _, n, _) = sys_ec_dump(&mut ec);
+                if state != 1 || n == 0 {
+                    self.output_history
+                        .push_str("EC: not captured — run `ec` on its own, it says why.\n");
+                } else if want == 0 || want > 0xFFFF {
+                    self.output_history.push_str("  usage: ec find <0-65535>\n");
+                } else {
+                    let lo = (want & 0xFF) as u8;
+                    let hi = ((want >> 8) & 0xFF) as u8;
+                    self.output_history
+                        .push_str(&format!("Searching EC for {} ({:#06x}):\n", want, want));
+                    let mut hits = 0;
+                    for i in 0..n.saturating_sub(1) {
+                        if ec[i] == lo && ec[i + 1] == hi {
+                            self.output_history
+                                .push_str(&format!("  offset {:#04x}  little-endian\n", i));
+                            hits += 1;
+                        } else if ec[i] == hi && ec[i + 1] == lo {
+                            self.output_history
+                                .push_str(&format!("  offset {:#04x}  BIG-endian\n", i));
+                            hits += 1;
+                        }
+                    }
+                    if hits == 0 {
+                        self.output_history.push_str(
+                            "  no match — the value may be scaled (mWh vs mAh), 8-bit, or not in\n\
+                             \x20 EC space at all on this machine.\n",
+                        );
+                    }
+                }
+            } else if cmd == "ec" || cmd == "ec dump" {
+                // Raw EC register space — the route around the namespace-walk crash.
+                //
+                // ACPI's _BIF/_BST would give a vendor-neutral battery layout, but reaching them
+                // needs an EmbeddedControl handler and installing one walks the namespace, which
+                // #GPs this kernel. The EC ports themselves are reachable, so this reads them
+                // directly. The map is model-specific: the offsets must be found by correlation.
+                let mut ec = [0u8; 256];
+                let (state, dport, cport, n, ecstat) = sys_ec_dump(&mut ec);
+                if state != 1 {
+                    self.output_history.push_str(match state {
+                        0 => "EC: nothing probed this boot. Run `acpi probe 7`, wait ~1s, retry.\n",
+                        2 => "EC: did not come up — no handle at \\_SB.PCI0.LPCB.ECDV, or _CRS \
+                              returned no usable IO ports.\n",
+                        3 => "EC: ports found but every read TIMED OUT. The EC is not answering:\n\
+                              \x20 likely the data/command ports are swapped, or this EC needs the \
+                              burst protocol.\n",
+                        _ => "EC: unknown state.\n",
+                    });
+                    if state == 3 {
+                        self.output_history.push_str(&format!(
+                            "  ports from _CRS: data {:#06x}, cmd {:#06x}   (Fedora: 0x930 / 0x934)\n\
+                             \x20 last EC status byte: {:#04x}\n\
+                             \x20   0xff = nothing decoding that port\n\
+                             \x20   0x00 = EC idle, but it never raised OBF\n\
+                             \x20   else = bit0 OBF, bit1 IBF; a stuck IBF means it never took the \
+                             command\n",
+                            dport, cport, ecstat & 0xFF
+                        ));
+                    }
+                } else {
+                    self.output_history.push_str(&format!(
+                        "EC registers (data port {:#06x}, cmd port {:#06x}, {} bytes):\n",
+                        dport, cport, n
+                    ));
+                    for row in 0..(n + 15) / 16 {
+                        let base = row * 16;
+                        let mut line = format!("  {:02x}: ", base);
+                        for i in 0..16 {
+                            if base + i < n {
+                                line.push_str(&format!("{:02x} ", ec[base + i]));
+                            }
+                        }
+                        line.push('\n');
+                        self.output_history.push_str(&line);
+                    }
+                    // What to look for, so the correlation does not need re-deriving each time.
+                    // Fedora reports this machine's BAT0 as ~1486 mAh charge at ~11051 mV.
+                    // The anchors are the STATIC fields — they read the same on Fedora and here, so
+                    // no simultaneous capture is needed. Fedora's ec_sys debugfs is gone from modern
+                    // kernels, which is why we search our own dump rather than diffing against one.
+                    self.output_history.push_str(
+                        "  Find the battery block with the STATIC anchors (same value every boot):\n\
+                         \x20   ec find 2131    last-full charge, mAh  (0x0853)\n\
+                         \x20   ec find 4474    design charge, mAh     (0x117A)\n\
+                         \x20 Then the live fields sit a few bytes away in the same struct. Dump\n\
+                         \x20 again after a while — the bytes that MOVE are charge/current/voltage.\n",
+                    );
+                }
+            } else if cmd == "battery" || cmd == "bat" {
+                // ACPI control-method battery. Depends on the namespace actually having loaded, so
+                // if this says "no battery" the first thing to check is `acpi log`, not the battery.
+                let b = sys_battery();
+                if !b.sampled {
+                    self.output_history.push_str(
+                        "Battery: not sampled yet.\n\
+                         \x20 ACPI methods no longer run on their own — a full namespace walk was \
+                         crashing the kernel.\n\
+                         \x20 Run `acpi probe 5`, wait a second, then `battery` again.\n",
+                    );
+                } else if !b.ec_ok {
+                    self.output_history.push_str(
+                        "Battery: the Embedded Controller did not come up.\n\
+                         \x20 No battery method was evaluated — doing that without an \
+                         EmbeddedControl handler\n\
+                         \x20 is what crashed the kernel before, so it is gated.\n\
+                         \x20 Likely: PNP0C09 not found, or _CRS gave no usable IO ports.\n",
+                    );
+                } else if !b.present {
+                    self.output_history.push_str(
+                        "Battery: EC is up, but no PNP0C0A device reported present.\n\
+                         \x20 Either _STA's battery-present bit (0x10) is clear, or _BIF/_BST would \
+                         not evaluate.\n\
+                         \x20 Fedora on this laptop reports BAT0 present, so expect the former only \
+                         if it is unplugged.\n",
+                    );
+                } else {
+                    let (cu, ru) = b.units();
+                    let status = if b.critical() { "critical" }
+                        else if b.charging() { "charging" }
+                        else if b.discharging() { "discharging" }
+                        else { "idle" };
+                    match b.percent() {
+                        Some(p) => self
+                            .output_history
+                            .push_str(&format!("Battery: {}%  ({})\n", p, status)),
+                        None => self
+                            .output_history
+                            .push_str(&format!("Battery: present, {} (no _BST)\n", status)),
+                    }
+                    if b.have_bst {
+                        self.output_history.push_str(&format!(
+                            "  remaining {} {}   rate {} {}   {} mV\n",
+                            b.remaining_cap, cu, b.present_rate, ru, b.voltage
+                        ));
+                    }
+                    if b.have_bif {
+                        self.output_history.push_str(&format!(
+                            "  last full {} {}   design {} {} @ {} mV\n",
+                            b.last_full_cap, cu, b.design_cap, cu, b.design_voltage
+                        ));
+                        if let Some(h) = b.health_percent() {
+                            self.output_history
+                                .push_str(&format!("  health {}% of design\n", h));
+                        }
+                    }
+                    if let Some(m) = b.minutes_remaining() {
+                        self.output_history
+                            .push_str(&format!("  about {}h {:02}m left\n", m / 60, m % 60));
+                    }
+                }
             } else if cmd == "settings" {
                 self.output_history.push_str("Launching Settings...\n");
                 if sys_fork() == 0 { sys_execve("/mnt/nvme/apps/Settings.nyx/run.bin\0"); sys_exit(1); }
@@ -915,6 +1510,14 @@ impl NyxApp for TerminalApp {
 fn main() {
     // Headless breadcrumb in the serial log so the boot test is legible even before the window paints.
     println!("nyx-terminal: D3 std port — shell over nyx-gui on target_os=nyx");
+
+    // Meridian step 11: install JetBrains Mono before the first frame. Only the mono face — see
+    // `register_mono`. If it fails to parse, `with_glyph_face` falls back to DejaVu, so the terminal
+    // still draws every character; it just loses the fixed pitch (and the wrap, which assumes it).
+    if !nyx_meridian::font::register_mono() {
+        println!("nyx-terminal: JetBrains Mono failed to parse — falling back to DejaVu");
+    }
+
     // run() takes over the process (event loop, never returns).
     nyx_gui::app::run(TerminalApp::new());
 }

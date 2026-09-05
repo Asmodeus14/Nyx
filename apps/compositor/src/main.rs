@@ -234,7 +234,7 @@ fn upload_arrow_cursor() {
     for (r, row) in ARROW_HW.iter().enumerate() {
         for (c, &p) in row.iter().enumerate() {
             let color = match p {
-                1 => Color::TEXT_DARK, // already 0xFF-alpha ARGB
+                1 => Color::CURSOR_OUTLINE, // already 0xFF-alpha ARGB
                 2 => Color::WHITE,
                 _ => 0, // transparent
             };
@@ -243,7 +243,8 @@ fn upload_arrow_cursor() {
             }
         }
     }
-    sys_cursor_set_image(&img);
+    // The arrow's tip IS its top-left pixel, so the hotspot is the origin.
+    sys_cursor_set_image(&img, 0, 0);
 }
 
 // ── U7: resize-from-any-edge ────────────────────────────────────────────────
@@ -318,7 +319,7 @@ fn double_arrow(img: &mut [u32; 64 * 64], ux: f32, uy: f32) {
     let (t1x, t1y) = (cx - ux * l, cy - uy * l);
     let (t2x, t2y) = (cx + ux * l, cy + uy * l);
     // Outline pass (dark, r=3) then fill pass (white, r=2).
-    for &(color, r) in &[(Color::TEXT_DARK, 3i32), (Color::WHITE, 2i32)] {
+    for &(color, r) in &[(Color::CURSOR_OUTLINE, 3i32), (Color::WHITE, 2i32)] {
         thick_line(img, t1x as i32, t1y as i32, t2x as i32, t2y as i32, r, color);
         // arrowhead barbs at tip2 (pointing +u) and tip1 (pointing -u)
         let (bx, by) = (t2x - ux * bh, t2y - uy * bh);
@@ -342,7 +343,10 @@ fn upload_cursor(t: CursorType) {
         CursorType::ResizeNESW => double_arrow(&mut img, 0.7071, -0.7071),
         _ => { upload_arrow_cursor(); return; }
     }
-    sys_cursor_set_image(&img);
+    // `double_arrow` centres its art on (16,16), which is where the pointer actually is. Until the
+    // driver carried a hotspot that offset was simply lost and these arrows sat 16px down-right of
+    // the edge they were reporting; now it is declared and subtracted.
+    sys_cursor_set_image(&img, 16, 16);
 }
 
 /// Draw the bottom taskbar strip: the opaque bar and its top border, nothing else. The Start button,
@@ -350,8 +354,8 @@ fn upload_cursor(t: CursorType) {
 /// bitmaps, link status, hover) this function doesn't.
 fn render_taskbar(canvas: &mut Canvas, screen_stride: usize, screen_h: usize) {
     let start_y = screen_h - BAR_H;
-    canvas.fill_rect(0, start_y, screen_stride, BAR_H, 0xFF_FFFFFF); // Opaque white taskbar
-    canvas.fill_rect(0, start_y, screen_stride, 1, 0xFF_D1D1D1);     // Border
+    canvas.fill_rect(0, start_y, screen_stride, BAR_H, Color::SURFACE); // Taskbar strip
+    canvas.fill_rect(0, start_y, screen_stride, 1, Color::LINE);       // Border
 }
 
 /// Signal strength to show for a link state, as (lit bars, colour). We have no RSSI from the driver,
@@ -360,9 +364,9 @@ fn render_taskbar(canvas: &mut Canvas, screen_stride: usize, screen_h: usize) {
 fn wifi_indicator(state: u32) -> (usize, u32) {
     match state {
         WIFI_CONNECTED => (3, Color::ACCENT_GREEN),
-        WIFI_CONNECTING => (2, Color::ACCENT_PRIMARY),
+        WIFI_CONNECTING => (2, Color::ACCENT),
         WIFI_AUTH_FAILED | WIFI_NO_LEASE | WIFI_HW_FAILED => (1, 0xFF_C0392B),
-        _ => (0, Color::TEXT_MUTED),
+        _ => (0, Color::FG_MUTED),
     }
 }
 
@@ -374,14 +378,14 @@ fn draw_wifi_glyph(canvas: &mut Canvas, x: usize, y: usize, state: u32) {
     for i in 0..3 {
         let h = 6 + i * 5;
         let bx = x + i * 7;
-        canvas.fill_rect(bx, base - h, 5, h, 0xFF_DCDCD6);
+        canvas.fill_rect(bx, base - h, 5, h, Color::LINE);
         if i < lit {
             canvas.fill_rect(bx, base - h, 5, h, color);
         }
     }
     // Not-connected reads as "off" rather than "weak": strike the track through.
     if lit == 0 {
-        canvas.fill_rect(x, base - 4, 19, 2, Color::TEXT_MUTED);
+        canvas.fill_rect(x, base - 4, 19, 2, Color::FG_MUTED);
     }
 }
 
@@ -1278,9 +1282,9 @@ pub extern "C" fn _start() -> ! {
             // 1. Submit GPU background fill (D1: whole screen on a full frame — byte-identical to before;
             // only the damage rect on a partial frame). The fill re-lays wallpaper under the composite.
             if full_frame {
-                sys_gpu_fill_rect(0, 0, screen_stride, screen_h, Color::WARM_BG);
+                sys_gpu_fill_rect(0, 0, screen_stride, screen_h, Color::SURFACE);
             } else {
-                sys_gpu_fill_rect(dmg_x, dmg_y, dmg_w, dmg_h, Color::WARM_BG);
+                sys_gpu_fill_rect(dmg_x, dmg_y, dmg_w, dmg_h, Color::SURFACE);
             }
 
             // 2. Synchronize! Wait for GPU wallpaper clear to finish before CPU starts drawing
@@ -1417,9 +1421,9 @@ pub extern "C" fn _start() -> ! {
                     let is_hovered = state.hover_tb_btn == Some(ci);
                     // Active button accented; a hovered (non-active) one gets a soft accent tint;
                     // minimized dimmed; otherwise it sits flush with the bar.
-                    let bg = if is_active { 0xFF_FDEBD8 }
-                             else if is_hovered { 0xFF_F2F2EF }
-                             else { 0xFF_FFFFFF };
+                    let bg = if is_active { Color::LINE }
+                             else if is_hovered { Color::RAISED }
+                             else { Color::SURFACE };
                     fill_round_rect(&mut canvas, bx, btn_y, TB_BTN_W, TB_BTN_H, 6, bg);
 
                     match &client.icon {
@@ -1448,16 +1452,16 @@ pub extern "C" fn _start() -> ! {
                             let mut buf = [0u8; 4];
                             let s = ch.encode_utf8(&mut buf);
                             let tw = Canvas::text_width(s, 1);
-                            let tcol = if win.is_minimized { Color::TEXT_MUTED } else { Color::TEXT_DARK };
+                            let tcol = if win.is_minimized { Color::FG_MUTED } else { Color::FG };
                             canvas.print_str(bx + (TB_BTN_W.saturating_sub(tw)) / 2, btn_y + 6, s, tcol, 1);
                         }
                     }
 
                     // Running/active underline — the only cue left once the label is gone.
                     if is_active {
-                        canvas.fill_rect(bx + 8, btn_y + TB_BTN_H - 2, TB_BTN_W - 16, 2, Color::ACCENT_PRIMARY);
+                        canvas.fill_rect(bx + 8, btn_y + TB_BTN_H - 2, TB_BTN_W - 16, 2, Color::ACCENT);
                     } else if !win.is_minimized {
-                        canvas.fill_rect(bx + 13, btn_y + TB_BTN_H - 2, TB_BTN_W - 26, 2, 0xFF_C8C8C2);
+                        canvas.fill_rect(bx + 13, btn_y + TB_BTN_H - 2, TB_BTN_W - 26, 2, 0xFF_3A3E43);
                     }
                 }
             }
@@ -1466,7 +1470,7 @@ pub extern "C" fn _start() -> ! {
             // menu is open, so the button reflects the menu's state rather than being inert.
             {
                 let (bx, by, bw, bh) = state.start_button_rect();
-                let bg = if state.start_menu_open { Color::ACCENT_HOVER } else { Color::ACCENT_PRIMARY };
+                let bg = if state.start_menu_open { Color::ACCENT_HOVER } else { Color::ACCENT };
                 fill_round_rect(&mut canvas, bx, by, bw, bh, 6, bg);
                 if let Some(logo) = &state.logo {
                     canvas.blit_rgba(bx + 8, by + (bh - LOGO_BTN) / 2, logo, LOGO_BTN, LOGO_BTN, None);
@@ -1571,7 +1575,7 @@ pub extern "C" fn _start() -> ! {
                 let (sx, sy, sw, sh) = state.menu_search_rect();
                 let ty = sy + sh / 2 - 8;
                 if state.search_len == 0 {
-                    menu_text.push((sx + 30, ty, "Search apps", Color::TEXT_MUTED));
+                    menu_text.push((sx + 30, ty, "Search apps", Color::FG_MUTED));
                 } else {
                     // The query is ASCII by construction (only 0x20..0x7F is accepted), so this is
                     // always valid UTF-8; the unwrap_or keeps a bad byte from panicking the shell.
@@ -1585,7 +1589,7 @@ pub extern "C" fn _start() -> ! {
                     let (gx, gy, _, _) = state.menu_tile_rect(0);
                     let w = Canvas::text_width(msg, 1);
                     menu_text.push((gx + (MENU_COLS * MENU_TILE_W).saturating_sub(w) / 2,
-                                    gy + 24, msg, Color::TEXT_MUTED));
+                                    gy + 24, msg, Color::FG_MUTED));
                 }
                 for (slot, &i) in hits.iter().enumerate() {
                     let (tx, ty, tw, th) = state.menu_tile_rect(slot);
@@ -1611,9 +1615,9 @@ pub extern "C" fn _start() -> ! {
             let mut chrome_drawn = false;
             if let Some(font) = &gpu_font {
                 let mut glyphs: Vec<GlyphQuad> = Vec::new();
-                glyphs.extend(font.layout_str(4, 2, ov_str, 1, Color::TEXT_MUTED));
-                glyphs.extend(font.layout_str(time_x as i32, ck_y as i32, clk_str, 1, Color::TEXT_DARK));
-                glyphs.extend(font.layout_str(date_x as i32, date_y as i32, date_str, 1, Color::TEXT_MUTED));
+                glyphs.extend(font.layout_str(4, 2, ov_str, 1, Color::FG_MUTED));
+                glyphs.extend(font.layout_str(time_x as i32, ck_y as i32, clk_str, 1, Color::FG));
+                glyphs.extend(font.layout_str(date_x as i32, date_y as i32, date_str, 1, Color::FG_MUTED));
                 glyphs.extend(font.layout_str(nyx_x as i32, nyx_y as i32, "NYX", 1, Color::WHITE));
                 for &(tx, ty, text, col) in menu_text.iter() {
                     glyphs.extend(font.layout_str(tx as i32, ty as i32, text, 1, col));
@@ -1625,9 +1629,9 @@ pub extern "C" fn _start() -> ! {
             }
             if !chrome_drawn {
                 // CPU fallback — identical layout/colours (never leave chrome blank).
-                canvas.print_str(4, 2, ov_str, Color::TEXT_MUTED, 1);
-                canvas.print_str(time_x, ck_y, clk_str, Color::TEXT_DARK, 1);
-                canvas.print_str(date_x, date_y, date_str, Color::TEXT_MUTED, 1);
+                canvas.print_str(4, 2, ov_str, Color::FG_MUTED, 1);
+                canvas.print_str(time_x, ck_y, clk_str, Color::FG, 1);
+                canvas.print_str(date_x, date_y, date_str, Color::FG_MUTED, 1);
                 canvas.print_str(nyx_x, nyx_y, "NYX", Color::WHITE, 1);
                 for &(tx, ty, text, col) in menu_text.iter() {
                     canvas.print_str(tx, ty, text, col, 1);

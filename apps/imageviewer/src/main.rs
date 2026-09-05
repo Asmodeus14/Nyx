@@ -232,9 +232,9 @@ impl NyxApp for ImageViewerApp {
         }
 
         // Footer: filename + dimensions (or the error), on an opaque strip.
-        canvas.fill_rect(0, height - FOOTER_H, width, FOOTER_H, Color::WARM_SURFACE);
-        canvas.fill_rect(0, height - FOOTER_H, width, 1, Color::WARM_BORDER);
-        canvas.print_str(12, height - FOOTER_H + 7, &self.status, Color::TEXT_DARK, 1);
+        canvas.fill_rect(0, height - FOOTER_H, width, FOOTER_H, Color::RAISED);
+        canvas.fill_rect(0, height - FOOTER_H, width, 1, Color::LINE);
+        canvas.print_str(12, height - FOOTER_H + 7, &self.status, Color::FG, 1);
     }
 
     // Any click advances to the next bundled sample (BMP → PNG → JPG → TGA → …),

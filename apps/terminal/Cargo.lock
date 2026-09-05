@@ -536,6 +536,18 @@ name = "nyx-htmltext"
 version = "0.1.0"
 
 [[package]]
+name = "nyx-meridian"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "libm",
+ "nyx-api",
+ "nyx-gui",
+ "spin",
+ "ttf-parser",
+]
+
+[[package]]
 name = "nyx-net"
 version = "0.1.0"
 dependencies = [
@@ -552,6 +564,7 @@ dependencies = [
  "nyx-api",
  "nyx-gui",
  "nyx-htmltext",
+ "nyx-meridian",
  "nyx-net",
  "nyx-toolchains",
 ]

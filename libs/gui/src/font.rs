@@ -60,7 +60,53 @@ struct FontState {
 // The face borrows only 'static font bytes and parsed tables (plain slices) — safe to share.
 unsafe impl Send for FontState {}
 
-static FONT: spin::Mutex<Option<FontState>> = spin::Mutex::new(None);
+/// How many typefaces can be live at once.
+///
+/// Slot 0 is the embedded DejaVu Sans and is what every existing caller gets. Meridian registers
+/// Inter at four weights plus JetBrains Mono into slots 1..=5 — see `nyx_meridian::font`.
+///
+/// ★ The font BYTES deliberately do not live in this crate. Eight applications link `nyx-gui`, and
+/// `include_bytes!`-ing two megabytes of Inter here would add it to every one of them for the
+/// benefit of the one binary that draws Meridian. So this is a registry: the engine lives here, the
+/// bytes are supplied by whoever needs them.
+pub const MAX_FACES: usize = 6;
+
+/// Slot 0: the original embedded DejaVu Sans. Unported apps never name a slot and get this.
+pub const FACE_DEFAULT: usize = 0;
+
+static FONTS: [spin::Mutex<Option<FontState>>; MAX_FACES] = [
+    spin::Mutex::new(None),
+    spin::Mutex::new(None),
+    spin::Mutex::new(None),
+    spin::Mutex::new(None),
+    spin::Mutex::new(None),
+    spin::Mutex::new(None),
+];
+
+/// Install a typeface into `slot`. Returns false if the slot is out of range or the bytes do not
+/// parse as a TrueType face — in which case nothing is installed and the slot keeps whatever was
+/// there, so a bad font degrades to the previous one rather than to no text at all.
+///
+/// Registering the same slot twice replaces the face and drops its glyph cache.
+pub fn register_face(slot: usize, ttf: &'static [u8]) -> bool {
+    if slot >= MAX_FACES {
+        return false;
+    }
+    match ttf_parser::Face::parse(ttf, 0) {
+        Ok(face) => {
+            let upem = face.units_per_em() as f32;
+            *FONTS[slot].lock() = Some(FontState { face, upem, cache: BTreeMap::new() });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// True once `slot` holds a usable face. Slot 0 reports true only after something has drawn with
+/// it, since DejaVu is loaded lazily on first use.
+pub fn face_ready(slot: usize) -> bool {
+    slot < MAX_FACES && FONTS[slot].lock().is_some()
+}
 
 /// Fills a `ttf-parser` glyph outline into an `ab_glyph_rasterizer`, transforming font units (y-up,
 /// origin at the glyph's bbox) into bitmap pixels (y-down, origin at the top-left of the `w*h` box).
@@ -170,28 +216,52 @@ impl ttf_parser::OutlineBuilder for BBox {
     fn close(&mut self) {}
 }
 
-/// Lazily parse the face on first use. Returns false if the embedded TTF fails to parse (should
-/// never happen — it's a known-good file — but keeps callers on a graceful path).
-fn ensure_loaded(slot: &mut Option<FontState>) -> bool {
-    if slot.is_some() {
+/// Lazily parse slot 0's embedded face on first use. Returns false if the embedded TTF fails to
+/// parse (should never happen — it's a known-good file — but keeps callers on a graceful path).
+///
+/// Only slot 0 self-loads. Every other slot must be filled by `register_face`, because this crate
+/// does not know what is supposed to be in them.
+fn ensure_loaded(slot: usize, cell: &mut Option<FontState>) -> bool {
+    if cell.is_some() {
         return true;
+    }
+    if slot != FACE_DEFAULT {
+        return false;
     }
     match ttf_parser::Face::parse(FONT_TTF, 0) {
         Ok(face) => {
             let upem = face.units_per_em() as f32;
-            *slot = Some(FontState { face, upem, cache: BTreeMap::new() });
+            *cell = Some(FontState { face, upem, cache: BTreeMap::new() });
             true
         }
         Err(_) => false,
     }
 }
 
-/// Run `f` with the cached glyph for (`c`, `px`), rasterizing on miss. Returns None if the font
-/// failed to load. This is the hot path (canvas.draw_char / text_width) — no per-call clone.
+/// Run `f` with the cached glyph for (`c`, `px`) from slot 0. The original entry point; every
+/// existing caller keeps drawing in DejaVu with no change.
 pub fn with_glyph<R>(c: char, px: usize, f: impl FnOnce(&Glyph) -> R) -> Option<R> {
-    let mut guard = FONT.lock();
-    if !ensure_loaded(&mut guard) {
-        return None;
+    with_glyph_face(FACE_DEFAULT, c, px, f)
+}
+
+/// Run `f` with the cached glyph for (`slot`, `c`, `px`), rasterizing on miss. This is the hot path
+/// (`canvas.draw_char` / `text_width`) — no per-call clone.
+///
+/// An unregistered or out-of-range slot falls back to slot 0 rather than returning None. Drawing
+/// the right words in the wrong typeface is a cosmetic problem; drawing nothing is a blank desktop,
+/// and on a machine with no QEMU that is a power cycle to diagnose.
+pub fn with_glyph_face<R>(slot: usize, c: char, px: usize, f: impl FnOnce(&Glyph) -> R) -> Option<R> {
+    let slot = if slot < MAX_FACES { slot } else { FACE_DEFAULT };
+    let mut guard = FONTS[slot].lock();
+    if !ensure_loaded(slot, &mut guard) {
+        // ★ Release the lock BEFORE recursing. Holding slot N's guard while taking slot 0's is a
+        // lock ordering waiting to bite, and this path is reachable from the compositor.
+        drop(guard);
+        return if slot == FACE_DEFAULT {
+            None
+        } else {
+            with_glyph_face(FACE_DEFAULT, c, px, f)
+        };
     }
     let st = guard.as_mut().unwrap();
     let key = (c, px as u32);
@@ -233,16 +303,30 @@ pub fn line_height(scale: usize) -> usize {
 
 /// Horizontal advance (pixels) of a single glyph rasterized at `px` height.
 pub fn advance_px(c: char, px: usize) -> usize {
+    advance_px_face(FACE_DEFAULT, c, px)
+}
+
+/// Horizontal advance (pixels) of a glyph from `slot` at `px` height.
+pub fn advance_px_face(slot: usize, c: char, px: usize) -> usize {
     let px = px.max(1);
-    with_glyph(c, px, |g| g.advance).unwrap_or(px / 2)
+    with_glyph_face(slot, c, px, |g| g.advance).unwrap_or(px / 2)
 }
 
 /// Ascent (pixels above the baseline) at `px` height.
 pub fn ascent_px(px: usize) -> usize {
+    ascent_px_face(FACE_DEFAULT, px)
+}
+
+/// Ascent for `slot`. Faces disagree: Inter and DejaVu have different ascenders at the same pixel
+/// size, so a caller that mixes faces on one line must position by the face it is drawing, not by
+/// the default.
+pub fn ascent_px_face(slot: usize, px: usize) -> usize {
     let px = px.max(1);
-    let mut guard = FONT.lock();
-    if !ensure_loaded(&mut guard) {
-        return (px * 3) / 4;
+    let slot = if slot < MAX_FACES { slot } else { FACE_DEFAULT };
+    let mut guard = FONTS[slot].lock();
+    if !ensure_loaded(slot, &mut guard) {
+        drop(guard);
+        return if slot == FACE_DEFAULT { (px * 3) / 4 } else { ascent_px_face(FACE_DEFAULT, px) };
     }
     let st = guard.as_ref().unwrap();
     let s = px as f32 / st.upem;
@@ -251,10 +335,22 @@ pub fn ascent_px(px: usize) -> usize {
 
 /// Full line height (pixels) at `px` height = (ascender - descender + line_gap) scaled.
 pub fn line_height_px(px: usize) -> usize {
+    line_height_px_face(FACE_DEFAULT, px)
+}
+
+/// Line height for `slot`.
+///
+/// ⚠️ Meridian does NOT use this for layout. The design specifies its own line height per style
+/// (40/44, 28/34, 15/22 …), and those are tighter than the font's natural metric — which is what
+/// makes the type read as designed rather than as a default. This remains for callers that want the
+/// face's own rhythm.
+pub fn line_height_px_face(slot: usize, px: usize) -> usize {
     let px = px.max(1);
-    let mut guard = FONT.lock();
-    if !ensure_loaded(&mut guard) {
-        return px;
+    let slot = if slot < MAX_FACES { slot } else { FACE_DEFAULT };
+    let mut guard = FONTS[slot].lock();
+    if !ensure_loaded(slot, &mut guard) {
+        drop(guard);
+        return if slot == FACE_DEFAULT { px } else { line_height_px_face(FACE_DEFAULT, px) };
     }
     let st = guard.as_ref().unwrap();
     let s = px as f32 / st.upem;
@@ -266,4 +362,9 @@ pub fn line_height_px(px: usize) -> usize {
 /// line breaking (the browser) never pass them.
 pub fn text_width_px(text: &str, px: usize) -> usize {
     text.chars().map(|c| advance_px(c, px)).sum()
+}
+
+/// Advance of a whole string in `slot` at `px` height.
+pub fn text_width_px_face(slot: usize, text: &str, px: usize) -> usize {
+    text.chars().map(|c| advance_px_face(slot, c, px)).sum()
 }

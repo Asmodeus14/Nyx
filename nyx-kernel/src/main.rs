@@ -23,6 +23,11 @@ pub mod percpu;
 pub mod time;
 pub mod rtc;
 pub mod postmortem;
+pub mod panic_screen;
+/// The identity, pre-rasterized at build time. Generated — see `tools/icons`.
+#[rustfmt::skip]
+pub mod brand_gen;
+pub mod boot_screen;
 pub mod random;
 pub mod scheduler;
 pub mod pci;
@@ -123,12 +128,59 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unsafe { crate::memory::BOOTLOADER_CR3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64(); }
     
     crate::serial_println!("[BOOT] NyxOS Kernel Starting...");
+
+    // ★ The screen has to exist BEFORE the post-mortem runs, and for a long time it did not.
+    //
+    // `report_and_clear` prints the previous run's death record and then holds for ~8 seconds
+    // "so this can be read/photographed". But it ran before `SCREEN_PAINTER` was built, so every
+    // line went to serial — and this machine has no serial console. The record that survives a
+    // freeze is the single most valuable thing the kernel ever prints, and it has been holding the
+    // machine for eight seconds while displaying the BOOTLOADER's leftover output instead.
+    //
+    // Only the parts that need no memory mapping happen here. `virt_to_phys` needs `memory::init`
+    // and stays below.
+    let mut fb_geom = None;
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let info = fb.info();
+        let raw_buffer = fb.buffer_mut();
+        let fb_virt_ptr = raw_buffer.as_ptr() as u64;
+
+        // Give the fatal-screen path a surface BEFORE anything else in boot can panic. Until the
+        // GPU driver arms its own plane this framebuffer is what is being scanned out, so a panic
+        // in the next few hundred lines is reportable from here on.
+        crate::panic_screen::register_firmware(
+            fb_virt_ptr,
+            info.width as u32,
+            info.height as u32,
+            info.stride as u32,
+            info.bytes_per_pixel as u32,
+            matches!(info.pixel_format, bootloader_api::info::PixelFormat::Rgb),
+        );
+        unsafe { crate::gui::SCREEN_PAINTER = Some(gui::VgaPainter { buffer: raw_buffer, info }); }
+        {
+            let mut mouse_state = crate::mouse::MOUSE_STATE.lock();
+            mouse_state.screen_width = info.width;
+            mouse_state.screen_height = info.height;
+        }
+        // Wipe the bootloader's own log the moment we can. It is not ours, it is not suppressible
+        // through `BootloaderConfig`, and leaving it under the post-mortem report makes two
+        // unrelated streams look like one.
+        if let Some(s) = crate::panic_screen::live_surface() {
+            s.clear((0, 0, 0));
+        }
+        crate::vga_log::reset_cursor();
+        fb_geom = Some((info.width, info.height, fb_virt_ptr));
+    }
+
     crate::vga_println!("[BOOT] NyxOS Kernel Boot Sequence Initiated...");
 
     // FIRST thing after the log exists. This machine has no serial console — BOOT_LOG is RAM and
     // dies with the box — so after a freeze this CMOS record is the ONLY surviving evidence, and
     // it must be printed before anything else can crowd the log or overwrite the register.
-    crate::postmortem::report_and_clear();
+    //
+    // It now genuinely reaches a screen, and its hold is spent on the report rather than on
+    // whatever happened to be left in the framebuffer.
+    let died = crate::postmortem::report_and_clear();
 
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     unsafe { crate::memory::PHYS_MEM_OFFSET = phys_mem_offset.as_u64(); }
@@ -145,26 +197,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // getrandom(318), and the PRNG that used to back it is guessable — see random.rs.
     random::init();
 
-    if let Some(fb) = boot_info.framebuffer.as_mut() {
-        let info = fb.info();
-        let raw_buffer = fb.buffer_mut();
-        let fb_virt_ptr = raw_buffer.as_ptr() as u64;
-        
-        unsafe { 
-             crate::gui::SCREEN_PAINTER = Some(gui::VgaPainter { buffer: raw_buffer, info });
-             if let Some(phys) = crate::memory::virt_to_phys(fb_virt_ptr) { crate::gui::FRAMEBUFFER_PHYS_ADDR = phys; }
-             else { crate::gui::FRAMEBUFFER_PHYS_ADDR = fb_virt_ptr; }
+    if let Some((w, h, fb_virt_ptr)) = fb_geom {
+        // The one part of the framebuffer setup that had to wait for paging.
+        unsafe {
+            if let Some(phys) = crate::memory::virt_to_phys(fb_virt_ptr) { crate::gui::FRAMEBUFFER_PHYS_ADDR = phys; }
+            else { crate::gui::FRAMEBUFFER_PHYS_ADDR = fb_virt_ptr; }
         }
-        
-        {
-            let mut mouse_state = crate::mouse::MOUSE_STATE.lock();
-            mouse_state.screen_width = info.width;
-            mouse_state.screen_height = info.height;
-        }
-        crate::vga_println!("[BOOT] Framebuffer Mapped: {}x{}", info.width, info.height);
+        crate::serial_println!("[BOOT] Framebuffer Mapped: {}x{}", w, h);
+
+        // Cold start, stage 1. From here the `[BOOT]` stream stays off the screen and the identity
+        // is what is on it — unless a key is pressed, in which case the log comes back.
+        //
+        // AFTER the post-mortem, deliberately. On a clean boot that read nothing and this is the
+        // first thing on screen. After a freeze the full report has just had its eight seconds,
+        // which on a machine with no serial port is the only chance anyone gets to read it — and
+        // the mark then comes up amber, naming what died.
+        crate::boot_screen::begin(died);
     }
 
-    init_hardened_gdt(); 
+    // Memory, paging and the heap are already up by this point — the framebuffer had to be mapped
+    // through them to get here.
+    crate::boot_screen::milestone(crate::boot_screen::Milestone::Memory);
+
+    init_hardened_gdt();
     interrupts::init_idt();
 
     crate::vga_println!("[BOOT] Initializing PS/2 Legacy Trackpad Emulator...");
@@ -204,7 +259,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::ioapic::route_irq(11, bsp_apic_id, 48); 
         
         smp::init_aps(&apic_ids);
+        crate::boot_screen::milestone(crate::boot_screen::Milestone::Acpi);
         pci::enumerate_pci();
+        crate::boot_screen::milestone(crate::boot_screen::Milestone::Pci);
     } else {
         crate::vga_println!("[BOOT] WARN: ACPI Tables missing! Attempting degraded boot.");
         let apic_ids = [0];
@@ -212,6 +269,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         time::init();
         crate::time::calibrate_tsc();
         pci::enumerate_pci();
+        crate::boot_screen::milestone(crate::boot_screen::Milestone::Pci);
     }
 
     // ==========================================
@@ -225,6 +283,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         crate::entity::awaken_entity(&mut crate::fs::GLOBAL_NVME);
     }
+    crate::boot_screen::milestone(crate::boot_screen::Milestone::Storage);
 
     // ==========================================
     // /tmp — in-memory scratch
@@ -244,8 +303,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             if let Some(ext4_fs) = crate::fs::NvmeLwExt4Fs::new() {
                 crate::vfs::VFS.mount("/mnt/nvme", Box::new(ext4_fs));
                 crate::vga_println!("[BOOT] Physical NVMe Hardware (lwext4 R/W) Mounted to /mnt/nvme");
-                
+                // Marked BEFORE the extraction, not after. Unpacking the initrd onto ext4 is the
+                // single longest step in boot, and a rule that does not move across it is a rule
+                // that appears to have stopped.
+                crate::boot_screen::milestone(crate::boot_screen::Milestone::Filesystem);
                 crate::installer::extract_tar_to_ext4(INITRD_TAR);
+                crate::boot_screen::milestone(crate::boot_screen::Milestone::Applications);
                 
             } else {
                 panic!("FATAL: NVMe Drive Found but no ext4 partition detected.");
@@ -373,6 +436,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::apic::init_timer(0x40);
 
     crate::vga_println!("[BOOT] Jumping to Ring 3 Natively (Entry: {:#x})...", entry_point);
+
+    // The last milestone, and the last thing the kernel draws. The rule fills, and then the screen
+    // belongs to userspace.
+    //
+    // `end` deliberately does NOT clear. Init forks the window server, which paints the whole
+    // screen on its first frame; blanking here would put a black flash between the mark and the
+    // desktop, which is precisely the "splash torn down, shell put up" seam the design exists to
+    // avoid. What is left on screen until that first frame is the identity, which is correct.
+    crate::boot_screen::milestone(crate::boot_screen::Milestone::Userspace);
+    crate::boot_screen::end();
+
     unsafe { process::enter_userspace(entry_point, stack_top); }
 }
 
@@ -405,30 +479,49 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // `core::fmt` does not need the heap — only `format!` does. `_vga_print` and `_print` both
     // take `fmt::Arguments`, so `info` can be rendered straight into them with no allocation.
     x86_64::instructions::interrupts::disable();
-    unsafe {
-        if let Some(painter) = &mut crate::gui::SCREEN_PAINTER {
-            let buf = painter.buffer.as_mut();
-            for i in (0..buf.len()).step_by(4) {
-                buf[i] = 0; buf[i+1] = 0; buf[i+2] = 255; buf[i+3] = 255;
-            }
-        }
-    }
+
+    // ★ This used to fill `gui::SCREEN_PAINTER` — the FIRMWARE framebuffer — and then print via
+    // `vga_println!`, which does the same. Both stopped being visible the moment P1a's
+    // `arm_scanout_plane` re-pointed the display plane at our own buffer at GVA 0x1600_0000: the
+    // handler painted red and printed the message into memory nobody was scanning out. Every kernel
+    // panic since has looked exactly like a hang, which is most of why "froze with no output" became
+    // the default symptom here. `panic_screen` paints the OWNED scanout and the firmware buffer
+    // both, so it does not matter which one is live, and it takes no locks — `vga_println!` goes
+    // through `VGA_LOGGER.lock()`, and a panic raised while holding that lock deadlocked here.
+    crate::panic_screen::fatal("KERNEL PANIC", format_args!("{}", info));
+
     crate::serial_println!("[PANIC] {}", info);
-    crate::vga_println!("\n\n  [FATAL KERNEL PANIC]\n  -> {}", info);
-    loop { x86_64::instructions::hlt(); }
+
+    // ★ Hold the screen instead of halting once.
+    //
+    // Painting once and going to `hlt` assumes nothing else writes the scanout afterwards. That is
+    // false: the other cores never stopped, and the GPU's BLT engine can still be draining work
+    // queued before the panic. The report came up in bands with desktop showing between them —
+    // legible enough to look like data, corrupt enough to be wrong, which is the worst outcome.
+    //
+    // Repainting wins whatever lands late, at no cost: the machine is dead, so spending it on
+    // redrawing the only thing the user can still act on is exactly the right use of it. The
+    // present syscalls are already gated (`screen_is_claimed`); this covers the paths that are not
+    // syscalls at all, including an in-flight blit.
+    //
+    // If the screen still comes up banded with this in place, the cause is NOT a race and the next
+    // suspect is the display plane's tiling mode: PLANE_CTL bits 12:10 (pipe+0x180) are never read
+    // by this driver, and a linear CPU fill into a tiled scanout de-tiles into exactly these bands.
+    // ⚠️ NOT `hlt` for the delay. Interrupts are disabled above, so `hlt` with IF=0 never wakes —
+    // the first one would park this core forever and the repaint would never run a second time.
+    // A spin delay is the only thing that works here.
+    loop {
+        for _ in 0..8_000_000u64 {
+            core::hint::spin_loop();
+        }
+        crate::panic_screen::fatal("KERNEL PANIC", format_args!("{}", info));
+    }
 }
 
 pub fn trigger_rsod(msg: &str) -> ! {
     x86_64::instructions::interrupts::disable();
-    unsafe {
-        if let Some(painter) = &mut crate::gui::SCREEN_PAINTER {
-            let buf = painter.buffer.as_mut();
-            for i in (0..buf.len()).step_by(4) {
-                buf[i] = 0; buf[i+1] = 0; buf[i+2] = 255; buf[i+3] = 255;
-            }
-        }
-    }
-    crate::vga_println!("\n\n  [FATAL KERNEL PANIC]\n  -> {}", msg);
+    crate::panic_screen::fatal("KERNEL PANIC", format_args!("{}", msg));
+    crate::serial_println!("[RSOD] {}", msg);
     loop { x86_64::instructions::hlt(); }
 }
 

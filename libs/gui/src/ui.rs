@@ -22,12 +22,12 @@ pub fn draw_taskbar(buffer: &mut [u32], stride: usize, screen_h: usize) {
     let bar_h = 36; let start_y = screen_h - bar_h;
     
     canvas.fill_rect(0, start_y, stride, bar_h, 0xD8_FFFFFF); 
-    canvas.fill_rect(0, start_y, stride, 1, 0xFF_D1D1D1);     
+    canvas.fill_rect(0, start_y, stride, 1, Color::LINE);     
     
-    canvas.print_str(20, start_y + 14, "10:20 AM", Color::TEXT_DARK, 1);
+    canvas.print_str(20, start_y + 14, "10:20 AM", Color::FG, 1);
     
     let btn_x = (stride / 2) - 35;
-    canvas.fill_rect(btn_x, start_y + 6, 70, 24, Color::ACCENT_PRIMARY);
+    canvas.fill_rect(btn_x, start_y + 6, 70, 24, Color::ACCENT);
     canvas.print_str(btn_x + 15, start_y + 8, "NYX", Color::WHITE, 1);
 }
 
@@ -108,7 +108,7 @@ pub fn draw_cursor(buffer: &mut [u32], stride: usize, screen_h: usize, mx: usize
         CursorType::Arrow => {
             for (row_idx, row) in ARROW_BITMAP.iter().enumerate() {
                 for (col_idx, &pixel) in row.iter().enumerate() {
-                    if pixel == 1 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::TEXT_DARK); } 
+                    if pixel == 1 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::CURSOR_OUTLINE); } 
                     else if pixel == 2 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::WHITE); }
                 }
             }
@@ -117,7 +117,7 @@ pub fn draw_cursor(buffer: &mut [u32], stride: usize, screen_h: usize, mx: usize
             let offset_x = mx.saturating_sub(2);
             for (row_idx, row) in IBEAM_BITMAP.iter().enumerate() {
                 for (col_idx, &pixel) in row.iter().enumerate() {
-                    if pixel == 1 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::TEXT_DARK); }
+                    if pixel == 1 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::CURSOR_OUTLINE); }
                 }
             }
         },
@@ -125,7 +125,7 @@ pub fn draw_cursor(buffer: &mut [u32], stride: usize, screen_h: usize, mx: usize
             let offset_x = mx.saturating_sub(4);
             for (row_idx, row) in HAND_BITMAP.iter().enumerate() {
                 for (col_idx, &pixel) in row.iter().enumerate() {
-                    if pixel == 1 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::TEXT_DARK); }
+                    if pixel == 1 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::CURSOR_OUTLINE); }
                     else if pixel == 2 { canvas.fill_rect(offset_x + col_idx, my + row_idx, 1, 1, Color::WHITE); }
                 }
             }
@@ -135,7 +135,7 @@ pub fn draw_cursor(buffer: &mut [u32], stride: usize, screen_h: usize, mx: usize
             // real double-arrow shapes). Keeps the SW fallback functional without extra bitmaps.
             for (row_idx, row) in ARROW_BITMAP.iter().enumerate() {
                 for (col_idx, &pixel) in row.iter().enumerate() {
-                    if pixel == 1 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::TEXT_DARK); }
+                    if pixel == 1 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::CURSOR_OUTLINE); }
                     else if pixel == 2 { canvas.fill_rect(mx + col_idx, my + row_idx, 1, 1, Color::WHITE); }
                 }
             }
@@ -145,8 +145,8 @@ pub fn draw_cursor(buffer: &mut [u32], stride: usize, screen_h: usize, mx: usize
 
 pub fn draw_window_rounded(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window) {
     let mut canvas = Canvas::new(buffer, stride, screen_h);
-    let surface = apply_opacity(Color::WARM_SURFACE, win.opacity);
-    let border = apply_opacity(Color::WARM_BORDER, win.opacity);
+    let surface = apply_opacity(Color::RAISED, win.opacity);
+    let border = apply_opacity(Color::LINE, win.opacity);
     let total_h = if win.is_minimized { 30 } else { win.h + 30 };
     canvas.fill_rect(win.x, win.y, win.w, total_h, surface);
     canvas.fill_rect(win.x, win.y, win.w, 1, border); 
@@ -169,7 +169,7 @@ pub fn draw_window_rounded(buffer: &mut [u32], stride: usize, screen_h: usize, w
 
     let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
     let tw = crate::canvas::Canvas::text_width(title_str, 1);
-    canvas.print_str(win.x + (win.w / 2).saturating_sub(tw / 2), win.y + 12, title_str, apply_opacity(Color::TEXT_DARK, win.opacity), 1);
+    canvas.print_str(win.x + (win.w / 2).saturating_sub(tw / 2), win.y + 12, title_str, apply_opacity(Color::FG, win.opacity), 1);
 }
 
 /// U4 GPU-compositor chrome: draw ONLY the title bar + border frame, NOT the content-area fill (the
@@ -227,12 +227,12 @@ fn round_rect_corners(canvas: &mut Canvas, x: usize, y: usize, w: usize, h: usiz
 pub fn round_window_corners(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, radius: usize, above: &[(i32, i32, i32, i32)]) {
     let mut canvas = Canvas::new(buffer, stride, screen_h);
     let total_h = if win.is_minimized { 30 } else { win.h + 30 };
-    let border = apply_opacity(Color::WARM_BORDER, win.opacity);
+    let border = apply_opacity(Color::LINE, win.opacity);
     // The frame borders (draw_window_chrome/draw_window_rounded) put the RIGHT border at column x+w and
     // the BOTTOM border at row y+total_h — one past the x..x+w-1 / y..y+total_h-1 content box. So the
     // rounded rect must be w+1 × total_h+1 to include (and curve) those right/bottom border lines;
     // otherwise they stay straight with square corners.
-    round_rect_corners(&mut canvas, win.x, win.y, win.w + 1, total_h + 1, radius, Color::WARM_BG, border, above);
+    round_rect_corners(&mut canvas, win.x, win.y, win.w + 1, total_h + 1, radius, Color::SURFACE, border, above);
 }
 
 /// Newton-Raphson sqrt (2 iters off a bit-twiddle seed). No libm in this crate; adequate for the
@@ -371,12 +371,12 @@ pub fn scrollbar_thumb(track_h: usize, content: usize, viewport: usize, scroll_o
 pub fn draw_scrollbar(canvas: &mut Canvas, x: usize, y: usize, w: usize, track_h: usize, content: usize, viewport: usize, scroll_off: usize) {
     if content <= viewport || w == 0 || track_h == 0 { return; }
     // Subtle track.
-    canvas.fill_rect(x, y, w, track_h, Color::WARM_BORDER);
+    canvas.fill_rect(x, y, w, track_h, Color::LINE);
     let (ty, th) = scrollbar_thumb(track_h, content, viewport, scroll_off);
     // Thumb inset 2px on each side; darker than the track.
     let inset = 2;
     if w > 2 * inset && th > 2 * inset {
-        canvas.fill_rect(x + inset, y + ty + inset, w - 2 * inset, th - 2 * inset, Color::TEXT_MUTED);
+        canvas.fill_rect(x + inset, y + ty + inset, w - 2 * inset, th - 2 * inset, Color::FG_MUTED);
     }
 }
 
@@ -421,9 +421,9 @@ pub fn ctl_btn_hit(win_x: usize, win_y: usize, mx: usize, my: usize) -> Option<u
 pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, win: &Window, above: &[(i32, i32, i32, i32)], is_active: bool, hover_btn: i32) {
     let mut canvas = Canvas::new(buffer, stride, screen_h);
     // Inactive windows use a slightly greyed surface so the focused window reads as "on top".
-    let base_surface = if is_active { Color::WARM_SURFACE } else { 0xFF_F1F1EE };
+    let base_surface = if is_active { Color::RAISED } else { Color::SURFACE };
     let surface = apply_opacity(base_surface, win.opacity);
-    let border = apply_opacity(Color::WARM_BORDER, win.opacity);
+    let border = apply_opacity(Color::LINE, win.opacity);
     let total_h = if win.is_minimized { 30 } else { win.h + 30 };
 
     // Title bar strip (top 30px) — solid surface fill; the content below is GPU-drawn.
@@ -442,9 +442,9 @@ pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, wi
     let (c_close, c_min, c_max) = if is_active {
         (0xFF_FF5F56u32, 0xFF_FFBD2Eu32, 0xFF_28C940u32)
     } else {
-        (0xFF_CFCFCAu32, 0xFF_CFCFCAu32, 0xFF_CFCFCAu32)
+        (0xFF_3A3E43u32, 0xFF_3A3E43u32, 0xFF_3A3E43u32)
     };
-    let hover_plate = apply_opacity(0xFF_FCE9D8, win.opacity); // soft accent plate under a hovered button
+    let hover_plate = apply_opacity(Color::LINE, win.opacity); // soft accent plate under a hovered button
     let btns = [(c_close, 'x'), (c_min, '-'), (c_max, '+')];
     for (bi, &(col, glyph)) in btns.iter().enumerate() {
         let (bx, by, bw, bh) = ctl_btn_rect(win.x, win.y, bi);
@@ -461,7 +461,7 @@ pub fn draw_window_chrome(buffer: &mut [u32], stride: usize, screen_h: usize, wi
     let gy = win.y as i32 + 14;
 
     let title_str = core::str::from_utf8(&win.title[..win.title_len]).unwrap_or("App");
-    let title_col = if is_active { Color::TEXT_DARK } else { Color::TEXT_MUTED };
+    let title_col = if is_active { Color::FG } else { Color::FG_MUTED };
     let tw = crate::canvas::Canvas::text_width(title_str, 1);
     let tx = win.x + (win.w / 2).saturating_sub(tw / 2);
     if !Canvas::point_occluded(tx as i32, gy, above) {
@@ -520,9 +520,9 @@ pub struct Button {
 }
 impl Widget for Button {
     fn draw(&mut self, canvas: &mut Canvas) {
-        let bg = if self.is_pressed { Color::ACCENT_HOVER } else if self.is_hovered { Color::ACCENT_PRIMARY } else { Color::WARM_BORDER };
+        let bg = if self.is_pressed { Color::ACCENT_HOVER } else if self.is_hovered { Color::ACCENT } else { Color::LINE };
         canvas.fill_rect(self.x, self.y, self.w, self.h, bg);
-        canvas.print_str(self.x + 10, self.y + (self.h/2) - 4, &self.text, if self.is_hovered {Color::WHITE} else {Color::TEXT_DARK}, 1);
+        canvas.print_str(self.x + 10, self.y + (self.h/2) - 4, &self.text, if self.is_hovered {Color::WHITE} else {Color::FG}, 1);
     }
     fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {
         let in_bounds = mx >= self.x && mx <= self.x + self.w && my >= self.y && my <= self.y + self.h;
@@ -541,14 +541,14 @@ pub struct TextBox {
 }
 impl Widget for TextBox {
     fn draw(&mut self, canvas: &mut Canvas) {
-        let border = if self.is_focused { Color::ACCENT_PRIMARY } else { Color::WARM_BORDER };
+        let border = if self.is_focused { Color::ACCENT } else { Color::LINE };
         canvas.fill_rect(self.x, self.y, self.w, self.h, Color::WHITE);
         canvas.fill_rect(self.x, self.y, self.w, 1, border);
         canvas.fill_rect(self.x, self.y + self.h, self.w, 1, border);
         canvas.fill_rect(self.x, self.y, 1, self.h, border);
         canvas.fill_rect(self.x + self.w, self.y, 1, self.h, border);
-        canvas.print_str(self.x + 5, self.y + 8, &self.text, Color::TEXT_DARK, 1);
-        if self.is_focused { canvas.fill_rect(self.x + 5 + (self.text.len() * 8), self.y + 6, 2, 12, Color::TEXT_DARK); }
+        canvas.print_str(self.x + 5, self.y + 8, &self.text, Color::FG, 1);
+        if self.is_focused { canvas.fill_rect(self.x + 5 + (self.text.len() * 8), self.y + 6, 2, 12, Color::FG); }
     }
     fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {
         if clicked {
@@ -573,13 +573,13 @@ pub struct CheckBox {
 }
 impl Widget for CheckBox {
     fn draw(&mut self, canvas: &mut Canvas) {
-        let bg = if self.is_checked { Color::ACCENT_PRIMARY } else { Color::WHITE };
+        let bg = if self.is_checked { Color::ACCENT } else { Color::WHITE };
         canvas.fill_rect(self.x, self.y, 16, 16, bg);
-        canvas.fill_rect(self.x, self.y, 16, 1, Color::WARM_BORDER);
-        canvas.fill_rect(self.x, self.y+16, 16, 1, Color::WARM_BORDER);
-        canvas.fill_rect(self.x, self.y, 1, 16, Color::WARM_BORDER);
-        canvas.fill_rect(self.x+16, self.y, 1, 16, Color::WARM_BORDER);
-        canvas.print_str(self.x + 25, self.y + 4, &self.text, Color::TEXT_DARK, 1);
+        canvas.fill_rect(self.x, self.y, 16, 1, Color::LINE);
+        canvas.fill_rect(self.x, self.y+16, 16, 1, Color::LINE);
+        canvas.fill_rect(self.x, self.y, 1, 16, Color::LINE);
+        canvas.fill_rect(self.x+16, self.y, 1, 16, Color::LINE);
+        canvas.print_str(self.x + 25, self.y + 4, &self.text, Color::FG, 1);
     }
     fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {
         if clicked && mx >= self.x && mx <= self.x + 16 && my >= self.y && my <= self.y + 16 {
@@ -602,10 +602,10 @@ impl Widget for ListBox {
             let item_y = self.y + (i * 20);
             if item_y + 20 > self.y + self.h { break; } 
             if Some(i) == self.selected_idx {
-                canvas.fill_rect(self.x, item_y, self.w, 20, Color::ACCENT_PRIMARY);
+                canvas.fill_rect(self.x, item_y, self.w, 20, Color::ACCENT);
                 canvas.print_str(self.x + 5, item_y + 6, item, Color::WHITE, 1);
             } else {
-                canvas.print_str(self.x + 5, item_y + 6, item, Color::TEXT_DARK, 1);
+                canvas.print_str(self.x + 5, item_y + 6, item, Color::FG, 1);
             }
         }
     }
@@ -629,15 +629,15 @@ impl Widget for Menu {
         // 🚨 FIX E0716: Treat it purely as a string slice (&str) rather than an allocated String reference
         let text = self.items.get(self.selected_idx).map(|s| s.as_str()).unwrap_or("Select");
         
-        canvas.fill_rect(self.x, self.y, self.w, 25, Color::WARM_SURFACE);
-        canvas.print_str(self.x + 5, self.y + 8, text, Color::TEXT_DARK, 1);
-        canvas.print_str(self.x + self.w - 15, self.y + 8, "v", Color::TEXT_DARK, 1);
+        canvas.fill_rect(self.x, self.y, self.w, 25, Color::RAISED);
+        canvas.print_str(self.x + 5, self.y + 8, text, Color::FG, 1);
+        canvas.print_str(self.x + self.w - 15, self.y + 8, "v", Color::FG, 1);
         
         if self.is_open {
             let drop_y = self.y + 25;
             canvas.fill_rect(self.x, drop_y, self.w, self.items.len() * 25, Color::WHITE);
             for (i, item) in self.items.iter().enumerate() {
-                canvas.print_str(self.x + 5, drop_y + (i * 25) + 8, item, Color::TEXT_DARK, 1);
+                canvas.print_str(self.x + 5, drop_y + (i * 25) + 8, item, Color::FG, 1);
             }
         }
     }
@@ -664,10 +664,10 @@ pub struct ScrollBar {
 }
 impl Widget for ScrollBar {
     fn draw(&mut self, canvas: &mut Canvas) {
-        canvas.fill_rect(self.x, self.y, self.w, self.h, 0xFF_E0E0E0);
+        canvas.fill_rect(self.x, self.y, self.w, self.h, Color::RAISED);
         let thumb_h = core::cmp::max(20, self.h / core::cmp::max(1, self.max_value));
         let thumb_y = self.y + ((self.h - thumb_h) * self.value) / core::cmp::max(1, self.max_value);
-        canvas.fill_rect(self.x + 2, thumb_y, self.w - 4, thumb_h, 0xFF_999999);
+        canvas.fill_rect(self.x + 2, thumb_y, self.w - 4, thumb_h, Color::FG_MUTED);
     }
     fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {
         if clicked && mx >= self.x && mx <= self.x + self.w && my >= self.y && my <= self.y + self.h {
@@ -702,13 +702,13 @@ pub struct Dialog {
 impl Widget for Dialog {
     fn draw(&mut self, canvas: &mut Canvas) {
         canvas.fill_rect(self.x + 5, self.y + 5, self.w, self.h, 0x40_000000); 
-        canvas.fill_rect(self.x, self.y, self.w, self.h, Color::WARM_BG);
-        canvas.fill_rect(self.x, self.y, self.w, 30, Color::WARM_SURFACE); 
-        canvas.fill_rect(self.x, self.y, self.w, 1, Color::WARM_BORDER);
-        canvas.fill_rect(self.x, self.y + self.h, self.w, 1, Color::WARM_BORDER);
-        canvas.fill_rect(self.x, self.y, 1, self.h, Color::WARM_BORDER);
-        canvas.fill_rect(self.x + self.w, self.y, 1, self.h, Color::WARM_BORDER);
-        canvas.print_str(self.x + 10, self.y + 8, &self.title, Color::TEXT_DARK, 1);
+        canvas.fill_rect(self.x, self.y, self.w, self.h, Color::SURFACE);
+        canvas.fill_rect(self.x, self.y, self.w, 30, Color::RAISED); 
+        canvas.fill_rect(self.x, self.y, self.w, 1, Color::LINE);
+        canvas.fill_rect(self.x, self.y + self.h, self.w, 1, Color::LINE);
+        canvas.fill_rect(self.x, self.y, 1, self.h, Color::LINE);
+        canvas.fill_rect(self.x + self.w, self.y, 1, self.h, Color::LINE);
+        canvas.print_str(self.x + 10, self.y + 8, &self.title, Color::FG, 1);
         for child in &mut self.children { child.draw(canvas); }
     }
     fn on_mouse(&mut self, mx: usize, my: usize, clicked: bool) -> bool {

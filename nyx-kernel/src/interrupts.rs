@@ -698,8 +698,24 @@ extern "x86-interrupt" fn gpf_handler(stack_frame: InterruptStackFrame, error_co
         // A userspace #GP must kill only the offending process, NOT panic the whole kernel.
         crate::serial_println!("\n[GPF] User Process Terminated. err={:#x} IP={:#x}",
             error_code, stack_frame.instruction_pointer.as_u64());
+        report_user_fault("GENERAL PROTECTION FAULT", format_args!(
+            "err {:#x} at ip {:#x}", error_code, stack_frame.instruction_pointer.as_u64()));
         terminate_current_user_process();
     }
+    // ★ Record the faulting IP in CMOS BEFORE panicking, so it survives to the next boot.
+    //
+    // The screen is not a trustworthy channel for this. A #GP here was transcribed off a red screen
+    // that paints in bands, one digit came out wrong, and the resulting address pointed into the
+    // MIDDLE of an instruction — which sent a whole debugging pass after a fault that cannot exist.
+    // CMOS does not care what the display engine is doing.
+    //
+    // `mark_why` keeps the FIRST cause, and the `panic!` below records WHY_PANIC at this file:line,
+    // which is the same for every kernel #GP and therefore tells you nothing. Claiming the slot here
+    // with the IP is strictly more information.
+    crate::postmortem::mark_why(
+        crate::postmortem::WHY_KERNEL_GPF,
+        stack_frame.instruction_pointer.as_u64(),
+    );
     panic!("EXCEPTION: GPF Error: {} ({:#x})\nIP: {:#x}", error_code, error_code, stack_frame.instruction_pointer.as_u64());
 }
 
@@ -712,6 +728,8 @@ extern "x86-interrupt" fn ud_handler(stack_frame: InterruptStackFrame) {
     if was_user {
         crate::serial_println!("\n[#UD] User Process Terminated (invalid opcode / abort). IP={:#x}",
             stack_frame.instruction_pointer.as_u64());
+        report_user_fault("INVALID OPCODE", format_args!(
+            "abort or bad instruction at ip {:#x}", stack_frame.instruction_pointer.as_u64()));
         terminate_current_user_process();
     }
     panic!("EXCEPTION: INVALID OPCODE (#UD)\nIP: {:#x}\nCS: {:#x}",
@@ -735,6 +753,8 @@ macro_rules! fatal_user_exception {
             if was_user {
                 crate::serial_println!("\n[{}] User Process Terminated. IP={:#x}",
                     $label, stack_frame.instruction_pointer.as_u64());
+                report_user_fault($label, format_args!(
+                    "at ip {:#x}", stack_frame.instruction_pointer.as_u64()));
                 terminate_current_user_process();
             }
             panic!("EXCEPTION: {}\nIP: {:#x}", $label, stack_frame.instruction_pointer.as_u64());
@@ -747,6 +767,8 @@ macro_rules! fatal_user_exception {
             if was_user {
                 crate::serial_println!("\n[{}] User Process Terminated. err={:#x} IP={:#x}",
                     $label, error_code, stack_frame.instruction_pointer.as_u64());
+                report_user_fault($label, format_args!(
+                    "err {:#x} at ip {:#x}", error_code, stack_frame.instruction_pointer.as_u64()));
                 terminate_current_user_process();
             }
             panic!("EXCEPTION: {} err={:#x}\nIP: {:#x}",
@@ -769,6 +791,47 @@ fatal_user_exception!(segment_not_present_handler,   "#NP segment not present", 
 /// hlt-loop until the scheduler switches away. Shared by the page-fault, #GP, and #UD handlers so a
 /// crashing userspace program never takes the kernel down with it. Assumes swapgs already ran (we're
 /// on the kernel GS). Never returns.
+/// Identify the task that faulted, for the on-screen banner: writes its name into `out` and returns
+/// its pid (0 if there is no current task — a fault before the scheduler is up).
+///
+/// Reads per-CPU state directly. `percpu::current()` is a `gs:[0x10]` load, not a lock; a fault
+/// handler that blocked on the scheduler lock to find out who faulted could deadlock against the
+/// very code that was holding it when it faulted.
+fn faulting_task(out: &mut [u8; 16]) -> u64 {
+    if GsBase::read().as_u64() == 0 {
+        return 0;
+    }
+    let percpu = crate::percpu::current();
+    let idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+    if idx >= percpu.scheduler.tasks.len() {
+        return 0;
+    }
+    let t = &percpu.scheduler.tasks[idx];
+    out.copy_from_slice(&t.name);
+    t.pid
+}
+
+/// Put a fault that killed ONE process on screen, then let `terminate_current_user_process` do the
+/// rest.
+///
+/// A band across the top of the live frame — deliberately not a full-screen fill. The system is
+/// still running: the compositor is still presenting, the other windows are still valid, and
+/// blanking all of it because one app dereferenced null would turn a recoverable event into a lost
+/// session. The band survives until the next present paints over it, which is the right lifetime.
+///
+/// Until now these faults went to serial and nowhere else, so on a machine with no serial cable an
+/// app simply vanished with no reason given.
+fn report_user_fault(label: &str, detail: core::fmt::Arguments) {
+    let mut name = [0u8; 16];
+    let pid = faulting_task(&mut name);
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    let name = core::str::from_utf8(&name[..end]).unwrap_or("?");
+    crate::panic_screen::fault_banner(
+        label,
+        format_args!("{} (pid {})  {}", name, pid, detail),
+    );
+}
+
 fn terminate_current_user_process() -> ! {
     if GsBase::read().as_u64() != 0 {
         let percpu = crate::percpu::current();
@@ -884,6 +947,8 @@ extern "x86-interrupt" fn pf_handler(stack_frame: InterruptStackFrame, error_cod
 
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
         crate::serial_println!("\n[SEGFAULT] User Process Terminated. Invalid Memory Access at: {:#x}", cr2);
+        report_user_fault("SEGMENTATION FAULT", format_args!(
+            "bad access to {:#x} at ip {:#x}", cr2, stack_frame.instruction_pointer.as_u64()));
         terminate_current_user_process();
     } else {
         if !was_user && (stack_frame.code_segment & 3) == 3 { unsafe { core::arch::asm!("swapgs", options(nostack)); } }
@@ -1163,6 +1228,13 @@ pub extern "C" fn keyboard_handler_impl() {
     use x86_64::instructions::port::Port;
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
+    // "Hold any key during stage 1" — the cold-start screen stands down and the boot log comes
+    // back. This is the only place a keystroke is reliably observed: by the time the IRQ is
+    // routed, polling the 8042 anywhere else sees nothing because this handler got there first.
+    // Make codes only, so a key RELEASE cannot trigger it on its way past.
+    if scancode < 0x80 {
+        crate::boot_screen::key_pressed();
+    }
     crate::shell::handle_key(scancode);
     // 🚨 EOI REMOVED FROM HERE!
 }
@@ -3338,6 +3410,9 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
         },
 
+        // ★ Guard must sit BEFORE the real 502 arm — match arms are tried in order, so a guard
+        // written after it is simply dead code. (It was, for one edit.)
+        502 if crate::panic_screen::screen_is_claimed() => { frame.rax = 0; },
         502 => { // sys_swap_buffers — present backbuffer -> owned scanout buffer (P1a), plane armed once.
              unsafe {
                  if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
@@ -3360,6 +3435,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
              }
         },
 
+        538 if crate::panic_screen::screen_is_claimed() => { frame.rax = 0; },
         538 => { // sys_swap_buffers_rect(x, y, w, h) — D1 region present.
             // Identical to 502 (backbuffer 0x1400_0000 -> active_gva at the full screen pitch) except it
             // BLTs only the damage sub-rect. Because src_x==dst_x==x, src_y==dst_y==y and the pitch is the
@@ -3426,17 +3502,331 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         },
 
         535 => {
-            // SYS_CURSOR_SET_IMAGE(argb_ptr): upload a 64x64 ARGB cursor bitmap. 1 ok / 0 err.
+            // SYS_CURSOR_SET_IMAGE(argb_ptr, hot_x, hot_y): upload a 64x64 ARGB cursor bitmap and
+            // the pixel inside it that is the pointer. 1 ok / 0 err.
             let ptr = arg1 as *const u32;
             let bytes = 64 * 64 * 4;
             if is_valid_user_ptr(ptr as *const u8, bytes) {
                 let img = unsafe { core::slice::from_raw_parts(ptr, 64 * 64) };
-                frame.rax = crate::drivers::gpu::intel::cursor::set_image(img) as u64;
+                frame.rax =
+                    crate::drivers::gpu::intel::cursor::set_image(img, arg2 as u32, arg3 as u32)
+                        as u64;
             } else {
                 frame.rax = EFAULT as u64;
             }
         },
 
+        // ★ 556/557, NOT 554/555. These two arms were first written as 554 and 555, which were
+        // already SYS_SET_TZ and SYS_FAULT_SELFTEST further down this same `match`. Being earlier in
+        // the match, they shadowed both: setting the display timezone silently returned the boot
+        // mark, and the fatal-screen self-test — the only way to prove a panic reaches the display on
+        // a machine with NO SERIAL CONSOLE — silently adjusted the backlight instead.
+        //
+        // `unreachable_patterns` would have caught this on the first build. `#![allow(warnings)]` at
+        // the top of this file suppressed it. Before adding a syscall here, run:
+        //   grep -oE '^ {8}[0-9]+ =>' nyx-kernel/src/interrupts.rs | grep -oE '[0-9]+' | sort -n | uniq -d
+        // and expect it to print nothing.
+        557 => {
+            // SYS_BACKLIGHT(value, absolute): read, step, or set the panel backlight. Returns the
+            // percentage, or a value above 100 meaning "this panel has no PWM backlight".
+            //
+            // `absolute` is a separate argument rather than, say, a negative sentinel in `value`,
+            // because the step path genuinely needs the full signed range and "set to 0" and "read"
+            // are different requests that must not collapse into each other.
+            // ★ NOTHING here evaluates AML. The current value is read out of the cache the thermal
+            // governor fills at IF=1, and a change is QUEUED for it to apply. `_BCM` on this laptop
+            // ends in a firmware SMI, which freezes the CPU while SMM runs — doing that from a
+            // syscall at IF=0 is what wedged core 0 and took the whole machine down with it.
+            // ★ PWM is a plain MMIO read/write — safe right here, with no AML and no SMI. Only the
+            // ACPI fallback has to go through the governor, so try the register first and queue
+            // only when there is no PWM backlight on this machine.
+            // ⚠️ Deliberately NOT an early `return` — this is one arm of the syscall dispatch, and
+            // returning from the middle of it would skip whatever the handler does after the match.
+            if let Some(p) = crate::drivers::gpu::intel::backlight::percent() {
+                let r = if arg2 == 1 {
+                    crate::drivers::gpu::intel::backlight::set_percent(arg1 as u32)
+                } else if arg1 as i64 as i32 == 0 {
+                    Some(p)
+                } else {
+                    crate::drivers::gpu::intel::backlight::step(arg1 as i64 as i32)
+                };
+                frame.rax = r.unwrap_or(u32::MAX) as u64;
+            } else {
+            let cur = crate::acpi::cache()
+                .filter(|c| c.ready)
+                .map(|c| c.panel_pct)
+                .unwrap_or(u32::MAX);
+
+            if arg2 == 1 {
+                crate::acpi::request_brightness(arg1 as u32);
+                // ★ And ask the governor to actually APPLY it on its next tick.
+                //
+                // Without this the request sat in an atomic that only `acpi probe 6` ever drained,
+                // so `panel set 50` reported success and changed nothing — a set command that
+                // silently does nothing until you type a second, undocumented one.
+                crate::acpi::request_probe(6, 0);
+                // Report the request, not the reading: the governor has not applied it yet, and
+                // echoing a stale value would look like the set silently failed.
+                frame.rax = (arg1 as u32).clamp(5, 100) as u64;
+            } else {
+                let delta = arg1 as i64 as i32;
+                if delta == 0 || cur == u32::MAX {
+                    frame.rax = cur as u64;
+                } else {
+                    let next = (cur as i32 + delta).clamp(5, 100) as u32;
+                    crate::acpi::request_brightness(next);
+                    frame.rax = next as u64;
+                }
+            }
+            }
+        },
+
+        556 => {
+            // SYS_BOOT_MARK: where cold-start left the Nyx mark, for the shell to carry to the
+            // corner. 0 = no graphical boot screen happened, so there is nothing to hand over.
+            frame.rax = crate::boot_screen::mark_rect();
+        },
+
+        558 => {
+            // SYS_PANEL_PROBE(out_ptr, cap): the panel's `_BCL` level table, via ACPICA. READ ONLY.
+            //
+            // A diagnostic, not the control path — `sys_backlight` (557) is the control path and now
+            // goes through `_BQC`/`_BCM` itself. This exists because "brightness does not work" has
+            // several distinct causes on this machine and they are only separable by looking at what
+            // the firmware reports: no LCD device in the namespace, a `_BCL` that will not evaluate,
+            // or a level table that does not match what the panel does.
+            //
+            // Returns the number of levels written, or 0 if the method could not be evaluated. The
+            // low byte of `_BQC` rides in bits 8..16 so one call answers both questions.
+            // Straight out of the governor's cache — no AML here. See the note on 557.
+            let cap = (arg2 as usize).min(64);
+            let (n, cur) = match crate::acpi::cache().filter(|c| c.ready) {
+                Some(c) => {
+                    let n = c.panel_n.min(cap);
+                    if arg1 != 0 && n > 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(c.panel_levels.as_ptr(), arg1 as *mut u8, n)
+                        };
+                    }
+                    (n, if c.panel_pct == u32::MAX { 0xFF } else { c.panel_pct & 0xFF })
+                }
+                None => (0, 0xFF),
+            };
+            frame.rax = (n as u64) | (cur as u64) << 8;
+        },
+
+        559 => {
+            // SYS_PANEL_DIAG(out_ptr, cap): why the panel probe failed, as UTF-8 text. READ ONLY.
+            //
+            // 558 folds every failure into "0 levels". That cost a power cycle once already — "no LCD
+            // device, or no method" covered both a namespace miss and a method that refused to run,
+            // which want opposite fixes. (It was the former, and not for an ACPI reason: a `\_`
+            // escape in the C path string had quietly made the path relative.)
+            //
+            // Text, not a packed struct, on purpose. The kernel is the only thing that can see these
+            // facts, and which facts matter changes every time a hypothesis is eliminated. Re-cutting
+            // an ABI for each round is how a diagnostic stops getting extended — which on a machine
+            // with no serial console is how you end up burning boots on guesses.
+            // Formatted from the governor's cache. No AML evaluation and no namespace walk here —
+            // both used to happen inline and both can block. See the note on 557.
+            let cap = (arg2 as usize).min(4096);
+            let mut s = alloc::string::String::new();
+            match crate::acpi::cache() {
+                None => s.push_str("  ACPI cache busy this instant — try again\n"),
+                Some(c) if !c.ready => {
+                    s.push_str("  ACPI not sampled yet (the thermal governor fills this once a second)\n");
+                }
+                // ⚠️ `ready` only means "a probe has run". `_BCL`/`_BQC` default to AE_NOT_FOUND,
+                // which reads as a hard failure when the truth is that nobody has asked yet — the
+                // same "no device vs not sampled" conflation this path keeps reinventing.
+                Some(c) if c.bcl_status == 5 && c.bqc_status == 5 && c.panel_n == 0 => {
+                    s.push_str("  ACPI: not probed this boot — run `acpi probe 2` (and 3, 4).\n");
+                    s.push_str("        Not needed for brightness; the PWM line above is the one that matters.\n");
+                }
+                Some(c) => {
+                    if c.panel_found {
+                        let p = core::str::from_utf8(&c.panel_path[..c.panel_path_len])
+                            .unwrap_or("<non-utf8>");
+                        s.push_str(&alloc::format!("  panel: found at {}\n", p));
+                    } else {
+                        s.push_str("  panel: no object with _BCL anywhere in the namespace\n");
+                    }
+                    s.push_str(&alloc::format!(
+                        "  _BCL {}\n  _BQC {}\n",
+                        crate::acpi::acpi_status_name(c.bcl_status),
+                        crate::acpi::acpi_status_name(c.bqc_status)
+                    ));
+                    if c.nodes >= 0 {
+                        s.push_str(&alloc::format!(
+                            "  walk: {} nodes, {} devices, {} with _BCL\n",
+                            c.nodes, c.devices, c.with_bcl
+                        ));
+                    } else {
+                        // -1 means the full walk was deliberately removed — it crashed the kernel,
+                        // and ACPICA's own log already answers what it was there to answer.
+                        s.push_str("  walk: removed (see `acpi log` for the table load instead)\n");
+                    }
+                }
+            }
+            s.push_str(&crate::acpi::init_report());
+
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(cap);
+            if arg1 != 0 && n > 0 {
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg1 as *mut u8, n) };
+            }
+            frame.rax = n as u64;
+        },
+
+        563 => {
+            // SYS_ACPI_NS_STEP(parent, prev, out_ptr): advance ONE namespace node. READ ONLY.
+            //
+            // Deliberately per-node rather than a walk. `AcpiWalkNamespace` #GPs this kernel even at
+            // depth 1 with an inert callback, and a kernel-side walk can only ever report "it died"
+            // — never which node. Stepping from userspace means each name is printed BEFORE the next
+            // step is asked for, so the offending node identifies itself.
+            //
+            // Safe here despite IF=0: this reads the namespace tree and does not execute AML, and
+            // the namespace mutex is now a real semaphore whose wait is bounded (returns AE_TIME
+            // rather than spinning forever), so it cannot wedge the core the way an AML call could.
+            //
+            // Layout at out_ptr: [0..8] next handle, [8..12] type, [12] name len, [13..] name.
+            let mut buf = [0u8; 128];
+            let r = crate::acpi::ns_step(arg1, arg2);
+            match r {
+                Some(n) => {
+                    buf[0..8].copy_from_slice(&n.handle.to_le_bytes());
+                    buf[8..12].copy_from_slice(&n.obj_type.to_le_bytes());
+                    let l = n.name_len.min(96);
+                    buf[12] = l as u8;
+                    buf[13..13 + l].copy_from_slice(&n.name[..l]);
+                    if arg3 != 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(buf.as_ptr(), arg3 as *mut u8, 13 + l)
+                        };
+                    }
+                    frame.rax = 1;
+                }
+                None => frame.rax = 0,
+            }
+        },
+
+        565 => {
+            // SYS_EC_DUMP(out_ptr, cap): the raw EC register space captured by `acpi probe 7`.
+            //
+            // Layout: [0] state, [1..3] LE u16 length, [4..260] EC bytes,
+            //         [264..266] data port, [266..268] cmd port, [268..270] last status.
+            // ⚠️ buf[0] is a STATE, not a bool — "no dump" has three different causes and folding
+            // them into one flag is the mistake this path keeps repeating:
+            //   0 = cache unreadable (try_lock lost, or nothing has probed at all)
+            //   1 = probe ran, EC came up, dump present
+            //   2 = probe ran but ec_install failed (no handle, or _CRS gave no ports)
+            //   3 = EC came up but every read timed out (ports wrong, or EC not responding)
+            // ⚠️ 272, not 260. The dump alone fills [4..260], so a trailer at [254..260] OVERWROTE
+            // EC offsets 0xFA-0xFF with our own port numbers — visible in the hex as `30 09 34 09`
+            // sitting in the last row. Two payloads sharing one buffer with no room for both.
+            let cap = (arg2 as usize).min(272);
+            let mut buf = [0u8; 272];
+            if let Some(c) = crate::acpi::cache() {
+                let n = c.ec_dump_len.min(256);
+                buf[0] = if !c.ec_ok { 2 } else if n == 0 { 3 } else { 1 };
+                // ★ 16-BIT LENGTH. This was `buf[3] = n as u8`, and a FULL dump is 256 bytes —
+                // which truncates to 0. So a completely successful read reported "0 bytes", the
+                // hex dump printed nothing, and `ec find` had nothing to search. The EC had been
+                // working the whole time; only the length byte could not represent the success.
+                buf[1..3].copy_from_slice(&(n as u16).to_le_bytes());
+                buf[4..4 + n].copy_from_slice(&c.ec_dump[..n]);
+                // ★ 16-bit ports, not 8. Packing them into single bytes truncated 0x930/0x934 to
+                // 0x30/0x34 and sent me hunting a port bug that did not exist — the kernel had the
+                // right values all along and only the diagnostic was lying. Fedora confirms
+                // EC_DATA=0x930, EC_CMD=0x934.
+                buf[264..266].copy_from_slice(&(c.ec_data_port as u16).to_le_bytes());
+                buf[266..268].copy_from_slice(&(c.ec_cmd_port as u16).to_le_bytes());
+                buf[268] = (c.ec_status & 0xFF) as u8;
+                buf[269] = (c.ec_status >> 8) as u8;
+            }
+            let total = cap.min(260);
+            if arg1 != 0 {
+                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), arg1 as *mut u8, total) };
+            }
+            frame.rax = total as u64;
+        },
+
+        564 => {
+            // SYS_ACPI_NS_HANDLE(path_ptr, len): resolve an absolute ACPI path. 0 = not found.
+            let len = (arg2 as usize).min(127);
+            let mut p = [0u8; 128];
+            if arg1 != 0 && len > 0 {
+                unsafe { core::ptr::copy_nonoverlapping(arg1 as *const u8, p.as_mut_ptr(), len) };
+            }
+            let s = core::str::from_utf8(&p[..len]).unwrap_or("");
+            frame.rax = crate::acpi::ns_handle(s);
+        },
+
+        562 => {
+            // SYS_ACPI_PROBE(step): ask the thermal governor to run ONE ACPI step on its next tick.
+            //
+            // Deliberately a request, not an action: the syscall runs at IF=0 and must not evaluate
+            // AML itself. The governor writes the step number to the CMOS breadcrumb before making
+            // the call, so if the machine dies the next boot names which one did it.
+            // arg2 is step-specific. For step 1 it is the walk depth (0 = unlimited), which lets the
+            // namespace-walk crash be bisected by depth from userspace with no rebuild per attempt.
+            crate::acpi::request_probe(arg1 as u8, arg2 as u32);
+            frame.rax = 1;
+        },
+
+        560 => {
+            // SYS_ACPI_LOG(out_ptr, cap): everything ACPICA has printed since boot. READ ONLY.
+            //
+            // ACPICA is loud and specific about why a table fails to load, and until now every word
+            // of it went into an empty `AcpiOsPrintf` stub. This is that channel, finally connected.
+            let cap = arg2 as usize;
+            let log = crate::c_stubs::acpi_log();
+            let n = log.len().min(cap);
+            if arg1 != 0 && n > 0 {
+                unsafe { core::ptr::copy_nonoverlapping(log.as_ptr(), arg1 as *mut u8, n) };
+            }
+            frame.rax = n as u64;
+        },
+
+        561 => {
+            // SYS_BATTERY(out_ptr): the ACPI control-method battery, as 11 i32s. READ ONLY.
+            //
+            // Layout matches `acpi::Battery`: present, power_unit, design_cap, last_full_cap,
+            // design_voltage, state, present_rate, remaining_cap, voltage, have_bif, have_bst.
+            // Cache read. `_BIF`/`_BST` are AML and must not run here — see the note on 557.
+            //
+            // ★ Returns 2 for "never sampled", NOT 0. Those are different facts and folding them
+            // together is the same mistake `_BCL` made earlier this session: "no battery" and
+            // "nobody has asked yet" want completely different responses from the user.
+            let sampled = crate::acpi::cache().map(|c| c.ready).unwrap_or(false);
+            let b = crate::acpi::cache()
+                .filter(|c| c.ready)
+                .map(|c| c.battery)
+                .unwrap_or_default();
+            let v: [i32; 11] = [
+                b.present as i32, b.power_unit, b.design_cap, b.last_full_cap, b.design_voltage,
+                b.state, b.present_rate, b.remaining_cap, b.voltage,
+                b.have_bif as i32, b.have_bst as i32,
+            ];
+            if arg1 != 0 {
+                unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), arg1 as *mut i32, 11) };
+            }
+            // 3 = the EC never came up, which is a different problem from "no battery": the methods
+            // were never evaluated at all, because doing so without an EmbeddedControl handler
+            // crashes the kernel.
+            let ec_ok = crate::acpi::cache().map(|c| c.ec_ok).unwrap_or(false);
+            frame.rax = if !sampled { 2 } else if !ec_ok { 3 } else { b.present as u64 };
+        },
+
+        // ★ Once a fatal report owns the screen, every present becomes a no-op.
+        //
+        // Only the panicking core stops; the others keep scheduling the shell, which keeps
+        // presenting frames straight over the red screen. The result was a report that came up
+        // torn and jittering, and a fault IP too corrupted to read correctly. Reporting 0 makes
+        // the caller think the GPU path declined, which is harmless — the machine is not coming
+        // back, and the CPU fallback is gated the same way.
+        536 if crate::panic_screen::screen_is_claimed() => { frame.rax = 0; },
         536 => {
             // SYS_GPU_COMPOSITE(list_ptr, count): GPU-composite `count` WindowQuads into the backbuffer.
             // 1 ok / 0 => caller falls back to CPU compositing.
@@ -3878,6 +4268,26 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             } else {
                 frame.rax = EINVAL as u64;
             }
+        },
+
+        555 => { // SYS_FAULT_SELFTEST(magic) — deliberately panic the kernel, to prove the fatal
+            // screen actually reaches a display.
+            //
+            // ★ Why a syscall whose only job is to kill the machine exists. Since P1a re-pointed
+            // the display plane, the panic handler had been painting a buffer nobody scanned out —
+            // for months, invisibly, because a panic that cannot report itself is indistinguishable
+            // from a hang. Verifying the fix needs a panic ON PURPOSE: this box has no QEMU, every
+            // test is a power cycle, and waiting for an organic panic to find out whether the
+            // reporting path works is exactly the trap that hid the bug in the first place.
+            //
+            // Gated on a magic argument rather than a bare number so a wild syscall with a garbage
+            // rax cannot bring the machine down. `trigger_rsod` is the non-unwinding path, which is
+            // the one worth testing — it is what fatal GPU and filesystem errors are meant to call.
+            if arg1 == 0x4E59_5846 { // "NYXF"
+                crate::serial_println!("[SELFTEST] fatal-screen self-test requested by userspace");
+                crate::trigger_rsod("Fatal screen self-test (syscall 555). Not a real fault.");
+            }
+            frame.rax = EINVAL as u64;
         },
 
         551 => { // SYS_DEBUG_MARK(byte) — userspace breadcrumb into CMOS. 0 clears it.

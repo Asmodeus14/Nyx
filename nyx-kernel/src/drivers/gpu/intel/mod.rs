@@ -10,6 +10,7 @@ use spin::Mutex;
 pub mod render;
 
 // Phase U1: display-controller hardware cursor plane (see cursor.rs). Driven from the mouse IRQ.
+pub mod backlight;
 pub mod cursor;
 
 pub static INTEL_GPU: Mutex<Option<IntelGpuDriver>> = Mutex::new(None);
@@ -503,6 +504,43 @@ impl IntelGpuDriver {
                     let phys = fb.start_address().as_u64();
                     if let Some(v) = crate::memory::phys_to_virt(phys) {
                         core::ptr::write_bytes(v as *mut u8, 0, (pages_needed * 4096) as usize);
+                        // Hand the fatal-screen path this buffer's CPU-visible address NOW, while we
+                        // already have it. Once the plane is armed below, this — not the firmware
+                        // framebuffer — is what the display engine scans out, and a panic that paints
+                        // the firmware buffer is a panic nobody sees. It cannot ask the driver for the
+                        // address later: `INTEL_GPU` is a Mutex, and a panic raised inside the GPU
+                        // driver would deadlock trying to take it.
+                        if let Some(painter) = &crate::gui::SCREEN_PAINTER {
+                            let info = painter.info;
+                            // ★ Hand over the plane's TILING, not just its geometry.
+                            //
+                            // PLANE_CTL is SURF - 0x1C (0x180 vs 0x19C); bits 12:10 select
+                            // linear / X / Y / Yf. The panic path writes this buffer with the CPU
+                            // while the desktop reaches it through the GPU BLT, so on a tiled plane
+                            // the GPU's pixels land correctly and the CPU's scatter into bands —
+                            // exactly what the fault screen looked like: stripes with the desktop
+                            // showing through, nothing readable.
+                            //
+                            // The plane is deliberately NOT reconfigured to linear. The desktop
+                            // renders correctly today, so its tiling and the BLT already agree;
+                            // forcing linear would break the working path to fix the broken one.
+                            // The panic writes swizzle to match instead.
+                            let ctl = self.read_reg(surf_reg - 0x1C);
+                            let tiling = (ctl >> 10) & 0x7;
+                            crate::panic_screen::register_scanout(
+                                v,
+                                info.width as u32,
+                                info.height as u32,
+                                info.stride as u32,
+                                info.bytes_per_pixel as u32,
+                                matches!(info.pixel_format, bootloader_api::info::PixelFormat::Rgb),
+                                tiling,
+                            );
+                            crate::serial_println!(
+                                "[PANIC-SCREEN] scanout registered; PLANE_CTL {:#x}, tiling mode {}",
+                                ctl, tiling
+                            );
+                        }
                     }
                     for i in 0..pages_needed {
                         self.map_ggtt_page((0x1600_0000 / 4096) + i as u32, phys + (i * 4096), true);
@@ -511,6 +549,21 @@ impl IntelGpuDriver {
                     self.active_gva = 0x1600_0000; // present targets our owned buffer
                     self.active_surf_reg = surf_reg;
                     crate::serial_println!("[INTEL GPU] P1a owned scanout: GVA 0x16000000; plane SURF reg {:#x}", surf_reg);
+
+                    // ★ Cold start, stage 2. The buffer armed above was just zeroed, so everything
+                    // the kernel painted at stage 1 is now on a surface the display engine no
+                    // longer scans out — without this the screen goes black in the middle of boot
+                    // and the progress rule carries on advancing over nothing.
+                    //
+                    // Repainting here IS stage 2 as designed: nothing moves and nothing is
+                    // re-laid-out, the mark simply goes to full strength, which is what says the
+                    // system is ready. (The wallpaper that also belongs to stage 2 needs the
+                    // blitter and a texture, neither of which exists yet at this point in init.)
+                    crate::boot_screen::rearm();
+
+                    // Cache the MMIO base for the backlight path while we have it. Same reason
+                    // as the cursor: SYSCALL runs at IF=0 and must never block on INTEL_GPU.
+                    crate::drivers::gpu::intel::backlight::init(self.mmio_base);
                 } else {
                     crate::serial_println!("[INTEL GPU] P1a: scanout buffer alloc FAILED; staying on GVA-0 present path");
                 }

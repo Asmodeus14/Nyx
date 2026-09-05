@@ -18,6 +18,25 @@ pub trait NyxApp {
     fn update(&mut self) -> bool { false }
     fn draw(&mut self, canvas: &mut Canvas);
     fn on_mouse(&mut self, _mx: usize, _my: usize, _clicked: bool) -> bool { false }
+
+    /// The pointer moved over this window with no button held. Window-local pixels. Return true to
+    /// redraw.
+    ///
+    /// Default `false`, which is what lets every existing app compile untouched: an app that does
+    /// not implement this simply never learns about hover, exactly as before.
+    ///
+    /// Already coalesced — at most one call per tick, carrying the newest position. So it is safe to
+    /// do real work here (a hit test, a layout query); what is not safe anywhere is returning `true`
+    /// unconditionally, which repaints the window on every pointer movement.
+    fn on_mouse_move(&mut self, _mx: usize, _my: usize) -> bool { false }
+
+    /// The pointer left this window, or a shell surface took it. Clear any hover state and return
+    /// true to redraw.
+    ///
+    /// An app that implements [`on_mouse_move`](Self::on_mouse_move) and not this one has a
+    /// highlight that never switches off.
+    fn on_mouse_leave(&mut self) -> bool { false }
+
     fn on_key(&mut self, _key: char) -> bool { false }
 
     /// Scrollbar (Boot B): opt-in. Return the app's FULL scrollable content height in px; `0` (default)
@@ -91,6 +110,11 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
         // queued message now and keep only the LATEST resize size, then reallocate ONCE below — the app
         // jumps straight to the current drag size in a single repaint.
         let mut pending_resize: Option<(usize, usize)> = None;
+        // Hover, coalesced the same way and for the same reason. One slot rather than two, so that a
+        // move followed by a leave stays a leave and a leave followed by a re-entry stays a move —
+        // separate `Option`s would lose the ordering and strand the highlight on.
+        //   Some(Some(pos)) = the pointer is here      Some(None) = it left      None = no news
+        let mut pending_hover: Option<Option<(usize, usize)>> = None;
         while sys_ipc_recv(&mut msg, false) {
             match msg.msg_type {
                 MSG_WINDOW_CLOSE => sys_exit(0),
@@ -100,6 +124,12 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
                 },
                 MSG_MOUSE_EVENT => {
                     event_redraw |= app.on_mouse(msg.data1 as usize, msg.data2 as usize, true);
+                },
+                MSG_MOUSE_MOVE => {
+                    pending_hover = Some(Some((msg.data1 as usize, msg.data2 as usize)));
+                },
+                MSG_MOUSE_LEAVE => {
+                    pending_hover = Some(None);
                 },
                 MSG_KEY_EVENT => {
                     if let Some(key) = core::char::from_u32(msg.data1 as u32) {
@@ -122,6 +152,14 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
                 },
                 _ => {}
             }
+        }
+
+        // Deliver the coalesced hover before the resize, so a move is reported against the geometry
+        // the pointer was actually over rather than against a window that has since changed size.
+        match pending_hover {
+            Some(Some((mx, my))) => event_redraw |= app.on_mouse_move(mx, my),
+            Some(None) => event_redraw |= app.on_mouse_leave(),
+            None => {}
         }
 
         // Apply the coalesced resize ONCE (allocate the new SHM at the final drag size). We still defer
