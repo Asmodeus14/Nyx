@@ -29,7 +29,12 @@ lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 log = { version = "0.4", default-features = false }
 
 # Graphics
-noto-sans-mono-bitmap = { version = "0.2.0", features = ["size_32"] }
+# `size_32` is the fatal-screen raster — a panic message is read across a room, once.
+# `size_16` is 8x16 per cell, which is the "kernel's own 8x16 bitmap font" the cold-start design
+# assumes. The kernel did not actually have one until this line; it is the only type available at
+# boot stage 1, because the TTF rasterizer lives in `libs/gui` and userspace does not exist yet —
+# which is also why every glyph on that screen is monospace.
+noto-sans-mono-bitmap = { version = "0.2.0", features = ["size_16", "size_32"] }
 
 # Async
 futures = { version = "0.3", default-features = false, features = ["alloc"] }

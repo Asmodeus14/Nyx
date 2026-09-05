@@ -4,22 +4,73 @@ use crate::effects::{alpha_blend, apply_opacity};
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128};
 
+/// The application palette, in Meridian's dark theme.
+///
+/// ## Why this went dark, and why the names changed
+///
+/// Every app used to draw itself warm and near-white (`WARM_BG` was `#F9F9F6`, `TEXT_DARK` was
+/// `#2D2D2A`). Under the Meridian shell that produced one screen containing two operating systems:
+/// near-black chrome, hairline borders and a gradient wallpaper, wrapped around cream-white windows
+/// in a bitmap font. Porting each app's interior is build-order steps 10-16; re-pointing the shared
+/// palette is the one change that makes all of them coherent at once.
+///
+/// The old names were kept for a while and were a trap — `TEXT_DARK` resolving to near-WHITE is the
+/// kind of thing that reads as correct in a diff and is wrong on screen. So they are renamed to
+/// match the tokens they now carry (`nyx_meridian::tokens`, `01-head.html`), and the compiler finds
+/// every call site rather than leaving one behind.
+///
+/// | was | now | value | Meridian token |
+/// |---|---|---|---|
+/// | `WARM_BG` | [`Color::SURFACE`] | `#0F1113` | `--surface` |
+/// | `WARM_SURFACE` | [`Color::RAISED`] | `#16181B` | `--raised` |
+/// | `WARM_BORDER` | [`Color::LINE`] | `#202224` | `--line` over `--surface` |
+/// | `TEXT_DARK` | [`Color::FG`] | `#F4F5F6` | `--fg` |
+/// | `TEXT_MUTED` | [`Color::FG_MUTED`] | `#969AA0` | `--fg-3` |
+/// | `ACCENT_PRIMARY` | [`Color::ACCENT`] | `#4676F0` | `--accent` |
+///
+/// `--line` is `rgba(255,255,255,0.070)` in the design — translucent, so it reads correctly over
+/// both a window and the wallpaper. Apps draw borders as opaque fills, so [`Color::LINE`] is that
+/// token already composited over `--surface`.
 pub struct Color;
 impl Color {
-    pub const WARM_BG: u32       = 0xFF_F9F9F6; 
-    pub const WARM_SURFACE: u32  = 0xFF_FFFFFF; 
-    pub const WARM_BORDER: u32   = 0xFF_E2E2DB; 
-    
-    pub const TEXT_DARK: u32     = 0xFF_2D2D2A; 
-    pub const TEXT_MUTED: u32    = 0xFF_8A8A85; 
-    
-    pub const ACCENT_PRIMARY: u32 = 0xFF_E67E22; 
-    pub const ACCENT_HOVER: u32   = 0xFF_D35400; 
-    pub const ACCENT_GREEN: u32   = 0xFF_27AE60; 
-    
+    /// An app's content ground. `--surface`.
+    pub const SURFACE: u32 = 0xFF_0F1113;
+    /// One step above the ground, where two panels meet. `--raised`.
+    pub const RAISED: u32 = 0xFF_16181B;
+    /// Hairline / border. `--line` resolved over [`Color::SURFACE`].
+    pub const LINE: u32 = 0xFF_202224;
+
+    /// Primary text. `--fg`.
+    pub const FG: u32 = 0xFF_F4F5F6;
+    /// Secondary text, metadata, placeholders. `--fg-3`.
+    ///
+    /// This is the CORRECTED `--fg-3`, not the design document's: the document's `#565B61` measures
+    /// 2.9:1 against its own ground, below the point where type is legible. See
+    /// `nyx_meridian::tokens` for the contrast table and the test that holds the line.
+    pub const FG_MUTED: u32 = 0xFF_969AA0;
+
+    /// The single accent. `--accent`.
+    pub const ACCENT: u32 = 0xFF_4676F0;
+    /// The accent, lifted for a hover state. Meridian has no such token — it washes the ground
+    /// instead of brightening the mark — but the unported apps still tint on hover.
+    pub const ACCENT_HOVER: u32 = 0xFF_6B90F4;
+    /// "Good"/connected. Brightened from `#27AE60`, which was chosen against a white ground and is
+    /// muddy on a near-black one.
+    pub const ACCENT_GREEN: u32 = 0xFF_3FBF74;
+
     pub const BLACK: u32 = 0xFF_000000;
     pub const WHITE: u32 = 0xFF_FFFFFF;
-    pub const NYX_ORANGE: u32  = 0xFF_FF5722;
+    /// The legacy brand orange. Left alone deliberately: it is an identity colour, not a UI tone,
+    /// and Meridian's own mark is drawn in [`Color::ACCENT`] where it appears at all.
+    pub const NYX_ORANGE: u32 = 0xFF_FF5722;
+
+    /// ★ The pointer's outline, and the one colour here that must NOT follow the theme.
+    ///
+    /// The cursor is a white arrow with a dark outline, composited over whatever is beneath it —
+    /// including a white window. It used to borrow `TEXT_DARK`, which meant flipping the palette to
+    /// a dark theme turned the outline near-white and made the pointer vanish against pale content.
+    /// It is pinned dark for that reason.
+    pub const CURSOR_OUTLINE: u32 = 0xFF_14161A;
 }
 
 pub struct Canvas<'a> {
@@ -276,11 +327,31 @@ impl<'a> Canvas<'a> {
     /// Draw one glyph at an exact pixel height rather than an integer `scale`. Used by the browser,
     /// where font sizes come from CSS and are not multiples of `BASE_PX`.
     pub fn draw_char_px(&mut self, x: usize, y: usize, c: char, color: u32, px: usize) {
+        self.draw_char_px_face(x, y, c, color, crate::font::FACE_DEFAULT, px);
+    }
+
+    /// Draw one glyph from a specific registered face.
+    ///
+    /// Added for Meridian's ported app interiors, which set type in JetBrains Mono and Inter rather
+    /// than the embedded DejaVu. `with_glyph_face` falls back to slot 0 when the slot is empty, so
+    /// an unregistered face costs the typography and nothing else — every word still appears.
+    ///
+    /// `x,y` is the top-left of the line cell. The baseline is `y + ascent` **of that face**, since
+    /// ascent differs between faces at the same pixel size.
+    pub fn draw_char_px_face(
+        &mut self,
+        x: usize,
+        y: usize,
+        c: char,
+        color: u32,
+        slot: usize,
+        px: usize,
+    ) {
         let px = px.max(1);
-        let baseline = y as i32 + crate::font::ascent_px(px) as i32;
+        let baseline = y as i32 + crate::font::ascent_px_face(slot, px) as i32;
         let width = self.width;
         let height = self.height;
-        crate::font::with_glyph(c, px, |g| {
+        crate::font::with_glyph_face(slot, c, px, |g| {
             if g.w == 0 || g.h == 0 {
                 return;
             }

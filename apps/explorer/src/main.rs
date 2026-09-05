@@ -139,6 +139,12 @@ struct ExplorerApp {
     editor_content: String,
     width: usize,
     height: usize,
+    /// The list row under the pointer, from `MSG_MOUSE_MOVE`.
+    ///
+    /// The first consumer of the hover protocol. Meridian's file rows lift under the pointer
+    /// (`.fr:hover`), and until the shell started sending moves there was no way for an application
+    /// to know where the pointer was except by being clicked.
+    hover_row: Option<usize>,
 }
 
 impl ExplorerApp {
@@ -154,12 +160,29 @@ impl ExplorerApp {
             editor_content: String::new(),
             width: 650,
             height: 450,
+            hover_row: None,
         }
     }
 
     fn reload(&mut self) {
         self.entries = load_dir(&self.current_path);
         self.scroll_px = 0;
+        // The rows under the pointer are now different rows.
+        self.hover_row = None;
+    }
+
+    /// The list row at a window-local `y`, or None if `y` is not over the list.
+    ///
+    /// One function, used by both the click path and the hover path. Two copies of
+    /// `(my - LIST_TOP + scroll_px) / ROW_H` is how a highlight ends up one row away from what a
+    /// click selects.
+    fn row_at(&self, my: usize) -> Option<usize> {
+        if self.state != AppState::Explorer || my < LIST_TOP || my >= self.height.saturating_sub(FOOTER_H)
+        {
+            return None;
+        }
+        let idx = (my - LIST_TOP + self.scroll_px) / ROW_H;
+        (idx < self.entries.len()).then_some(idx)
     }
 
     fn list_height(&self) -> usize {
@@ -192,9 +215,9 @@ impl NyxApp for ExplorerApp {
         let width = self.width;
         let height = self.height;
 
-        canvas.fill_rect(0, 0, width, height, Color::WARM_BG);
-        canvas.fill_rect(0, 0, width, HEADER_H, Color::WARM_SURFACE);
-        canvas.fill_rect(0, HEADER_H, width, 1, Color::WARM_BORDER);
+        canvas.fill_rect(0, 0, width, height, Color::SURFACE);
+        canvas.fill_rect(0, 0, width, HEADER_H, Color::RAISED);
+        canvas.fill_rect(0, HEADER_H, width, 1, Color::LINE);
 
         if self.state == AppState::Explorer {
             // clamp scroll after any resize
@@ -208,26 +231,26 @@ impl NyxApp for ExplorerApp {
             // Path bar
             let path_w = width.saturating_sub(80 + 100);
             canvas.fill_rect(80, 10, path_w, 30, Color::WHITE);
-            canvas.fill_rect(80, 10, path_w, 1, Color::WARM_BORDER);
-            canvas.print_str(90, 17, &self.current_path, Color::TEXT_DARK, 1);
+            canvas.fill_rect(80, 10, path_w, 1, Color::LINE);
+            canvas.print_str(90, 17, &self.current_path, Color::FG, 1);
 
             // Column geometry
             let size_right = width.saturating_sub(90); // size text right-aligned here
             let type_x = width.saturating_sub(78);
 
             // Column header
-            canvas.fill_rect(0, COLHDR_Y, width, ROW_H - 2, Color::WARM_BG);
-            canvas.print_str(16, COLHDR_Y + 3, "Name", Color::TEXT_MUTED, 1);
+            canvas.fill_rect(0, COLHDR_Y, width, ROW_H - 2, Color::SURFACE);
+            canvas.print_str(16, COLHDR_Y + 3, "Name", Color::FG_MUTED, 1);
             let sz_hdr = "Size";
-            canvas.print_str(size_right.saturating_sub(Canvas::text_width(sz_hdr, 1)), COLHDR_Y + 3, sz_hdr, Color::TEXT_MUTED, 1);
-            canvas.print_str(type_x, COLHDR_Y + 3, "Type", Color::TEXT_MUTED, 1);
-            canvas.fill_rect(0, LIST_TOP - 2, width, 1, Color::WARM_BORDER);
+            canvas.print_str(size_right.saturating_sub(Canvas::text_width(sz_hdr, 1)), COLHDR_Y + 3, sz_hdr, Color::FG_MUTED, 1);
+            canvas.print_str(type_x, COLHDR_Y + 3, "Type", Color::FG_MUTED, 1);
+            canvas.fill_rect(0, LIST_TOP - 2, width, 1, Color::LINE);
 
             // Rows (scrolled)
             let list_top = LIST_TOP as isize;
             let list_bottom = (height - FOOTER_H) as isize;
             if self.entries.is_empty() {
-                canvas.print_str(width / 2 - 50, LIST_TOP + 20, "Folder is Empty", Color::TEXT_MUTED, 1);
+                canvas.print_str(width / 2 - 50, LIST_TOP + 20, "Folder is Empty", Color::FG_MUTED, 1);
             } else {
                 for (i, e) in self.entries.iter().enumerate() {
                     let y_i = list_top + (i * ROW_H) as isize - self.scroll_px as isize;
@@ -235,53 +258,72 @@ impl NyxApp for ExplorerApp {
                     if y_i >= list_bottom { break; }         // and everything after is lower
                     let y = y_i as usize;
 
+                    // The row under the pointer lifts one step off the surface. A wash, not a
+                    // selection — nothing here is selected until it is clicked.
+                    if self.hover_row == Some(i) {
+                        canvas.fill_rect(0, y, width, ROW_H, Color::RAISED);
+                    }
+
                     // Name (with an accent chip for folders)
-                    let name_color = if e.is_dir { Color::ACCENT_PRIMARY } else { Color::TEXT_DARK };
+                    let name_color = if e.is_dir { Color::ACCENT } else { Color::FG };
                     let icon = if e.is_dir { "[]" } else { "  " };
                     canvas.print_str(16, y + 3, icon, name_color, 1);
                     // Truncate the name so it doesn't collide with the Size column.
                     let name = truncate_to(&e.name, size_right.saturating_sub(40), canvas);
-                    canvas.print_str(38, y + 3, &name, Color::TEXT_DARK, 1);
+                    canvas.print_str(38, y + 3, &name, Color::FG, 1);
 
                     // Size (right-aligned) — dirs have none
                     if !e.is_dir {
                         let s = human_size(e.size);
-                        canvas.print_str(size_right.saturating_sub(Canvas::text_width(&s, 1)), y + 3, &s, Color::TEXT_MUTED, 1);
+                        canvas.print_str(size_right.saturating_sub(Canvas::text_width(&s, 1)), y + 3, &s, Color::FG_MUTED, 1);
                     }
                     // Type
                     let ty = if e.is_dir { "<DIR>" } else { "file" };
-                    canvas.print_str(type_x, y + 3, ty, Color::TEXT_MUTED, 1);
+                    canvas.print_str(type_x, y + 3, ty, Color::FG_MUTED, 1);
                 }
             }
 
             // Footer: drive capacity bar + text
             let fy = height - FOOTER_H;
-            canvas.fill_rect(0, fy, width, FOOTER_H, Color::WARM_SURFACE);
-            canvas.fill_rect(0, fy, width, 1, Color::WARM_BORDER);
+            canvas.fill_rect(0, fy, width, FOOTER_H, Color::RAISED);
+            canvas.fill_rect(0, fy, width, 1, Color::LINE);
             if let Some(sf) = sys_statfs() {
                 let used = sf.total_bytes.saturating_sub(sf.free_bytes);
                 let bar_x = 10;
                 let bar_y = fy + 9;
                 let bar_w = 160usize;
                 let bar_h = 10usize;
-                canvas.fill_rect(bar_x, bar_y, bar_w, bar_h, Color::WARM_BORDER);
+                canvas.fill_rect(bar_x, bar_y, bar_w, bar_h, Color::LINE);
                 let filled = if sf.total_bytes > 0 { (used.saturating_mul(bar_w as u64) / sf.total_bytes) as usize } else { 0 };
                 canvas.fill_rect(bar_x, bar_y, filled.min(bar_w), bar_h, Color::ACCENT_GREEN);
                 let txt = alloc::format!("NVMe: {} free of {}", human_size(sf.free_bytes), human_size(sf.total_bytes));
-                canvas.print_str(bar_x + bar_w + 12, fy + 8, &txt, Color::TEXT_DARK, 1);
+                canvas.print_str(bar_x + bar_w + 12, fy + 8, &txt, Color::FG, 1);
             } else {
-                canvas.print_str(10, fy + 8, "NVMe: capacity unavailable", Color::TEXT_MUTED, 1);
+                canvas.print_str(10, fy + 8, "NVMe: capacity unavailable", Color::FG_MUTED, 1);
             }
         }
         else if self.state == AppState::Editor {
             let mut back_btn = Button { x: 10, y: 10, w: 70, h: 30, text: String::from("Back"), is_hovered: false, is_pressed: false };
             back_btn.draw(canvas);
             let title_str = alloc::format!("Reading: {}", join_path(&self.current_path, &self.active_file));
-            canvas.print_str(95, 17, &title_str, Color::TEXT_DARK, 1);
+            canvas.print_str(95, 17, &title_str, Color::FG, 1);
 
             canvas.fill_rect(10, 60, width - 20, height - 70, 0xFF_1E1E1E);
             draw_text_wrapped(canvas, 15, 65, width - 30, height - 80, &self.editor_content, 0xFF_CCCCCC);
         }
+    }
+
+    fn on_mouse_move(&mut self, _mx: usize, my: usize) -> bool {
+        let row = self.row_at(my);
+        // Redraw ONLY on a change. Returning true for every pointer movement would repaint the
+        // whole window at the mouse's sample rate for no visible difference.
+        let changed = row != self.hover_row;
+        self.hover_row = row;
+        changed
+    }
+
+    fn on_mouse_leave(&mut self) -> bool {
+        self.hover_row.take().is_some()
     }
 
     fn on_mouse(&mut self, mx: usize, my: usize, _clicked: bool) -> bool {
@@ -306,8 +348,7 @@ impl NyxApp for ExplorerApp {
             }
             // A list row
             else if my >= LIST_TOP && my < height - FOOTER_H {
-                let idx = (my - LIST_TOP + self.scroll_px) / ROW_H;
-                if idx < self.entries.len() {
+                if let Some(idx) = self.row_at(my) {
                     let e = &self.entries[idx];
                     let target = join_path(&self.current_path, &e.name);
                     if e.is_dir {

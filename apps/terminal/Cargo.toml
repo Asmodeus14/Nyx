@@ -20,6 +20,10 @@ nyx-net = { path = "../../libs/net" }
 # properly, but linking it here would drag html5ever, cssparser and the layout engine into the
 # terminal to do a tag strip.
 nyx-htmltext = { path = "../../libs/htmltext" }
+# Meridian step 11 — the terminal's interior. Two things only: the palette (`tokens::Theme`) and
+# JetBrains Mono via `font::register_mono()`, which installs ONLY the mono face. The atlas and the
+# icon table are the shell's business; this app draws through nyx-gui's CPU rasterizer as before.
+nyx-meridian = { path = "../../libs/meridian" }
 
 [[bin]]
 name = "nyx-terminal"

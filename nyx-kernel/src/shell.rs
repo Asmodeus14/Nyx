@@ -42,6 +42,32 @@ pub fn handle_key(scancode: u8) {
                         // Either Windows/Super key. Also Unicode-less; the compositor swallows this
                         // one to toggle the start menu rather than forwarding it to the focused app.
                         KeyCode::LWin | KeyCode::RWin => Some('\u{E019}'),
+                        // Multimedia keys. Extended-set scancodes on the same path as the arrows —
+                        // not new machinery, simply not decoded until now. There are no brightness
+                        // equivalents: those are handled by the EC and never reach the 8042.
+                        KeyCode::VolumeDown => Some('\u{E01C}'),
+                        KeyCode::VolumeUp   => Some('\u{E01D}'),
+                        KeyCode::Mute       => Some('\u{E01E}'),
+                        // The function row, F1..F12 → E020..E02B, contiguous so userspace can do
+                        // arithmetic on it. `pc_keyboard` has decoded these all along; we dropped
+                        // them, which is why no Nyx app has ever seen an F-key.
+                        //
+                        // This is also the only reachable route to panel brightness. The keycap
+                        // brightness symbols are `Fn` chords that the EC eats before the 8042 sees
+                        // anything; the bare F-key underneath them arrives normally. The shell binds
+                        // a pair and synthesises E01A/E01B from it.
+                        KeyCode::F1  => Some('\u{E020}'),
+                        KeyCode::F2  => Some('\u{E021}'),
+                        KeyCode::F3  => Some('\u{E022}'),
+                        KeyCode::F4  => Some('\u{E023}'),
+                        KeyCode::F5  => Some('\u{E024}'),
+                        KeyCode::F6  => Some('\u{E025}'),
+                        KeyCode::F7  => Some('\u{E026}'),
+                        KeyCode::F8  => Some('\u{E027}'),
+                        KeyCode::F9  => Some('\u{E028}'),
+                        KeyCode::F10 => Some('\u{E029}'),
+                        KeyCode::F11 => Some('\u{E02A}'),
+                        KeyCode::F12 => Some('\u{E02B}'),
                         _ => None,
                     };
                     if let Some(c) = mapped {

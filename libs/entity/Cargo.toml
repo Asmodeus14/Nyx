@@ -1,0 +1,13 @@
+[package]
+name = "nyx-entity"
+version = "0.1.0"
+edition = "2021"
+
+# Build-order step 17. Ported from `Nyx-ui/reference/entity`, which is the design's own reference
+# implementation of the algorithm. The SAME algorithm also exists in JavaScript inside
+# `design/ver3.0/parts/16-entity-creature.html`; the two are the specification and they must agree
+# cell for cell, or a creature shown in the document is not the creature the machine grows.
+#
+# `no_std`, no `alloc`, no floating point — so it links into the shell, and so that the arithmetic is
+# reproducible rather than merely close.
+[dependencies]

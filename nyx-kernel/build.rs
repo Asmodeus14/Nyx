@@ -26,6 +26,12 @@ fn main() {
         "acpica-core/parser",
         "acpica-core/tables",
         "acpica-core/utilities",
+        // Vendored all along but never compiled, so `AcpiWalkResources` was an undefined symbol.
+        // Needed by the EC driver: the EC's IO ports must be read from the EVALUATED `_CRS` (this
+        // machine patches them in at runtime via _Y5A/_Y5B, so the DSDT template reads 0x0000), and
+        // walking a resource template without this module means hand-parsing AML resource
+        // descriptors — a job ACPICA already does correctly.
+        "acpica-core/resources",
     ];
 
     for dir in dirs {
@@ -43,15 +49,31 @@ fn main() {
     build.include("acpica-includes");
 
     build.define("ACPI_MACHINE_WIDTH", "64");
+    // ⚠️ TRAP: this reads as "no system C library" and means the OPPOSITE.
+    //
+    // ACPICA tests it with `#ifdef`/`#ifndef`, never `#if`, so defining it to "0" still counts as
+    // defined. `accommon.h` then SKIPS `acclib.h`, ACPICA's own `isdigit`/`strlen`/`memcpy` macros
+    // never appear, and the host glibc declarations win instead. That is how an all-zero
+    // `__ctype_b_loc` table (c_stubs.rs) silently broke `isdigit`, which broke width parsing in
+    // ACPICA's `vsnprintf`, which misaligned varargs and page-faulted the kernel at 0x20251212.
+    //
+    // Left defined deliberately. Undefining it compiles `utilities/utclib.c`, which defines its own
+    // `memcpy`/`memset`/`memcmp`/`strlen` and would collide with `compiler-builtins-mem`. If that
+    // is ever untangled, the correct end state is to NOT define this at all.
     build.define("ACPI_USE_SYSTEM_CLIBRARY", "0");
     build.define("ACPI_LIBRARY", None); 
     build.define("_KERNEL", None);
     
-    build.flag("-ffreestanding"); 
-    build.flag("-nostdlib");      
-    build.flag("-fno-builtin"); 
+    build.flag("-ffreestanding");
+    build.flag("-nostdlib");
+    build.flag("-fno-builtin");
     build.flag("-mno-red-zone");
     build.flag("-fno-strict-aliasing");
+    // The host gcc defaults _FORTIFY_SOURCE on, which rewrites snprintf/vsnprintf calls to
+    // __snprintf_chk/__vsnprintf_chk — glibc symbols that do not exist in a freestanding kernel.
+    // ACPICA supplies its own snprintf (utilities/utprint.c) and we want exactly that one.
+    // The lwext4 build below already does this; ACPICA needed it as soon as it called either.
+    build.flag("-U_FORTIFY_SOURCE");
 
     build.compile("acpica");
 

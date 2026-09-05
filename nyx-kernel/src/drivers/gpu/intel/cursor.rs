@@ -66,6 +66,18 @@ static MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 static PIPE_BASE: AtomicU32 = AtomicU32::new(0);
 static CURSOR_CPU: AtomicU64 = AtomicU64::new(0); // CPU vaddr of the bitmap page (for set_image)
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Where inside the 64x64 bitmap the pointer actually points. Set with each image; read by the IRQ.
+static HOT_X: AtomicU32 = AtomicU32::new(0);
+static HOT_Y: AtomicU32 = AtomicU32::new(0);
+/// Last pointer position written, so a shape swap can re-place the plane without waiting for a move.
+static LAST_X: AtomicU32 = AtomicU32::new(0);
+static LAST_Y: AtomicU32 = AtomicU32::new(0);
+
+/// CURPOS sign bits. X is bits [14:0] with the sign at 15; Y is [30:16] with the sign at 31, and the
+/// encoding is SIGN-MAGNITUDE, not two's complement — the magnitude goes in the field and the sign
+/// bit is set separately (i915 `intel_cursor_position`).
+const CURSOR_POS_X_SIGN: u32 = 1 << 15;
+const CURSOR_POS_Y_SIGN: u32 = 1 << 31;
 
 #[inline]
 unsafe fn wr(mmio: u64, off: u32, val: u32) {
@@ -187,10 +199,16 @@ pub fn init() -> bool {
 
 /// Upload a 64x64 ARGB (0xAARRGGBB) bitmap into the cursor page and re-arm. If the cursor isn't
 /// initialized this is a no-op returning false. `argb` must be exactly 64*64 pixels.
-pub fn set_image(argb: &[u32]) -> bool {
+///
+/// `hot_x`/`hot_y` are the pixel inside the bitmap that *is* the pointer. Every shape except the
+/// arrow is drawn centred, so the plane has to be positioned up and to the left of the pointer — see
+/// `move_to`, which is where the hotspot is actually spent.
+pub fn set_image(argb: &[u32], hot_x: u32, hot_y: u32) -> bool {
     if !ENABLED.load(Ordering::Relaxed) {
         return false;
     }
+    HOT_X.store(hot_x.min(CURSOR_W - 1), Ordering::SeqCst);
+    HOT_Y.store(hot_y.min(CURSOR_H - 1), Ordering::SeqCst);
     if argb.len() < (CURSOR_W * CURSOR_H) as usize {
         return false;
     }
@@ -215,11 +233,25 @@ pub fn set_image(argb: &[u32]) -> bool {
         let pipe = PIPE_BASE.load(Ordering::Relaxed);
         wr(mmio, pipe + OFF_CURBASE, GVA_HW_CURSOR);
     }
+    // A shape can change while the pointer is standing still — a window moves out from under it, or
+    // the shell decides the pointer is now over a resize band. The new shape has a different
+    // hotspot, so re-issue the last position or the plane sits 12px off until the mouse next moves.
+    move_to(
+        LAST_X.load(Ordering::Relaxed) as usize,
+        LAST_Y.load(Ordering::Relaxed) as usize,
+    );
     true
 }
 
 /// Move the cursor to (x, y) in pixels. Lockless — safe to call from the mouse IRQ. Writes CURPOS then
 /// re-arms via CURBASE (a lone CURPOS may not latch). No-op if the cursor isn't enabled.
+///
+/// `x`/`y` are where the POINTER is. Where the PLANE goes is `pointer - hotspot`, and for every
+/// centred shape in the Meridian set that is negative whenever the pointer is within 12px of the top
+/// or left edge. CURPOS is built for exactly this: bit 15 (X) and bit 31 (Y) are sign bits and the
+/// field holds the magnitude. This code used to mask them off with a note that "on-screen
+/// coordinates are non-negative" — true of the pointer, false of the plane, and the reason the old
+/// resize arrows were drawn pre-offset at (16,16) inside their bitmap.
 #[inline]
 pub fn move_to(x: usize, y: usize) {
     if !ENABLED.load(Ordering::Relaxed) {
@@ -230,8 +262,22 @@ pub fn move_to(x: usize, y: usize) {
     if mmio == 0 {
         return;
     }
-    // On-screen coordinates are non-negative: X in [14:0], Y in [30:16], sign bits clear.
-    let pos = (((y as u32) & 0x7FFF) << 16) | ((x as u32) & 0x7FFF);
+    LAST_X.store(x as u32, Ordering::Relaxed);
+    LAST_Y.store(y as u32, Ordering::Relaxed);
+
+    let px = x as i32 - HOT_X.load(Ordering::Relaxed) as i32;
+    let py = y as i32 - HOT_Y.load(Ordering::Relaxed) as i32;
+    let mut pos = 0u32;
+    if px < 0 {
+        pos |= CURSOR_POS_X_SIGN | ((-px) as u32 & 0x7FFF);
+    } else {
+        pos |= px as u32 & 0x7FFF;
+    }
+    if py < 0 {
+        pos |= CURSOR_POS_Y_SIGN | (((-py) as u32 & 0x7FFF) << 16);
+    } else {
+        pos |= (py as u32 & 0x7FFF) << 16;
+    }
     unsafe {
         wr(mmio, pipe + OFF_CURPOS, pos);
         wr(mmio, pipe + OFF_CURBASE, GVA_HW_CURSOR);

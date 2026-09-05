@@ -1,0 +1,17 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nyx-api = { path = "../../libs/api" }
+nyx-gui = { path = "../../libs/gui" }
+# The interface language: tokens, atlas, icons, shapes, geometry. Everything Meridian-specific that
+# can be proved on the host lives there, not here — this binary has no `_start`-free path and so no
+# tests of its own.
+nyx-meridian = { path = "../../libs/meridian" }
+
+linked_list_allocator = "0.10.5"
+
+[profile.release]
+panic = "abort"

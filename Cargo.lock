@@ -1890,6 +1890,10 @@ name = "nyx-api"
 version = "0.1.0"
 
 [[package]]
+name = "nyx-entity"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-explorer"
 version = "0.1.0"
 dependencies = [
@@ -1920,6 +1924,10 @@ dependencies = [
 
 [[package]]
 name = "nyx-htmltext"
+version = "0.1.0"
+
+[[package]]
+name = "nyx-icons-gen"
 version = "0.1.0"
 
 [[package]]
@@ -1970,6 +1978,18 @@ dependencies = [
  "uart_16550",
  "volatile 0.2.7",
  "x86_64",
+]
+
+[[package]]
+name = "nyx-meridian"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "libm",
+ "nyx-api",
+ "nyx-gui",
+ "spin",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -2826,6 +2846,16 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest",
  "keccak",
+]
+
+[[package]]
+name = "shell"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator 0.10.6",
+ "nyx-api",
+ "nyx-gui",
+ "nyx-meridian",
 ]
 
 [[package]]

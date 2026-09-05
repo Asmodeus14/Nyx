@@ -67,8 +67,25 @@ impl fmt::Write for VgaLogger {
     }
 }
 
+/// Put the log cursor back at the top-left.
+///
+/// Used when the cold-start screen hands the framebuffer back mid-boot: the log should start at
+/// the top of a freshly cleared screen, not wherever it had reached before the screen took over.
+pub fn reset_cursor() {
+    let mut l = VGA_LOGGER.lock();
+    l.x = MARGIN_LEFT;
+    l.y = MARGIN_TOP;
+}
+
 #[doc(hidden)]
 pub fn _vga_print(args: fmt::Arguments) {
+    // ★ The cold-start screen and this logger draw to the same pixels, and the loser is whichever
+    // ran second. While the graphical screen is up the `[BOOT]` stream goes to serial only — which
+    // is where every one of these lines was already going, so nothing is lost. Holding a key at
+    // power-on suppresses the screen instead and the log comes back; see `boot_screen::begin`.
+    if crate::boot_screen::is_quiet() {
+        return;
+    }
     // Disable interrupts so a context switch doesn't split a log message in half
     x86_64::instructions::interrupts::without_interrupts(|| {
         VGA_LOGGER.lock().write_fmt(args).unwrap();

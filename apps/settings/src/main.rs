@@ -70,12 +70,12 @@ impl NyxApp for SettingsApp {
         let width = canvas.width;
         let height = canvas.height;
 
-        canvas.fill_rect(0, 0, width, height, Color::WARM_BG);
+        canvas.fill_rect(0, 0, width, height, Color::SURFACE);
 
         // Sidebar Background
-        canvas.fill_rect(0, 0, 180, height, Color::WARM_SURFACE);
-        canvas.fill_rect(180, 0, 1, height, Color::WARM_BORDER);
-        canvas.print_str(15, 20, "SETTINGS", Color::TEXT_DARK, 2);
+        canvas.fill_rect(0, 0, 180, height, Color::RAISED);
+        canvas.fill_rect(180, 0, 1, height, Color::LINE);
+        canvas.print_str(15, 20, "SETTINGS", Color::FG, 2);
 
         // 1. Draw Sidebar Widgets
         self.btn_display.draw(canvas);
@@ -87,32 +87,32 @@ impl NyxApp for SettingsApp {
         let cx = 210;
         match self.active_tab {
             SettingsTab::Display => {
-                canvas.print_str(cx, 30, "Display Settings", Color::TEXT_DARK, 2);
-                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::WARM_BORDER);
+                canvas.print_str(cx, 30, "Display Settings", Color::FG, 2);
+                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::LINE);
                 
-                canvas.print_str(cx, 160, "Global Scale Factor", Color::TEXT_DARK, 1);
+                canvas.print_str(cx, 160, "Global Scale Factor", Color::FG, 1);
                 
                 // Draw display widgets
                 self.txt_resolution.draw(canvas);
                 self.menu_scale.draw(canvas); // Draw menu last so it overlaps everything else
             },
             SettingsTab::Personalization => {
-                canvas.print_str(cx, 30, "Personalization", Color::TEXT_DARK, 2);
-                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::WARM_BORDER);
+                canvas.print_str(cx, 30, "Personalization", Color::FG, 2);
+                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::LINE);
 
                 // Draw personalization widgets
                 self.chk_animations.draw(canvas);
                 self.chk_dark_mode.draw(canvas);
             },
             SettingsTab::System => {
-                canvas.print_str(cx, 30, "System Specifications", Color::TEXT_DARK, 2);
-                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::WARM_BORDER);
-                canvas.print_str(cx, 80, "OS: NyxOS v0.1 (Lethe Build)", Color::TEXT_DARK, 1);
-                canvas.print_str(cx, 110, "Architecture: x86_64", Color::TEXT_DARK, 1);
-                canvas.print_str(cx, 140, "Window Server: Nyx Compositor Phase 3", Color::TEXT_DARK, 1);
+                canvas.print_str(cx, 30, "System Specifications", Color::FG, 2);
+                canvas.fill_rect(cx, 60, width - cx - 30, 1, Color::LINE);
+                canvas.print_str(cx, 80, "OS: NyxOS v0.1 (Lethe Build)", Color::FG, 1);
+                canvas.print_str(cx, 110, "Architecture: x86_64", Color::FG, 1);
+                canvas.print_str(cx, 140, "Window Server: Nyx Compositor Phase 3", Color::FG, 1);
             },
             _ => {
-                canvas.print_str(cx, 30, "Module Pending", Color::TEXT_DARK, 2);
+                canvas.print_str(cx, 30, "Module Pending", Color::FG, 2);
             }
         }
     }

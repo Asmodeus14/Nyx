@@ -1,0 +1,14 @@
+[package]
+name = "nyx-icons-gen"
+version = "0.1.0"
+edition = "2021"
+
+# Build-time only. Reads the Meridian icon set out of the design document and emits
+# `libs/meridian/src/icons_gen.rs`. Runs on the HOST, never on Nyx.
+#
+# Deliberately dependency-free: the input is one file whose exact contents are known, so a real SVG
+# or HTML parser would be more machinery than the job needs and one more thing pinned in the lock
+# file. The scanner errors on anything it does not recognise rather than skipping it, so an icon
+# added to the design with a new path command fails the build instead of silently rendering blank.
+
+[dependencies]

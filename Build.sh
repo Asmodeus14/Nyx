@@ -18,6 +18,12 @@ echo "[1/7] Building Init Orchestrator (init)..."
 echo "[2/7] Building Window Server (compositor)..."
 (cd apps/compositor && $BUILD_CMD)
 
+# The Meridian shell (Nyx-ui/design/ver3.0). Built EVERY time, even when the compositor is the one
+# being shipped: keeping it compiling is what stops it rotting while the apps around it change, and
+# it costs seconds. Which of the two becomes WindowServer.nyx is $WINDOW_SERVER, applied further down.
+echo "[2b] Building Meridian shell (shell)..."
+(cd apps/shell && $BUILD_CMD)
+
 # [3] Terminal is now a std target_os=nyx binary (D3) — built via Build-std.sh below (step [9f]),
 # not the no_std $BUILD_CMD path.
 
@@ -109,9 +115,25 @@ mkdir -p build_initrd/apps/PosixProbe.nyx/scratch
 mkdir -p build_initrd/apps/HelloC.nyx
 
 # 2. Copy the compiled binaries into the folders as 'run.bin'
-# Notice the binary name for WindowServer is now 'compositor'
 cp target/x86_64-nyx/release/nyx-init build_initrd/apps/Init.nyx/run.bin
-cp target/x86_64-nyx/release/compositor build_initrd/apps/WindowServer.nyx/run.bin
+
+# WindowServer.nyx is whichever shell $WINDOW_SERVER names — `compositor` (the shipping desktop) or
+# `shell` (Meridian). Defaults to the compositor, because testing on this machine is bare metal only
+# and a shell that does not come up looks exactly like a kernel freeze from the outside. Reverting is
+# this one variable, not a code change:
+#
+#     WINDOW_SERVER=shell ./Build.sh
+#
+# apps/init execs the PATH, not a binary name, and nothing else refers to either binary — but note
+# the window server is PID 4 (`COMPOSITOR_PID` in libs/gui/src/app.rs) purely by fork order, so it
+# must stay the same position in init's spawn list.
+WINDOW_SERVER="${WINDOW_SERVER:-compositor}"
+if [ ! -f "target/x86_64-nyx/release/$WINDOW_SERVER" ]; then
+    echo "  !! WINDOW_SERVER=$WINDOW_SERVER has no built binary; expected target/x86_64-nyx/release/$WINDOW_SERVER" >&2
+    exit 1
+fi
+echo "  -> WindowServer.nyx = $WINDOW_SERVER"
+cp "target/x86_64-nyx/release/$WINDOW_SERVER" build_initrd/apps/WindowServer.nyx/run.bin
 # D3: terminal is a std binary now — its output lives under apps/terminal/target/ (workspace-excluded),
 # not the root target dir.
 cp apps/terminal/target/x86_64-unknown-nyx/release/nyx-terminal build_initrd/apps/Terminal.nyx/run.bin

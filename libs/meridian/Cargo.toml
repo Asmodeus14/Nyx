@@ -1,0 +1,17 @@
+[package]
+name = "nyx-meridian"
+version = "0.1.0"
+edition = "2021"
+
+# Meridian — the Nyx interface language. Tokens, the multi-size/multi-face glyph atlas, the icon
+# set, and the shapes the shell draws. Split out of `apps/shell` so the pure geometry and packing
+# logic can be unit-tested ON THE HOST: this machine has no QEMU and every on-hardware test costs a
+# power cycle, so anything that can be proved with `cargo test` must not need a boot to find out.
+
+[dependencies]
+nyx-api = { path = "../api" }
+nyx-gui = { path = "../gui" }
+ttf-parser = { version = "0.25", default-features = false, features = ["no-std-float"] }
+ab_glyph_rasterizer = { version = "0.1", default-features = false, features = ["libm"] }
+libm = "0.2"
+spin = "0.9"

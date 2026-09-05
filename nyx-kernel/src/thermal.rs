@@ -240,6 +240,17 @@ pub extern "C" fn nyx_task_manager_daemon() {
             }
         }
 
+        // Re-evaluate ACPI here, and ONLY here.
+        //
+        // This is the one context in the kernel that can safely run AML: a real task at IF=1 that
+        // may be preempted while ACPICA takes its interpreter mutex, allocates, walks OperationRegions,
+        // or — for `_BCM` on this laptop — stalls the CPU inside a firmware SMI. The same work in a
+        // syscall arm at IF=0 wedged core 0 and killed the machine; the post-mortem heartbeat caught
+        // it exactly: "cores alive: 0b11111110 ... no core scheduled ANY userspace task for 19s".
+        //
+        // The panel and battery syscalls now only copy scalars out of the cache this fills.
+        crate::acpi::refresh_cache();
+
         // CPU accounting every cycle; PRINTED once a minute when cool, every cycle once we're warm
         // enough to care. Silence while healthy keeps the boot log readable, but the moment the
         // machine starts heating we get a per-second record of who is responsible — which survives

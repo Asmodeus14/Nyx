@@ -83,22 +83,22 @@ impl NyxApp for StdGuiApp {
         let w = canvas.width;
         let h = canvas.height;
 
-        canvas.fill_rect(0, 0, w, h, Color::WARM_BG);
-        canvas.fill_rect(0, 0, w, 40, Color::WARM_SURFACE);
-        canvas.fill_rect(0, 40, w, 1, Color::WARM_BORDER);
+        canvas.fill_rect(0, 0, w, h, Color::SURFACE);
+        canvas.fill_rect(0, 0, w, 40, Color::RAISED);
+        canvas.fill_rect(0, 40, w, 1, Color::LINE);
 
-        canvas.print_str(16, 12, "Rust std, running on Nyx", Color::TEXT_DARK, 2);
+        canvas.print_str(16, 12, "Rust std, running on Nyx", Color::FG, 2);
 
-        canvas.print_str(16, 64, "This window is drawn by a target_os=nyx", Color::TEXT_DARK, 1);
-        canvas.print_str(16, 84, "binary built with -Z build-std=std.", Color::TEXT_DARK, 1);
-        canvas.print_str(16, 112, "It links nyx-gui + nyx-api UNCHANGED.", Color::TEXT_DARK, 1);
+        canvas.print_str(16, 64, "This window is drawn by a target_os=nyx", Color::FG, 1);
+        canvas.print_str(16, 84, "binary built with -Z build-std=std.", Color::FG, 1);
+        canvas.print_str(16, 112, "It links nyx-gui + nyx-api UNCHANGED.", Color::FG, 1);
 
         // Live std proof: format! (alloc) + std::time (monotonic clock) inside the GUI loop.
         let uptime_ms = now.duration_since(start).as_millis();
         let line = format!("std::time uptime: {} ms   frames: {}", uptime_ms, self.frames);
-        canvas.print_str(16, 152, &line, Color::TEXT_DARK, 1);
+        canvas.print_str(16, 152, &line, Color::FG, 1);
 
-        canvas.print_str(16, 200, "D2 milestone: std + GUI coexist.", Color::TEXT_DARK, 1);
+        canvas.print_str(16, 200, "D2 milestone: std + GUI coexist.", Color::FG, 1);
     }
 }
 

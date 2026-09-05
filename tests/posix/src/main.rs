@@ -43,11 +43,11 @@ use nyx_gui::canvas::{Canvas, Color};
 
 use report::{Report, Verdict};
 
-const BG: u32 = Color::WARM_BG;
-const SURFACE: u32 = Color::WARM_SURFACE;
-const BORDER: u32 = Color::WARM_BORDER;
-const TEXT: u32 = Color::TEXT_DARK;
-const MUTED: u32 = Color::TEXT_MUTED;
+const BG: u32 = Color::SURFACE;
+const SURFACE: u32 = Color::RAISED;
+const BORDER: u32 = Color::LINE;
+const TEXT: u32 = Color::FG;
+const MUTED: u32 = Color::FG_MUTED;
 
 const HEADER_H: usize = 62;
 const ROW_H: usize = 34;

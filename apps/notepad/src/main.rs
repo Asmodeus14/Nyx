@@ -33,12 +33,12 @@ use nyx_api::keys;
 use nyx_gui::app::NyxApp;
 use nyx_gui::canvas::{Canvas, Color};
 
-const BG: u32 = Color::WARM_BG;
-const SURFACE: u32 = Color::WARM_SURFACE;
-const BORDER: u32 = Color::WARM_BORDER;
-const TEXT: u32 = Color::TEXT_DARK;
-const MUTED: u32 = Color::TEXT_MUTED;
-const ACCENT: u32 = Color::ACCENT_PRIMARY;
+const BG: u32 = Color::SURFACE;
+const SURFACE: u32 = Color::RAISED;
+const BORDER: u32 = Color::LINE;
+const TEXT: u32 = Color::FG;
+const MUTED: u32 = Color::FG_MUTED;
+const ACCENT: u32 = Color::ACCENT;
 
 const TOOLBAR_H: usize = 40;
 const STATUS_H: usize = 22;

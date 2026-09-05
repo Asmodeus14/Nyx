@@ -155,6 +155,17 @@ pub const WHY_MM_DEADLOCK: u8 = 4;
 /// answer at all to "did it run out of memory?". That is a question you cannot answer any other way
 /// after the fact: the freeze wipes BOOT_LOG and this machine has no serial console.
 pub const WHY_KERNEL_OOM: u8 = 5;
+/// A KERNEL-MODE #GP. Detail = the faulting instruction pointer.
+///
+/// Worth its own cause for the same reason as `WHY_KERNEL_OOM`: the `panic!` in `gpf_handler`
+/// otherwise records `WHY_PANIC` at that handler's own file:line, which is identical for every
+/// kernel #GP and so carries no information. The IP is the entire diagnosis — feed it to
+/// `addr2line -e target/x86_64-unknown-none/release/nyx-kernel <ip>`.
+///
+/// It exists because the screen could not be trusted: a #GP IP read off the banded red screen was
+/// off by one digit and pointed mid-instruction, which cost a debugging pass. CMOS survives the
+/// power cycle and does not care what the display engine is doing.
+pub const WHY_KERNEL_GPF: u8 = 6;
 
 fn stage_name(s: u8) -> &'static str {
     match s {
@@ -185,6 +196,7 @@ fn why_name(w: u8) -> &'static str {
         WHY_KERNEL_PF => "KERNEL-MODE page fault (detail = CR2)",
         WHY_MM_DEADLOCK => "MEMORY_MANAGER lock DEADLOCK (detail = MM_SITE id, see mm_site_name)",
         WHY_KERNEL_OOM => "KERNEL HEAP EXHAUSTED (detail = requested bytes)",
+        WHY_KERNEL_GPF => "KERNEL-MODE #GP (detail = faulting IP; run addr2line on it)",
         _ => "unknown",
     }
 }
@@ -405,11 +417,29 @@ fn hold_for_reading() {
     }
 }
 
+/// What the previous run's death record said, in the two words the boot screen has room for.
+///
+/// The full report goes to the log, where it belongs. This is only enough for the cold-start screen
+/// to stop being silent about it. Both fields point into the existing name tables, so carrying it
+/// costs nothing and cannot allocate.
+#[derive(Clone, Copy)]
+pub struct Death {
+    /// Furthest boot stage the previous run reached.
+    pub stage: &'static str,
+    /// What killed it.
+    pub why: &'static str,
+}
+
 /// Read back and print whatever the PREVIOUS run left behind, then clear it.
 ///
 /// Call this early in boot — it is the first thing worth knowing after a freeze, and it must run
 /// before anything else can fill BOOT_LOG or overwrite the record.
-pub fn report_and_clear() {
+///
+/// Returns the record if there was one, so the cold-start screen can bring the mark up in its
+/// attention state. On a machine with no serial port this CMOS record is the only evidence that
+/// survives a freeze, and until now it was visible for exactly as long as it took the desktop to
+/// paint over the log.
+pub fn report_and_clear() -> Option<Death> {
     let (magic, stage, why, detail, stage_detail) = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         let magic = read_reg(REG_MAGIC);
         let stage = read_reg(REG_STAGE);
@@ -529,10 +559,30 @@ pub fn report_and_clear() {
     // compositor, which owns the framebuffer and paints straight over this, so without a pause the
     // one artifact that survived the freeze is destroyed a second later by the machine recovering.
     let had_record = magic == MAGIC && !(stage == PM_IDLE && why == WHY_NONE);
-    if had_record || hb_tasks != 0 || user_mark_v != 0 || stuck != 0 {
-        say!("[POSTMORTEM] (holding ~10s so this can be read/photographed — boot continues after)");
+    // ★ Only when something actually DIED.
+    //
+    // This used to fire on a bare heartbeat too — and a heartbeat is written by any run that lasted
+    // more than a second, so it fired on essentially every boot. Eight seconds of report before the
+    // machine will show you anything is a real cost to pay on a normal power-on, and paying it
+    // every time is how a warning stops being read at all. A death record or a stuck lock is
+    // evidence; "the previous run ran" is not.
+    //
+    // Nothing is lost from the report itself — the heartbeat lines above are still printed, and
+    // pressing a key at any point during boot brings the whole log back (`boot_screen`).
+    if had_record || stuck != 0 {
+        say!("[POSTMORTEM] (holding ~8s so this can be read/photographed — boot continues after)");
         hold_for_reading();
     }
 
     clear();
+
+    // A stuck lock counts as a death even without a record: it is the freeze that leaves no death
+    // record at all, which is exactly the case worth surfacing on the next boot's screen.
+    if had_record {
+        Some(Death { stage: stage_name(stage), why: why_name(why) })
+    } else if stuck != 0 {
+        Some(Death { stage: "scheduler", why: lock_site_name(stuck) })
+    } else {
+        None
+    }
 }

@@ -105,11 +105,11 @@ impl NyxApp for SysMonApp {
         let height = canvas.height;
         self.last_h = height; // remember for the scrollbar clamp
 
-        canvas.fill_rect(0, 0, width, height, Color::WARM_BG);
-        canvas.fill_rect(0, 0, 150, height, Color::WARM_SURFACE);
-        canvas.fill_rect(150, 0, 1, height, Color::WARM_BORDER); 
+        canvas.fill_rect(0, 0, width, height, Color::SURFACE);
+        canvas.fill_rect(0, 0, 150, height, Color::RAISED);
+        canvas.fill_rect(150, 0, 1, height, Color::LINE); 
 
-        canvas.print_str(15, 20, "SYS MON", Color::ACCENT_PRIMARY, 2);
+        canvas.print_str(15, 20, "SYS MON", Color::ACCENT, 2);
 
         let tabs = [
             (SysMonState::Vitals, "Entity Vitals", 80),
@@ -119,8 +119,8 @@ impl NyxApp for SysMonApp {
 
         for (s, text, y) in tabs.iter() {
             let is_active = self.state == *s;
-            if is_active { canvas.fill_rect(10, *y - 5, 130, 30, Color::ACCENT_PRIMARY); }
-            let text_color = if is_active { Color::WHITE } else { Color::TEXT_MUTED };
+            if is_active { canvas.fill_rect(10, *y - 5, 130, 30, Color::ACCENT); }
+            let text_color = if is_active { Color::WHITE } else { Color::FG_MUTED };
             canvas.print_str(20, *y + 2, text, text_color, 1);
         }
 
@@ -128,10 +128,10 @@ impl NyxApp for SysMonApp {
 
         match self.state {
             SysMonState::Vitals => {
-                canvas.print_str(cx, 20, "Entity Live Telemetry", Color::TEXT_DARK, 2);
+                canvas.print_str(cx, 20, "Entity Live Telemetry", Color::FG, 2);
                 
                 let core_text = alloc::format!("Architecture: x86_64 SMP | Active Hardware Cores: {}", self.active_cores);
-                canvas.print_str(cx, 60, &core_text, Color::TEXT_MUTED, 1);
+                canvas.print_str(cx, 60, &core_text, Color::FG_MUTED, 1);
                 canvas.print_str(cx, 80, "NVMe Lossless Compression: ACTIVE", Color::ACCENT_GREEN, 1);
 
                 let bars = [
@@ -143,9 +143,9 @@ impl NyxApp for SysMonApp {
 
                 for (label, val, y, color) in bars.iter() {
                     let text = alloc::format!("{}: {:.2}", label, val);
-                    canvas.print_str(cx, *y, &text, Color::TEXT_DARK, 1);
+                    canvas.print_str(cx, *y, &text, Color::FG, 1);
                     
-                    canvas.fill_rect(cx, *y + 20, cw, 12, Color::WARM_BORDER); // Scaled dynamically
+                    canvas.fill_rect(cx, *y + 20, cw, 12, Color::LINE); // Scaled dynamically
                     let fill_w = ((val.clamp(0.0, 100.0) / 100.0) * cw as f32) as usize;
                     if fill_w > 0 {
                         canvas.fill_rect(cx, *y + 20, fill_w, 12, *color);
@@ -153,7 +153,7 @@ impl NyxApp for SysMonApp {
                 }
             },
             SysMonState::Tasks => {
-                canvas.print_str(cx, 20, "Hardware & Scheduler", Color::TEXT_DARK, 2);
+                canvas.print_str(cx, 20, "Hardware & Scheduler", Color::FG, 2);
                 
                 let temp_color = if self.sys_info.current_temp >= 80 { 0xFF_E74C3C } else { Color::ACCENT_GREEN };
                 canvas.print_str(cx, 70, &alloc::format!("Silicon Temp: {} C", self.sys_info.current_temp), temp_color, 1);
@@ -165,8 +165,8 @@ impl NyxApp for SysMonApp {
                     if rpm == u32::MAX { "not readable (no vendor driver)".into() }
                     else { alloc::format!("{} RPM", rpm) }
                 };
-                canvas.print_str(cx, 90, &alloc::format!("CPU Fan: {}", fan_text(self.sys_info.cpu_fan_rpm)), Color::TEXT_DARK, 1);
-                canvas.print_str(cx, 110, &alloc::format!("GPU Fan: {}", fan_text(self.sys_info.gpu_fan_rpm)), Color::TEXT_DARK, 1);
+                canvas.print_str(cx, 90, &alloc::format!("CPU Fan: {}", fan_text(self.sys_info.cpu_fan_rpm)), Color::FG, 1);
+                canvas.print_str(cx, 110, &alloc::format!("GPU Fan: {}", fan_text(self.sys_info.gpu_fan_rpm)), Color::FG, 1);
 
                 // Which machine has no fan driver? Fan tachometers are vendor-private, so the SMBIOS
                 // identity is the thing that says whether "not readable" is fixable.
@@ -176,10 +176,10 @@ impl NyxApp for SysMonApp {
                 } else {
                     alloc::format!("System: {}", machine)
                 };
-                canvas.print_str(cx, 130, &machine_line, Color::TEXT_MUTED, 1);
+                canvas.print_str(cx, 130, &machine_line, Color::FG_MUTED, 1);
 
-                canvas.fill_rect(cx, 156, cw, 1, Color::WARM_BORDER);
-                canvas.print_str(cx, 168, &alloc::format!("Total Kernel Tasks: {}", self.sys_info.task_count), Color::TEXT_DARK, 1);
+                canvas.fill_rect(cx, 156, cw, 1, Color::LINE);
+                canvas.print_str(cx, 168, &alloc::format!("Total Kernel Tasks: {}", self.sys_info.task_count), Color::FG, 1);
 
                 let mut ty = 196;
                 let limit = core::cmp::min(self.sys_info.task_count as usize, 10);
@@ -187,12 +187,12 @@ impl NyxApp for SysMonApp {
                     let t = &self.sys_info.tasks[i];
                     let name = core::str::from_utf8(&t.name).unwrap_or("Unknown").trim_matches(char::from(0));
                     let t_str = alloc::format!("PID {:02} | {} | {} Ticks", t.pid, name, t.cpu_ticks);
-                    canvas.print_str(cx, ty, &t_str, Color::TEXT_MUTED, 1);
+                    canvas.print_str(cx, ty, &t_str, Color::FG_MUTED, 1);
                     ty += 20;
                 }
             },
             SysMonState::Bootlog => {
-                canvas.print_str(cx, 20, "Kernel Ring Buffer (dmesg)", Color::TEXT_DARK, 2);
+                canvas.print_str(cx, 20, "Kernel Ring Buffer (dmesg)", Color::FG, 2);
                 
                 let log_y = 60; let log_h = height.saturating_sub(80);
                 canvas.fill_rect(cx, log_y, cw, log_h, 0xFF_1E1E1E); 

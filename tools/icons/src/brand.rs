@@ -1,0 +1,256 @@
+//! Generates `nyx-kernel/src/brand_gen.rs` — the identity, pre-rasterized for the boot screen.
+//!
+//! ## Why the kernel carries pixels at all
+//!
+//! At stage 1 of cold start the kernel is drawing into the bootloader framebuffer with no GPU, no
+//! blitter, and no TTF rasterizer — the rasterizer is `libs/gui`, which is userspace and does not
+//! exist yet. There is no way to *set* the word "nyx" at that point even if Inter were compiled in.
+//!
+//! That constraint is the reason the wordmark was drawn as geometry rather than set in a typeface:
+//! geometry can be resolved here, at build time, into a coverage bitmap that the kernel only has to
+//! alpha-blend. Two bitmaps, ~19 KB, blended by hand into about 19,000 pixels once.
+//!
+//! ## Coverage, not colour
+//!
+//! Both marks are one-colour shapes, so 8-bit coverage is the whole of the information — the kernel
+//! picks the colour at blend time. That is what lets the same 96×96 bitmap be the half-strength mark
+//! of stage 1, the full-strength mark of stage 2, and the amber attention mark after a freeze,
+//! without three copies.
+
+use std::path::Path;
+
+use crate::raster;
+use crate::svg;
+
+/// The design part that defines the identity, relative to the `Nyx-ui` root.
+pub const SOURCE: &str = "design/ver3.0/parts/14-brand.html";
+
+/// What to rasterize, at what height in pixels, and the name it gets in the kernel.
+///
+/// The heights are the design's own (`11-boot.html`): "the mark at 96×96 and the wordmark at
+/// 152×66". 152 is not a third number to keep in step — it falls out of the wordmark's 36.83×16
+/// viewBox at 66px tall, and `the_wordmark_keeps_its_aspect` checks that it still does.
+pub const WANT: [(&str, &str, usize); 2] = [
+    ("nyx-mark", "MARK", 96),
+    ("nyx-word", "WORDMARK", 66),
+];
+
+pub struct Asset {
+    pub id: String,
+    pub name: &'static str,
+    /// The box the design specifies, before cropping.
+    pub box_w: usize,
+    pub box_h: usize,
+    /// The cropped bitmap and where it sits in that box.
+    pub w: usize,
+    pub h: usize,
+    pub off_x: usize,
+    pub off_y: usize,
+    pub cov: Vec<u8>,
+}
+
+pub fn build(src: &str) -> Result<Vec<Asset>, String> {
+    let ids: Vec<&str> = WANT.iter().map(|w| w.0).collect();
+    let symbols = svg::parse_document(src, &ids)?;
+    let mut out = Vec::new();
+    for &(id, name, px) in &WANT {
+        let sym = symbols
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("{} does not define a symbol '{}'", SOURCE, id))?;
+        // Filled geometry throughout — no strokes anywhere in the identity, which is why the mark
+        // survives being scaled from a 22px caption glyph to a 96px boot mark without refitting.
+        let bm = raster::rasterize(sym, px, 0.0);
+        let (c, ox, oy) = raster::crop(&bm);
+        if c.w == 0 {
+            return Err(format!("'{}' rasterized to nothing at {}px", id, px));
+        }
+        out.push(Asset {
+            id: sym.id.clone(),
+            name,
+            box_w: bm.w,
+            box_h: bm.h,
+            w: c.w,
+            h: c.h,
+            off_x: ox,
+            off_y: oy,
+            cov: c.cov,
+        });
+    }
+    Ok(out)
+}
+
+pub fn preview(a: &Asset) {
+    println!("\n{} -> {}  box {}x{}, ink {}x{} at ({},{}), {} bytes",
+             a.id, a.name, a.box_w, a.box_h, a.w, a.h, a.off_x, a.off_y, a.cov.len());
+    // Two columns per cell so the aspect survives a terminal's tall character cell, and every third
+    // row, because a 96-row mark does not fit on a screen otherwise.
+    for y in (0..a.h).step_by(3) {
+        let row: String = (0..a.w)
+            .step_by(2)
+            .map(|x| match a.cov[y * a.w + x] {
+                0 => ' ',
+                1..=63 => '.',
+                64..=127 => ':',
+                128..=191 => '*',
+                _ => '#',
+            })
+            .collect();
+        println!("|{}|", row);
+    }
+}
+
+pub fn emit(assets: &[Asset]) -> String {
+    let mut body = String::new();
+    let mut entries = String::new();
+    let mut total = 0usize;
+    for a in assets {
+        total += a.cov.len();
+        body.push_str(&format!("static {}_COV: [u8; {}] = [\n", a.name, a.cov.len()));
+        for chunk in a.cov.chunks(24) {
+            body.push_str("    ");
+            for b in chunk {
+                body.push_str(&format!("{},", b));
+            }
+            body.push('\n');
+        }
+        body.push_str("];\n\n");
+        entries.push_str(&format!(
+            "/// `{}` from the design document, at {}x{}.\n\
+             pub static {}: Coverage = Coverage {{\n\
+             \x20   w: {}, h: {}, off_x: {}, off_y: {}, box_w: {}, box_h: {},\n\
+             \x20   cov: &{}_COV,\n\
+             }};\n\n",
+            a.id, a.box_w, a.box_h, a.name,
+            a.w, a.h, a.off_x, a.off_y, a.box_w, a.box_h, a.name
+        ));
+    }
+
+    format!(
+        "// @generated by `cargo run -p nyx-icons-gen` — DO NOT EDIT BY HAND.\n\
+         //\n\
+         // Source: Nyx-ui/{}\n\
+         // {} bytes of 8-bit coverage.\n\
+         //\n\
+         // The identity, resolved to pixels for the one screen that cannot resolve it itself. At\n\
+         // cold-start stage 1 the kernel has the bootloader framebuffer and nothing else — no GPU,\n\
+         // no blitter, and no TTF rasterizer, because the rasterizer is `libs/gui` and userspace\n\
+         // does not exist yet. Geometry is why the wordmark can appear there at all.\n\
+         //\n\
+         // Coverage rather than colour: the kernel chooses the tone at blend time, so the same 96px\n\
+         // bitmap is the half-strength mark of stage 1, the full-strength mark of stage 2, and the\n\
+         // amber attention mark after a freeze.\n\
+         \n\
+         #![allow(dead_code)]\n\
+         \n\
+         /// An 8-bit coverage bitmap, cropped to its ink.\n\
+         pub struct Coverage {{\n\
+         \x20   pub w: usize,\n\
+         \x20   pub h: usize,\n\
+         \x20   /// Where the ink sits inside the box the design specifies.\n\
+         \x20   pub off_x: usize,\n\
+         \x20   pub off_y: usize,\n\
+         \x20   /// The design's box. Position by THIS, not by `w`/`h`, or two assets that were\n\
+         \x20   /// cropped by different margins will not line up with each other.\n\
+         \x20   pub box_w: usize,\n\
+         \x20   pub box_h: usize,\n\
+         \x20   /// `w * h` bytes, row-major, 0..=255.\n\
+         \x20   pub cov: &'static [u8],\n\
+         }}\n\
+         \n{}{}",
+        SOURCE, total, entries, body
+    )
+}
+
+/// Where the kernel's copy lives — cold-start stages 1 and 2.
+pub fn out_path() -> &'static Path {
+    Path::new("nyx-kernel/src/brand_gen.rs")
+}
+
+/// Where userspace's copy lives — cold-start stage 3, where the shell picks the mark up from
+/// exactly where the kernel left it.
+pub fn meridian_out_path() -> &'static Path {
+    Path::new("libs/meridian/src/brand_gen.rs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set() -> Option<Vec<Asset>> {
+        let root = crate::default_ui_root();
+        let src = std::fs::read_to_string(root.join(SOURCE)).ok()?;
+        Some(build(&src).expect("the checked-in brand document must rasterize"))
+    }
+
+    #[test]
+    fn the_wordmark_keeps_its_aspect() {
+        // 152 is derived, not declared: the design says "the wordmark at 152×66" and that number
+        // has to keep falling out of the 36.83×16 viewBox, or the boot screen's layout — which
+        // centres the word under the mark — is being written against a width that no longer exists.
+        let Some(set) = set() else { return };
+        let w = set.iter().find(|a| a.name == "WORDMARK").unwrap();
+        assert_eq!((w.box_w, w.box_h), (152, 66));
+        let m = set.iter().find(|a| a.name == "MARK").unwrap();
+        assert_eq!((m.box_w, m.box_h), (96, 96));
+    }
+
+    #[test]
+    fn both_assets_are_solid_and_antialiased() {
+        // Filled geometry: there must be a real interior, not just edges. And there must be soft
+        // edges, or the supersampling silently did nothing and the boot mark will have jagged
+        // diagonals — which the mark is almost entirely made of.
+        let Some(set) = set() else { return };
+        for a in &set {
+            let solid = a.cov.iter().filter(|&&c| c == 255).count();
+            let soft = a.cov.iter().filter(|&&c| c > 0 && c < 255).count();
+            assert!(solid > a.cov.len() / 8, "{}: only {} solid px", a.name, solid);
+            assert!(soft > 200, "{}: only {} antialiased px", a.name, soft);
+        }
+    }
+
+    #[test]
+    fn the_mark_has_its_two_counters() {
+        // The mark is an N with two corners removed; the counters are the two gaps the diagonal
+        // makes with the stems. If the three subpaths cancelled each other instead of unioning —
+        // the classic even-odd-versus-nonzero mistake — the middle of the mark would be hollow and
+        // the counters would merge into one. Checking the centre row for exactly three ink runs is
+        // what tells those apart.
+        let Some(set) = set() else { return };
+        let m = set.iter().find(|a| a.name == "MARK").unwrap();
+        let y = m.h / 2;
+        let mut runs = 0;
+        let mut prev = false;
+        for x in 0..m.w {
+            let ink = m.cov[y * m.w + x] > 128;
+            if ink && !prev {
+                runs += 1;
+            }
+            prev = ink;
+        }
+        assert_eq!(runs, 3, "centre row has {} ink runs; expected stem, diagonal, stem", runs);
+    }
+
+    #[test]
+    fn a_group_transform_actually_moves_the_geometry() {
+        // `<g>` support is what made the wordmark reachable. This pins the part that would fail
+        // silently: a translate that parsed but was never applied leaves a perfectly good bitmap
+        // drawn in the wrong place, which for the lockup means the mark sitting on top of the word.
+        let doc = r#"<symbol id="t" viewBox="0 0 24 24">
+            <g fill="currentColor" stroke="none" transform="translate(10 0)">
+              <g transform="translate(0, 10)"><path d="M0 0h4v4H0z"/></g>
+            </g></symbol>"#;
+        let syms = svg::parse_document(doc, &["t"]).unwrap();
+        let pts = &syms[0].parts[0].polys[0].pts;
+        assert!(pts.iter().all(|&(x, y)| (10.0..=14.0).contains(&x) && (10.0..=14.0).contains(&y)),
+                "translate() was parsed but not applied: {:?}", pts);
+        assert_eq!(syms[0].parts[0].ink, svg::Ink::Fill, "fill must inherit from the group");
+    }
+
+    #[test]
+    fn an_unsupported_group_transform_is_an_error() {
+        let doc = r#"<symbol id="t" viewBox="0 0 24 24">
+            <g transform="matrix(1 0 0 1 5 5)"><path d="M0 0h4v4H0z"/></g></symbol>"#;
+        assert!(svg::parse_document(doc, &["t"]).is_err());
+    }
+}
