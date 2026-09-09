@@ -185,6 +185,9 @@ extern "C" {
     fn acpi_root_count(bad_out: *mut i32) -> i32;
     fn acpi_battery_read(out: *mut i32, max: i32) -> i32;
     fn acpi_battery_fetch(out: *mut i32, max: i32) -> i32;
+    fn acpi_ec_ac_status(ac_online: *mut i32, batt_present: *mut i32) -> i32;
+    fn acpi_thermal_read() -> i32;
+    fn acpi_thermal_fetch(out: *mut i32, max: i32) -> i32;
     fn acpi_ec_install(out_data: *mut u32, out_cmd: *mut u32) -> i32;
     fn acpi_ns_step(parent: *mut core::ffi::c_void, prev: *mut core::ffi::c_void,
                     next: *mut *mut core::ffi::c_void,
@@ -592,6 +595,13 @@ pub fn refresh_cache() {
             // is step 11, which sets the one variable `_REG` exists to set and runs no AML at all.
             let ok = unsafe { acpi_ec_run_reg() };
             crate::vga_println!("[ACPI] EC _REG -> {}", if ok == 1 { "ok" } else { "failed" });
+        }
+        12 => {
+            // ★ `_TMP` on all four sensors. Needs ECRD (probe 11) or every one of them returns the
+            // hardcoded 0x0BB8 = 26.85 C stub — see acpi_thermal_read for why that is worse than a
+            // failure. Marks 80..83 per sensor, 84 on completion.
+            let n = unsafe { acpi_thermal_read() };
+            crate::vga_println!("[ACPI] _TMP sensors read: {}", n);
         }
         11 => {
             // ★★ The way around a fatal `_REG`: set `\ECRD` directly.
@@ -1082,6 +1092,42 @@ pub fn init_report() -> alloc::string::String {
             "  last AML battery read: present={} bif={} bst={}\n    design={} full={} mV={} rem={} rate={} state={}\n",
             aml_present, av[9], av[10], av[2], av[3], av[4], av[7], av[6], av[5],
         ));
+    }
+
+    // ★ AC adapter — a raw EC read, no AML. `_PSR` is `ECG5() & 1` and `ECG5()` is `ECRB(0x06)`, so
+    // the register holds the answer; evaluating `_PSR` would additionally fire `PNOT()` on every
+    // state change, which is work we do not need to poll.
+    let (mut ac, mut bp) = (0i32, 0i32);
+    if unsafe { acpi_ec_ac_status(&mut ac, &mut bp) } == 1 {
+        out.push_str(&format!(
+            "  AC adapter: {}   battery present: {}   (EC 0x06)\n",
+            if ac == 1 { "ONLINE" } else { "on battery" },
+            if bp == 1 { "yes" } else { "no" },
+        ));
+    }
+
+    // ★★ Thermal. Deci-Kelvin from `_TMP`; 2732 dK = 0 C.
+    //
+    // ⚠️ 3000 dK (26.85 C) on every sensor is NOT a reading — it is the `Else` branch of `_TMP`
+    // firing because `ECRD` is zero. Flagged explicitly, because a plausible constant is the one
+    // failure mode that never looks like one.
+    let mut tz = [0i32; 4];
+    let tzn = unsafe { acpi_thermal_fetch(tz.as_mut_ptr(), 4) };
+    if tzn > 0 {
+        let names = ["CPU", "MEM", "SKN", "M.2"];
+        let mut line = alloc::string::String::from("  thermal (_TMP):");
+        for (i, &dk) in tz.iter().enumerate() {
+            if dk > 0 {
+                line.push_str(&format!(" {} {}C", names[i], (dk - 2732) / 10));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
+        if tz.iter().filter(|&&d| d > 0).all(|&d| d == 3000) {
+            out.push_str("    ** all 3000 dK = the _TMP stub, not a reading: ECRD is 0 **\n");
+        }
+    } else {
+        out.push_str("  thermal (_TMP): not read this boot (`acpi probe 12`)\n");
     }
 
     out.push_str(match (ec_ok, ecrd_ok == 1 && ecrd != 0) {

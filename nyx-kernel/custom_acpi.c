@@ -999,6 +999,84 @@ int acpi_battery_fetch(int *out, int max) {
     return nyx_batt_present;
 }
 
+/* ── AC adapter ────────────────────────────────────────────────────────────────────────────────
+ *
+ * No AML, and deliberately so. The DSDT hands us the answer directly:
+ *
+ *     Method (_PSR) { Local0 = ECG5 (); Local0 &= One;  ... Return (Local0) }   // AC online
+ *     Method (BAT0._STA) { Local0 = ECG5 (); Local0 &= 0x02; ... }              // battery present
+ *
+ * and `ECG5()` is `ECRB(0x06)`. So both bits live in EC register 0x06 and a raw read gets them with
+ * no interpreter, no handler and no risk. ⚠️ `_PSR` additionally calls `PNOT()` whenever the state
+ * differs from `PWRS` — a Serialized method that notifies every power consumer — which is real work
+ * we neither need nor want on a poll. Reading the register is the whole of the information.
+ *
+ * No bank select here: 0x03 selects the BATTERY window, and `ECG5` does not touch it. */
+int acpi_ec_ac_status(int *ac_online, int *batt_present) {
+    UINT8 v = 0;
+    if (!nyx_ec_read_byte(0x06, &v)) return 0;
+    if (ac_online)    *ac_online    = (v & 0x01) ? 1 : 0;
+    if (batt_present) *batt_present = (v & 0x02) ? 1 : 0;
+    return 1;
+}
+
+/* ── Thermal ───────────────────────────────────────────────────────────────────────────────────
+ *
+ * ★★★ THIS IS THE CLEAREST PAYOFF OF SETTING `ECRD`, AND THE MOST DANGEROUS THING TO GET WRONG.
+ *
+ *     Method (_TMP, 0, Serialized) {
+ *         If (\ECRD) { Local0 = ECDV.KDRT (n); Return ((0x0AAC + (Local0 * 0x0A))) }
+ *         Else       { Return (0x0BB8) }
+ *     }
+ *
+ * ⚠️⚠️ With `ECRD` clear, every sensor on this machine returns **0x0BB8 = 3000 deci-Kelvin =
+ * 26.85 C** — a hardcoded constant that looks exactly like a plausible idle temperature. A thermal
+ * stack built against that would have looked like it worked, forever, on a laptop that overheats.
+ * `26.85 C` (or a suspiciously round 3000) is the tell that `ECRD` is zero, NOT a reading.
+ *
+ * Units are deci-Kelvin: 0x0AAC = 2732 = 273.2 K = 0 C, and `KDRT` returns whole degrees C, so
+ * degrees C = (dK - 2732) / 10. Values are parked in a static and collected by
+ * `acpi_thermal_fetch`, for the same reason the battery is — see acpi_battery_read. */
+static const char *NYX_TZ_PATHS[4] = {
+    "\\_SB.PCI0.B0D4",              /* package / CPU  (KDRT 0) */
+    "\\_SB.PCI0.LPCB.ECDV.TMEM",    /* memory         (KDRT 2) */
+    "\\_SB.PCI0.LPCB.ECDV.TSKN",    /* skin                    */
+    "\\_SB.PCI0.LPCB.ECDV.NGFF",    /* M.2 / SSD               */
+};
+static volatile int nyx_tz_dk[4];
+static volatile int nyx_tz_found = 0;
+
+int acpi_thermal_read(void) {
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        nyx_tz_dk[i] = 0;
+        ACPI_HANDLE h = NULL;
+        if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)NYX_TZ_PATHS[i], &h)) || !h) continue;
+        ACPI_BUFFER r; r.Length = ACPI_ALLOCATE_BUFFER; r.Pointer = NULL;
+        /* 80..83, one per sensor: four evaluations bracketed by a single pair would repeat the
+         * mark-55 mistake of bracketing several things and distinguishing none. */
+        nyx_mark((unsigned char)(80 + i));
+        if (ACPI_SUCCESS(AcpiEvaluateObject(h, (char*)"_TMP", NULL, &r)) && r.Pointer) {
+            ACPI_OBJECT *o = (ACPI_OBJECT *)r.Pointer;
+            if (o->Type == ACPI_TYPE_INTEGER) {
+                nyx_tz_dk[i] = (int)(o->Integer.Value & 0x7FFFFFFF);
+                n++;
+            }
+            AcpiOsFree(r.Pointer);
+        }
+    }
+    nyx_mark(84);
+    nyx_tz_found = n;
+    return n;
+}
+
+int acpi_thermal_fetch(int *out, int max) {
+    if (!out || max <= 0) return 0;
+    int n = (max < 4) ? max : 4;
+    for (int i = 0; i < n; i++) out[i] = nyx_tz_dk[i];
+    return nyx_tz_found;
+}
+
 /* Stack depth observed across the AML evaluation, so the overflow theory can be checked rather than
  * argued. `rsp_min` is the deepest point our handler was ever called at — the interpreter's own
  * recursion sits below the governor frame, and this is the only place we get to see it. */
