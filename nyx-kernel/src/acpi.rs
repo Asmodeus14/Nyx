@@ -519,7 +519,10 @@ pub fn refresh_cache() {
     let before = root_count();
     let (ec_ok, dport, cport) = ec_install();
     let mid = root_count();
-    let bat = if ec_ok { ec_battery() } else { Battery::default() };
+    // ★ Was `ec_battery()` — the Dell-specific register map — unconditionally. Now prefers the
+    // vendor-neutral `_BIF`/`_BST` once they have proven themselves on this boot, and falls back to
+    // the raw map permanently if anything about that goes wrong. See `battery_current`.
+    let bat = battery_current(ec_ok);
     let after = root_count();
     note_root_counts(before, mid, after);
 
@@ -854,6 +857,89 @@ pub fn request_probe(step: u8, arg: u32) {
 /// Extra parameter for the requested step. For step 1 this is the walk depth (0 = unlimited).
 static PROBE_ARG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// ── Which battery path the Entity actually reads ───────────────────────────────────────────────
+//
+// 0 = not yet decided, 1 = AML (`_BIF`/`_BST`), 2 = raw register map, latched.
+//
+// ★ The raw map is hardware-verified against Fedora but is a decode of THIS Dell and nothing else.
+// `_BIF`/`_BST` are the vendor-neutral layout and now work, so prefer them — but never at the cost
+// of the working path: any failure latches to 2 and never retries.
+static BATT_SOURCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Breadcrumbs for the one-shot promotion. If a boot dies inside this range, the NEXT boot sees it
+/// in the surviving CMOS byte and refuses to arm — see `battery_source_init`.
+const PROMO_MARKS: core::ops::RangeInclusive<u8> = 85..=89;
+
+/// Decide once, on the governor, whether AML can supply the battery.
+///
+/// ⚠️⚠️ THIS PUTS ACPI CALLS ON AN AUTOMATIC PATH, WHICH HAS TAKEN THIS MACHINE DOWN BEFORE.
+/// `acpi_ec_install` briefly did the handler install on this same once-a-second tick and the box
+/// panicked the instant it reached ring 3 — unbootable, no serial console, no way to opt out short
+/// of a rebuild. What makes it defensible now: attach (9) and the `ECRD` write (11) have each run
+/// clean on hardware, and `_REG` — the one that is actually fatal — is not called.
+///
+/// ★ And it disarms itself. `postmortem::prev_user_mark()` is the byte that survived the last power
+/// cycle; if it names this range, the previous boot died in here and we do not try again. That turns
+/// the worst case from "reflash to boot" into "one bad boot, then raw forever".
+fn battery_source_init() {
+    if BATT_SOURCE.load(core::sync::atomic::Ordering::Relaxed) != 0 { return; }
+
+    let prev = crate::postmortem::prev_user_mark();
+    if PROMO_MARKS.contains(&prev) {
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        crate::vga_println!(
+            "[ACPI] battery: last boot stopped at mark {} inside AML promotion — staying on the raw map",
+            prev,
+        );
+        return;
+    }
+
+    crate::postmortem::user_mark(85);
+    if unsafe { acpi_ec_install_handler() } != 1 {
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    crate::postmortem::user_mark(86);
+    if unsafe { acpi_ec_force_ecrd() } != 1 {
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    // Prove it end-to-end before committing. `bif`/`bst` mean the PACKAGES PARSED — the methods
+    // returning without faulting is not the same claim, and the two were conflated in this subsystem
+    // once already.
+    crate::postmortem::user_mark(87);
+    let probe = battery();
+    let good = probe.present && probe.have_bif && probe.have_bst && probe.last_full_cap > 0;
+    crate::postmortem::user_mark(88);
+
+    BATT_SOURCE.store(if good { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+    crate::vga_println!(
+        "[ACPI] battery source: {}",
+        if good { "AML _BIF/_BST (vendor-neutral)" } else { "raw EC map (AML declined)" },
+    );
+}
+
+/// What the Entity shows. AML when it has proven itself this boot, the verified raw map otherwise.
+pub fn battery_current(ec_ok: bool) -> Battery {
+    if !ec_ok { return Battery::default(); }
+    battery_source_init();
+
+    if BATT_SOURCE.load(core::sync::atomic::Ordering::Relaxed) == 1 {
+        let b = battery();
+        // ⚠️ Re-checked every tick, not just at promotion. A source that silently degrades to zeroes
+        // would show a plausible 0% rather than a gap, which is the failure this project keeps
+        // deciding is worse than admitting ignorance.
+        if b.present && b.have_bif && b.have_bst && b.last_full_cap > 0 {
+            return b;
+        }
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        crate::vga_println!("[ACPI] battery: AML read went bad — latching to the raw map");
+    }
+    ec_battery()
+}
+
 pub fn battery() -> Battery {
     let mut v = [0i32; 11];
     // ★ Two calls on purpose. `acpi_battery_read` evaluates the AML and parks its result in a static;
@@ -1083,6 +1169,18 @@ pub fn init_report() -> alloc::string::String {
     // screen never shows it is the same mistake as writing it to a serial port this laptop does not
     // have. `bif`/`bst` are the load-bearing flags: they mean the PACKAGES PARSED, not merely that
     // the methods returned without faulting.
+    // ★ Which path the Entity is ACTUALLY reading. On screen, because the promotion announces itself
+    // via `vga_println!` — the kernel boot log, invisible once the desktop is up. Same mistake as
+    // "serial still has it" on a laptop with no serial port, and it has now been made twice here.
+    out.push_str(&format!(
+        "  battery source: {}\n",
+        match BATT_SOURCE.load(core::sync::atomic::Ordering::Relaxed) {
+            1 => "AML _BIF/_BST (vendor-neutral)",
+            2 => "raw EC map (Dell-specific, latched)",
+            _ => "not decided yet",
+        },
+    ));
+
     let mut av = [0i32; 11];
     let aml_present = unsafe { acpi_battery_fetch(av.as_mut_ptr(), 11) };
     if av.iter().all(|&x| x == 0) {
