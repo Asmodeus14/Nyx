@@ -545,6 +545,34 @@ pub fn fatal(title: &str, body: fmt::Arguments) {
         s.newline();
         let _ = s.write_fmt(body);
         report_trailer(&mut s);
+
+        // ★★★★ PUSH THE PIXELS OUT OF THE CACHES. This is very likely the actual bug.
+        //
+        // Four attempts have left the report legible-ish with the desktop showing through as short
+        // dark runs, and the runs are about SIXTEEN PIXELS wide. At 32bpp that is 64 bytes — ONE
+        // CACHE LINE — and cache-line granularity is not something a drawing bug produces. It is the
+        // signature of memory that has been written but not written BACK.
+        //
+        // We paint with the CPU; the display engine scans physical RAM. If the framebuffer is mapped
+        // write-back, our stores sit in L1/L2 and reach RAM when the hardware feels like it, so the
+        // panel shows a mix of new content (lines already evicted) and whatever was there before
+        // (lines still dirty in cache) — in exactly 64-byte runs. Write-combining fails the same way
+        // with partially filled WC buffers.
+        //
+        // It also explains why "paint it twice" helped inconsistently: that changed the TIMING of
+        // eviction without ever forcing it, which is why the earlier geometry theories (tiling,
+        // stride, aliased surfaces) all measured clean and none of them fixed anything.
+        //
+        // `sfence` drains the write-combining buffers; `wbinvd` writes back and invalidates every
+        // cache line. Both are single instructions and take NO LOCKS — the entire requirement for
+        // this path, where the panicking core may already hold any lock in the kernel. `wbinvd`
+        // costs milliseconds and flushes the whole hierarchy; on a machine that is not coming back
+        // that is not a cost, and legibility is the only thing still worth anything.
+        unsafe {
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+            core::arch::asm!("wbinvd", options(nostack, preserves_flags));
+        }
+
         if pass == 0 {
             // Long enough for an in-flight present to finish and for the flag to be seen everywhere;
             // short enough that nobody watching thinks the machine hung before the screen appeared.
@@ -624,4 +652,16 @@ pub fn fault_banner(what: &str, body: fmt::Arguments) {
     s.puts(what);
     s.newline();
     let _ = s.write_fmt(body);
+
+    // Same cache-writeback problem as `fatal` — see the long note there. A band that is half in L2
+    // is exactly as unreadable as a report that is.
+    //
+    // ⚠️ `wbinvd` here and not just `sfence`, despite this path running per dying process rather
+    // than once at the end of the world. A process fault is an exceptional event, not a hot path,
+    // and an illegible banner has no value at all — so the milliseconds are worth it. If something
+    // ever crash-loops hard enough for this to matter, the flush is not the problem worth fixing.
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+        core::arch::asm!("wbinvd", options(nostack, preserves_flags));
+    }
 }
