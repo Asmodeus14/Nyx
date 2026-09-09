@@ -295,8 +295,21 @@ const AT_NYX_TLS_ALIGN: u64 = 0x7000_0004;
 /// apps that ignore all of this still work: they simply treat RSP as their stack top and grow down.
 ///
 /// `stack_top` is the highest usable stack address (already page-mapped). `argv0` is the program
-/// path (becomes argv[0]).
-pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) -> u64 {
+/// path (becomes argv[0]); `argv1` is the optional single argument (a file to open).
+///
+/// ## Why only one argument
+///
+/// Because one is what the system can currently produce. `sys_execve` takes a path and at most one
+/// argument, which is exactly what "open this file with that application" needs — the case that
+/// unblocks Files handing a PNG to the Image Viewer. A general `argv: &[&str]` would be more
+/// code in the syscall's validation path (every pointer in an array of pointers is a separate
+/// unvalidated user read) for a caller that does not exist. Widen it when one does.
+pub unsafe fn build_initial_stack(
+    stack_top: u64,
+    argv0: &str,
+    argv1: Option<&str>,
+    elf: &LoadedElf,
+) -> u64 {
     // A small bump area growing DOWN from the top holds the string/aux data the pointers reference.
     let mut p = stack_top & !0xF;
 
@@ -306,6 +319,15 @@ pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) 
     let argv0_ptr = p;
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), argv0_ptr as *mut u8, bytes.len());
     *((argv0_ptr + bytes.len() as u64) as *mut u8) = 0;
+
+    // 1a. argv[1], if the program was launched with one.
+    let argv1_ptr = argv1.map(|a| {
+        let b = a.as_bytes();
+        p -= (b.len() + 1) as u64;
+        core::ptr::copy_nonoverlapping(b.as_ptr(), p as *mut u8, b.len());
+        *((p + b.len() as u64) as *mut u8) = 0;
+        p
+    });
 
     // 1b. The environment. This used to be a bare NULL, so `getenv` returned null for everything.
     //
@@ -376,8 +398,9 @@ pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) 
     //    (the old bare-stack path did, via `& !0xF) - 8`) or every existing no_std app's prologue
     //    would misalign its SSE spills. argc still sits exactly at RSP; std's naked `_start` reads
     //    argc/argv/auxv relative to RSP and re-aligns to 16 before calling into Rust.
+    let argc: u64 = if argv1_ptr.is_some() { 2 } else { 1 };
     let words: u64 = 1               // argc
-        + 1                          // argv[0]
+        + argc                       // argv[0..argc]
         + 1                          // argv NULL terminator
         + ENVIRON.len() as u64       // envp entries
         + 1                          // envp NULL terminator
@@ -387,8 +410,9 @@ pub unsafe fn build_initial_stack(stack_top: u64, argv0: &str, elf: &LoadedElf) 
     sp -= 8;    // ...then bias to RSP % 16 == 8 to match the Nyx _start ABI
 
     let mut w = sp as *mut u64;
-    *w = 1; w = w.add(1);            // argc = 1
+    *w = argc; w = w.add(1);         // argc
     *w = argv0_ptr; w = w.add(1);   // argv[0]
+    if let Some(a) = argv1_ptr { *w = a; w = w.add(1); }  // argv[1]
     *w = 0; w = w.add(1);           // argv NULL
     for e in env_ptrs.iter() { *w = *e; w = w.add(1); }
     *w = 0; w = w.add(1);           // envp NULL
@@ -440,6 +464,22 @@ pub struct Process {
     /// the root itself). Inherited across fork and preserved across execve, which is what makes a
     /// shell's `cd` stick for the commands it launches.
     pub cwd: alloc::string::String,
+    /// The single argument this process was `execve`'d with — the file it was asked to open.
+    /// Empty means none.
+    ///
+    /// ## Why this is a syscall and not just argv[1]
+    ///
+    /// It IS also argv[1]; `build_initial_stack` puts it there, so std apps see it through
+    /// `std::env::args()`. But a Nyx `no_std` app's `_start` is a plain `extern "C" fn`, and by the
+    /// time Rust's prologue has run the incoming RSP is gone — there is no supported way to read
+    /// argc/argv from inside one without making every app's entry point naked. Keeping a copy here
+    /// and handing it back through `SYS_LAUNCH_ARG` costs one String per process and works
+    /// identically for both kinds of binary.
+    ///
+    /// Preserved across `fork` (the child is the same program with the same argument) and REPLACED
+    /// by `execve`, which is the whole point: it describes the program currently running, not the
+    /// one that launched it.
+    pub launch_arg: alloc::string::String,
     /// Userspace address to zero and futex-wake when this THREAD exits (`set_tid_address`, and
     /// `CLONE_CHILD_CLEARTID` once clone grows flags). This is the mechanism `pthread_join` is built
     /// on: the joiner futex-waits on this word, and the exiting thread clearing it is the wakeup.
@@ -490,6 +530,7 @@ impl Process {
             mmap_bump: 0x4000_0000_0000, 
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
+            launch_arg: alloc::string::String::new(),
             clear_child_tid: 0,
             sigactions: alloc::vec![[0u64; 4]; 64],
             sigmask: 0,
@@ -519,6 +560,7 @@ impl Process {
             mmap_bump: 0x4000_0000_0000,
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
+            launch_arg: alloc::string::String::new(),
             clear_child_tid: 0,
             sigactions: alloc::vec![[0u64; 4]; 64],
             sigmask: 0,
@@ -558,6 +600,7 @@ impl Process {
             mmap_bump: 0x4000_0000_0000,
             fd_table: alloc::vec![None; FD_MAX],
             cwd: alloc::string::String::from("/"),
+            launch_arg: alloc::string::String::new(),
             clear_child_tid: 0,
             sigactions: alloc::vec![[0u64; 4]; 64],
             sigmask: 0,

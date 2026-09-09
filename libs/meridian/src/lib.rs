@@ -42,15 +42,29 @@ extern crate std;
 pub mod atlas;
 pub mod brand;
 pub mod charset;
+/// The quantum circuit diagram and its measurement table — the QCLang window's geometry.
+pub mod circuit;
 pub mod cursor;
 pub mod font;
 pub mod icons;
+/// Idle, sleep and the lock — the three states the desktop enters when nobody is using it, and the
+/// only place the creature is allowed on the whole screen.
+pub mod idle;
 pub mod layout;
 pub mod motion;
+/// The network drill-down on the Entity surface — the view whose existence is what allows
+/// `apps/wifi` to be retired, per step 20 of the build order.
+pub mod network;
+pub mod panes;
 pub mod paper;
+/// The Text window's one centred column of prose — the measure, the block stack and the caret.
+pub mod prose;
 pub mod scale;
 pub mod shapes;
+pub mod text;
 pub mod tokens;
+/// The Image window — the centred frame, the floating control bar and the zoom readout.
+pub mod viewer;
 
 /// The Meridian icon set, rasterized from the design document at build time.
 ///

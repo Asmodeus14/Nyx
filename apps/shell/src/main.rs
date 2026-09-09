@@ -46,7 +46,9 @@ use linked_list_allocator::LockedHeap;
 
 use nyx_api::*;
 use nyx_gui::canvas::{Canvas, Color};
-use nyx_gui::ui::{draw_scrollbar, SCROLLBAR_W};
+// `nyx_gui::ui`'s scrollbar is gone from here: the shell draws Meridian's own (see
+// `layout::scrollbar_track`). Since step 20 retired `apps/compositor` that whole module has no
+// caller left on the image — it is marked dead at the top of the file rather than removed.
 
 use nyx_meridian::atlas::Atlas;
 use nyx_meridian::icons::Icons;
@@ -54,7 +56,9 @@ use nyx_meridian::layout::{self, CmdEntry, Control, Rect};
 use nyx_meridian::tokens::{self, Style, Theme};
 use nyx_meridian::cursor::{self, Shape};
 use nyx_meridian::brand;
+use nyx_meridian::idle::{self, Phase};
 use nyx_meridian::motion::{Motion, Transition, UNIT, WINDOW_OPEN_SCALE};
+use nyx_meridian::network::{self, PanelLayout, Page};
 use nyx_meridian::{font, icons, paper, scale, shapes};
 
 #[global_allocator]
@@ -85,13 +89,17 @@ struct App {
 /// `u-shield` for a conformance harness, `u-branch` for a toolchain artefact. `a-browser` — a globe,
 /// drawn for a browser that has since been deleted — goes to GL Cube, which renders a rotating solid
 /// and is the only thing left in the set that is a sphere.
-const APPS: [App; 13] = [
+/// ★ Step 20 removed a row: **Wi-Fi**. It was an application because there was nowhere else to put
+/// a network picker; now there is. The Entity surface drills into the network view in place, and the
+/// Command still reaches it by the same "Network — …" row it always had — so nothing that used to
+/// be reachable stopped being reachable, only the window went away. That is the whole of the build
+/// order's *"only once the Entity drill-down is doing its job"*.
+const APPS: [App; 12] = [
     App { icon: Icons::APP_FILES,    label: "Files",          bundle: "/mnt/nvme/apps/Explorer.nyx/" },
     App { icon: Icons::APP_TERMINAL, label: "Terminal",       bundle: "/mnt/nvme/apps/Terminal.nyx/" },
-    App { icon: Icons::APP_QCLANG,   label: "QC Studio",      bundle: "/mnt/nvme/apps/QcStudio.nyx/" },
+    App { icon: Icons::APP_QCLANG,   label: "QCLang",         bundle: "/mnt/nvme/apps/QcStudio.nyx/" },
     App { icon: Icons::DOC,          label: "Notepad",        bundle: "/mnt/nvme/apps/Notepad.nyx/" },
     App { icon: Icons::APP_MONITOR,  label: "System Monitor", bundle: "/mnt/nvme/apps/SystemMonitor.nyx/" },
-    App { icon: Icons::WIFI,         label: "Wi-Fi",          bundle: "/mnt/nvme/apps/Wifi.nyx/" },
     App { icon: Icons::GRID,         label: "Image Viewer",   bundle: "/mnt/nvme/apps/ImageViewer.nyx/" },
     App { icon: Icons::APP_SETTINGS, label: "Settings",       bundle: "/mnt/nvme/apps/Settings.nyx/" },
     App { icon: Icons::APP_BROWSER,  label: "GL Cube",        bundle: "/mnt/nvme/apps/GlCube.nyx/" },
@@ -107,10 +115,17 @@ const APPS: [App; 13] = [
 /// ★ This deliberately differs from `Icons::DOCK`, which is the design document's dock. Two of the
 /// design's eight slots have no application on this system: `a-browser` (the graphical browser was
 /// deleted — browsing is `get`/`links`/`open` in the Terminal now) and `a-entity` (`libs/entity` is
-/// step 17 of the build order and does not exist). A dock glyph whose exec path is not on the image
-/// launches nothing and reads as a hang, which is exactly why those rows were cut from the old start
-/// menu too. So the count the design's argument rests on — eight glyphs and one mark — is kept, with
-/// the eight applications this machine actually has.
+/// a library the shell links, not a window you open). A dock glyph whose exec path is not on the
+/// image launches nothing and reads as a hang, which is exactly why those rows were cut from the old
+/// start menu too. So the count the design's argument rests on — eight glyphs and one mark — is
+/// kept, with the eight applications this machine actually has.
+///
+/// ⚠️ These are indices into [`APPS`], so **any change to that table renumbers this one**. Step 20
+/// removed the Wi-Fi row from the middle of `APPS` and every slot after it shifted by one; the
+/// symptom of getting this wrong is a dock glyph that launches its neighbour, which is precisely
+/// what the old compositor's three parallel lists used to do before they were collapsed into one
+/// table. Wi-Fi's slot went to GL Cube rather than being left empty — the design's argument rests on
+/// there being eight.
 const DOCK: [Option<usize>; layout::DOCK_SLOTS] =
     [Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), None, Some(7)];
 
@@ -450,14 +465,314 @@ fn write_config(text: &str) {
     sys_close(fd);
 }
 
+// ───────────────────────────── The creature, step 18 ─────────────────────────────
+//
+// The Entity has had a mark, three states and a disclosure surface since step 6. What it has not had
+// is a face. `libs/entity` (step 17) generates one from a 32-bit seed struck at first boot; this is
+// where that lands on screen.
+//
+// The creature is NOT a live readout. Its appearance changes when the evolution stage advances or an
+// influence counter crosses its threshold — a few times a year — and between those events it is one
+// cached sprite. A creature that responded to CPU load would twitch every time a build started, and
+// within a week nobody would look at it. That is `libs/entity`'s design decision; this file's job is
+// to honour it by regenerating only when told to.
+
+/// Where the Entity lives. Flat in the root of the persistent mount, the same convention
+/// [`CONFIG_PATH`] uses and for the same reason — it avoids creating a directory that may not exist.
+///
+/// ⚠️ **Deleting this file is the only way to get a different Entity**, and that is deliberate. There
+/// is no reroll, no regenerate button and no setting. An Entity you could reroll until you liked it
+/// would be a character creator, and the whole claim of the feature is that you did not choose this
+/// one.
+const ENTITY_PATH: &str = "/mnt/nvme/entity.bin";
+
+/// The creature's sprite, and the state it was generated from.
+struct Creature {
+    state: nyx_entity::State,
+    /// `px * px` ARGB, regenerated only when [`nyx_entity::State::tick_hour`] says the appearance
+    /// changed. `None` when the surface has no room to draw one at all — see
+    /// `layout::creature_px_for`.
+    sprite: Vec<u32>,
+    px: i32,
+    /// The idle screen's creature, at [`idle::IDLE_PX`] — eyes open, and eyes shut.
+    ///
+    /// Two sprites rather than one plus a per-frame lid pass, because the lid is a *palette* edit on
+    /// the field and re-blitting 120x120 on every blink frame to save 57 KB of RAM on a machine with
+    /// gigabytes of it is the wrong trade. Both come from a single `build`.
+    idle_open: Vec<u32>,
+    idle_shut: Vec<u32>,
+    idle_px: i32,
+    /// Uptime in whole hours since this shell started, so `tick_hour` is called once per hour and
+    /// not once per frame.
+    ticked_hours: usize,
+    /// True until the birth has been written to disk. A first boot that fails to persist must retry
+    /// rather than silently strike a new seed on the next boot.
+    unsaved: bool,
+}
+
+impl Creature {
+    /// Load the Entity, or strike a new one.
+    ///
+    /// ⚠️ The seed is mixed from the RTC **and** three machine-unique inputs, because two machines
+    /// imaged from the same disk would otherwise share a creature. `Seed::strike` wants a CPU brand,
+    /// an NVMe serial and a MAC; what this box can actually answer with is the SMBIOS string
+    /// `sys_get_hw_info` returns, so that stands in for the first two and the MAC is zero until
+    /// there is a syscall for it. The clock is what makes it unique in practice, which is exactly
+    /// the role `strike`'s own documentation gives it.
+    fn load_or_birth(screen_h: i32) -> Creature {
+        let now = sys_get_rtc().unix();
+        let mut buf = [0u8; nyx_entity::STATE_BYTES];
+        let (state, unsaved) = match read_entity(&mut buf).and_then(|_| nyx_entity::State::load(&buf)) {
+            Some(s) => (s, false),
+            None => {
+                let mut hw = [0u8; 256];
+                let n = sys_get_hw_info(&mut hw);
+                let seed = nyx_entity::Seed::strike(now, &hw[..n], &hw[..n], [0; 6]);
+                sys_print("[ENTITY] no entity.bin — striking a new seed\n");
+                (nyx_entity::State::birth(seed, now), true)
+            }
+        };
+        let mut c = Creature {
+            state,
+            sprite: Vec::new(),
+            px: layout::creature_px_for(screen_h, 4, ENT_CONTROLS),
+            idle_open: Vec::new(),
+            idle_shut: Vec::new(),
+            idle_px: 0,
+            ticked_hours: 0,
+            unsaved,
+        };
+        c.regenerate();
+        c.persist();
+        c
+    }
+
+    /// Rasterize the creature at the size this screen has room for.
+    ///
+    /// `appearance::blit` writes `cell * 24` pixels square, so the cell is chosen from the size the
+    /// layout picked rather than rasterizing at 96 and scaling — a scaled creature is a blurred one,
+    /// and 24 cells at 2px is a genuinely different (and still correct) drawing.
+    fn regenerate(&mut self) {
+        let g = nyx_entity::appearance::G;
+        // ONE build, three blits. The field is 576 bytes of palette indices and building it is pure
+        // integer work, but it is also the thing that must not disagree between the surface creature
+        // and the idle creature — they are the same animal.
+        let mut field = nyx_entity::appearance::build(
+            &self.state.genome(),
+            self.state.stage(),
+            &self.state.influence,
+        );
+
+        // The Entity surface, at whatever size the layout had room for. Zero means the surface has
+        // no room for a creature at all — see `layout::creature_px_for`.
+        if self.px > 0 {
+            let cell = (self.px / g as i32).max(1) as usize;
+            let side = cell * g;
+            self.sprite = alloc::vec![0u32; side * side];
+            nyx_entity::appearance::blit(&field, cell, &mut self.sprite, side);
+            self.px = side as i32;
+        } else {
+            self.sprite.clear();
+        }
+
+        // The idle screen, which always has room — it is the whole screen.
+        let cell = (idle::IDLE_PX / g as i32).max(1) as usize;
+        let side = cell * g;
+        self.idle_px = side as i32;
+        self.idle_open = alloc::vec![0u32; side * side];
+        nyx_entity::appearance::blit(&field, cell, &mut self.idle_open, side);
+        field.close_eyes();
+        self.idle_shut = alloc::vec![0u32; side * side];
+        nyx_entity::appearance::blit(&field, cell, &mut self.idle_shut, side);
+    }
+
+    /// The sprite to draw right now: shut while blinking, and shut for the whole of sleep.
+    fn idle_sprite(&self, ms: usize, asleep: bool) -> &[u32] {
+        let blink = self.state.genome().personality.blink_ticks;
+        if asleep || idle::blink_closed(ms, blink) { &self.idle_shut } else { &self.idle_open }
+    }
+
+    /// Where the creature sits, relative to its resting place. Sleep slows the breath to a constant
+    /// eleven seconds for every personality — which is where the design's *"a Calm Entity barely
+    /// changes, an Energetic one visibly settles"* comes from without anything being written to make
+    /// it true.
+    fn idle_offset(&self, ms: usize, asleep: bool) -> (i32, i32) {
+        let float = if asleep {
+            idle::ASLEEP_FLOAT_TICKS
+        } else {
+            self.state.genome().personality.float_ticks
+        };
+        let (dx, dy) = idle::drift(ms);
+        (dx, dy + idle::float_dy(ms, float, self.idle_px))
+    }
+
+    /// Advance the hour counter, and regenerate only if the creature actually changed.
+    fn tick(&mut self, uptime_ms: usize) {
+        let hours = uptime_ms / 3_600_000;
+        while self.ticked_hours < hours {
+            self.ticked_hours += 1;
+            if self.state.tick_hour(sys_get_rtc().unix()) {
+                sys_print("[ENTITY] appearance changed — regenerating\n");
+                self.regenerate();
+            }
+            self.unsaved = true;
+        }
+        if self.unsaved {
+            self.persist();
+        }
+    }
+
+    fn persist(&mut self) {
+        let mut buf = [0u8; nyx_entity::STATE_BYTES];
+        self.state.save(&mut buf);
+        if write_entity(&buf) {
+            self.unsaved = false;
+        }
+    }
+
+    /// `NX-7F3A-91C2`.
+    fn seed_text(&self) -> String {
+        let f = self.state.seed.format();
+        String::from(core::str::from_utf8(&f).unwrap_or("NX-????-????"))
+    }
+
+    /// `Stage 4 · Intelligence`.
+    fn stage_text(&self) -> String {
+        let s = self.state.stage();
+        alloc::format!("Stage {} \u{00B7} {}", s.index(), s.name())
+    }
+
+    /// `Curious · Protective · Focused`.
+    fn traits_text(&self) -> String {
+        let p = self.state.genome().personality;
+        alloc::format!("{} \u{00B7} {} \u{00B7} {}", p.name(0), p.name(1), p.name(2))
+    }
+
+    /// `Born 4 March · 312 h`, or just the hours when the RTC could not answer at birth.
+    fn born_text(&self) -> String {
+        const MONTHS: [&str; 12] = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ];
+        let h = self.state.counters.uptime_hours;
+        if self.state.born_unix == 0 {
+            return alloc::format!("{} h", h);
+        }
+        let d = civil(self.state.born_unix);
+        alloc::format!("Born {} {} \u{00B7} {} h", d.1, MONTHS[(d.0 as usize - 1).min(11)], h)
+    }
+}
+
+/// `(month, day)` for a unix instant. Only ever used for the birth date, which is why it does not
+/// bother with the year: the design's footer is `Born 4 March`, and an Entity old enough for the
+/// year to matter has earned a line of its own rather than a longer one here.
+fn civil(unix: u64) -> (u8, u8) {
+    let t = nyx_api::civil_from_unix_public(unix as i64);
+    (t.month, t.day)
+}
+
+// ─────────────────────────────── The lock ───────────────────────────────
+
+/// `/mnt/nvme/auth.bin` — version, iteration count, salt, derived key. 53 bytes.
+///
+/// ⚠️ **Say plainly what this protects against, because it is not much.** Nyx has no disk
+/// encryption. The NVMe is readable by anyone who takes the machine apart, and this file gates a
+/// drawing routine rather than access to data. The lock stops a person borrowing your desk. It does
+/// not stop a person with a screwdriver, and it must never be described in the interface as though
+/// it does — no padlock icon, no "secure", no shield. The honest fix is full-disk encryption, which
+/// is a genuinely large piece of work and is not this one.
+///
+/// **An absent file means no password is set and the lock never appears.** That is the default, and
+/// it is why the file is read rather than created at boot.
+const AUTH_PATH: &str = "/mnt/nvme/auth.bin";
+const AUTH_VERSION: u8 = 1;
+const AUTH_SALT: usize = 16;
+const AUTH_KEY: usize = 32;
+const AUTH_BYTES: usize = 1 + 4 + AUTH_SALT + AUTH_KEY;
+
+/// The stored credential.
+struct Auth {
+    iters: u32,
+    salt: [u8; AUTH_SALT],
+    key: [u8; AUTH_KEY],
+}
+
+impl Auth {
+    fn load() -> Option<Auth> {
+        let fd = sys_open(AUTH_PATH);
+        if fd < 0 { return None; }
+        let mut buf = [0u8; AUTH_BYTES];
+        let n = sys_read(fd, &mut buf);
+        sys_close(fd);
+        if (n as usize) < AUTH_BYTES || buf[0] != AUTH_VERSION { return None; }
+        let mut a = Auth {
+            iters: u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]),
+            salt: [0; AUTH_SALT],
+            key: [0; AUTH_KEY],
+        };
+        a.salt.copy_from_slice(&buf[5..5 + AUTH_SALT]);
+        a.key.copy_from_slice(&buf[5 + AUTH_SALT..AUTH_BYTES]);
+        // A zero iteration count would make PBKDF2 a single HMAC. Refuse the file rather than
+        // silently accepting a weaker one than was written.
+        if a.iters == 0 { None } else { Some(a) }
+    }
+
+    /// Constant-time. See `nyx_crypto::ct_eq` for why this is worth four lines behind a PBKDF2
+    /// front door: it is free now and awkward to retrofit later.
+    fn matches(&self, attempt: &[u8]) -> bool {
+        let got = nyx_crypto::pbkdf2_sha1(attempt, &self.salt, self.iters, AUTH_KEY);
+        nyx_crypto::ct_eq(&got, &self.key)
+    }
+}
+
+fn read_entity(buf: &mut [u8; nyx_entity::STATE_BYTES]) -> Option<()> {
+    let fd = sys_open(ENTITY_PATH);
+    if fd < 0 {
+        return None;
+    }
+    let n = sys_read(fd, buf);
+    sys_close(fd);
+    (n as usize >= nyx_entity::STATE_BYTES).then_some(())
+}
+
+/// Best-effort, like [`write_config`]. A box with no disk keeps its Entity until reboot and strikes
+/// a new one next time — which is a fair outcome for a machine with nowhere to remember anything,
+/// and better than refusing to show a creature at all.
+fn write_entity(buf: &[u8; nyx_entity::STATE_BYTES]) -> bool {
+    let fd = sys_open_flags(ENTITY_PATH, O_CREAT | O_TRUNC);
+    if fd < 0 {
+        return false;
+    }
+    let n = sys_write(fd, buf);
+    sys_close(fd);
+    n as usize == buf.len()
+}
+
 /// How many control rows the Entity surface has. ONE source of truth: the geometry is sized from it
 /// and the rows are drawn from it, and those two disagreeing is how a hit-test lands on the row above
 /// the one you clicked.
 const ENT_CONTROLS: usize = 4;
 
 /// Which of those rows is Brightness. It is LAST so the three the design specifies keep the indices
-/// they already had — `on_click` matches Network on row 0.
+/// they already had — Network stays row 0.
 const ENT_BRIGHT_ROW: usize = 3;
+
+/// Which of those rows drills into the network view. Named rather than written as `0` at the click
+/// site, because that literal is how a row index and a row order drift apart silently.
+const ENT_NETWORK_ROW: usize = 0;
+
+/// How far the pointer must travel in one [`IDLE_PROBE_MS`] window to count as a person being here.
+///
+/// A deliberate hand movement covers hundreds of pixels a second. Trackpoint drift and a resting
+/// palm cover single digits. 24 is comfortably above the second and far below the first.
+const IDLE_MOVE_PX: i32 = 24;
+/// How far the pointer must jump to WAKE an idle screen. Smaller, because by then the intent is not
+/// in doubt — but not zero, or drift dismisses the screen it just prevented.
+const IDLE_WAKE_PX: i32 = 8;
+/// The sampling window. One second: long enough that drift cannot cross the threshold inside it,
+/// short enough that letting go of the mouse costs at most a second of the 90 before the chrome
+/// recedes.
+const IDLE_PROBE_MS: usize = 1000;
 
 /// Waiting for the user to press the key they want. Two presses, dimmer first.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -600,6 +915,471 @@ impl Handoff {
 }
 
 /// Draw the travelling mark for this frame, if the handoff is still running.
+/// Idle, sleep and the lock — Meridian step 19.
+///
+/// Drawn as an overlay over a fully composited desktop rather than as a separate frame path. That
+/// costs a wasted composite on every idle frame and it is the right trade: the alternative skips
+/// `sys_gpu_composite` entirely, which lets the render engine settle into RC6, and the first
+/// composite after waking then hangs in `wait_for_idle` while the hardware cursor keeps moving. See
+/// the note in the main loop.
+///
+/// ⚠️ The clock here is the ONLY thing on either screen that is not the creature. There is no
+/// notification list, no calendar and no "3 unread" — *"a lock screen that leaks your notifications
+/// to anyone walking past is a lock screen that has misunderstood its job."*
+fn idle_paint(state: &Shell, canvas: &mut Canvas, atlas: Option<&Atlas>, now: usize) {
+    let fade = idle::idle_fade(state.idle_ms(now));
+    if fade == 0 && !state.locked {
+        return;
+    }
+    let (w, h) = (state.screen_stride, state.screen_h as usize);
+    let asleep = state.phase == Phase::Asleep;
+    // The cross-fade to black IS this fill: `fill_rect` alpha-blends anything under 255, so a ramp
+    // from 0 to 255 dissolves the desktop into the ground over the design's 40 frames.
+    let bg = if asleep { idle::SLEEP_BG } else { idle::IDLE_BG };
+    let a = if state.locked { 255 } else { fade as u32 };
+    canvas.fill_rect(0, 0, w, h, (a << 24) | (bg & 0x00FF_FFFF));
+
+    let mut labels: Vec<Label> = Vec::new();
+    let px = state.creature.idle_px;
+    let clock = state.vitals.clock();
+    let clock_h = tokens::MONO.line() as i32;
+
+    // The whole stack — creature, then the clock — is centred, not the creature alone. Getting this
+    // wrong is what the design warns about: *"left to itself it aligns against the widest sibling,
+    // which throws the whole stack off axis."*
+    let base = idle::idle_creature(state.screen_w, state.screen_h, px, clock_h);
+    let (dx, dy) = state.creature.idle_offset(now, asleep);
+
+    let sprite = state.creature.idle_sprite(now, asleep);
+    if !sprite.is_empty() && px > 0 {
+        let x = (base.x + dx).max(0) as usize;
+        let y = (base.y + dy).max(0) as usize;
+        canvas.composite_buffer(x, y, sprite, px as usize, px as usize, a as u8);
+    }
+
+    // The clock travels with the creature. It is part of the same drifting stack — a clock nailed to
+    // the centre while the creature wanders away from it would come apart over a night, which is
+    // exactly the timescale the drift is for.
+    let cw = measure(atlas, tokens::MONO, &clock);
+    labels.push(Label {
+        x: base.x + dx + (px - cw) / 2,
+        y: idle::idle_clock_y(base) + dy,
+        style: tokens::MONO,
+        text: clock,
+        color: dim(idle::IDLE_CLOCK, a),
+    });
+
+    if state.locked {
+        lock_labels(state, canvas, atlas, base, now, &mut labels);
+    }
+
+    if !labels.is_empty() {
+        paint_text(atlas, canvas, &labels, &[]);
+    }
+}
+
+/// The lock's field, its rule, its hint and the seed. Split out only for length.
+fn lock_labels(
+    state: &Shell,
+    canvas: &mut Canvas,
+    atlas: Option<&Atlas>,
+    creature: Rect,
+    now: usize,
+    labels: &mut Vec<Label>,
+) {
+    let f = idle::lock_field(state.screen_w, creature);
+
+    // One dot per character, drawn the way every other place you type in Nyx is drawn — plain marks
+    // on a hairline.
+    let (dots, caret) = idle::lock_dots(f, state.typed_chars());
+    for d in dots {
+        // `border-radius: 3px` on a 6px box is a circle, so the radius is half the box whatever the
+        // panel scale makes the box.
+        shapes::fill_round_rect(canvas, d.x.max(0) as usize, d.y.max(0) as usize,
+                                d.w as usize, d.h as usize, (d.w / 2) as usize, state.theme.fg_2);
+    }
+    canvas.fill_rect(caret.x.max(0) as usize, caret.y.max(0) as usize,
+                     caret.w as usize, caret.h as usize, state.theme.accent);
+
+    // `.lock-r.act` — the field always has focus, because it is the only thing on the screen.
+    let rule = idle::lock_rule(f);
+    canvas.fill_rect(rule.x.max(0) as usize, rule.y.max(0) as usize,
+                     rule.w as usize, rule.h.max(1) as usize, state.theme.line_2);
+
+    // *"Failure is a sentence, not an animation."* No shake, no flash, no red.
+    let penalty = idle::penalty_remaining(state.fails, state.fail_at, now);
+    let (hint, color) = match penalty {
+        Some(secs) => (alloc::format!("Too many attempts. Wait {} s.", secs), idle::LOCK_HINT_ERR),
+        None if state.lock_err => (String::from("Incorrect. Try again."), idle::LOCK_HINT_ERR),
+        None => (String::from("Return to unlock"), idle::LOCK_HINT),
+    };
+    let hw = measure(atlas, tokens::B3, &hint);
+    labels.push(Label {
+        x: f.x + (f.w - hw) / 2,
+        y: idle::lock_hint_y(f),
+        style: tokens::B3,
+        text: hint,
+        color,
+    });
+
+    // *"The seed is the only identifier on the screen."* Not a hostname, not a user name, not an
+    // email address — it is unique to the installation, it means nothing to anyone who has not seen
+    // this machine before, and it is the one string that makes a locked Nyx recognisably yours
+    // without disclosing anything about you.
+    let seed = state.creature.seed_text();
+    let sw = measure(atlas, tokens::MONO, &seed);
+    let sh = tokens::MONO.line() as i32;
+    labels.push(Label {
+        x: (state.screen_w - sw) / 2,
+        y: idle::lock_seed_y(state.screen_h, sh),
+        style: tokens::MONO,
+        text: seed,
+        color: idle::IDLE_DIM,
+    });
+}
+
+/// Scale a 0xAARRGGBB colour's alpha by `a`/255, for the cross-fade.
+fn dim(color: u32, a: u32) -> u32 {
+    let src = (color >> 24) & 0xFF;
+    ((src * a / 255) << 24) | (color & 0x00FF_FFFF)
+}
+
+/// Fade `color` toward `ground` as `a` falls from 255 to 0, keeping it fully opaque.
+///
+/// ★ Why this is not just [`dim`]. The batched glyph path CANNOT fade. `build_ps_text` carries one
+/// per-quad **luminance** and outputs `RGB = lum, A = coverage` — the alpha the caller asked for is
+/// discarded, and the blend uses the glyph's antialiasing coverage instead. So setting a Label's
+/// alpha channel does nothing at all on the GPU path; a text fade has to be done by moving the
+/// COLOUR toward the ground, which is a luminance change and therefore something that shader can
+/// express.
+///
+/// This is the same reason the Entity's attention-state mark leaves the batch and is blended
+/// CPU-side, and the same reason every accent in Meridian is a `fill_rect`.
+fn fade_to(color: u32, ground: u32, a: u32) -> u32 {
+    if a >= 255 {
+        return color;
+    }
+    // A straight per-channel lerp — `ground + (color - ground) * a / 255` — done in SIGNED
+    // arithmetic so it works whichever of the two is brighter. That matters: the dark theme fades
+    // light chrome down toward a near-black ground, and the light theme fades dark chrome UP toward
+    // a near-white one. Unsigned subtraction would wrap on one of the two and invert the fade.
+    let lerp = |sh: u32| -> u32 {
+        let c = ((color >> sh) & 0xFF) as i32;
+        let g = ((ground >> sh) & 0xFF) as i32;
+        (g + (c - g) * a as i32 / 255).clamp(0, 255) as u32
+    };
+    0xFF00_0000 | (lerp(16) << 16) | (lerp(8) << 8) | lerp(0)
+}
+
+/// The Entity surface's second view — the network panel. Meridian step 20.
+///
+/// Takes `&mut Shell` for one reason: the action words are plain text of measured width, so where
+/// they landed is only knowable here, and the click path has no atlas. It is cached into
+/// `net.action_rects` the same way `ent_detail_lines` is cached, and for the same reason — two
+/// answers to "where is that word" is a click that lands next to it.
+fn net_paint(
+    state: &mut Shell,
+    canvas: &mut Canvas,
+    atlas: Option<&Atlas>,
+    labels: &mut Vec<Label>,
+    icons_out: &mut Vec<IconDraw>,
+    theme: Theme,
+) {
+    let (l, page) = state.net_geometry();
+
+    shapes::drop_shadow(canvas, l.surface.x, l.surface.y, l.surface.w, l.surface.h,
+                        layout::surface_radius(), &[]);
+    shapes::fill_round_rect(canvas, l.surface.x.max(0) as usize, l.surface.y.max(0) as usize,
+                            l.surface.w as usize, l.surface.h as usize,
+                            layout::surface_radius(), theme.chrome);
+    shapes::stroke_round_rect(canvas, l.surface.x.max(0) as usize, l.surface.y.max(0) as usize,
+                              l.surface.w as usize, l.surface.h as usize,
+                              layout::surface_radius(), theme.line_2);
+    for y in l.rules() {
+        shapes::hairline_h(canvas, l.surface.x as usize, y.max(0) as usize,
+                           l.surface.w as usize, theme.line);
+    }
+
+    // ── The back affordance ───────────────────────────────────────────────────────────────────
+    // *"with a back affordance and no new surface."* One row, one glyph, one word.
+    if state.net.hover == Some(NetHit::Back) {
+        shapes::fill_round_rect(canvas, l.back.x.max(0) as usize, l.back.y.max(0) as usize,
+                                l.back.w as usize, l.back.h as usize, 5, theme.wash);
+    }
+    icons_out.push(IconDraw {
+        id: Icons::BACK,
+        px: layout::ent_crow_icon() as usize,
+        x: l.back.x + layout::ent_crow_pad_x(),
+        y: l.back.y + (l.back.h - layout::ent_crow_icon()) / 2,
+        color: theme.fg_3,
+    });
+    labels.push(Label {
+        x: l.back.x + layout::ent_crow_pad_x() + 16 + 12,
+        y: centre_text_y(l.back.y, l.back.h, tokens::B2),
+        style: tokens::B2,
+        text: String::from("Network"),
+        color: theme.fg,
+    });
+
+    // ── The statement and its one line ────────────────────────────────────────────────────────
+    labels.push(Label {
+        x: l.statement.x,
+        y: l.statement.y,
+        style: tokens::D3,
+        text: network::statement(&state.net.status),
+        color: theme.fg,
+    });
+    let detail = if !state.net.present {
+        String::from("There is no Wi-Fi adapter on this machine.")
+    } else {
+        network::state_detail(&state.net.status, state.net.current_secure())
+    };
+    labels.push(Label {
+        x: l.detail.x,
+        y: l.detail.y,
+        style: tokens::B3,
+        text: fit(atlas, tokens::B3, &detail, l.detail.w),
+        color: theme.fg_3,
+    });
+
+    // ── Address / Gateway / Resolver ──────────────────────────────────────────────────────────
+    // All three come straight out of the DHCP lease the kernel published. The design's `Signal` row
+    // sits between the state line and these; see `nyx_meridian::network` for why it is not here.
+    for (i, (k, val)) in network::link_rows(&state.net.status).iter().enumerate() {
+        let Some(row) = l.link_row(i) else { continue };
+        labels.push(Label {
+            x: row.x,
+            y: centre_text_y(row.y, row.h, tokens::B3),
+            style: tokens::B3,
+            text: String::from(*k),
+            color: theme.fg_3,
+        });
+        // An address is a number to be read back, typed in or compared — the same argument that
+        // puts the Entity's seed in MONO puts these there too.
+        let vw = measure(atlas, tokens::MONO, val);
+        labels.push(Label {
+            x: row.right() - vw,
+            y: centre_text_y(row.y, row.h, tokens::MONO),
+            style: tokens::MONO,
+            text: val.clone(),
+            color: theme.fg,
+        });
+    }
+
+    // ── AVAILABLE ─────────────────────────────────────────────────────────────────────────────
+    let (lx, ly) = l.section_label();
+    labels.push(Label {
+        x: lx,
+        y: ly,
+        style: tokens::LB,
+        text: String::from("Available"),
+        color: theme.fg_4,
+    });
+
+    if state.net.nets.is_empty() {
+        if let Some(row) = l.row(0) {
+            // Never "no networks in range" when the radio is off — that blames the neighbourhood
+            // for a switch the user just flicked themselves.
+            let msg = if !state.net.present {
+                "No adapter."
+            } else if !state.net.radio_on() {
+                "Turn Wi-Fi on to see what is in range."
+            } else {
+                "Nothing in range. Rescan to look again."
+            };
+            labels.push(Label {
+                x: row.x + layout::ent_crow_pad_x(),
+                y: centre_text_y(row.y, row.h, tokens::B3),
+                style: tokens::B3,
+                text: String::from(msg),
+                color: theme.fg_4,
+            });
+        }
+    }
+
+    for i in 0..page.len {
+        let Some(row) = l.row(i) else { continue };
+        let Some(n) = state.net.nets.get(page.start + i) else { continue };
+        let selected = state.net.sel == Some(page.start + i);
+        let hovered = state.net.hover == Some(NetHit::Row(i));
+        if selected || hovered {
+            shapes::fill_round_rect(canvas, row.x.max(0) as usize, row.y.max(0) as usize,
+                                    row.w as usize, row.h as usize, 5, theme.wash);
+        }
+        if selected {
+            // The Command's selection bar, on the same argument: it is a `fill_rect`, so the accent
+            // survives — nothing in the batched glyph path can carry a colour.
+            canvas.fill_rect(row.x.max(0) as usize,
+                             (row.y + layout::cmd_sel_bar_inset()).max(0) as usize,
+                             layout::cmd_sel_bar_w() as usize,
+                             (row.h - layout::cmd_sel_bar_inset() * 2).max(0) as usize,
+                             theme.accent);
+        }
+
+        // A network we cannot join is drawn at the muted tier throughout — the row is still there,
+        // still readable and still explains itself when clicked, but it never looks available.
+        let joinable = network::joinable(n);
+        let name_color = if joinable { theme.fg } else { theme.fg_3 };
+        let text_x = row.x + layout::ent_crow_pad_x();
+
+        if n.is_secure() {
+            icons_out.push(IconDraw {
+                id: Icons::LOCK,
+                px: layout::ent_crow_icon() as usize,
+                x: text_x,
+                y: row.y + (row.h - layout::ent_crow_icon()) / 2,
+                color: if joinable { theme.fg_3 } else { theme.fg_4 },
+            });
+        }
+        // The name starts past the padlock's column whether or not there is one, so an open network
+        // does not sit a glyph to the left of its neighbours.
+        let name_x = text_x + 16 + 10;
+        let saved = state.net.saved.as_deref() == Some(n.name());
+        let meta = network::row_status(n, saved);
+        let mw = measure(atlas, tokens::B3, &meta);
+        let budget = row.right() - layout::ent_crow_pad_x() - mw - 12 - name_x;
+        labels.push(Label {
+            x: name_x,
+            y: centre_text_y(row.y, row.h, tokens::B2),
+            style: tokens::B2,
+            text: fit(atlas, tokens::B2, n.name(), budget),
+            color: name_color,
+        });
+        labels.push(Label {
+            x: row.right() - layout::ent_crow_pad_x() - mw,
+            y: centre_text_y(row.y, row.h, tokens::B3),
+            style: tokens::B3,
+            text: meta,
+            color: theme.fg_4,
+        });
+    }
+
+    // The pager. Plain text in the last row, because *"actions are plain text, never buttons"* —
+    // and there is no scroll wheel on this machine to make it unnecessary.
+    if page.has_pager() {
+        if let Some(row) = l.row(page.len) {
+            if state.net.hover == Some(NetHit::Pager) {
+                shapes::fill_round_rect(canvas, row.x.max(0) as usize, row.y.max(0) as usize,
+                                        row.w as usize, row.h as usize, 5, theme.wash);
+            }
+            labels.push(Label {
+                x: row.x + layout::ent_crow_pad_x(),
+                y: centre_text_y(row.y, row.h, tokens::B3),
+                style: tokens::B3,
+                text: alloc::format!(
+                    "More \u{00B7} {} of {}",
+                    page.index + 1,
+                    page.pages
+                ),
+                color: theme.fg_3,
+            });
+        }
+    }
+
+    // ── The passphrase ────────────────────────────────────────────────────────────────────────
+    if let Some(field) = l.psk_field() {
+        let rule = l.psk_rule().unwrap();
+        canvas.fill_rect(rule.x.max(0) as usize, rule.y.max(0) as usize,
+                         rule.w as usize, 1, theme.accent);
+        if state.net.show_psk {
+            // Revealed. Shown for the one case masking actively hurts: a long passphrase typed
+            // wrong, where the only other feedback is a failed handshake ten seconds later. It is
+            // never the default and never survives a change of selection — see `reset_psk`.
+            let text = String::from(core::str::from_utf8(&state.net.psk).unwrap_or(""));
+            labels.push(Label {
+                x: field.x,
+                y: centre_text_y(field.y, field.h, tokens::MONO),
+                style: tokens::MONO,
+                // Tail-anchored: the caret is at the end, and that is the part being looked at.
+                text: fit_tail(atlas, tokens::MONO, &text, field.w - 2),
+                color: theme.fg,
+            });
+            let tw = measure(atlas, tokens::MONO, &text).min(field.w - 2);
+            canvas.fill_rect((field.x + tw + 1).max(0) as usize,
+                             (field.y + field.h / 2 - 9).max(0) as usize,
+                             1, 18, theme.accent);
+        } else if let Some((dots, caret)) = l.psk_dots(state.net.typed()) {
+            for d in dots {
+                shapes::fill_round_rect(canvas, d.x.max(0) as usize, d.y.max(0) as usize,
+                                        d.w as usize, d.h as usize, (d.w / 2).max(1) as usize,
+                                        theme.fg_2);
+            }
+            canvas.fill_rect(caret.x.max(0) as usize, caret.y.max(0) as usize,
+                             caret.w as usize, caret.h as usize, theme.accent);
+        }
+        if let Some(hint) = l.psk_hint() {
+            labels.push(Label {
+                x: hint.x,
+                y: hint.y,
+                style: tokens::HINT,
+                text: String::from("Return to join"),
+                color: theme.fg_4,
+            });
+        }
+    }
+
+    // ── The actions, then the message ─────────────────────────────────────────────────────────
+    let actions = state.net.actions();
+    let revealed = state.net.show_psk;
+    let remember = state.net.remember;
+    let bar = l.actions();
+    let mut x = bar.x;
+    let mut rects: Vec<(NetAction, Rect)> = Vec::new();
+    for (i, a) in actions.iter().enumerate() {
+        let text = a.label(revealed, remember);
+        let w = measure(atlas, tokens::B3, text);
+        if x + w > bar.right() {
+            // Out of room. Dropping the tail is better than overrunning the panel: everything that
+            // could be dropped here is also reachable another way (the radio switch is the last
+            // action, and Escape always backs out).
+            break;
+        }
+        let hovered = state.net.hover == Some(NetHit::Action(i));
+        labels.push(Label {
+            x,
+            y: centre_text_y(bar.y, bar.h, tokens::B3),
+            style: tokens::B3,
+            text: String::from(text),
+            color: if hovered { theme.fg } else { theme.fg_2 },
+        });
+        if hovered {
+            // Underlined on hover rather than plated: a plate would turn a word into a button, and
+            // the design is explicit that these are not buttons.
+            canvas.fill_rect(x.max(0) as usize,
+                             (bar.y + bar.h - 1).max(0) as usize,
+                             w as usize, 1, theme.fg_3);
+        }
+        // The hit box is the word plus the gap's worth of slack on each side — a 17px-tall run of
+        // text is a small target, and the gap belongs to nothing else.
+        rects.push((*a, Rect::new(x - 5, bar.y - 4, w + 10, bar.h + 8)));
+        x += w;
+        if i + 1 < actions.len() {
+            let sep = " \u{00B7} ";
+            let sw = measure(atlas, tokens::B3, sep);
+            labels.push(Label {
+                x,
+                y: centre_text_y(bar.y, bar.h, tokens::B3),
+                style: tokens::B3,
+                text: String::from(sep),
+                color: theme.fg_4,
+            });
+            x += sw;
+        }
+    }
+    state.net.action_rects = rects;
+
+    if !state.net.message.is_empty() {
+        let msg = l.message();
+        labels.push(Label {
+            x: msg.x,
+            y: msg.y,
+            style: tokens::B3,
+            text: fit(atlas, tokens::B3, &state.net.message, msg.w),
+            color: theme.fg_3,
+        });
+    }
+}
+
 fn handoff_paint(state: &Shell, canvas: &mut Canvas, theme: Theme) {
     let Some(from) = state.handoff.from else { return };
     let t = state.handoff.t;
@@ -646,11 +1426,13 @@ fn upload_cursor(shape: Shape) {
 
 // ─────────────────────────────── Windows ───────────────────────────────
 
-/// Grab band just inside a surface's edge where a drag starts a resize. Scaled: it is a pointer
-/// target, and on a 4K panel an 8px band is a band you keep missing.
-fn resize_band() -> i32 {
-    scale::px(8)
-}
+/// Grab band just inside a surface's edge where a drag starts a resize.
+///
+/// ★ Now `layout::resize_band` rather than a local `scale::px(8)`. The scrollbar's inset is derived
+/// from this value — it exists solely to sit outside the band, because the resize edge is tested
+/// first and would otherwise claim most of the bar — and a test in that module proves the two clear
+/// each other. Two copies of the number would let the proof pass while the desktop disagreed.
+use nyx_meridian::layout::resize_band;
 
 /// Minimum surface size.
 ///
@@ -743,17 +1525,25 @@ fn client_scroll(client: &Client) -> (usize, usize) {
     (hdr.content_h as usize, hdr.scroll_off as usize)
 }
 
-fn mouse_to_scroll(my: usize, bar_y: usize, viewport: usize, content: usize) -> usize {
-    if content <= viewport {
-        return 0;
+/// A client's live caption context and dirty flag — `.w-cap .ctx` and the unsaved tick.
+///
+/// Read from the mapped header on every frame, exactly like [`client_scroll`], because the whole
+/// point is that it changes: a word count that only updated when the window was created would be
+/// worse than showing none. Empty for every app that never sets it, which is all of them but Text
+/// and QCLang.
+///
+/// Invalid UTF-8 is treated as **absent** rather than substituted, so a truncation bug in an app
+/// shows up as "no context" instead of as replacement characters sitting on the desktop.
+fn client_context(client: &Client) -> (&str, bool) {
+    if client.buffer.is_null() {
+        return ("", false);
     }
-    let (_, thumb_h) = nyx_gui::ui::scrollbar_thumb(viewport, content, viewport, 0);
-    let track_range = viewport.saturating_sub(thumb_h);
-    if track_range == 0 {
-        return 0;
-    }
-    let rel = my.saturating_sub(bar_y).saturating_sub(thumb_h / 2).min(track_range);
-    rel * (content - viewport) / track_range
+    let hdr = unsafe {
+        &*((client.buffer as *const u8).sub(core::mem::size_of::<WindowHeader>())
+            as *const WindowHeader)
+    };
+    let len = hdr.context.iter().position(|&c| c == 0).unwrap_or(hdr.context.len());
+    (core::str::from_utf8(&hdr.context[..len]).unwrap_or(""), hdr.dirty != 0)
 }
 
 /// Edge bitmask for a point against a SURFACE: L=1 R=2 T=4 B=8. Unlike the old compositor there is
@@ -858,6 +1648,61 @@ fn centre_text_y(top: i32, h: i32, style: Style) -> i32 {
     top + (h - style.line() as i32) / 2
 }
 
+/// The **tail** of `text` that fits `budget`, dropping characters off the front.
+///
+/// [`fit`]'s mirror image, for the one place the interesting end is the last character rather than
+/// the first: a revealed passphrase, where the caret is at the end and the reason it was revealed at
+/// all is to check what was just typed. No ellipsis — a leading `…` in a password field reads as a
+/// character of the password.
+fn fit_tail(atlas: Option<&Atlas>, style: Style, text: &str, budget: i32) -> String {
+    if budget <= 0 {
+        return String::new();
+    }
+    let mut start = 0usize;
+    while start < text.len() && measure(atlas, style, &text[start..]) > budget {
+        start += 1;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    String::from(&text[start..])
+}
+
+/// `text` trimmed with a trailing `…` until it fits `budget`, measured the way it will be drawn.
+///
+/// Returns **empty** for a budget too narrow even for the ellipsis, rather than a lone `…`. A single
+/// character where a filename belongs looks like a rendering fault; nothing looks like the window
+/// being too narrow, which is what has actually happened.
+///
+/// The shell's own, rather than `text::ellipsize`, because that measures with the CPU rasterizer and
+/// the shell sets type through the atlas — measuring with one and drawing with the other is the
+/// drift `text.rs` exists to prevent, one layer up.
+fn fit(atlas: Option<&Atlas>, style: Style, text: &str, budget: i32) -> String {
+    if budget <= 0 {
+        return String::new();
+    }
+    if measure(atlas, style, text) <= budget {
+        return String::from(text);
+    }
+    let ell = measure(atlas, style, "…");
+    if ell > budget {
+        return String::new();
+    }
+    let mut end = text.len();
+    while end > 0 {
+        end -= 1;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if measure(atlas, style, &text[..end]) + ell <= budget {
+            break;
+        }
+    }
+    let mut out = String::from(&text[..end]);
+    out.push('…');
+    out
+}
+
 /// Pixel width of `text` in `style`. Falls back to the CPU font's metrics when the atlas failed to
 /// build, so right-aligned text stays right-aligned on the degraded path instead of drifting.
 fn measure(atlas: Option<&Atlas>, style: Style, text: &str) -> i32 {
@@ -886,6 +1731,47 @@ enum Action {
     FoldAll,
     /// Ask which F-keys step the panel backlight. See [`BrightKeys`] for why this has to be asked.
     LearnBrightnessKeys,
+    /// Open the Entity surface on its network view. Step 20's replacement for launching `apps/wifi`.
+    OpenNetwork,
+}
+
+/// The power view's rows, in order. ONE source of truth: the geometry is sized from it, the rows
+/// are drawn from it and the hit-test indexes it, which is what stops a click landing on the row
+/// above the one under the pointer.
+const POWER_ROWS: [Power; 2] = [Power::Off, Power::Restart];
+
+/// The two things that end a session. There is no third: Nyx implements no ACPI S3, so a Sleep row
+/// here would be a control that either does nothing or parks the machine somewhere it cannot wake
+/// from. Meridian's "sleep" is the idle screen with the panel at 15%, which is a different claim and
+/// an honest one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Power {
+    Off,
+    Restart,
+}
+
+impl Power {
+    fn action(self) -> u64 {
+        match self {
+            Power::Off => POWER_OFF,
+            Power::Restart => POWER_RESTART,
+        }
+    }
+    /// The row before it is armed.
+    fn label(self) -> &'static str {
+        match self {
+            Power::Off => "Shut down",
+            Power::Restart => "Restart",
+        }
+    }
+    /// The row once it is armed. Restating the verb rather than saying "Confirm" alone, so a glance
+    /// at the highlighted row still says which of the two is about to happen.
+    fn armed_label(self) -> &'static str {
+        match self {
+            Power::Off => "Shut down \u{2014} press Return again",
+            Power::Restart => "Restart \u{2014} press Return again",
+        }
+    }
 }
 
 /// One line of the Command's result list: a group heading, or a result with an action.
@@ -975,7 +1861,17 @@ impl Vitals {
     /// The precedence is deliberate: heat first, then storage, then load. The Entity says ONE thing,
     /// so it has to say the most important one — a "Working" ring during a thermal event would be
     /// technically true and useless.
-    fn refresh(&mut self, fps: usize) {
+    /// `idle_ms` is how long since the last input, and it is here for one reason: **it is the only
+    /// way to see whether the idle clock is running without waiting five minutes and guessing.**
+    ///
+    /// Step 19 shipped and then did not fire on hardware, and the whole failure is invisible — a
+    /// desktop that has not idled looks exactly like a desktop you have not left alone long enough.
+    /// Open the Entity, take your hands off, and this line counts. If it stays at zero the input
+    /// test is wrong; if it counts and nothing happens at 90 s, the phase machine is. That is a
+    /// question answered in ten seconds instead of a power cycle, on a machine with no serial
+    /// console — and it is the Entity's own voice, which is exactly the surface for "nothing has
+    /// touched me for a while".
+    fn refresh(&mut self, fps: usize, idle_ms: usize) {
         {
             // ~2.7 KB on the stack, once a second. Kept local rather than held as a field so the
             // shell's own struct stays small enough to live on the stack comfortably.
@@ -1031,10 +1927,19 @@ impl Vitals {
         } else {
             self.mood = Mood::Nominal;
             self.phrase = "System nominal";
-            self.detail = alloc::format!(
-                "{} tasks across {} cores. Compositing at {} frames per second.",
-                self.tasks, self.cores, fps
-            );
+            // Past half a minute the idle time replaces the frame rate. Both are "the machine is
+            // fine"; only one of them is also the answer to a question you might be asking.
+            self.detail = if idle_ms >= 30_000 {
+                alloc::format!(
+                    "{} tasks across {} cores. Untouched for {} min {:02} s.",
+                    self.tasks, self.cores, idle_ms / 60_000, (idle_ms / 1000) % 60
+                )
+            } else {
+                alloc::format!(
+                    "{} tasks across {} cores. Compositing at {} frames per second.",
+                    self.tasks, self.cores, fps
+                )
+            };
         }
     }
 
@@ -1067,14 +1972,272 @@ impl Vitals {
         alloc::format!("{:02}:{:02}", self.rtc.hour, self.rtc.min)
     }
 
-    fn date(&self) -> String {
-        const MONTHS: [&str; 12] = [
-            "January", "February", "March", "April", "May", "June",
-            "July", "August", "September", "October", "November", "December",
-        ];
-        let m = MONTHS[((self.rtc.month as usize).saturating_sub(1)).min(11)];
-        alloc::format!("{} {} {}", self.rtc.day, m, self.rtc.year)
+}
+
+// ───────────────────── The network drill-down (Meridian step 20) ─────────────────────
+//
+// *"The Entity surface drills in place: tap Network on the first level and the panel becomes the
+// network view, with a back affordance and no new surface."*
+//
+// The geometry and every content decision live in `nyx_meridian::network`, host-tested. What is
+// here is the part that cannot be: the scan list, the passphrase being typed, and the one rule that
+// makes this safe to put in the window server at all — the shell never calls a blocking radio
+// syscall. It launches `apps/wifiagent` and polls the published snapshot instead. See
+// `nyx_api::WifiOp`.
+
+/// Which view the Entity surface is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntView {
+    /// The Entity proper — creature, statement, measurements, identity, controls.
+    Root,
+    /// The network panel, drilled into from the Network control row.
+    Network,
+}
+
+/// What the pointer is over inside the network view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetHit {
+    Back,
+    /// A network row, as an index into the *visible page*, not into `nets`.
+    Row(usize),
+    /// The last row, when the list is paged.
+    Pager,
+    /// An action on the footer line, by index into `NetView::actions`.
+    Action(usize),
+}
+
+/// One plain-text action. *"Actions are plain text, never buttons."*
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetAction {
+    Rescan,
+    Disconnect,
+    Forget,
+    RadioOn,
+    RadioOff,
+    /// Reveal or re-mask the passphrase. Only present while the field is up.
+    Reveal,
+    /// Flip whether a successful join is written to `wifi.conf`.
+    Remember,
+}
+
+impl NetAction {
+    /// The label states what CLICKING does, not what is currently true — the same convention the
+    /// Command's rows use, where "Appearance — Light" means *click to go there*. A toggle labelled
+    /// with its own state reads as a status line that mysteriously reacts to being clicked.
+    fn label(self, revealed: bool, remember: bool) -> &'static str {
+        match self {
+            NetAction::Rescan => "Rescan",
+            NetAction::Disconnect => "Disconnect",
+            NetAction::Forget => "Forget",
+            NetAction::RadioOn => "Turn Wi-Fi on",
+            NetAction::RadioOff => "Turn Wi-Fi off",
+            NetAction::Reveal => {
+                if revealed {
+                    "Hide"
+                } else {
+                    "Show"
+                }
+            }
+            NetAction::Remember => {
+                if remember {
+                    "Join once only"
+                } else {
+                    "Remember this network"
+                }
+            }
+        }
     }
+}
+
+/// How long the shell waits between re-reading the link while the network view is open. Both calls
+/// it makes — `sys_wifi_status` and `sys_wifi_list` — read a published snapshot and never touch the
+/// driver lock (the kernel's own note on syscall 544: *"the picker calls this on a timer, and a
+/// blocking acquire here is one of the two ways the machine used to wedge"*), so this is cheap. It
+/// is faster than the 1 Hz heartbeat because a join changes state in steps a person is watching for.
+const NET_POLL_MS: usize = 400;
+
+struct NetView {
+    /// The last scan, in `network::order`.
+    nets: Vec<WifiNetwork>,
+    status: WifiStatus,
+    /// Whether the adapter exists at all. `false` makes the whole view say so and offer nothing.
+    present: bool,
+    /// The SSID in `wifi.conf`, so Forget can name what it would drop.
+    saved: Option<String>,
+    /// The selected row, as an index into `nets`.
+    sel: Option<usize>,
+    /// The passphrase being typed, as bytes — it is UTF-8 under construction and may not be a valid
+    /// `str` between keystrokes.
+    psk: Vec<u8>,
+    /// Whether it is shown in the clear. Forced back to `false` whenever the selection changes, so
+    /// revealing is a decision about ONE passphrase and can never outlive it.
+    show_psk: bool,
+    /// Whether a successful join is written to `wifi.conf`. On by default — that is what makes the
+    /// machine come back online by itself, and it is what the old picker defaulted to. Reset with
+    /// the passphrase, so it is a decision about one join.
+    remember: bool,
+    page: usize,
+    hover: Option<NetHit>,
+    /// The operation in flight: what it is, when it started, and the pid doing it.
+    busy: Option<(WifiOp, usize, u64)>,
+    /// The last thing the view has to say. Always about something that actually happened.
+    message: String,
+    /// Where each action was drawn last frame.
+    ///
+    /// Cached rather than recomputed, for the same reason `ent_detail_lines` is: the hit-test has no
+    /// atlas in hand, and these rects are sized to measured text. Two different answers would put
+    /// the click somewhere other than the word. Empty before the first paint, which is correct —
+    /// there is nothing on screen to click yet.
+    action_rects: Vec<(NetAction, Rect)>,
+    /// When the snapshot was last re-read.
+    polled: usize,
+}
+
+impl NetView {
+    fn new() -> NetView {
+        NetView {
+            nets: Vec::new(),
+            status: WifiStatus::default(),
+            present: false,
+            saved: None,
+            sel: None,
+            psk: Vec::new(),
+            show_psk: false,
+            remember: true,
+            page: 0,
+            hover: None,
+            busy: None,
+            message: String::new(),
+            action_rects: Vec::new(),
+            polled: 0,
+        }
+    }
+
+    fn radio_on(&self) -> bool {
+        self.present && self.status.state != WIFI_RADIO_OFF
+    }
+    fn connected(&self) -> bool {
+        self.status.state == WIFI_CONNECTED
+    }
+
+    /// The selected network, if the selection still points at one. The list is re-sorted on every
+    /// poll, so this is checked rather than assumed.
+    fn selected(&self) -> Option<&WifiNetwork> {
+        self.sel.and_then(|i| self.nets.get(i))
+    }
+
+    /// Whether the passphrase field is up: a secured, joinable network is selected.
+    fn wants_psk(&self) -> bool {
+        self.selected()
+            .map(|n| n.is_secure() && network::joinable(n))
+            .unwrap_or(false)
+    }
+
+    /// Whether the network we are ON advertises RSN, for the "Connected · WPA2" line. `None` when
+    /// the current SSID is not in the scan list — see `network::state_detail`.
+    fn current_secure(&self) -> Option<bool> {
+        let name = self.status.name();
+        if name.is_empty() {
+            return None;
+        }
+        self.nets.iter().find(|n| n.name() == name).map(|n| n.is_secure())
+    }
+
+    /// Drop the passphrase and re-mask. Both together, always: clearing the text while leaving
+    /// `show_psk` set means the next network's first keystroke appears in the clear.
+    fn reset_psk(&mut self) {
+        self.psk.clear();
+        self.show_psk = false;
+        // Back to remembering. A "join once" chosen for a café must not still be in force the next
+        // time you pick your own network and expect the machine to come back to it.
+        self.remember = true;
+    }
+
+    /// How many characters have been typed. Counts UTF-8 lead bytes, so a half-entered multi-byte
+    /// sequence cannot make this disagree with what was drawn.
+    fn typed(&self) -> usize {
+        self.psk.iter().filter(|&&b| (b & 0xC0) != 0x80).count()
+    }
+
+    /// The actions offered right now, left to right.
+    ///
+    /// Rescan is absent while connected because the kernel refuses it — a scan retunes the radio off
+    /// the AP's channel for seconds — and an action that cannot work is worse than one that is not
+    /// offered. Everything is absent while an operation is in flight: the radio is taken, and the
+    /// message line is already saying so.
+    fn actions(&self) -> Vec<NetAction> {
+        let mut out = Vec::new();
+        if !self.present || self.busy.is_some() {
+            return out;
+        }
+        if !self.radio_on() {
+            out.push(NetAction::RadioOn);
+            // Forget only rewrites a file, so it stays reachable with the radio off — it is the one
+            // way to stop a machine reconnecting to a network you have left for good.
+            if self.saved.is_some() {
+                out.push(NetAction::Forget);
+            }
+            return out;
+        }
+        // Both of these belong to the selected network, so they are only offered while one is
+        // selected and joinable — an "Join once only" with nothing selected would be a toggle over
+        // nothing.
+        if self.wants_psk() {
+            out.push(NetAction::Reveal);
+        }
+        if self.selected().map_or(false, network::joinable) {
+            out.push(NetAction::Remember);
+        }
+        if self.connected() {
+            out.push(NetAction::Disconnect);
+        } else {
+            out.push(NetAction::Rescan);
+        }
+        if self.saved.is_some() {
+            out.push(NetAction::Forget);
+        }
+        out.push(NetAction::RadioOff);
+        out
+    }
+}
+
+/// Whether a process is still running, by looking for its pid in the task table.
+///
+/// This is how the shell knows a radio operation has finished. There is no `waitpid` on this system
+/// and the shell must not block on one anyway, so it asks the same question the System Monitor asks
+/// — sixty tasks, once every [`NET_POLL_MS`], and only while something is actually in flight.
+fn pid_alive(pid: u64) -> bool {
+    // ~2.7 KB on the stack, the same pattern `Vitals::refresh` uses and for the same reason.
+    let mut info: SystemInfo = unsafe { core::mem::zeroed() };
+    sys_get_system_info(&mut info as *mut SystemInfo);
+    let n = (info.task_count as usize).min(info.tasks.len());
+    info.tasks[..n].iter().any(|t| t.pid == pid)
+}
+
+/// Fork and exec the Wi-Fi agent with one operation, returning its pid.
+///
+/// ★ The shell NEVER calls `sys_wifi_scan`, `sys_wifi_connect`, `sys_wifi_disconnect` or
+/// `sys_wifi_set_radio` itself. All four block in the driver for seconds, and this process is the
+/// window server: the desktop would stop compositing for the whole join while the hardware cursor —
+/// driven from the mouse IRQ — kept gliding over the frozen frame. That is not a cosmetic problem.
+/// It is exactly what the GL-runtime freeze looks like, and fifteen seconds without the 1 Hz
+/// heartbeat is long enough for the render engine to enter RC6 and lose MOCS, at which point the
+/// first composite afterwards really does hang.
+fn launch_agent(op: WifiOp, ssid: &str, psk: &str) -> Option<u64> {
+    let mut buf = [0u8; WIFI_OP_MAX];
+    let n = wifi_op_encode(&mut buf, op, ssid, psk);
+    let arg = core::str::from_utf8(&buf[..n]).ok()?;
+    breadcrumb("[NET] pre-fork: ", op.verb());
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_execve_arg("/mnt/nvme/apps/WifiAgent.nyx/run.bin\0", arg);
+        breadcrumb("[NET] execve returned, exec FAILED: ", op.verb());
+        sys_exit(1);
+    }
+    if pid < 0 {
+        return None;
+    }
+    Some(pid as u64)
 }
 
 // ─────────────────────────────── State ───────────────────────────────
@@ -1162,6 +2325,31 @@ struct Shell {
     /// whole geometry is derived from it and the click hit-test has no atlas in hand — two different
     /// answers would put the control rows somewhere other than where they were drawn.
     ent_detail_lines: i32,
+    /// The Entity itself — seed, stage, influence and the sprite generated from them. Step 18.
+    creature: Creature,
+    /// Which of the surface's two views is up. Reset to `Root` whenever the surface closes: a
+    /// disclosure that reopens three levels deep is a surface with hidden state. Step 20.
+    ent_view: EntView,
+    /// The network drill-down's own state, live only while `ent_view` is `Network`.
+    net: NetView,
+    /// The pointer position and time of the last idle sample — `(x, y, ms)`.
+    ///
+    /// Deliberately NOT `prev_mx`/`prev_my`: those advance once per rendered frame and answer a
+    /// question about damage, not about presence. See the note in `process_input`.
+    idle_probe: (i32, i32, usize),
+    /// The chrome opacity of the last drawn frame, so the 90 s recede can ask for frames only
+    /// while it is actually moving. Starts at 255 — fully present — which is what it is at boot.
+    chrome_key: u8,
+    /// Which of the Command footer's power glyphs the pointer is over — an index into
+    /// [`POWER_ROWS`], which is also what `layout::cmd_power_hit` returns.
+    power_hover: Option<usize>,
+    /// A power action that has been clicked once and is waiting for a second click.
+    ///
+    /// Meridian has no dialogs — no modal box, no OK/Cancel pair — so a destructive action cannot
+    /// ask "are you sure?" the way other systems do. It arms instead: the glyph lights, the footer
+    /// line stops counting results and says what is about to happen, and the second click on the
+    /// same glyph does it. Escape, any key, or closing the Command all disarm.
+    power_armed: Option<Power>,
 
     // ── brightness ──
     /// Which two F-keys step the panel. Read from disk at startup; see [`BrightKeys`].
@@ -1177,6 +2365,34 @@ struct Shell {
     /// working after the pointer leaves the row vertically, which is what every slider does and
     /// what makes one feel attached rather than slippery.
     ent_drag_bright: bool,
+
+    /// Meridian step 19. When the last key or pointer movement arrived; everything about idle is
+    /// arithmetic on `now - last_input`.
+    last_input: usize,
+    /// The phase as of the last frame, so entering one can be detected rather than re-applied every
+    /// frame — the backlight drop in particular must happen once.
+    phase: Phase,
+    /// The panel level to put back on wake, captured the moment before sleep dropped it. `None`
+    /// means sleep never touched it: either this display has no PWM backlight, or we have not slept.
+    bright_before_sleep: Option<u32>,
+    /// The animation key of the last drawn idle frame — `(dx, dy, lid)`. The idle screen is redrawn
+    /// only when this changes, which is a handful of frames a second rather than sixty.
+    idle_key: (i32, i32, bool),
+    /// The stored credential, read once at startup. `None` = no password is set and the lock never
+    /// appears, which is the default state of every Nyx installation.
+    auth: Option<Auth>,
+    /// True while the lock is covering the desktop. Windows keep running behind it — this is a
+    /// display gate on a single-user machine, not a session boundary, and pretending otherwise
+    /// would be a lie about what it does.
+    locked: bool,
+    /// The passphrase being typed. Cleared on success, on failure, and on lock.
+    attempt: Vec<u8>,
+    /// Consecutive failures, and when the fifth landed.
+    fails: u32,
+    fail_at: usize,
+    /// True once a wrong passphrase has been entered, so the hint reads *Incorrect. Try again.*
+    /// until the next one is accepted.
+    lock_err: bool,
 
     last_clock_sec: usize,
     frame_count: u64,
@@ -1244,10 +2460,27 @@ impl Shell {
             ent_hover: None,
             vitals: Vitals::new(),
             ent_detail_lines: 0,
+            creature: Creature::load_or_birth(h),
+            ent_view: EntView::Root,
+            net: NetView::new(),
+            idle_probe: (w / 2, h / 2, 0),
+            chrome_key: 255,
+            power_hover: None,
+            power_armed: None,
             bright: BrightKeys::load(),
             learn: None,
             bright_pct: None,
             ent_drag_bright: false,
+            last_input: 0,
+            phase: Phase::Active,
+            bright_before_sleep: None,
+            idle_key: (i32::MIN, i32::MIN, false),
+            auth: Auth::load(),
+            locked: false,
+            attempt: Vec::new(),
+            fails: 0,
+            fail_at: 0,
+            lock_err: false,
             last_clock_sec: 0,
             frame_count: 0,
             last_frame_ms: 0,
@@ -1309,7 +2542,13 @@ impl Shell {
 
     fn mark_entity(&mut self) {
         const M: i32 = 16;
-        let s = self.entity_geometry().surface;
+        // ⚠️ Whichever view is up. `entity_geometry` and `net_geometry` return DIFFERENT heights for
+        // the same surface, and marking the root's rect while the network view is drawn leaves the
+        // taller one's overhang stale — a band of last frame's pixels along the top edge.
+        let s = match self.ent_view {
+            EntView::Network => self.net_geometry().0.surface,
+            EntView::Root => self.entity_geometry().surface,
+        };
         self.mark_dirty(s.x - M, s.y - M, s.w + M * 2, s.h + M * 2);
     }
 
@@ -1410,15 +2649,22 @@ impl Shell {
         // Shell commands: things only the shell can do, so they belong to no application.
         let theme_label = if self.theme.is_dark { "Appearance — Light" } else { "Appearance — Dark" };
         let network_label = alloc::format!("Network — {}", self.vitals.network_value());
-        let wifi_app = APPS.iter().position(|a| a.label == "Wi-Fi");
         let bright_label = alloc::format!("Brightness keys — {}", self.bright.describe());
+        // ⚠️ Shut down and Restart are NOT rows here, and were briefly. A verb that ends the session
+        // must not be reachable by typing three letters and pressing Return with the selection still
+        // resting on the first match — which is exactly what a result row is for. They are glyphs in
+        // this panel's footer instead; see `layout::cmd_power_slot`.
         let cmds: [(&str, &str, &str, Option<Action>); 4] = [
             (theme_label, Icons::APP_SETTINGS, "Command", Some(Action::ToggleTheme)),
             ("Fold all windows", Icons::WIN_FOLD, "Command", Some(Action::FoldAll)),
-            (&network_label, Icons::WIFI, "Choose a network", wifi_app.map(Action::Launch)),
+            // ★ Step 20. This row launched `apps/wifi` until the Entity's drill-down existed to
+            // take the job; now it opens the surface on the network view. That is the whole of
+            // *"deleting an application is the last step, never the first"* in one line — the row
+            // that reaches the network never went away, only what it reaches.
+            (&network_label, Icons::WIFI, "Choose a network", Some(Action::OpenNetwork)),
             // The current binding is in the LABEL, not the meta column, so it is searchable: typing
             // "F5" finds the row that explains why F5 does what it does.
-            (&bright_label, Icons::POWER, "Rebind", Some(Action::LearnBrightnessKeys)),
+            (&bright_label, Icons::BRIGHT, "Rebind", Some(Action::LearnBrightnessKeys)),
         ];
         let hitting: Vec<usize> = (0..cmds.len()).filter(|&i| matches(cmds[i].0, &q)).collect();
         if !hitting.is_empty() {
@@ -1459,10 +2705,19 @@ impl Shell {
         self.cmd_open = open;
         self.query_len = 0;
         self.cmd_hover = None;
+        // Opening OR closing disarms. An armed shutdown must not survive the Command being
+        // dismissed and reopened — the second Return would then land on a row the user has no
+        // reason to think is still loaded.
+        self.power_armed = None;
         if open {
             // Opening closes the Entity: they are the two modal surfaces, and two things asking to
             // be read at once is neither of them being read.
-            self.ent_open = false;
+            //
+            // ⚠️ Through `set_entity`, not by clearing `ent_open` here. Since step 20 closing the
+            // surface also has to leave the network view and drop the passphrase typed into it —
+            // and a second path that only clears the flag is exactly how a half-typed passphrase
+            // survives into the next time the surface opens.
+            self.set_entity(false);
             self.clear_desktop_hover();
             self.rebuild_command();
         } else {
@@ -1485,6 +2740,8 @@ impl Shell {
             Some(a) => a,
             None => return,
         };
+
+
         self.set_command(false);
         match action {
             Action::Launch(app) => launch(&APPS[app]),
@@ -1502,6 +2759,12 @@ impl Shell {
                 self.mark_full();
             }
             Action::LearnBrightnessKeys => self.begin_learn(),
+            Action::OpenNetwork => {
+                // `set_entity(true)` first: it samples the backlight and closes the Command, and
+                // `enter_network` is what puts the surface on the second level.
+                self.set_entity(true);
+                self.enter_network();
+            }
         }
     }
 
@@ -1519,7 +2782,22 @@ impl Shell {
             };
             dst.copy_from_slice(&self.paper);
         }
+        self.announce_theme_to_all();
         self.mark_full();
+    }
+
+    /// Tell every client which theme it is now.
+    ///
+    /// Apps draw into their own SHM with their own copy of the token table, so the shell repainting
+    /// itself changes nothing inside a window. Before this existed, switching to light gave a light
+    /// desktop full of dark windows.
+    fn announce_theme_to_all(&self) {
+        let d = if self.theme.is_dark { THEME_DARK } else { THEME_LIGHT };
+        for c in self.clients.iter() {
+            if c.win.exists {
+                sys_ipc_send(c.owner_pid, MSG_THEME_CHANGED, d, 0);
+            }
+        }
     }
 
     // ── the Entity ──
@@ -1535,14 +2813,389 @@ impl Shell {
             // — this shell is the only writer — so polling it would be a syscall per frame to learn
             // something we already know.
             self.bright_pct = sys_backlight(0);
+        } else {
+            // Always back to the root. A disclosure surface that reopens where it was left is one
+            // with hidden state, and the Entity's whole job is to be the thing you can trust at a
+            // glance. It also drops the typed passphrase and disarms any pending shutdown, both of
+            // which are exactly the right moment to drop.
+            self.leave_network();
         }
         self.mark_full();
+    }
+
+    // ── the network drill-down (Meridian step 20) ──
+
+    /// Enter the network view. Reads the snapshot immediately so the panel opens with the list it
+    /// already has rather than with an empty "Available" block that fills in half a second later.
+    fn enter_network(&mut self) {
+        self.ent_view = EntView::Network;
+        self.net = NetView::new();
+        self.net.message = String::from("Pick a network to join.");
+        self.poll_network(0);
+        self.mark_full();
+    }
+
+    /// Perform, or arm, one power action.
+    ///
+    /// ★ Meridian has no dialogs, so a verb that ends the session cannot ask "are you sure?". It
+    /// **arms** instead: the first press lights the glyph and names itself in the footer, the second
+    /// fires. Two presses on the same 30px target, with the machine saying what it is about to do in
+    /// between — which is the whole of what a confirmation dialog buys, without a dialog.
+    fn power_press(&mut self, p: Power) {
+        if self.power_armed == Some(p) {
+            self.power_armed = None;
+            // The Entity is written on a 1 Hz tick, so a shutdown between ticks would drop up to a
+            // second of it. The last useful thing this process does.
+            self.creature.persist();
+            sys_power(p.action());
+            // Only reachable if the firmware declined; the kernel has already said so on screen.
+        } else {
+            self.power_armed = Some(p);
+        }
+        self.needs_redraw = true;
+        self.mark_full();
+    }
+
+    fn leave_network(&mut self) {
+        // The passphrase is dropped here and nowhere else — every path out of the view goes through
+        // this function, which is what makes "it is not kept" a property rather than a hope.
+        self.net.reset_psk();
+        self.net = NetView::new();
+        self.ent_view = EntView::Root;
+        self.mark_full();
+    }
+
+    /// Re-read the published link snapshot and the last scan.
+    ///
+    /// Both syscalls read `WIFI_SNAPSHOT` and never take the driver lock, so this cannot block even
+    /// while the agent is mid-join. That is the entire reason the drill-down can live in the window
+    /// server; see [`launch_agent`].
+    fn poll_network(&mut self, now: usize) {
+        self.net.polled = now;
+
+        match sys_wifi_status() {
+            Some(s) => {
+                self.net.status = s;
+                self.net.present = true;
+            }
+            None => {
+                self.net.present = false;
+                self.net.message = String::from("This machine has no Wi-Fi adapter.");
+            }
+        }
+
+        let mut buf = [WifiNetwork::default(); 48];
+        let n = sys_wifi_list(&mut buf);
+        // Remember what was selected BY NAME before the list is rebuilt. The list is re-sorted every
+        // poll — the current network moves to the top the instant a join lands — so holding an index
+        // across a refresh would silently move the selection to a different network, with a
+        // passphrase already half-typed for the old one.
+        let was = self.net.selected().map(|n| String::from(n.name()));
+        self.net.nets.clear();
+        for e in buf.iter().take(n) {
+            self.net.nets.push(*e);
+        }
+        let mut buf = [0u8; 160];
+        self.net.saved = match wifi_load_network(&mut buf) {
+            Some((slen, _)) => core::str::from_utf8(&buf[..slen]).ok().map(String::from),
+            None => None,
+        };
+        network::order(&mut self.net.nets, self.net.saved.as_deref());
+        self.net.sel = was.and_then(|name| self.net.nets.iter().position(|n| n.name() == name));
+        if self.net.sel.is_none() {
+            self.net.reset_psk();
+        }
+    }
+
+    /// One tick of the network view: poll, and notice when the agent has finished.
+    fn tick_network(&mut self, now: usize) {
+        if !self.ent_open || self.ent_view != EntView::Network {
+            return;
+        }
+        if now.wrapping_sub(self.net.polled) < NET_POLL_MS {
+            return;
+        }
+        let before = (self.net.status.state, self.net.status.ip, self.net.nets.len());
+        self.poll_network(now);
+
+        if let Some((op, started, pid)) = self.net.busy {
+            let elapsed = now.wrapping_sub(started);
+            // The pid leaving the task table is the real signal; the budget is only a backstop for
+            // a helper that died in a way that left it there. The OUTCOME never comes from either —
+            // it comes from the snapshot below, so a timeout that fires early cannot invent a
+            // result, it can only stop saying "Connecting…" too soon.
+            if !pid_alive(pid) || elapsed > op.budget_ms() {
+                self.net.busy = None;
+                self.net.message = self.net_outcome(op);
+                if op.is_join() && self.net.connected() {
+                    self.net.sel = None;
+                    self.net.reset_psk();
+                }
+            }
+        }
+
+        let after = (self.net.status.state, self.net.status.ip, self.net.nets.len());
+        if before != after || self.net.busy.is_some() {
+            self.needs_redraw = true;
+            self.mark_full();
+        }
+    }
+
+    /// What to say now that `op` has finished. Read from the link state, never from what we asked
+    /// for — the kernel refuses any radio operation while another owns the radio, and reports the
+    /// state unchanged when it does, so "we asked for it" is not evidence it happened.
+    fn net_outcome(&self, op: WifiOp) -> String {
+        match op {
+            WifiOp::Scan => {
+                if self.net.nets.is_empty() {
+                    String::from("Scan finished. No networks in range.")
+                } else {
+                    alloc::format!("Scan finished. {} networks in range.", self.net.nets.len())
+                }
+            }
+            WifiOp::Join | WifiOp::JoinOnce => match self.net.status.state {
+                WIFI_CONNECTED => {
+                    alloc::format!("Connected to \"{}\".", self.net.status.name())
+                }
+                WIFI_AUTH_FAILED => String::from("The password was rejected. Try again."),
+                WIFI_NO_LEASE => {
+                    String::from("Joined, but the router never offered an address.")
+                }
+                WIFI_HW_FAILED => String::from("The adapter refused to tune to that network."),
+                _ => String::from("The join did not complete."),
+            },
+            WifiOp::Leave => String::from("Disconnected."),
+            WifiOp::RadioOn => {
+                if self.net.radio_on() {
+                    String::from("Wi-Fi is on. Rescan to look for networks.")
+                } else {
+                    String::from("The radio was busy. Try again.")
+                }
+            }
+            WifiOp::RadioOff => {
+                if self.net.radio_on() {
+                    String::from("The radio was busy. Try again.")
+                } else {
+                    String::from("Wi-Fi is off.")
+                }
+            }
+        }
+    }
+
+    /// Hand an operation to the agent. Everything the view does that touches the radio goes through
+    /// here, so there is exactly one place that can start one and exactly one that can be busy.
+    fn start_op(&mut self, op: WifiOp, now: usize) {
+        if self.net.busy.is_some() {
+            return;
+        }
+        let (ssid, psk) = if op.is_join() {
+            let Some(n) = self.net.selected() else { return };
+            let ssid = String::from(n.name());
+            let psk = String::from(core::str::from_utf8(&self.net.psk).unwrap_or(""));
+            (ssid, psk)
+        } else {
+            (String::new(), String::new())
+        };
+        match launch_agent(op, &ssid, &psk) {
+            Some(pid) => {
+                self.net.busy = Some((op, now, pid));
+                self.net.message = match op {
+                    WifiOp::Scan => String::from("Scanning every channel\u{2026}"),
+                    WifiOp::Join | WifiOp::JoinOnce => {
+                        alloc::format!("Joining \"{}\"\u{2026}", ssid)
+                    }
+                    WifiOp::Leave => String::from("Disconnecting\u{2026}"),
+                    WifiOp::RadioOn => String::from("Turning Wi-Fi on\u{2026}"),
+                    WifiOp::RadioOff => String::from("Turning Wi-Fi off\u{2026}"),
+                };
+            }
+            None => {
+                // Naming the helper matters: this is the one failure here that is not about the
+                // radio at all, and "couldn't connect" would send someone to look at the router.
+                self.net.message = String::from("Couldn't start the Wi-Fi agent.");
+            }
+        }
+        self.needs_redraw = true;
+        self.mark_full();
+    }
+
+    /// The network view's geometry, and which slice of the list it is showing.
+    ///
+    /// Recomputed from the same inputs everywhere it is needed rather than cached, so the frame that
+    /// draws a row and the click that lands on it cannot disagree.
+    fn net_geometry(&self) -> (PanelLayout, Page) {
+        let links = network::link_rows(&self.net.status).len();
+        let psk = self.net.wants_psk();
+        let cap = network::max_rows(self.screen_h, links, psk);
+        let page = network::paginate(self.net.nets.len(), cap, self.net.page);
+        // ⚠️ `.max(1)` — an empty list still needs one row, because that is where "Nothing in range"
+        // goes. Without it `avail_row(0)` returns `None` and the empty state draws nothing at all:
+        // a hairline, a heading, and then the footer. Which reads as the scan having broken rather
+        // than as it having found nothing, and those are opposite messages.
+        let rows = page.rows().max(1);
+        let l = network::panel_layout(self.screen_w, self.screen_h, links, rows, psk);
+        (l, page)
+    }
+
+    /// What the pointer is over. `action_rects` is what the last frame drew — see the field's note.
+    fn net_hit(&self, mx: i32, my: i32) -> Option<NetHit> {
+        let (l, page) = self.net_geometry();
+        if l.back.contains(mx, my) {
+            return Some(NetHit::Back);
+        }
+        if let Some(i) = l.row_hit(mx, my) {
+            return if page.has_pager() && i == page.len {
+                Some(NetHit::Pager)
+            } else {
+                Some(NetHit::Row(i))
+            };
+        }
+        for (i, (_, r)) in self.net.action_rects.iter().enumerate() {
+            if r.contains(mx, my) {
+                return Some(NetHit::Action(i));
+            }
+        }
+        None
+    }
+
+    /// A click inside the network view.
+    fn net_press(&mut self, mx: i32, my: i32, now: usize) {
+        let Some(hit) = self.net_hit(mx, my) else { return };
+        let (_, page) = self.net_geometry();
+        match hit {
+            NetHit::Back => self.leave_network(),
+            NetHit::Pager => {
+                self.net.page = self.net.page.wrapping_add(1);
+                self.needs_redraw = true;
+                self.mark_full();
+            }
+            NetHit::Row(i) => {
+                let idx = page.start + i;
+                if self.net.sel == Some(idx) {
+                    // Clicking the selected row again puts it down. There is no Cancel button in
+                    // this language, so the way out of a selection is the way into it.
+                    self.net.sel = None;
+                    self.net.reset_psk();
+                    self.net.message = String::from("Pick a network to join.");
+                } else if let Some(n) = self.net.nets.get(idx) {
+                    let refusal = network::refusal(n);
+                    let secure = n.is_secure();
+                    self.net.sel = Some(idx);
+                    self.net.reset_psk();
+                    self.net.message = match refusal {
+                        // The obstacle, not the standard. "Unsupported security" tells nobody what
+                        // to do; naming the router setting does.
+                        Some(why) => String::from(why),
+                        None if secure => String::from("Type the password, then press Return."),
+                        None => String::from("Open network. Press Return to join."),
+                    };
+                }
+                self.needs_redraw = true;
+                self.mark_full();
+            }
+            NetHit::Action(i) => {
+                let Some(&(action, _)) = self.net.action_rects.get(i) else { return };
+                match action {
+                    NetAction::Rescan => self.start_op(WifiOp::Scan, now),
+                    NetAction::Disconnect => self.start_op(WifiOp::Leave, now),
+                    NetAction::RadioOn => self.start_op(WifiOp::RadioOn, now),
+                    NetAction::RadioOff => self.start_op(WifiOp::RadioOff, now),
+                    NetAction::Reveal => {
+                        self.net.show_psk = !self.net.show_psk;
+                        self.needs_redraw = true;
+                        self.mark_full();
+                    }
+                    NetAction::Remember => {
+                        self.net.remember = !self.net.remember;
+                        self.net.message = if self.net.remember {
+                            String::from("This network will be remembered and rejoined at boot.")
+                        } else {
+                            // Naming the consequence, not the setting: "one network is remembered"
+                            // is the fact that makes the choice matter at all.
+                            String::from(
+                                "Joining once. The remembered network will not be replaced.",
+                            )
+                        };
+                        self.needs_redraw = true;
+                        self.mark_full();
+                    }
+                    NetAction::Forget => {
+                        // Forget rewrites a file and blocks on nothing, so the shell does it itself
+                        // — a whole process to truncate 40 bytes would be ceremony.
+                        self.net.message = if wifi_forget_network() {
+                            self.net.saved = None;
+                            String::from("Forgotten. This machine won't reconnect on its own.")
+                        } else {
+                            String::from("Couldn't update the saved-network file.")
+                        };
+                        self.needs_redraw = true;
+                        self.mark_full();
+                    }
+                }
+            }
+        }
+    }
+
+    /// A key while the network view is up. Returns whether it was consumed.
+    fn net_key(&mut self, key: char, now: usize) -> bool {
+        if self.net.busy.is_some() {
+            // Everything is in flight. Swallowing the key rather than queueing it is deliberate:
+            // a passphrase typed at a frozen field and applied ten seconds later is worse than one
+            // that visibly did nothing.
+            return true;
+        }
+        match key {
+            '\x1b' => {
+                self.leave_network();
+                true
+            }
+            '\n' | '\r' => {
+                let Some(n) = self.net.selected() else { return true };
+                if !network::joinable(n) {
+                    return true;
+                }
+                if n.is_secure() && self.net.psk.len() < 8 {
+                    // WPA2-PSK is 8..63 characters. Refusing here saves a ten-second handshake
+                    // whose only outcome could have been "the password was rejected".
+                    self.net.message =
+                        String::from("A WPA2 password is at least 8 characters.");
+                    self.needs_redraw = true;
+                    self.mark_full();
+                    return true;
+                }
+                let op = if self.net.remember { WifiOp::Join } else { WifiOp::JoinOnce };
+                self.start_op(op, now);
+                true
+            }
+            '\x08' => {
+                if !self.net.wants_psk() {
+                    return true;
+                }
+                // Pop a whole character, not a byte — the field counts characters and a lone
+                // continuation byte left behind is a string that is no longer UTF-8.
+                while self.net.psk.pop().map_or(false, |b| (b & 0xC0) == 0x80) {}
+                self.needs_redraw = true;
+                self.mark_full();
+                true
+            }
+            c if (c as u32) >= 0x20 && (c as u32) < 0x7f => {
+                if self.net.wants_psk() && self.net.psk.len() < 63 {
+                    self.net.psk.push(c as u8);
+                    self.needs_redraw = true;
+                    self.mark_full();
+                }
+                true
+            }
+            // Everything else — the arrow keys and the rest of the PUA block — is swallowed rather
+            // than falling through to the desktop underneath. The surface is modal while it is up.
+            _ => true,
+        }
     }
 
     /// Sample the machine and re-wrap what the Entity has to say about it. Once a second: every
     /// input here changes on human timescales, and the frame is being recomposited anyway.
     fn refresh_vitals(&mut self, atlas: Option<&Atlas>) {
-        self.vitals.refresh(self.fps);
+        self.vitals.refresh(self.fps, self.idle_ms(sys_get_time()));
         // Cap the detail the way the Command caps its result list, and for the same reason: the
         // surface has a fixed bottom edge and grows UPWARD, so an over-long sentence — or the same
         // sentence at 2x scale — pushes the statement off the top of the screen, where nothing
@@ -1642,6 +3295,27 @@ impl Shell {
                     self.next_win_id += 1;
                     self.mark_full();
                     sys_ipc_send(msg.sender_pid, MSG_WINDOW_CREATED, shm_id, 0);
+                    // Straight after the ack, so an app launched into an already-light session
+                    // paints light on its very first frame instead of flashing dark once.
+                    sys_ipc_send(
+                        msg.sender_pid,
+                        MSG_THEME_CHANGED,
+                        if self.theme.is_dark { THEME_DARK } else { THEME_LIGHT },
+                        0,
+                    );
+                }
+                MSG_SET_THEME => {
+                    // A request from an app — Settings. The shell owns the theme because it owns the
+                    // wallpaper texture, so this goes through the same `set_theme` the Command uses
+                    // and the requester learns the result from the broadcast like everyone else.
+                    let want_dark = match msg.data1 {
+                        THEME_DARK => true,
+                        THEME_LIGHT => false,
+                        _ => !self.theme.is_dark,
+                    };
+                    if want_dark != self.theme.is_dark {
+                        self.set_theme(if want_dark { Theme::dark() } else { Theme::light() });
+                    }
                 }
                 MSG_WINDOW_UPDATE_SHM => {
                     // Verbatim from the compositor: the SHM resize handshake. Capture the OLD
@@ -1684,6 +3358,134 @@ impl Shell {
                 _ => {}
             }
         }
+    }
+
+    // ── idle, sleep and the lock (Meridian step 19) ──
+
+    /// How long since the last key or pointer movement.
+    fn idle_ms(&self, now: usize) -> usize {
+        now.saturating_sub(self.last_input)
+    }
+
+    /// Advance the state machine. Called once per loop, after input.
+    ///
+    /// Only *transitions* do work here. Everything continuous — the fades, the drift, the float — is
+    /// a pure function of `idle_ms` computed at draw time, so nothing has to be stepped and nothing
+    /// can drift out of sync with the clock.
+    fn tick_idle(&mut self, now: usize) {
+        let next = idle::phase_for(self.idle_ms(now));
+        if next == self.phase {
+            return;
+        }
+        let prev = self.phase;
+        self.phase = next;
+
+        // Entering sleep: drop the panel. ⚠️ 15%, not 0. *"A screen that looks asleep on a machine
+        // that is fully awake will get carried into a bag, and the difference is a hot laptop."*
+        // Nyx has no ACPI S3 — the machine stays on and only the display darkens, so the panel must
+        // stay visibly lit.
+        if next == Phase::Asleep {
+            // `bright_pct` is None on a display with no PWM backlight. Nothing to drop, nothing to
+            // restore, and no pretending otherwise.
+            if let Some(before) = self.bright_pct {
+                self.bright_before_sleep = Some(before);
+                sys_backlight_set(15);
+                self.bright_pct = Some(15);
+            }
+        } else if prev == Phase::Asleep {
+            if let Some(before) = self.bright_before_sleep.take() {
+                let got = sys_backlight_set(before);
+                self.bright_pct = got.or(self.bright_pct);
+            }
+        }
+
+        // Every phase change repaints the whole screen: the recede fade, the cross-fade to black and
+        // the wake all cover everything.
+        self.needs_redraw = true;
+        self.mark_full();
+    }
+
+    /// Characters typed into the lock, not bytes. Counts the non-continuation bytes of the UTF-8 in
+    /// `attempt`, so it cannot fail on a partial sequence and needs no second copy of the string.
+    fn typed_chars(&self) -> usize {
+        self.attempt.iter().filter(|b| (**b & 0xC0) != 0x80).count()
+    }
+
+    /// Everything about the idle screen that can change between frames: where the creature sits and
+    /// whether its eyes are shut. Two frames with the same key are the same picture.
+    fn idle_anim_key(&self, now: usize) -> (i32, i32, bool) {
+        let asleep = self.phase == Phase::Asleep;
+        let (dx, dy) = self.creature.idle_offset(now, asleep);
+        let blink = self.creature.state.genome().personality.blink_ticks;
+        (dx, dy, asleep || idle::blink_closed(now, blink))
+    }
+
+    /// Any key, or any pointer movement. Straight back to the desktop if no password is set; to the
+    /// lock if one is.
+    fn wake(&mut self, now: usize) {
+        self.last_input = now;
+        // Re-anchor here too. `wake` is also reached from the key path, which never touches the
+        // probe — leaving it at wherever the pointer was five minutes ago would make the very next
+        // sample look like a large movement and hold the machine awake for no reason.
+        self.idle_probe = (self.mx, self.my, now);
+        if self.phase.shows_creature() && self.auth.is_some() && !self.locked {
+            self.lock();
+        }
+        self.tick_idle(now);
+        self.needs_redraw = true;
+        self.mark_full();
+    }
+
+    fn lock(&mut self) {
+        self.locked = true;
+        self.attempt.clear();
+        self.lock_err = false;
+        // ⚠️ Failures are NOT reset by locking. Otherwise the thirty-second penalty is escaped by
+        // waiting for the machine to idle again, which takes less than thirty seconds of doing
+        // nothing.
+        self.needs_redraw = true;
+        self.mark_full();
+    }
+
+    /// Every keystroke while the lock is up.
+    fn on_lock_key(&mut self, key: char, now: usize) {
+        if idle::penalty_remaining(self.fails, self.fail_at, now).is_some() {
+            // Rate limiting rather than theatre. The field simply does not accept input; the hint
+            // line is already saying so.
+            return;
+        }
+        match key {
+            '\n' | '\r' => {
+                let ok = self.auth.as_ref().is_some_and(|a| a.matches(&self.attempt));
+                self.attempt.clear();
+                if ok {
+                    self.locked = false;
+                    self.fails = 0;
+                    self.lock_err = false;
+                } else {
+                    self.lock_err = true;
+                    self.fails += 1;
+                    if self.fails >= idle::MAX_FAILURES {
+                        self.fail_at = now;
+                    }
+                }
+            }
+            // `pc_keyboard` decodes Backspace through the Unicode branch as U+0008, so it arrives on
+            // the ordinary char queue. A password field needs nothing added to the input path.
+            '\u{8}' => { self.attempt.pop(); }
+            c if !c.is_control() => {
+                // Bounded so a stuck key cannot grow this without limit. Far above any real
+                // passphrase, and silent — telling an onlooker the length is the disclosure the
+                // design's "no username, no avatar" rule exists to avoid.
+                if self.attempt.len() < 128 {
+                    let mut b = [0u8; 4];
+                    self.attempt.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+                }
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
+        self.mark_full();
     }
 
     // ── input ──
@@ -1730,8 +3532,27 @@ impl Shell {
     }
 
     fn process_input(&mut self, now: usize) {
+        // ⚠️ `process_input` runs at ~500 Hz, not once per frame. That is why idle is timed from
+        // here and not from the render loop: a wake has to be felt on the *next* frame, and polling
+        // the clock at 60 Hz would put up to 16 ms of slack in front of the one interaction where
+        // responsiveness is the whole point.
+        let was = self.phase;
+
         if let Some(key) = sys_read_key() {
-            self.on_key(key);
+            self.last_input = now;
+            // The lock OWNS the keyboard, exactly as the Command does. Nothing reaches the desktop
+            // or the focused app while it is up — that is what makes it a gate rather than a
+            // decoration painted over live windows.
+            if self.locked {
+                self.on_lock_key(key, now);
+            } else if was.shows_creature() {
+                // The keystroke that wakes the machine is consumed by the waking. Anything else
+                // means the first character of whatever you typed to wake it up lands in whatever
+                // window happened to be focused five minutes ago.
+                self.wake(now);
+            } else {
+                self.on_key(key, now);
+            }
         }
 
         let (mx_raw, my_raw, left, _right) = sys_get_mouse();
@@ -1739,10 +3560,66 @@ impl Shell {
         self.my = (my_raw as i32).clamp(0, self.screen_h - 1);
         self.left = left;
 
-        if (self.mx != self.prev_mx || self.my != self.prev_my) && !self.hw_cursor {
+        let moved = self.mx != self.prev_mx || self.my != self.prev_my;
+        if moved && !self.hw_cursor {
             let pad = 20;
             self.mark_dirty(self.prev_mx - pad, self.prev_my - pad, pad * 2, pad * 2);
             self.mark_dirty(self.mx - pad, self.my - pad, pad * 2, pad * 2);
+        }
+
+        // ★★ THE IDLE INPUT TEST. Rewritten 2026-09-08: the desktop never idled on hardware.
+        //
+        // ⚠️ It used to be `if moved || left`, reusing the `moved` above — and `moved` compares
+        // against `prev_mx`/`prev_my`, which are advanced ONCE PER RENDERED FRAME at the foot of the
+        // main loop. That is a *rendering* variable answering an *input* question, and the two want
+        // opposite things: rendering wants to know "has the pointer left the rect I last drew it
+        // in", idle wants "has a person touched this machine". One field cannot be both, and while
+        // the 1 Hz heartbeat usually re-syncs it within a second, nothing guarantees that.
+        //
+        // ⚠️ And a pixel is not a person. This is a Latitude with a trackpoint: a resting palm, or
+        // simple electrical drift, produces a steady dribble of one-pixel motion that the hardware
+        // cursor is far too small to make visible. Any test that treats a single pixel as presence
+        // pins `last_input` to now, forever, and the machine can never idle — which is exactly the
+        // symptom. So presence is a question of SPEED, not distance: sample the pointer once a
+        // second and ask whether it covered real ground. A hand covers hundreds of pixels; drift
+        // covers three.
+        if left {
+            // A button is unambiguous. No threshold, no sampling window.
+            self.last_input = now;
+            self.idle_probe = (self.mx, self.my, now);
+            if was.shows_creature() {
+                self.wake(now);
+            }
+        } else if was.shows_creature() {
+            // Waking is the one interaction where latency is the whole point, so it does not wait
+            // for the sampling window — but it still needs a threshold, or the same drift that
+            // stopped the screen appearing would tear it away again a second later.
+            let d = (self.mx - self.idle_probe.0).abs() + (self.my - self.idle_probe.1).abs();
+            if d >= IDLE_WAKE_PX {
+                self.last_input = now;
+                self.idle_probe = (self.mx, self.my, now);
+                self.wake(now);
+            }
+        } else if now.wrapping_sub(self.idle_probe.2) >= IDLE_PROBE_MS {
+            let d = (self.mx - self.idle_probe.0).abs() + (self.my - self.idle_probe.1).abs();
+            if d >= IDLE_MOVE_PX {
+                self.last_input = now;
+            }
+            // Re-anchored either way. Anchoring only on the trip would let a slow creep drag the
+            // anchor along behind it and read as continuous presence.
+            self.idle_probe = (self.mx, self.my, now);
+        }
+
+        // The lock swallows the pointer as well as the keyboard. Without this a click lands on a
+        // window that is not on screen, which is both a security hole and — because the click would
+        // raise and focus something invisible — an excellent way to make the lock look broken.
+        // ⚠️ `prev_mx`/`prev_my` are advanced once per FRAME at the foot of the main loop, not here
+        // — `process_input` runs at ~500 Hz and would otherwise clear `moved` before the frame that
+        // has to act on it. So this returns without touching them.
+        if self.locked {
+            self.prev_left = self.left;
+            self.cursor = Shape::Pointer;
+            return;
         }
 
         if self.left && !self.prev_left {
@@ -1767,7 +3644,7 @@ impl Shell {
     ///
     /// The Command OWNS the keyboard while it is open — that is what makes typing into it work at
     /// all, since every other key goes straight to the focused app.
-    fn on_key(&mut self, key: char) {
+    fn on_key(&mut self, key: char, now: usize) {
         use nyx_api::keys;
 
         // Capturing a binding owns the keyboard outright — see `Shell::learn`.
@@ -1807,6 +3684,15 @@ impl Shell {
         }
 
         if self.cmd_open {
+            // ★ ANY key disarms a pending power glyph — including Return, unlike the row version
+            // this replaced. The glyphs are pointer-only targets with no keyboard path in, so the
+            // moment attention moves back to the query the arming is stale, and a shutdown that is
+            // still loaded while you are typing a search is a shutdown waiting for a stray click.
+            if self.power_armed.is_some() {
+                self.power_armed = None;
+                self.mark_full();
+                self.needs_redraw = true;
+            }
             match key {
                 '\x1b' => self.set_command(false),
                 '\x08' => {
@@ -1853,6 +3739,15 @@ impl Shell {
             return;
         }
 
+        // The network view owns the keyboard while it is up — a passphrase is being typed, and a
+        // key that leaked past it would land in whatever window was focused before the surface
+        // opened. Tested before the Entity's own Escape so that Escape steps BACK one level rather
+        // than closing the surface outright.
+        if self.ent_open && self.ent_view == EntView::Network {
+            self.net_key(key, now);
+            return;
+        }
+
         if self.ent_open && key == '\x1b' {
             self.set_entity(false);
             return;
@@ -1883,12 +3778,24 @@ impl Shell {
         // because it is drawn last and over everything.
         if self.cmd_open {
             let kinds = self.kinds();
-            if let Some(i) = layout::command_hit(self.screen_w, &kinds, mx, my) {
+            let body = layout::command_body_height(&kinds);
+            // ⚠️ The footer glyphs are tested BEFORE `command_hit`. They sit inside the panel, and
+            // the result list is the thing everything else in here falls through to — so a glyph
+            // tested second is a glyph that never fires.
+            if let Some(i) = layout::cmd_power_hit(self.screen_w, body, mx, my) {
+                if let Some(p) = POWER_ROWS.get(i).copied() {
+                    self.power_press(p);
+                }
+            } else if let Some(i) = layout::command_hit(self.screen_w, &kinds, mx, my) {
+                // Any click that is not on the armed glyph disarms it. A shutdown left loaded while
+                // the pointer wanders the result list is a shutdown one mis-click away.
+                self.power_armed = None;
                 self.run(i);
-            } else if !layout::command_panel(self.screen_w, layout::command_body_height(&kinds))
-                .contains(mx, my)
-            {
+            } else if !layout::command_panel(self.screen_w, body).contains(mx, my) {
                 self.set_command(false);
+            } else {
+                self.power_armed = None;
+                self.mark_full();
             }
             return;
         }
@@ -1900,17 +3807,25 @@ impl Shell {
             self.set_entity(open);
             return;
         }
+        if self.ent_open && self.ent_view == EntView::Network {
+            let (l, _) = self.net_geometry();
+            if l.surface.contains(mx, my) {
+                self.net_press(mx, my, now);
+            } else {
+                self.set_entity(false);
+            }
+            return;
+        }
         if self.ent_open {
             let l = self.entity_geometry();
             if let Some(row) = l.control_hit(mx, my) {
-                // Network opens the Wi-Fi app; Brightness is a control in its own right. Power now
-                // reports real EC data but has nowhere to lead — there is no power-settings surface
-                // yet — and Volume has no driver at all.
-                if row == 0 {
-                    if let Some(i) = APPS.iter().position(|a| a.label == "Wi-Fi") {
-                        self.set_entity(false);
-                        launch(&APPS[i]);
-                    }
+                // Network drills into the network view — step 20, and the reason `apps/wifi` could
+                // finally be deleted. Brightness is a control in its own right. Power is a READOUT
+                // and stays one: the verbs that END a session live in the Command's footer, where
+                // the Super key reaches them, not on the surface that reports what the machine IS.
+                // Volume has no driver at all.
+                if row == ENT_NETWORK_ROW {
+                    self.enter_network();
                 } else if row == ENT_BRIGHT_ROW && self.bright_pct.is_some() {
                     // Anywhere in the row, not just on the 2px track — a 2px hit target is a dare.
                     // The track shows the level; the whole row sets it.
@@ -1989,28 +3904,27 @@ impl Shell {
                 continue; // nothing else of a folded window is on screen
             }
 
+            // ★ The scrollbar is tested BEFORE the resize edge, and the order is the whole reason
+            // the bar can sit against the wall instead of floating ~14px inside it. `scrollbar_hit`
+            // declines when there is nothing to scroll and reserves both corners, so the resizer
+            // keeps everything it actually needs — see that function. Draw and hit-test go through
+            // the same geometry, so the column that lights up is the column that grabs.
+            let (content_h, _) = client_scroll(&self.clients[idx]);
+            if layout::scrollbar_hit(w_r, content_h as i32, w_r.h, mx, my) {
+                self.scrolling = Some(idx);
+                let target = layout::scroll_from_mouse(w_r, content_h as i32, w_r.h, my);
+                sys_ipc_send(self.clients[idx].owner_pid, MSG_SCROLL, target as u64, 0);
+                self.mark_win(w_r);
+                clicked = Some(idx);
+                break;
+            }
+
             let e = resize_edges(&self.clients[idx].win, mx, my);
             if e != 0 {
                 self.resizing = Some(idx);
                 self.resize_edges = e;
                 clicked = Some(idx);
                 break;
-            }
-
-            // The scrollbar the apps still expect. Un-Meridian-ised on purpose: it belongs to the
-            // app's interior, and the interiors are ported in steps 10-16 of the build order.
-            let (content_h, _) = client_scroll(&self.clients[idx]);
-            if content_h > w_r.h as usize {
-                let bar_x = w_r.right() - SCROLLBAR_W as i32;
-                if mx >= bar_x && mx <= w_r.right() && my >= w_r.y && my <= w_r.bottom() {
-                    self.scrolling = Some(idx);
-                    let target =
-                        mouse_to_scroll(my as usize, w_r.y as usize, w_r.h as usize, content_h);
-                    sys_ipc_send(self.clients[idx].owner_pid, MSG_SCROLL, target as u64, 0);
-                    self.mark_win(w_r);
-                    clicked = Some(idx);
-                    break;
-                }
             }
 
             if w_r.contains(mx, my) {
@@ -2110,8 +4024,7 @@ impl Shell {
                 let r = self.clients[idx].win.r;
                 let (content_h, _) = client_scroll(&self.clients[idx]);
                 if content_h > r.h as usize {
-                    let target =
-                        mouse_to_scroll(self.my as usize, r.y as usize, r.h as usize, content_h);
+                    let target = layout::scroll_from_mouse(r, content_h as i32, r.h, self.my);
                     sys_ipc_send(self.clients[idx].owner_pid, MSG_SCROLL, target as u64, 0);
                     self.mark_win(r);
                 }
@@ -2143,11 +4056,38 @@ impl Shell {
             } else {
                 Shape::Pointer
             }
+        } else if self.ent_open {
+            // The Entity takes the pointer entirely, exactly as the Command does. Without this the
+            // resize arrows of a window UNDERNEATH the surface show through it — and the click that
+            // follows lands on the surface, so the cursor was promising something the click would
+            // not do. The network view's passphrase field is the one region here with an editable
+            // shape of its own.
+            let text = self.ent_view == EntView::Network
+                && self
+                    .net_geometry()
+                    .0
+                    .psk_field()
+                    .map_or(false, |f| f.contains(self.mx, self.my));
+            if text {
+                Shape::Text
+            } else {
+                Shape::Pointer
+            }
         } else {
             let mut c = Shape::Pointer;
             for client in self.clients.iter().rev() {
                 if !client.win.exists {
                     continue;
+                }
+                // Same order as the click path above, and it has to be: the cursor is the promise
+                // the click keeps. Showing a resize arrow over a column that scrolls was the
+                // original complaint, and it comes straight back if these two disagree.
+                let (content_h, _) = client_scroll(client);
+                let w_r = client.win.r;
+                if !client.win.folded
+                    && layout::scrollbar_hit(w_r, content_h as i32, w_r.h, self.mx, self.my)
+                {
+                    break; // Shape::Pointer — the bar is not a resize affordance
                 }
                 let e = resize_edges(&client.win, self.mx, self.my);
                 if e != 0 {
@@ -2251,10 +4191,31 @@ impl Shell {
         // The two modal surfaces take the pointer entirely; nothing behind them can be hovered.
         if self.cmd_open {
             let kinds = self.kinds();
-            let new = layout::command_hit(self.screen_w, &kinds, self.mx, self.my);
-            if new != self.cmd_hover {
+            let body = layout::command_body_height(&kinds);
+            let glyph = layout::cmd_power_hit(self.screen_w, body, self.mx, self.my);
+            // A pointer on a power glyph is NOT also on a result row — same reason the press path
+            // tests the glyphs first.
+            let new = if glyph.is_some() {
+                None
+            } else {
+                layout::command_hit(self.screen_w, &kinds, self.mx, self.my)
+            };
+            if new != self.cmd_hover || glyph != self.power_hover {
                 self.cmd_hover = new;
+                self.power_hover = glyph;
                 self.mark_command();
+            }
+            return;
+        }
+        if self.ent_open && self.ent_view == EntView::Network {
+            let new = self.net_hit(self.mx, self.my);
+            if new != self.net.hover {
+                self.net.hover = new;
+                // The whole SURFACE, not the whole screen and not just the row: a hover moves a
+                // plate off one row and onto another, and the action words underline in a different
+                // section entirely. `mark_entity` now covers whichever view is up.
+                self.mark_entity();
+                self.needs_redraw = true;
             }
             return;
         }
@@ -2690,6 +4651,9 @@ pub extern "C" fn _start() -> ! {
 
     let mut last_frame = sys_get_time();
     let ms_per_frame = 1000 / 60;
+    // Start the idle clock now rather than at zero. `sys_get_time` is uptime and the shell starts
+    // some seconds into it, so a zero would hand the desktop 90 seconds of credit it never earned.
+    state.last_input = last_frame;
 
     sys_print("[SHELL] Meridian online.\n");
 
@@ -2699,6 +4663,53 @@ pub extern "C" fn _start() -> ! {
         state.process_input(now);
         state.update();
         state.tick_osd(now);
+        state.tick_idle(now);
+        // The network view's own beat — 2.5 Hz, and only while it is open. It reads the published
+        // Wi-Fi snapshot, which never touches the driver lock, and notices when the agent process
+        // holding the radio has exited. See `Shell::tick_network`.
+        state.tick_network(now);
+
+        // The idle screen animates, so it needs frames — but not sixty of them. The creature moves
+        // when the drift ticks a pixel (about once every six seconds), when the float steps (a few
+        // times a second) or when the lid drops (twice per blink cycle). Redrawing on a change of
+        // that key rather than unconditionally is the difference between a screensaver that costs a
+        // few frames a second and one that pins the GPU all night on a laptop with a thermal
+        // history.
+        //
+        // ⚠️ This does NOT stop the 1 Hz heartbeat, and must not be "optimised" into doing so — see
+        // the note on that block below. The design's *"the framebuffer stops being redrawn except
+        // for the drift"* is deliberately not implemented: letting the render engine idle into RC6
+        // loses MOCS and forcewake, and the first composite after waking hangs in `wait_for_idle`
+        // while the hardware cursor keeps moving. Indistinguishable from a freeze, and it would only
+        // ever be found on hardware after a fifteen-minute wait.
+        // ⚠️ `locked` is in this condition as well as the phase. The lock screen shows the same
+        // creature and the same float, but `phase` is Active while someone is standing there typing
+        // — so keying off the phase alone would animate it at the 1 Hz heartbeat and the breath
+        // would read as a stutter.
+        if state.phase.shows_creature() || state.locked {
+            let key = state.idle_anim_key(now);
+            if key != state.idle_key {
+                state.idle_key = key;
+                state.needs_redraw = true;
+                state.mark_full();
+            }
+        }
+
+        // ★ The recede needs FRAMES. `chrome_alpha` steps over 20 of them once past 90 s, and
+        // between the 1 Hz heartbeat and the pointer standing still there is nothing else asking for
+        // a repaint at that moment — so without this the dock would fade in twenty one-second jumps
+        // instead of a third of a second, which reads as the desktop glitching rather than settling.
+        //
+        // Only while it is actually moving: the alpha is constant at 255 before 90 s and at 0 after
+        // the ramp, so this asks for nothing at all except during the ramp itself.
+        {
+            let a = idle::chrome_alpha(state.idle_ms(now));
+            if a != state.chrome_key {
+                state.chrome_key = a;
+                state.needs_redraw = true;
+                state.mark_dock();
+            }
+        }
 
         // Cold start, stage 3. Runs for 22 frames on the first second of the machine's life and
         // then never again — so it simply forces a full frame while it runs, rather than scissoring
@@ -2721,6 +4732,11 @@ pub extern "C" fn _start() -> ! {
             // load, the link, the clock — changes on human timescales, and this frame is being
             // fully recomposited regardless.
             state.refresh_vitals(atlas.as_ref());
+            // The Entity ages on the same beat. `tick` is cheap when nothing is due — it compares
+            // whole hours of uptime against a counter — and it is the only thing that ever writes
+            // `entity.bin`, so a birth that failed to persist gets retried here every second until
+            // it lands rather than silently striking a new seed on the next boot.
+            state.creature.tick(now);
             state.needs_redraw = true;
         }
 
@@ -2930,18 +4946,40 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
                 if focused { theme.line_2 } else { theme.line },
             );
 
+            // The scrollbar, in Meridian's idiom rather than `nyx_gui`'s 12px flush widget — see
+            // `layout::scrollbar_track`. No container: a hairline track and a rounded thumb, inset
+            // so it is a mark ON the surface instead of something stuck to its edge, and so it
+            // clears the resize band that would otherwise steal two thirds of it.
             let (content_h, scroll_off) = client_scroll(&state.clients[i]);
-            if content_h > r.h as usize {
-                draw_scrollbar(
-                    &mut canvas,
-                    (r.right() - SCROLLBAR_W as i32).max(0) as usize,
-                    r.y.max(0) as usize,
-                    SCROLLBAR_W,
-                    r.h as usize,
-                    content_h,
-                    r.h as usize,
-                    scroll_off,
-                );
+            let track = layout::scrollbar_track(r);
+            if let Some(thumb) =
+                layout::scrollbar_thumb(track, content_h as i32, r.h, scroll_off as i32)
+            {
+                if track.w > 0 && track.h > 0 && track.x >= 0 && track.y >= 0 {
+                    let radius = (track.w / 2).max(1) as usize;
+                    shapes::fill_round_rect(
+                        &mut canvas,
+                        track.x as usize,
+                        track.y as usize,
+                        track.w as usize,
+                        track.h as usize,
+                        radius,
+                        theme.line,
+                    );
+                    // The thumb lifts a tier while it is being dragged. On a long list a drag moves
+                    // the content by a few pixels, which is not obviously a response; this is what
+                    // says the grab was picked up.
+                    let live = state.scrolling == Some(i);
+                    shapes::fill_round_rect(
+                        &mut canvas,
+                        thumb.x.max(0) as usize,
+                        thumb.y.max(0) as usize,
+                        thumb.w as usize,
+                        thumb.h as usize,
+                        radius,
+                        if live { theme.fg_3 } else { theme.fg_4 },
+                    );
+                }
             }
         } else {
             // A folded window is a caption line over a hairline, with a 3px accent tick. Zero quads.
@@ -2965,13 +5003,68 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
         // The caption. Its name sits OUTSIDE the surface — this is the single most visible thing
         // about Meridian, and it is why a window needs no title bar at all.
         let cap = layout::caption(r);
+        let name = String::from(state.clients[i].win.name());
+        let cap_y = centre_text_y(cap.y, cap.h, tokens::CAPTION);
+        let mut pen = cap.x + layout::caption_pad_x();
         labels.push(Label {
-            x: cap.x + layout::caption_pad_x(),
-            y: centre_text_y(cap.y, cap.h, tokens::CAPTION),
+            x: pen,
+            y: cap_y,
             style: tokens::CAPTION,
-            text: String::from(state.clients[i].win.name()),
+            text: name.clone(),
             color: if focused { theme.fg } else { theme.fg_3 },
         });
+        pen += measure(atlas, tokens::CAPTION, &name);
+
+        // `.w-cap .sep` then `.w-cap .ctx` — the window's own context, read live from its header.
+        // An app that sets none gets neither, not even the separator: the dot is punctuation between
+        // two runs, and a dot with nothing after it reads as a rendering fault.
+        let (ctx, dirty) = client_context(&state.clients[i]);
+        // The caption line is shared with the two window controls, which are right-aligned on it and
+        // appear on hover. A context long enough to reach them would be drawn straight through
+        // FOLD and CLOSE — so the run is ellipsized to stop short of the first one, with room left
+        // for the unsaved tick that may follow it.
+        let ctl_left = layout::control(r, 0).map(|b| b.x).unwrap_or(cap.right() - layout::caption_pad_x());
+        let ctx_budget = ctl_left
+            - layout::caption_gap()
+            - if dirty { layout::fold_tick() + layout::caption_gap() } else { 0 }
+            - (pen + layout::caption_gap() + layout::caption_sep() + layout::caption_gap());
+        let ctx = &fit(atlas, tokens::B3, ctx, ctx_budget);
+        if !ctx.is_empty() {
+            let d = layout::caption_sep();
+            pen += layout::caption_gap();
+            // Drawn CPU-side rather than as a quad: it is two pixels, and it is not a glyph.
+            shapes::fill_round_rect(
+                &mut canvas,
+                pen.max(0) as usize,
+                (cap_y + tokens::CAPTION.line() as i32 / 2 - d / 2).max(0) as usize,
+                d as usize,
+                d as usize,
+                (d / 2).max(1) as usize,
+                theme.fg_4,
+            );
+            pen += d + layout::caption_gap();
+            labels.push(Label {
+                x: pen,
+                y: cap_y,
+                style: tokens::B3,
+                text: String::from(ctx),
+                color: if focused { theme.fg_3 } else { theme.fg_4 },
+            });
+            pen += measure(atlas, tokens::B3, ctx);
+        }
+
+        // Unsaved: the SAME 3px accent tick a folded window carries. One appearance in the system
+        // for "there is something here you have not dealt with", which is the design's own ask.
+        if dirty {
+            pen += layout::caption_gap();
+            canvas.fill_rect(
+                pen.max(0) as usize,
+                (cap_y + tokens::CAPTION.line() as i32 / 2).max(0) as usize,
+                layout::fold_tick() as usize,
+                1,
+                theme.accent,
+            );
+        }
 
         // Controls appear only on hover or focus, and they FADE — `opacity 0→1` over 5 frames.
         // There are two: FOLD and CLOSE. Maximise is a double-click on the caption and gets no
@@ -3036,14 +5129,32 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
         }
     }
 
+    // ★★ THE RECEDE, Meridian step 19 — *"after 90 s the dock and the Entity mark fade out; windows
+    //    stay untouched, nothing has been hidden."*
+    //
+    // ⚠️ This was SPECIFIED, host-tested in `idle::chrome_alpha`, and then never wired to anything.
+    // `chrome_alpha` had no caller at all, so `Phase::Receded` was a state the machine entered and
+    // did nothing about — which is why leaving the desktop alone appeared to do nothing at 90 s even
+    // when the clock underneath was running perfectly.
+    //
+    // ⚠️ It fades by COLOUR, not by alpha, and it has to. The batched glyph shader carries one
+    // luminance per quad and discards the requested alpha (see `fade_to`), so an alpha ramp on these
+    // labels would be a no-op that looked like the recede failing again. Lerping toward the ground
+    // is a luminance change, which is exactly what that shader can express.
+    let chrome_a = idle::chrome_alpha(state.idle_ms(sys_get_time())) as u32;
+    let ground = theme.void;
+
     // 6. The dock: eight glyphs resting on the wallpaper. No container — not a pill, not a bar.
-    for slot in 0..layout::DOCK_SLOTS {
+    //    Skipped outright once fully receded: at alpha 0 every glyph would be exactly the ground
+    //    colour, so this is the same picture for less work.
+    for slot in 0..if chrome_a > 0 { layout::DOCK_SLOTS } else { 0 } {
         let s = match layout::dock_slot(state.screen_h, slot) {
             Some(s) => s,
             None => continue,
         };
         if layout::is_divider(slot) {
-            shapes::hairline_v(&mut canvas, s.x as usize, s.y as usize, s.h as usize, theme.line);
+            shapes::hairline_v(&mut canvas, s.x as usize, s.y as usize, s.h as usize,
+                               fade_to(theme.line, ground, chrome_a));
             continue;
         }
         let app = match DOCK[slot] {
@@ -3057,13 +5168,17 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
             px: layout::dock_icon() as usize,
             x: s.x,
             y: s.y,
-            color: if is_active {
-                theme.fg
-            } else if hovered || running {
-                theme.fg_2
-            } else {
-                theme.fg_4
-            },
+            color: fade_to(
+                if is_active {
+                    theme.fg
+                } else if hovered || running {
+                    theme.fg_2
+                } else {
+                    theme.fg_4
+                },
+                ground,
+                chrome_a,
+            ),
         });
         // The running dot. Accent-tinted when active, so it is a CPU `fill_rect` and not a glyph —
         // the batched text shader carries one luminance and would render the accent as grey.
@@ -3074,7 +5189,10 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
                     d.y as usize,
                     d.w as usize,
                     d.h as usize,
-                    if is_active { theme.accent } else { theme.fg_4 },
+                    // The running dot IS a `fill_rect`, so unlike the glyphs it can carry a real
+                    // alpha — but it is faded the same way as everything else beside it, or the
+                    // accent dot would be the one thing left burning on a receded dock.
+                    fade_to(if is_active { theme.accent } else { theme.fg_4 }, ground, chrome_a),
                 );
             }
         }
@@ -3082,27 +5200,40 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
 
     // 7. The Entity: one 22px mark and a two-word phrase at bottom-right. This is the entire
     //    permanent chrome on that side of the screen — there is no tray, because this IS the tray.
-    let v = &state.vitals;
+    // Copied out rather than held as a borrow of `state`: since step 20 the surface below may be
+    // drawn by `net_paint`, which needs `&mut Shell` to cache where it put its action words. Both
+    // are `Copy`, so this costs nothing and keeps the borrow out of the way.
+    let phrase = state.vitals.phrase;
+    let mood = state.vitals.mood;
     let mark = layout::entity_mark(state.screen_w, state.screen_h);
-    {
-        let pw = measure(atlas, tokens::B3, v.phrase);
+    // Faded on the same ramp as the dock. The mark is the other half of the permanent chrome, and
+    // the design fades them together — one of the two staying lit would read as a notification.
+    if chrome_a > 0 {
+        let pw = measure(atlas, tokens::B3, phrase);
         let p = layout::entity_phrase(state.screen_w, state.screen_h, pw);
         labels.push(Label {
             x: p.x,
             y: centre_text_y(p.y, p.h, tokens::B3),
             style: tokens::B3,
-            text: String::from(v.phrase),
-            color: if v.mood == Mood::Attention { theme.fg_2 } else { theme.fg_3 },
+            text: String::from(phrase),
+            color: fade_to(
+                if mood == Mood::Attention { theme.fg_2 } else { theme.fg_3 },
+                ground,
+                chrome_a,
+            ),
         });
     }
-    if v.mood == Mood::Attention {
+    if chrome_a == 0 {
+        // Fully receded: no mark at all. Falling through would draw it at full strength, because
+        // the attention branch below blends CPU-side and the normal branch pushes a glyph.
+    } else if mood == Mood::Attention {
         // ★ THE ONE DOCUMENTED EXCEPTION. In the attention state the mark is accent-tinted, and a
         // tinted glyph cannot ride the batched text path: `build_ps_text` interpolates a single
         // luminance across the quad, so that shader is greyscale-only and the accent would arrive as
         // grey. So this one mark leaves the fast path and is blended CPU-side — a single 22px glyph
         // per frame, against a budget of about a million pixels. Every other accent in Meridian is a
         // `fill_rect` (the caret, the running dot, the selection bar) and is unaffected.
-        if let Some(ic) = icons::get(v.mood.glyph(), layout::entity_mark_px() as usize) {
+        if let Some(ic) = icons::get(mood.glyph(), layout::entity_mark_px() as usize) {
             let px: Vec<u32> = ic.cov.iter().map(|&c| (c as u32) << 24).collect();
             canvas.blit_rgba(
                 (mark.x + ic.off_x as i32).max(0) as usize,
@@ -3110,22 +5241,29 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
                 &px,
                 ic.w as usize,
                 ic.h as usize,
-                Some(theme.accent),
+                Some(fade_to(theme.accent, ground, chrome_a)),
             );
         }
     } else {
         icons_out.push(IconDraw {
-            id: v.mood.glyph(),
+            id: mood.glyph(),
             px: layout::entity_mark_px() as usize,
             x: mark.x,
             y: mark.y,
-            color: theme.fg_3,
+            color: fade_to(theme.fg_3, ground, chrome_a),
         });
     }
 
     // 7b. The Entity surface, when disclosed: a statement, then measurements separated by hairlines
     //     and space. Not a card grid.
-    if state.ent_open {
+    //
+    //     ★ Step 20 gave the surface a SECOND view. `EntView::Network` replaces everything below in
+    //     place — same rect, same width, same bottom edge — rather than opening a window, because
+    //     *"nothing in Meridian opens a settings window to answer a question."*
+    if state.ent_open && state.ent_view == EntView::Network {
+        net_paint(state, &mut canvas, atlas, &mut labels, &mut icons_out, theme);
+    } else if state.ent_open {
+        let v = &state.vitals;
         let l = state.entity_geometry();
         shapes::drop_shadow(&mut canvas, l.surface.x, l.surface.y, l.surface.w, l.surface.h,
                             layout::surface_radius(), &[]);
@@ -3138,6 +5276,54 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
         for y in l.rules() {
             shapes::hairline_h(&mut canvas, l.surface.x as usize, y.max(0) as usize,
                                l.surface.w as usize, theme.line);
+        }
+
+        // ── The creature block, step 18 ──────────────────────────────────────────────────────────
+        //
+        // `.ent-cr { background: var(--sunken) }` in BOTH themes — the design says so explicitly,
+        // and it is the same device the terminal and the code pane use to say *this region is
+        // content, not chrome*. It sits at the very top of the surface, so its own corners have to
+        // be carved to the surface's radius or it draws square shoulders over the rounded panel.
+        if l.creature.h > 0 {
+            canvas.fill_rect(
+                l.creature.x.max(0) as usize, l.creature.y.max(0) as usize,
+                l.creature.w as usize, l.creature.h as usize, theme.sunken,
+            );
+            shapes::carve_round_corners(
+                &mut canvas, l.surface.x.max(0) as usize, l.surface.y.max(0) as usize,
+                l.surface.w as usize, l.creature.h as usize * 2,
+                layout::surface_radius(), |_, _| theme.chrome,
+            );
+            let rule = l.creature_rule();
+            shapes::hairline_h(&mut canvas, rule.x as usize, rule.y.max(0) as usize,
+                               rule.w as usize, theme.line);
+
+            if !state.creature.sprite.is_empty() {
+                let b = l.creature_box();
+                canvas.composite_buffer(
+                    b.x.max(0) as usize, b.y.max(0) as usize,
+                    &state.creature.sprite, b.w as usize, b.h as usize, 255,
+                );
+            }
+
+            let (tx, ty) = l.creature_tag();
+            labels.push(Label {
+                x: tx, y: ty, style: tokens::LB,
+                text: String::from("Nyx Entity"), color: theme.fg_4,
+            });
+            // "● ONLINE". The pip is the accent, and it is the truth: the Entity is a library this
+            // process calls, so if this surface is drawing at all the Entity is running.
+            let live = "Online";
+            let lw = measure(atlas, tokens::LB, live);
+            let (pip, text_x, top) = l.creature_live(lw, tokens::LB.line() as i32);
+            shapes::fill_round_rect(
+                &mut canvas, pip.x.max(0) as usize, pip.y.max(0) as usize,
+                pip.w as usize, pip.h as usize, (pip.w / 2).max(1) as usize, theme.accent,
+            );
+            labels.push(Label {
+                x: text_x, y: top, style: tokens::LB,
+                text: String::from(live), color: theme.fg_3,
+            });
         }
 
         labels.push(Label {
@@ -3183,6 +5369,39 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
                 x: row.right() - vw,
                 y: centre_text_y(row.y, row.h, tokens::B2),
                 style: tokens::B2,
+                text: val.clone(),
+                color: theme.fg,
+            });
+        }
+
+        // The identity rows — *"three facts and no statistics."* Seed, stage, traits. No experience
+        // bar, no percentage to the next stage, nothing to optimise; the design is explicit that
+        // there is nothing here to grind at. Same row treatment as the measurements above them,
+        // because both are the machine telling you something. See `layout`'s note for why they are
+        // not the design's taller stacked form.
+        let identity: [(&str, String); layout::ENT_IDENTITY_ROWS] = [
+            ("Entity", state.creature.seed_text()),
+            ("Evolution", state.creature.stage_text()),
+            ("Traits", state.creature.traits_text()),
+        ];
+        for (i, (k, val)) in identity.iter().enumerate() {
+            let Some(row) = l.identity_row(i) else { continue };
+            labels.push(Label {
+                x: row.x,
+                y: centre_text_y(row.y, row.h, tokens::B3),
+                style: tokens::B3,
+                text: String::from(*k),
+                color: theme.fg_3,
+            });
+            // The seed is set in MONO. It is a hex identifier, not a word — and it is the one string
+            // in the system a person might read aloud or type back in, which is what tabular figures
+            // and unambiguous glyphs are for.
+            let style = if i == 0 { tokens::MONO } else { tokens::B2 };
+            let vw = measure(atlas, style, val);
+            labels.push(Label {
+                x: row.right() - vw,
+                y: centre_text_y(row.y, row.h, style),
+                style,
                 text: val.clone(),
                 color: theme.fg,
             });
@@ -3299,11 +5518,15 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
             text: clock,
             color: theme.fg_2,
         });
+        // ⚠️ This slot held the calendar date until step 18. The design gives it to the Entity's age
+        // instead — "the footer carries the one number that means anything, how long this Entity has
+        // existed" — so the date is now shown nowhere in Meridian. That is the design's call and not
+        // an oversight; the clock beside it is still the only clock there is.
         labels.push(Label {
             x: l.footer.x + cw + 10,
             y: l.footer.y + layout::ent_f_pad_top(),
             style: tokens::B3,
-            text: v.date(),
+            text: state.creature.born_text(),
             color: theme.fg_3,
         });
     }
@@ -3323,7 +5546,11 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
         }
 
         let kinds = state.kinds();
-        let panel = layout::command_panel(state.screen_w, layout::command_body_height(&kinds));
+        // Kept as its own binding rather than inlined: every `layout::cmd_power_*` call below takes
+        // the same body height, and two of them computing it differently is how a glyph ends up
+        // drawn in one place and hit-tested in another.
+        let body = layout::command_body_height(&kinds);
+        let panel = layout::command_panel(state.screen_w, body);
         shapes::drop_shadow(&mut canvas, panel.x, panel.y, panel.w, panel.h,
                             layout::surface_radius(), &[]);
         shapes::fill_round_rect(&mut canvas, panel.x.max(0) as usize, panel.y.max(0) as usize,
@@ -3473,15 +5700,78 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
             });
             fx += measure(atlas, tokens::HINT, what) + 22;
         }
+        // ★ Shut down and Restart, as two bare glyphs in the right-hand corner. Icon only: this is
+        // the footer, everything else in it is a hint rather than a control, and a labelled button
+        // here would read as the most important thing in the Command — which is a list of things to
+        // open, not a list of ways to stop.
+        //
+        // ⚠️ Draw and hit-test BOTH go through `layout::cmd_power_slot`. The one bug this shape is
+        // prone to is a target that has drifted off what it looks like, and a glyph you can miss by
+        // three pixels is bad here in a way it is not for a dock icon.
+        for (i, p) in POWER_ROWS.iter().enumerate() {
+            let (Some(slot), Some(g)) = (
+                layout::cmd_power_slot(state.screen_w, body, i),
+                layout::cmd_power_glyph(state.screen_w, body, i),
+            ) else {
+                continue;
+            };
+            let armed = state.power_armed == Some(*p);
+            let hot = state.power_hover == Some(i);
+            if armed || hot {
+                // The armed ground is the accent, not a red: Meridian has no danger colour, and
+                // inventing one for two glyphs would be the only red on the whole system.
+                let ground = if armed { theme.acc_dim } else { theme.wash };
+                shapes::fill_round_rect(
+                    &mut canvas,
+                    slot.x.max(0) as usize,
+                    slot.y.max(0) as usize,
+                    slot.w as usize,
+                    (slot.h - 8).max(1) as usize,
+                    6,
+                    ground,
+                );
+            }
+            icons_out.push(IconDraw {
+                id: match p {
+                    // ⚠️ NOT `Icons::POWER` — that is the Entity's BATTERY gauge, and shipping it
+                    // here read on screen as "why is the shutdown icon a battery?".
+                    Power::Off => Icons::SHUTDOWN,
+                    Power::Restart => Icons::RELOAD,
+                },
+                px: layout::cmd_power_icon() as usize,
+                x: g.x,
+                y: g.y,
+                color: if armed {
+                    theme.accent
+                } else if hot {
+                    theme.fg_2
+                } else {
+                    theme.fg_4
+                },
+            });
+        }
+
+        // The count, or — once a power glyph is armed — what that glyph is about to do. Meridian
+        // has no dialogs, so this line IS the confirmation prompt: it is the only place the machine
+        // can say "shut down" in words before it does it.
         let shown = state.hits.iter().filter(|h| h.kind == CmdEntry::Row).count();
-        let count = alloc::format!("{} of {} results", shown, state.hits_total);
+        let (count, tone) = match state.power_armed {
+            Some(p) => (String::from(p.armed_label()), theme.accent),
+            None => (
+                alloc::format!("{} of {} results", shown, state.hits_total),
+                theme.fg_4,
+            ),
+        };
         let cw = measure(atlas, tokens::HINT, &count);
         labels.push(Label {
-            x: panel.right() - layout::cmd_q_pad_x() - cw,
+            // ⚠️ Stops at `cmd_footer_text_right`, not at the panel edge. This text is right-aligned
+            // and grows leftward from wherever its right edge is, so anchoring it to the panel would
+            // run it straight under the glyphs above.
+            x: layout::cmd_footer_text_right(state.screen_w, body) - cw,
             y: centre_text_y(f_y, layout::cmd_footer_h(), tokens::HINT),
             style: tokens::HINT,
             text: count,
-            color: theme.fg_4,
+            color: tone,
         });
     }
 
@@ -3509,6 +5799,10 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
     // Drawn after the batched text so it sits on top of the Entity mark it is dissolving into, and
     // before the cursor, which is on top of everything always.
     handoff_paint(state, &mut canvas, theme);
+
+    // 8c. Idle, sleep and the lock. Over everything, because that is what they are — the desktop is
+    //     still there and still running underneath, it is simply not being shown.
+    idle_paint(state, &mut canvas, atlas, sys_get_time());
 
     // The software fallback draws the SAME bitmap the plane would have shown, so a machine whose
     // cursor plane refused to come up looks like Meridian rather than like an older system.

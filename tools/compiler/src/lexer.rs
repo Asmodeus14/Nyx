@@ -206,6 +206,27 @@ pub fn tokenize(source: &str) -> Vec<(Token, usize, usize)> {
     tokens
 }
 
+/// True if `word` is a reserved word of the language rather than an identifier.
+///
+/// Asked of the **lexer itself** rather than answered from a second list. `logos` already decides
+/// this for every token it produces: a word it classifies as anything other than [`Token::Ident`] is
+/// by definition reserved. So a keyword added to the token enum is highlighted from the moment it
+/// exists, and a list that drifts out of step with the grammar cannot happen — which is the usual
+/// failure of hand-maintained editor keyword tables.
+pub fn is_keyword(word: &str) -> bool {
+    if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let mut lex = Token::lexer(word);
+    let first = lex.next();
+    // One token, and not an identifier or a literal.
+    lex.next().is_none()
+        && matches!(first, Some(Ok(ref t)) if !matches!(
+            t,
+            Token::Ident(_) | Token::IntLiteral(_) | Token::FloatLiteral(_) | Token::StringLiteral(_)
+        ))
+}
+
 pub fn is_gate_name(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),

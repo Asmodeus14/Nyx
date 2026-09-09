@@ -1,0 +1,8 @@
+[package]
+name = "nyx-crypto"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies, deliberately. Everything here was already in the tree and already running on
+# every Wi-Fi connect; lifting it must not introduce a supply chain that the kernel then links.
+[dependencies]

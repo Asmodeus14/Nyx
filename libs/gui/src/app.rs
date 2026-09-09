@@ -47,6 +47,29 @@ pub trait NyxApp {
     /// Scrollbar: the compositor moved the bar to `new_offset` (px, already clamped to the track). Apply
     /// it to the app's scroll state and return true to trigger a redraw. Default: ignore.
     fn on_scroll(&mut self, _new_offset: usize) -> bool { false }
+
+    /// The dimmer run the window server draws after this window's name on the caption line —
+    /// `.w-cap .ctx`. Empty (the default) draws nothing, not even the separator dot.
+    ///
+    /// Re-read **every frame**, so it is the right place for anything that changes: a file name, a
+    /// word count, a document's dimensions. The design's argument for the caption model is that a
+    /// window should not spend a strip of its own surface saying what it is looking at.
+    ///
+    /// Truncated to 64 bytes on a **character boundary** — a cut through a codepoint would hand the
+    /// shell invalid UTF-8, and `Win::name()`-style decoding would then silently render nothing.
+    fn context(&self) -> &str { "" }
+
+    /// True when this window has changes the user has not saved. Drawn as the 3px accent tick a
+    /// folded window uses. Default false, so nothing changes for an app that has no such state.
+    fn is_dirty(&self) -> bool { false }
+
+    /// The shell's theme is now dark (`true`) or light (`false`). Return true to redraw.
+    ///
+    /// Delivered once just after the window is created and again whenever the theme changes, so an
+    /// app that stores the flag and picks `Theme::dark()`/`Theme::light()` in `draw` is always in
+    /// step with the desktop. Default `false` — an app that ignores this keeps whatever it hardcoded,
+    /// which is exactly how every app behaved before the message existed.
+    fn on_theme(&mut self, _dark: bool) -> bool { false }
 }
 
 pub fn run<T: NyxApp>(mut app: T) -> ! {
@@ -88,7 +111,29 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
     }
 
     let mut pixels_ptr = unsafe { buffer_ptr.add(core::mem::size_of::<WindowHeader>()) } as *mut u32;
-    
+
+    // ── Back buffer ──────────────────────────────────────────────────────────────────────────────
+    // `app.draw` used to paint straight into the SHM the compositor samples, and a ported interior's
+    // first act is to clear the whole surface. Nothing fences the two processes, so any frame the
+    // compositor happened to sample mid-paint showed a flat empty plate with the content growing back
+    // into it. On a static app that race is nearly unhittable — it repaints once and then sits still.
+    // While SCROLLING the app repaints every tick, so it fires continuously and reads as the window
+    // repainting itself.
+    //
+    // So paint into a private buffer and blit the finished frame across. Note what this is NOT: there
+    // is still no fence, and the compositor can still sample mid-blit. What changes is what a torn
+    // frame *looks* like — the SHM now only ever holds a complete frame, or a seam between two
+    // complete frames, instead of a half-drawn one — and the exposure window shrinks from the whole
+    // paint (hundreds of rects and glyphs) to one linear copy.
+    //
+    // A second SHM rather than `sys_alloc_pages` because pages cannot be handed back and a resize drag
+    // reallocates on every step. This block is never advertised to the compositor, so it is always
+    // single-owner: `sys_destroy_shm` is safe the moment we are done with it, with no ACK to wait for.
+    // If the allocation fails we fall back to painting into the SHM directly — tearing beats a window
+    // that never opens.
+    let mut back_id = sys_create_shm(width * height * 4);
+    let mut back_ptr = if back_id != 0 { sys_map_shm(back_id) as *mut u32 } else { core::ptr::null_mut() };
+
     app.init();
 
     let mut needs_redraw = true;
@@ -115,6 +160,7 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
         // separate `Option`s would lose the ordering and strand the highlight on.
         //   Some(Some(pos)) = the pointer is here      Some(None) = it left      None = no news
         let mut pending_hover: Option<Option<(usize, usize)>> = None;
+        let mut pending_theme: Option<bool> = None;
         while sys_ipc_recv(&mut msg, false) {
             match msg.msg_type {
                 MSG_WINDOW_CLOSE => sys_exit(0),
@@ -140,6 +186,11 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
                     // Compositor moved our scrollbar → apply the new offset (data1) to scroll state.
                     event_redraw |= app.on_scroll(msg.data1 as usize);
                 },
+                MSG_THEME_CHANGED => {
+                    // Coalesced by keeping only the latest: a rapid toggle would otherwise repaint
+                    // once per message, and only the final state is on screen anyway.
+                    pending_theme = Some(msg.data1 == THEME_DARK);
+                },
                 MSG_SHM_RELEASED => {
                     // R1: the compositor released its mapping of an old resized-away buffer (data1 =
                     // its shm id). It's now single-owner, so destroy it — frees the physical RAM back
@@ -152,6 +203,12 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
                 },
                 _ => {}
             }
+        }
+
+        // The theme first: it changes what everything else will be drawn in, and an app that lays
+        // out differently per theme should hear about it before it is asked where the pointer is.
+        if let Some(dark) = pending_theme {
+            event_redraw |= app.on_theme(dark);
         }
 
         // Deliver the coalesced hover before the resize, so a move is reported against the geometry
@@ -184,21 +241,51 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
             shm_id = new_shm_id;                        // this is now the live buffer
             pending_shm_swap = Some(new_shm_id);
             pending_retire.push((old_id, old_base));    // retire the old one on the compositor's ACK
+
+            // The back buffer follows the new size. Unlike the front buffer this one needs no
+            // handshake — the compositor has never seen it, so it is single-owner and can go now.
+            if !back_ptr.is_null() {
+                sys_destroy_shm(back_id, back_ptr as u64);
+            }
+            back_id = sys_create_shm(width * height * 4);
+            back_ptr = if back_id != 0 { sys_map_shm(back_id) as *mut u32 } else { core::ptr::null_mut() };
+
             needs_redraw = true;
         }
 
         let update_redraw = app.update();
         
         if needs_redraw || event_redraw || update_redraw {
-            let screen = unsafe { core::slice::from_raw_parts_mut(pixels_ptr, width * height) };
-            let mut canvas = Canvas::new(screen, width, height);
-            
-            // 1. Fully paint the buffer
-            app.draw(&mut canvas);
+            // 1. Fully paint the back buffer (or the SHM itself, if we never got one).
+            let target = if back_ptr.is_null() { pixels_ptr } else { back_ptr };
+            {
+                let screen = unsafe { core::slice::from_raw_parts_mut(target, width * height) };
+                let mut canvas = Canvas::new(screen, width, height);
+                app.draw(&mut canvas);
+            }
+
+            // 1a. Publish the finished frame in one pass. The borrow above has ended, and both
+            //     pointers come from distinct SHM blocks, so the regions cannot overlap.
+            if !back_ptr.is_null() {
+                unsafe { core::ptr::copy_nonoverlapping(back_ptr, pixels_ptr, width * height) };
+            }
 
             // 1b. Report scroll state into the header so the compositor can draw/drive the scrollbar.
             header.content_h = app.content_height() as u32;
             header.scroll_off = app.scroll_offset() as u32;
+
+            // 1c. ...and the caption context, which the window server draws OUTSIDE the surface.
+            //     Truncated on a char boundary: a cut through a codepoint would hand the shell
+            //     invalid UTF-8, which decodes to an empty string and reads as the feature not
+            //     working rather than as a name being too long.
+            let ctx = app.context();
+            let mut end = ctx.len().min(64);
+            while end > 0 && !ctx.is_char_boundary(end) {
+                end -= 1;
+            }
+            header.context.fill(0);
+            header.context[..end].copy_from_slice(&ctx.as_bytes()[..end]);
+            header.dirty = app.is_dirty() as u32;
 
             // 2. NOW safely tell the Compositor the buffer is ready
             if let Some(swap_id) = pending_shm_swap {

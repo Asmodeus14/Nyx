@@ -15,13 +15,12 @@ BUILD_CMD="cargo build --release --target $TARGET_JSON -Z build-std=core,alloc -
 echo "[1/7] Building Init Orchestrator (init)..."
 (cd apps/init && $BUILD_CMD)
 
-echo "[2/7] Building Window Server (compositor)..."
-(cd apps/compositor && $BUILD_CMD)
-
-# The Meridian shell (Nyx-ui/design/ver3.0). Built EVERY time, even when the compositor is the one
-# being shipped: keeping it compiling is what stops it rotting while the apps around it change, and
-# it costs seconds. Which of the two becomes WindowServer.nyx is $WINDOW_SERVER, applied further down.
-echo "[2b] Building Meridian shell (shell)..."
+# ★ The window server, and since Meridian step 20 the only one. `apps/compositor` used to be built
+# here first and shipped by default, with Meridian built beside it and selected by $WINDOW_SERVER —
+# the arrangement the build order asked for: "apps/compositor keeps booting the whole way, so the
+# machine always has a working desktop and the two shells can be compared side by side." Step 20 is
+# the end of that order, so the fallback and the variable that chose it are both gone.
+echo "[2/7] Building Window Server (Meridian shell)..."
 (cd apps/shell && $BUILD_CMD)
 
 # [3] Terminal is now a std target_os=nyx binary (D3) — built via Build-std.sh below (step [9f]),
@@ -43,13 +42,11 @@ echo "[8/9] Building GL Cube validation app (glcube)..."
 echo "[9/9] Building Image Viewer (imageviewer)..."
 (cd apps/imageviewer && $BUILD_CMD)
 
-# P8: the Wi-Fi network picker — the only way to choose a network now that the driver has no
-# built-in SSID, so a failure here means a machine that can't get online. Not swallowed.
-echo "[9a] Building Wi-Fi picker (wifi)..."
-(cd apps/wifi && $BUILD_CMD)
-
-# Headless auto-reconnect agent, spawned by init at boot from the saved-network file.
-echo "[9a2] Building Wi-Fi auto-connect agent (wifiagent)..."
+# The Wi-Fi agent. Two jobs since step 20: spawned by init with no argument it rejoins the
+# remembered network at boot, and spawned by the shell WITH one it performs a scan, a join or a radio
+# toggle on the shell's behalf. It is the only process that blocks in the radio — a failure here
+# means a machine that can't get online, so it is not swallowed.
+echo "[9a] Building Wi-Fi agent (wifiagent)..."
 (cd apps/wifiagent && $BUILD_CMD)
 
 # std-port smoke test (Workstream B): build a real `std` binary for target_os=nyx and bundle it so
@@ -59,9 +56,11 @@ echo "[9b] Building std hello (target_os=nyx)..."
 # B-gamma.3 child binary: spawned by stdhello via std::process::Command to prove fork+execve+wait4.
 echo "[9c] Building std child (target_os=nyx)..."
 ./Build-std.sh tests/stdchild stdchild || echo "  (std child build skipped/failed — continuing)"
-# Workstream C (C2): on-device qclang front-end (std target_os=nyx; links the portable compiler core).
-echo "[9d] Building qcstudio (target_os=nyx)..."
-./Build-std.sh apps/qcstudio qcstudio || echo "  (qcstudio build skipped/failed — continuing)"
+# Meridian step 14: the QCLang window (was Workstream C's headless round-trip). Still compiles the
+# .ql on-device and still byte-compares against host qclang — it just SHOWS the result now, so a
+# stale binary would silently ship a program that opens no window at all. Hence no `|| echo` swallow.
+echo "[9d] Building QCLang (std target_os=nyx)..."
+./Build-std.sh apps/qcstudio qcstudio
 # Workstream D (D2): std-GUI foundation spike — a std target_os=nyx binary that links the no_std
 # nyx-gui/nyx-api UNCHANGED and opens a window (proves the font pipeline builds for nyx under build-std).
 echo "[9e] Building stdgui (target_os=nyx)..."
@@ -107,7 +106,6 @@ mkdir -p build_initrd/apps/StdChild.nyx
 mkdir -p build_initrd/apps/QcStudio.nyx
 mkdir -p build_initrd/apps/StdGui.nyx
 mkdir -p build_initrd/apps/Notepad.nyx
-mkdir -p build_initrd/apps/Wifi.nyx
 mkdir -p build_initrd/apps/WifiAgent.nyx
 # The harness writes ONLY inside this scratch directory (probes/mod.rs panics on any path that
 # escapes it). It has to exist up front — mkdir(2) is one of the things being probed.
@@ -117,23 +115,18 @@ mkdir -p build_initrd/apps/HelloC.nyx
 # 2. Copy the compiled binaries into the folders as 'run.bin'
 cp target/x86_64-nyx/release/nyx-init build_initrd/apps/Init.nyx/run.bin
 
-# WindowServer.nyx is whichever shell $WINDOW_SERVER names — `compositor` (the shipping desktop) or
-# `shell` (Meridian). Defaults to the compositor, because testing on this machine is bare metal only
-# and a shell that does not come up looks exactly like a kernel freeze from the outside. Reverting is
-# this one variable, not a code change:
+# WindowServer.nyx is Meridian. There is no longer a choice to make here: $WINDOW_SERVER selected
+# between `compositor` and `shell` until step 20 retired the former.
 #
-#     WINDOW_SERVER=shell ./Build.sh
-#
-# apps/init execs the PATH, not a binary name, and nothing else refers to either binary — but note
-# the window server is PID 4 (`COMPOSITOR_PID` in libs/gui/src/app.rs) purely by fork order, so it
-# must stay the same position in init's spawn list.
-WINDOW_SERVER="${WINDOW_SERVER:-compositor}"
-if [ ! -f "target/x86_64-nyx/release/$WINDOW_SERVER" ]; then
-    echo "  !! WINDOW_SERVER=$WINDOW_SERVER has no built binary; expected target/x86_64-nyx/release/$WINDOW_SERVER" >&2
+# ⚠️ apps/init execs the PATH, not a binary name — but the window server is PID 4
+# (`COMPOSITOR_PID` in libs/gui/src/app.rs) purely by fork order, so it must stay the FIRST thing
+# init spawns. That constant's name is now the only thing on the image that remembers the
+# compositor existed.
+if [ ! -f "target/x86_64-nyx/release/shell" ]; then
+    echo "  !! the Meridian shell did not build; expected target/x86_64-nyx/release/shell" >&2
     exit 1
 fi
-echo "  -> WindowServer.nyx = $WINDOW_SERVER"
-cp "target/x86_64-nyx/release/$WINDOW_SERVER" build_initrd/apps/WindowServer.nyx/run.bin
+cp target/x86_64-nyx/release/shell build_initrd/apps/WindowServer.nyx/run.bin
 # D3: terminal is a std binary now — its output lives under apps/terminal/target/ (workspace-excluded),
 # not the root target dir.
 cp apps/terminal/target/x86_64-unknown-nyx/release/nyx-terminal build_initrd/apps/Terminal.nyx/run.bin
@@ -145,7 +138,6 @@ cp target/x86_64-nyx/release/nyx-explorer build_initrd/apps/Explorer.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-sysmon build_initrd/apps/SystemMonitor.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-glcube build_initrd/apps/GlCube.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-imageviewer build_initrd/apps/ImageViewer.nyx/run.bin
-cp target/x86_64-nyx/release/nyx-wifi build_initrd/apps/Wifi.nyx/run.bin
 cp target/x86_64-nyx/release/nyx-wifiagent build_initrd/apps/WifiAgent.nyx/run.bin
 # std-port smoke test binary (built for the x86_64-unknown-nyx std target; workspace-excluded, so
 # its output lives under tests/stdhello/target/, not the root target dir).
@@ -164,6 +156,10 @@ cp apps/qcstudio/samples/expected.qasm build_initrd/apps/QcStudio.nyx/expected.q
 cp apps/stdgui/target/x86_64-unknown-nyx/release/stdgui build_initrd/apps/StdGui.nyx/run.bin 2>/dev/null || true
 # Notepad: std target_os=nyx text editor (saves to /mnt/nvme via std::fs).
 cp apps/notepad/target/x86_64-unknown-nyx/release/notepad build_initrd/apps/Notepad.nyx/run.bin 2>/dev/null || true
+# Meridian step 15: a document to open. Text starts on /mnt/nvme/untitled.md when nothing is handed
+# to it, so without this the first thing anyone sees is an empty column and no way to tell whether
+# the app works. Double-click it in Files to prove the launch-argument path at the same time.
+cp apps/notepad/samples/atlas-sizes.md build_initrd/atlas-sizes.md 2>/dev/null || true
 # POSIX conformance harness + the fixed-content file its read-only probes measure themselves against
 # (its size is cross-checked with syscall 541, which already works, so a wrong `read` is detectable).
 # Not `|| true`: see [9i]. A probe that fails to ship is a missing row; a probe that ships stale is
@@ -209,14 +205,13 @@ fi
 
 # 3. Copy any JSON manifests from the source folders into the App Bundles
 cp apps/init/*.json build_initrd/apps/Init.nyx/ 2>/dev/null || true
-cp apps/compositor/*.json build_initrd/apps/WindowServer.nyx/ 2>/dev/null || true
+cp apps/shell/*.json build_initrd/apps/WindowServer.nyx/ 2>/dev/null || true
 cp apps/terminal/*.json build_initrd/apps/Terminal.nyx/ 2>/dev/null || true
 cp apps/settings/*.json build_initrd/apps/Settings.nyx/ 2>/dev/null || true
 cp apps/explorer/*.json build_initrd/apps/Explorer.nyx/ 2>/dev/null || true
 cp apps/sysmon/*.json build_initrd/apps/SystemMonitor.nyx/ 2>/dev/null || true
 cp apps/glcube/*.json build_initrd/apps/GlCube.nyx/ 2>/dev/null || true
 cp apps/imageviewer/*.json build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
-cp apps/wifi/*.json build_initrd/apps/Wifi.nyx/ 2>/dev/null || true
 
 # 3b. Bundle the Image Viewer's sample image asset(s) so it has something to open on launch.
 # Only ship real image files — NOT the generator script (make_sample.py).
@@ -226,9 +221,10 @@ cp apps/imageviewer/assets/*.tga build_initrd/apps/ImageViewer.nyx/ 2>/dev/null 
 cp apps/imageviewer/assets/*.png build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
 cp apps/imageviewer/assets/*.jpg build_initrd/apps/ImageViewer.nyx/ 2>/dev/null || true
 
-# 3c. Each app carries its OWN icon inside its .nyx bundle as icon.png — the compositor decodes it
-# (via libs/image) for the start menu, and apps declare the same path in their window header so the
-# taskbar button matches. Committed artwork; regenerate with `python3 tools/make_icons.py`.
+# 3c. Each app carries its OWN icon inside its .nyx bundle as icon.png. Meridian does not read them
+# — its dock and Command are drawn from the icon set compiled into `libs/meridian` — but an app still
+# declares the path in its window header, and `apps/explorer` decodes them (via libs/image) to pick a
+# file's application. Committed artwork; regenerate with `python3 tools/make_icons.py`.
 install_icon() { cp "assets/icons/$1.png" "build_initrd/apps/$2.nyx/icon.png" 2>/dev/null || true; }
 install_icon terminal    Terminal
 install_icon settings    Settings
@@ -240,17 +236,34 @@ install_icon stdhello    StdHello
 install_icon qcstudio    QcStudio
 install_icon stdgui      StdGui
 install_icon notepad     Notepad
-install_icon wifi        Wifi
 install_icon posixprobe  PosixProbe
 # Borrows the terminal glyph: it is a console program, and a bespoke icon is not worth a new drawing
 # routine for a test binary.
 install_icon terminal    HelloC
-# The shell's own mark, in the compositor's bundle.
+# The shell's own mark, in the window server's bundle.
 install_icon nyx         WindowServer
 
-# 4. Package it into a lightweight tape archive
+# 3d. ★ The shared typeface bundle. ONE copy of the five faces for the whole system.
+#
+# Until 2026-09-08 `libs/meridian/src/font.rs` `include_bytes!`d these, which put 1.93 MB in the
+# shell and System Monitor and 1.24 MB in every other ported app — 10.6 MB of an image that was
+# 33.6 MB, eight copies of the same five files. `--gc-sections` cannot drop a byte of a static
+# something reaches, so the only fix was to stop embedding them. Apps read what they need out of
+# /mnt/nvme/fonts/ at startup; a missing bundle falls back to DejaVu, which is visible on screen.
+#
+# The OFL licences ship WITH the fonts, which is the point of putting them here rather than leaving
+# them in the source tree where the binary that uses them cannot reach one.
+mkdir -p build_initrd/fonts
+cp libs/meridian/fonts/*.ttf build_initrd/fonts/
+cp libs/meridian/fonts/LICENSE-*.txt build_initrd/fonts/
+
+# 4. Package it into a lightweight tape archive.
+#
+# ⚠️ `fonts` is a second top-level member alongside `apps`. `installer::extract_tar_to_ext4` walks
+# whatever the archive contains and mkdir/writes each path under /mnt/nvme, so it needed no change —
+# but an archive that lists only `apps` silently ships a system with no typefaces.
 cd build_initrd
-tar -cf ../initrd.tar apps
+tar -cf ../initrd.tar apps fonts
 cd ..
 cp initrd.tar nyx-kernel/src/initrd.tar
 touch nyx-kernel/src/main.rs

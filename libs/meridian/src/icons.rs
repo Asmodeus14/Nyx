@@ -56,7 +56,17 @@ impl Icons {
     pub const CHEVRON: &'static str = "u-chev";
     pub const CHEVRON_DOWN: &'static str = "u-chev-d";
     pub const WIFI: &'static str = "u-wifi";
+    /// ⚠️ **This is a BATTERY** — rounded cell, terminal nub, fill bar. It is the Entity's power
+    /// *readout*. Do NOT put it on a control that ends the session: that shipped once and was read
+    /// on hardware within a minute as *"why is the shutdown icon a battery?"*, which was the right
+    /// question. Use [`Icons::SHUTDOWN`].
     pub const POWER: &'static str = "u-power";
+    /// ★ The IEC 5009 power symbol — broken ring, vertical bar. The verb that ends the session.
+    ///
+    /// The second symbol added to `parts/02-icons.html` beyond the design as authored (see
+    /// [`Icons::BRIGHT`]): ver3.0 has no shutdown control anywhere, because it was drawn for a
+    /// desktop that is simply always on. Same 24 grid, same stroke, same arc idiom as `u-reload`.
+    pub const SHUTDOWN: &'static str = "u-shutdown";
     pub const VOLUME: &'static str = "u-volume";
     /// ★ The one symbol here that is NOT in the design as authored. Added to `parts/02-icons.html`
     /// for the Entity's Brightness control row, which is itself an extension — the design puts
@@ -88,13 +98,13 @@ impl Icons {
 
 /// Every icon the shell can name. Used by the atlas to decide what to pack, and by the test that
 /// proves none of these ids has gone stale.
-pub const NAMED: [&str; 37] = [
+pub const NAMED: [&str; 38] = [
     Icons::ENTITY_NOMINAL, Icons::ENTITY_WORKING, Icons::ENTITY_ATTENTION,
     Icons::APP_FILES, Icons::APP_TERMINAL, Icons::APP_CODE, Icons::APP_BROWSER,
     Icons::APP_MONITOR, Icons::APP_QCLANG, Icons::APP_ENTITY, Icons::APP_SETTINGS,
     Icons::WIN_FOLD, Icons::WIN_CLOSE, Icons::WIN_EXPAND,
     Icons::SEARCH, Icons::RETURN, Icons::CHEVRON, Icons::CHEVRON_DOWN,
-    Icons::WIFI, Icons::POWER, Icons::VOLUME, Icons::BRIGHT, Icons::THERMAL,
+    Icons::WIFI, Icons::POWER, Icons::SHUTDOWN, Icons::VOLUME, Icons::BRIGHT, Icons::THERMAL,
     Icons::FOLDER, Icons::DOC, Icons::CLOCK, Icons::BACK, Icons::FORWARD,
     Icons::RELOAD, Icons::LOCK, Icons::PLUS, Icons::GRID, Icons::BRANCH,
     Icons::SHIELD, Icons::CHECK, Icons::WARN, Icons::MARK,

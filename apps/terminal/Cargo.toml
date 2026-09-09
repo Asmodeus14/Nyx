@@ -24,6 +24,9 @@ nyx-htmltext = { path = "../../libs/htmltext" }
 # JetBrains Mono via `font::register_mono()`, which installs ONLY the mono face. The atlas and the
 # icon table are the shell's business; this app draws through nyx-gui's CPU rasterizer as before.
 nyx-meridian = { path = "../../libs/meridian" }
+# Meridian step 19 — `passwd` derives the lock's stored key. The same crate the shell verifies
+# against and the same one `iwlwifi` uses for WPA2, so there is exactly one PBKDF2 in the tree.
+nyx-crypto = { path = "../../libs/crypto" }
 
 [[bin]]
 name = "nyx-terminal"

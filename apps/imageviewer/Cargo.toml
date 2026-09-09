@@ -3,15 +3,18 @@ name = "nyx-imageviewer"
 version = "0.1.0"
 edition = "2021"
 
-# Nyx Image Viewer — a no_std nyx-gui app. Loads an image file from the VFS,
-# decodes it to B8G8R8A8, and blits it (fit-to-window, nearest-neighbour) via
-# Canvas::composite_buffer. Depends ONLY on nyx-api + nyx-gui (+ the heap
-# allocator), like apps/explorer.
+# Meridian step 16 — Image. A no_std nyx-gui app: loads an image file from the VFS, decodes it to
+# B8G8R8A8 and blits it via Canvas::composite_buffer. The permanent footer strip is gone; the
+# filename, dimensions and size are on the caption line and the controls appear on hover.
 [dependencies]
 nyx-api = { path = "../../libs/api" }
 nyx-gui = { path = "../../libs/gui" }
 linked_list_allocator = "0.10.5"
 nyx-image = { path = "../../libs/image" }
+# The interior: `viewer` (the centred frame, the floating control bar, the zoom readout and the pan
+# limits) plus the tokens, `text` and the antialiased rounded-rect shapes. All the geometry is
+# host-tested there, because this binary's own tests cannot run on the host.
+nyx-meridian = { path = "../../libs/meridian" }
 
 # A2b image decoders. Both must be no_std + alloc (this app builds with
 # -Z build-std=core,alloc for the bare x86_64-nyx target, so default `std`

@@ -85,6 +85,31 @@ impl Field {
             self.cells[y as usize * G + x as usize] = v;
         }
     }
+
+    /// Close the eyes: one full-width row of [`SHADOW`] across [`Field::eye_row`].
+    ///
+    /// The design's `.lid` is `<rect x="0" y="ey*s" width="G*s" height="s" fill="#161A1E"/>` —
+    /// `#161A1E` is exactly `PALETTE[SHADOW]`, so the colour and the row are the reference's.
+    ///
+    /// ⚠️ **The width is a deliberate deviation.** The reference rect spans all 24 cells, including
+    /// the transparent ones outside the body. In an SVG over a page that is a faint bar; blitted
+    /// into an ARGB surface it is an *opaque* bar 120px wide floating on either side of the
+    /// creature, because [`EMPTY`] is `0x00000000` and SHADOW is not. So this masks to cells that
+    /// already carry ink. If a future cross-check against the JavaScript flags the eye row, this is
+    /// why — and the reference is the one that is wrong for an opaque target.
+    ///
+    /// ⚠️ Destructive, and there is no `open()`. A blink is a *transient* — the caller keeps the
+    /// open field and lids a copy, or rebuilds. Making this reversible would mean remembering seven
+    /// palette indices per cell to restore, which is more state than rebuilding the field costs.
+    pub fn close_eyes(&mut self) {
+        let y = self.eye_row;
+        if y >= G { return; }
+        for x in 0..G {
+            if self.cells[y * G + x] != EMPTY {
+                self.cells[y * G + x] = SHADOW;
+            }
+        }
+    }
 }
 
 pub fn build(g: &Genome, stage: Stage, inf: &Influence) -> Field {
@@ -352,6 +377,47 @@ pub fn blit(f: &Field, cell: usize, dst: &mut [u32], pitch_px: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genome::Genome;
+
+    /// The lid closes the eyes and touches nothing else — not the row above, not the row below, and
+    /// crucially not the transparent margin either side. That last one is the whole reason
+    /// `close_eyes` masks: an unmasked lid is an opaque bar, and it would only have been noticed on
+    /// hardware, 110 ms at a time.
+    #[test]
+    fn the_lid_covers_the_eyes_and_nothing_beside_them() {
+        for seed in ["NX-7F3A-91C2", "NX-0000-0001", "NX-FFFF-FFFF"] {
+            let g = Genome::from_seed(crate::Seed::parse(seed.as_bytes()).unwrap());
+            for stage in [Stage::Genesis, Stage::Awakening, Stage::Adaptation,
+                          Stage::Intelligence, Stage::Mature] {
+                let open = build(&g, stage, &Influence::default());
+                let mut shut = build(&g, stage, &Influence::default());
+                shut.close_eyes();
+
+                let ey = open.eye_row;
+                // Every row but the eye row is untouched.
+                for y in 0..G {
+                    if y == ey { continue; }
+                    assert_eq!(&open.cells[y * G..(y + 1) * G], &shut.cells[y * G..(y + 1) * G],
+                               "{} stage {} row {} changed", seed, stage.index(), y);
+                }
+                // On the eye row: empty stays empty, ink becomes SHADOW.
+                let mut closed_any = false;
+                for x in 0..G {
+                    let (o, s) = (open.cells[ey * G + x], shut.cells[ey * G + x]);
+                    if o == EMPTY {
+                        assert_eq!(s, EMPTY, "{}: lid painted into the transparent margin at x={}",
+                                   seed, x);
+                    } else {
+                        assert_eq!(s, SHADOW);
+                        if o == ACC || o == LITE { closed_any = true; }
+                    }
+                }
+                // The eyes are the only mandatory accent, and they are on this row — so a lid that
+                // covered no accent cell would be a lid that missed the eyes entirely.
+                assert!(closed_any, "{} stage {}: the lid covered no eye", seed, stage.index());
+            }
+        }
+    }
 
     /// The two JavaScript idioms this file leans on, pinned directly.
     ///

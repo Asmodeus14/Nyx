@@ -28,6 +28,31 @@ lazy_static::lazy_static! {
 pub static mut PHYS_MEM_OFFSET: u64 = 0;
 pub static mut BOOTLOADER_CR3: u64 = 0;
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Physical frame accounting — the numbers System Monitor reports.
+//
+// Atomics rather than a getter behind `MEMORY_MANAGER`, deliberately. That lock is a bare spin lock
+// taken by the page-fault handler, and a syscall arm (which runs at IF=0) blocking on it is the exact
+// preemption-boundary deadlock this file's watchdog exists to catch — a monitoring app polling once
+// a second would be a standing invitation to it. A counter costs one relaxed add on a path that is
+// already walking page tables, and it is readable from anywhere without taking anything.
+//
+// Relaxed is right: these are a display value with no happens-before relationship to the mapping
+// they describe. A reader that catches a torn pair is one frame out of ~4 million.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+pub static FRAMES_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FRAMES_USED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// (used_bytes, total_bytes) of physical RAM. Total counts only regions the bootloader marked
+/// `Usable`, so it is smaller than the sticker on the DIMM — firmware, ACPI and MMIO holes are not
+/// memory this kernel can ever hand out, and reporting them would make usage look better than it is.
+pub fn memory_usage() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    let used = FRAMES_USED.load(Ordering::Relaxed);
+    let total = FRAMES_TOTAL.load(Ordering::Relaxed);
+    (used.saturating_mul(4096), total.saturating_mul(4096))
+}
+
 pub struct MemorySystem {
     pub mapper: OffsetPageTable<'static>,
     pub frame_allocator: BootInfoFrameAllocator,
@@ -71,8 +96,18 @@ pub struct BootInfoFrameAllocator {
 
 impl BootInfoFrameAllocator {
     pub unsafe fn init(memory_map: &'static [bootloader_api::info::MemoryRegion], phys_offset: VirtAddr) -> Self {
-        BootInfoFrameAllocator { 
-            memory_map, current_region: 0, current_offset: 0, phys_offset, recycled_frames: None 
+        // Count what this allocator will ever be able to hand out. Done here rather than lazily so
+        // the total is available before the first allocation, and so it is measured from the same
+        // slice the allocator walks — a second source would be free to disagree.
+        let total: u64 = memory_map
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::Usable)
+            .map(|r| r.end.saturating_sub(r.start) / 4096)
+            .sum();
+        FRAMES_TOTAL.store(total, core::sync::atomic::Ordering::Relaxed);
+
+        BootInfoFrameAllocator {
+            memory_map, current_region: 0, current_offset: 0, phys_offset, recycled_frames: None
         }
     }
 
@@ -84,6 +119,16 @@ impl BootInfoFrameAllocator {
         let next_ptr = match self.recycled_frames { Some(f) => f.start_address().as_u64(), None => 0, };
         unsafe { *ptr = next_ptr; }
         self.recycled_frames = Some(frame);
+        // Saturating, not a bare `fetch_sub`: a frame freed that this allocator never handed out
+        // would wrap the counter to ~16 exabytes used, which is a far worse lie than being one frame
+        // optimistic.
+        FRAMES_USED
+            .fetch_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |u| Some(u.saturating_sub(1)),
+            )
+            .ok();
     }
 
     pub fn allocate_contiguous_frames(&mut self, num_frames: usize, alignment: u64, below_4gb: bool) -> Option<PhysFrame> {
@@ -95,9 +140,12 @@ impl BootInfoFrameAllocator {
 
         while self.current_region < self.memory_map.len() {
             let region = &self.memory_map[self.current_region];
-            if region.kind == MemoryRegionKind::Usable {
+            // ⚠️ Same 1 MB floor as the single-frame path. See `LOW_MEM_RESERVED`.
+            if region.kind == MemoryRegionKind::Usable
+                && skip_low_memory(region.start, region.end, &mut self.current_offset)
+            {
                 let mut target_addr = region.start + self.current_offset;
-                
+
                 // Align the target address
                 let remainder = target_addr % alignment;
                 if remainder != 0 {
@@ -113,6 +161,7 @@ impl BootInfoFrameAllocator {
 
                     // Found a suitable block
                     self.current_offset = (target_addr - region.start) + size;
+                    FRAMES_USED.fetch_add(num_frames as u64, core::sync::atomic::Ordering::Relaxed);
                     return Some(PhysFrame::containing_address(PhysAddr::new(target_addr)));
                 }
             }
@@ -127,6 +176,50 @@ impl BootInfoFrameAllocator {
     }
 }
 
+/// ★★★★ Physical memory below this is NEVER handed out as a general frame.
+///
+/// This fixes a real corruption bug, found 2026-09-09 by counting the ACPI namespace at boot
+/// checkpoints: **1802 nodes before `smp::init_aps`, 637 and a dangling tail after it.**
+///
+/// The namespace was not the bug. The ACPI pool's first slab simply sits at the bottom of the kernel
+/// heap, and **the bottom of the heap was backed by physical frames below 1 MB**: this allocator
+/// walks `Usable` regions from the lowest address upward and excluded nothing, while UEFI marks
+/// conventional memory from roughly 0x1000 up as usable.
+///
+/// Then AP bring-up writes the real-mode trampoline to **physical 0x8000** and its argument block to
+/// **0x8F00** — addresses fixed by the architecture, because a starting AP begins in real mode and
+/// can only reach the first megabyte. Those writes landed inside the kernel heap.
+///
+/// ★ The tell was exact: the smashed node's `Name` field read `0xffff9000`, the top half of
+/// `*args_ptr.offset(3) = ap_stack_top` — a `0xFFFF_9000_…` address from `allocate_kernel_stack`,
+/// written straight through a heap block.
+///
+/// ⚠️ The namespace was only the WITNESS — the first structure self-describing enough to notice.
+/// Anything else allocated early was being corrupted too, silently. Weigh that against any
+/// unexplained early-boot oddity in this project's history.
+///
+/// 1 MiB rather than just the trampoline page: everything below it is legacy territory — the IVT,
+/// the BDA, the EBDA, VGA memory, option ROMs, and the trampoline. None of it is safe to hand to a
+/// general allocator, and a megabyte is not worth being clever about.
+pub const LOW_MEM_RESERVED: u64 = 0x10_0000;
+
+/// Advance `(current_region, current_offset)` past reserved low memory, if it is sitting in it.
+///
+/// Returns `false` if this whole region is below the line and the caller should move to the next.
+/// Shared by both allocation paths on purpose: they had already drifted apart once, and a reservation
+/// that only one of them honours is not a reservation.
+#[inline]
+fn skip_low_memory(region_start: u64, region_end: u64, offset: &mut u64) -> bool {
+    if region_start + *offset >= LOW_MEM_RESERVED {
+        return true;
+    }
+    if region_end <= LOW_MEM_RESERVED {
+        return false;
+    }
+    *offset = LOW_MEM_RESERVED - region_start;
+    true
+}
+
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
         if let Some(frame) = self.recycled_frames {
@@ -135,25 +228,32 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
             let ptr = virt_addr.as_ptr() as *const u64;
             unsafe {
                 let next_addr = *ptr;
-                if next_addr == 0 { self.recycled_frames = None; } 
+                if next_addr == 0 { self.recycled_frames = None; }
                 else { self.recycled_frames = Some(PhysFrame::containing_address(PhysAddr::new(next_addr))); }
             }
+            FRAMES_USED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return Some(frame);
         }
 
         while self.current_region < self.memory_map.len() {
             let region = &self.memory_map[self.current_region];
             if region.kind == MemoryRegionKind::Usable {
-                let target_addr = region.start + self.current_offset;
-                if target_addr + 4096 <= region.end {
-                    self.current_offset += 4096;
-                    return Some(PhysFrame::containing_address(PhysAddr::new(target_addr)));
+                // ⚠️ Never below 1 MB — see `LOW_MEM_RESERVED`. Physical 0x8000 is the SMP
+                // trampoline, and handing it out as heap is what silently smashed the ACPI
+                // namespace (and whatever else landed there) on every boot.
+                if skip_low_memory(region.start, region.end, &mut self.current_offset) {
+                    let target_addr = region.start + self.current_offset;
+                    if target_addr + 4096 <= region.end {
+                        self.current_offset += 4096;
+                        FRAMES_USED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        return Some(PhysFrame::containing_address(PhysAddr::new(target_addr)));
+                    }
                 }
             }
             self.current_region += 1;
             self.current_offset = 0;
         }
-        None 
+        None
     }
 }
 

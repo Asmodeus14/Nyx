@@ -61,6 +61,18 @@ unsafe impl Send for AcpiPool {}
 
 static ACPI_POOL: spin::Mutex<AcpiPool> = spin::Mutex::new(AcpiPool { free: [core::ptr::null_mut(); 8] });
 
+// ★ Pool statistics, because **a NULL return from `AcpiOsAllocate` is currently silent**.
+//
+// ACPICA handles it correctly — it unwinds with `AE_NO_MEMORY` — but "handled correctly" here means
+// a table parse stops early and the load still reports success, which is one of the two live
+// explanations for a namespace that is 637 nodes long where the DSDT declares ~1468. Nothing counted
+// it, so it could neither be confirmed nor ruled out. Now it can.
+pub static POOL_TAKEN: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+pub static POOL_LARGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static POOL_FAILED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static POOL_SLABS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Take one block of class `c`, carving a fresh slab if that list is empty.
 ///
 /// Interrupts are masked around the pool lock for the same reason the global heap masks them: this
@@ -80,6 +92,7 @@ unsafe fn acpi_pool_take(c: usize) -> *mut u8 {
             if slab.is_null() {
                 return core::ptr::null_mut();
             }
+            POOL_SLABS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // Thread the slab onto the free list, first word of each block = next.
             for i in 0..n {
                 let b = slab.add(i * bs);
@@ -111,10 +124,15 @@ pub unsafe extern "C" fn AcpiOsAllocate(size: u64) -> *mut c_void {
         None => return core::ptr::null_mut(),
     };
 
+    use core::sync::atomic::Ordering::Relaxed;
     let base = match ACPI_CLASS_SIZES.iter().position(|&s| s >= total) {
         Some(c) => {
             let b = acpi_pool_take(c);
-            if b.is_null() { return core::ptr::null_mut(); }
+            if b.is_null() {
+                POOL_FAILED.fetch_add(1, Relaxed);
+                return core::ptr::null_mut();
+            }
+            POOL_TAKEN[c].fetch_add(1, Relaxed);
             *(b.add(8) as *mut u64) = c as u64;
             b
         }
@@ -126,7 +144,11 @@ pub unsafe extern "C" fn AcpiOsAllocate(size: u64) -> *mut c_void {
             let b = alloc::alloc::alloc(layout);
             // Null rather than a panic: ACPICA checks for null and unwinds with AE_NO_MEMORY,
             // whereas `handle_alloc_error` would take the kernel down instead.
-            if b.is_null() { return core::ptr::null_mut(); }
+            if b.is_null() {
+                POOL_FAILED.fetch_add(1, Relaxed);
+                return core::ptr::null_mut();
+            }
+            POOL_LARGE.fetch_add(1, Relaxed);
             *(b.add(8) as *mut u64) = ACPI_CLASS_LARGE;
             b
         }
@@ -514,9 +536,98 @@ pub extern "C" fn nyx_acpi_log_enabled() -> i32 {
     ACPI_LOG_OPEN.load(core::sync::atomic::Ordering::Relaxed) as i32
 }
 
+/// Append the pool's counters to the ACPICA log, at the end of bring-up.
+///
+/// ★ The 64-byte class is the interesting one: `ACPI_NAMESPACE_NODE` is 48 bytes plus this
+/// allocator's 16-byte header, so **every namespace node is a 64-byte block**. Its count is an
+/// upper bound on how many nodes were ever created, arrived at without touching the `Peer` chain
+/// that is itself under suspicion — which is the whole point of measuring it here.
+///
+/// `failed` must be 0. Anything else means a table parse was cut short by an allocation that
+/// returned NULL, and the "13 tables successfully loaded" line does not know about it.
+pub fn pool_report() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut line = alloc::string::String::from("  acpi pool:");
+    for (i, sz) in ACPI_CLASS_SIZES.iter().enumerate() {
+        let n = POOL_TAKEN[i].load(Relaxed);
+        if n != 0 {
+            line.push_str(&alloc::format!(" {}B={}", sz, n));
+        }
+    }
+    line.push_str(&alloc::format!(
+        " large={} slabs={} FAILED={}\n",
+        POOL_LARGE.load(Relaxed),
+        POOL_SLABS.load(Relaxed),
+        POOL_FAILED.load(Relaxed),
+    ));
+    // NUL-terminated: `nyx_acpi_log` takes a C string, not a pointer/length pair.
+    line.push('\0');
+    unsafe { nyx_acpi_log(line.as_ptr() as *const c_char) };
+}
+
 /// Close the ACPICA log. Called once, after bring-up.
 pub fn close_acpi_log() {
     ACPI_LOG_OPEN.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+// ★★ THE NAMESPACE-WALK CURSOR — where a walk was standing when the machine died.
+//
+// The problem this solves: a walk that #GPs leaves one CMOS breadcrumb byte, "entered 1, never
+// returned", and every attempt to narrow it further has cost a power cycle per guess. The 64-bit
+// CMOS detail field cannot help — bytes 1 and 3 read back as zero on this board (see `nyx_mark`).
+//
+// So this does not go through CMOS at all. It is plain kernel memory, updated per node, and
+// **`panic_screen::fatal` prints it**. A kernel #GP panics, the panic paints the live scanout, and
+// the red screen now names the exact node the walker was on. One boot, the whole answer, and no
+// dependence on a CMOS byte surviving a power cycle.
+//
+// Relaxed ordering throughout: this is written by one core and read only after that same core has
+// stopped the world, so there is nothing to synchronise with and this sits in a hot loop.
+pub mod walk_trace {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+    /// Which walker: 1 = ACPICA's `AcpiNsWalkNamespace`, 2 = our stepper-based one.
+    pub static KIND: AtomicU32 = AtomicU32::new(0);
+    pub static LEVEL: AtomicU32 = AtomicU32::new(0);
+    pub static INDEX: AtomicU32 = AtomicU32::new(0);
+    /// The node's four-character ACPI name, as the raw little-endian `UINT32`.
+    pub static NAME: AtomicU32 = AtomicU32::new(0);
+    pub static NODE: AtomicU64 = AtomicU64::new(0);
+    pub static PARENT: AtomicU64 = AtomicU64::new(0);
+
+    /// The name as four printable characters. ⚠️ Sanitised, because the whole point is that this may
+    /// be read off a **corrupt** node — an un-checked byte here would scribble control characters
+    /// into the one report we get.
+    pub fn name_chars() -> [char; 4] {
+        let n = NAME.load(Relaxed);
+        let mut out = ['?'; 4];
+        for (i, c) in out.iter_mut().enumerate() {
+            let b = (n >> (i * 8)) as u8;
+            *c = if b.is_ascii_graphic() { b as char } else { '?' };
+        }
+        out
+    }
+}
+
+/// Record the node a walk is standing on. Called once per node from `custom_acpi.c`.
+#[no_mangle]
+pub extern "C" fn nyx_walk_at(kind: u32, level: u32, index: u32, name: u32, node: u64, parent: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    walk_trace::ACTIVE.store(true, Relaxed);
+    walk_trace::KIND.store(kind, Relaxed);
+    walk_trace::LEVEL.store(level, Relaxed);
+    walk_trace::INDEX.store(index, Relaxed);
+    walk_trace::NAME.store(name, Relaxed);
+    walk_trace::NODE.store(node, Relaxed);
+    walk_trace::PARENT.store(parent, Relaxed);
+}
+
+/// Clear the cursor once a walk has returned, so a later unrelated panic does not report a stale
+/// node as though the walker were still in it.
+#[no_mangle]
+pub extern "C" fn nyx_walk_done() {
+    walk_trace::ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Leave a one-byte CMOS breadcrumb from C.

@@ -24,6 +24,10 @@ members = [
     # that renders differently on the machine than in the document is not a rendering bug; it means
     # the two implementations have silently forked and every Entity in existence has changed.
     "libs/entity",
+    # SHA-1 / HMAC / PBKDF2, lifted out of `iwlwifi.rs` so the Meridian lock can derive a key without
+    # importing one from a Wi-Fi driver. A workspace member because the known-answer tests that used
+    # to run once per boot and print to a screen nobody reads now run on every `cargo test`.
+    "libs/crypto",
     "libs/image",
     "libs/toolchains",
     # HTTP/TLS transport. A workspace member so `cargo test -p nyx-net` can exercise the URL and
@@ -36,10 +40,19 @@ members = [
     
     # Applications
     "apps/init",
-    "apps/compositor",
-    # The Meridian window server. Built ALONGSIDE apps/compositor, never in place of it: testing here
-    # is bare metal only, so a bad Meridian frame must not cost a working desktop. `Build.sh` picks
-    # which of the two becomes WindowServer.nyx.
+    # ★ The window server, and since Meridian step 20 the ONLY one.
+    #
+    # `apps/compositor` — the panel, start-menu and system-tray desktop this project ran on for its
+    # whole life — was retired here, together with `apps/wifi`, the standalone network picker it
+    # launched from its tray. Both were kept deliberately until the last step of the 20-step build
+    # order, on that order's own rule: *"deleting an application is the last step, never the first."*
+    # The compositor was the desktop to fall back to while Meridian was built beside it, and the
+    # picker was the only way to join a network from that desktop.
+    #
+    # What replaced them: the Entity's network drill-down (`libs/meridian`'s `network` module) for
+    # the desktop, and the terminal's `wifi` command for everything else — including the case the
+    # compositor used to cover, which is "the desktop did not come up and this machine still has to
+    # get online".
     "apps/shell",
     # apps/terminal is now a std target_os=nyx binary (D3) — built standalone via Build-std.sh, so it
     # lives in `exclude` below, not here.
@@ -48,7 +61,10 @@ members = [
     "apps/sysmon",
     "apps/glcube",
     "apps/imageviewer",
-    "apps/wifi",
+    # Headless, short-lived, and since step 20 it does double duty: init still spawns it with no
+    # argument to rejoin the remembered network at boot, and `apps/shell` now spawns it WITH one for
+    # every scan, join and radio toggle. The shell is the window server and those calls block in the
+    # driver for seconds — see `nyx_api::WifiOp`.
     "apps/wifiagent",
 
 ]

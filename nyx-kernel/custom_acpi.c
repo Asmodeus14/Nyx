@@ -227,11 +227,27 @@ void acpi_log_tables(void) {
 //
 // `prev` = NULL starts at the first child of `parent`; pass back the returned handle to advance.
 // Returns 1 on success, 0 when the scope is exhausted or the call failed.
+// ★★ `parent_out` and `name4_out` are the whole diagnostic now, and they are why this function grew.
+//
+// `acpi ls` reported 512 distinct handles off the ROOT with no repeat — but 512 was its own loop cap,
+// not a count, and a real ACPI root has ten to twenty children. So the sibling chain does not
+// terminate, and the question is where it stops being a real chain.
+//
+// Two facts answer that, and neither can be got from the full pathname:
+//
+//   `Parent` — every genuine sibling shares one. The first node whose parent differs from the first
+//              node's parent is the exact index where the walk left the child list. No crash needed.
+//   `Name`   — the RAW four-byte field, one load. `AcpiGetName(ACPI_FULL_PATHNAME)` cannot be trusted
+//              here: it walks `Parent` upward to build the path, so on a runaway node it either
+//              fails or invents a plausible string out of garbage. The raw word cannot lie.
 int acpi_ns_step(void *parent, void *prev, void **next,
-                 char *name_out, int name_max, int *type_out) {
+                 char *name_out, int name_max, int *type_out,
+                 void **parent_out, unsigned int *name4_out) {
     if (next) *next = NULL;
     if (name_out && name_max > 0) name_out[0] = '\0';
     if (type_out) *type_out = -1;
+    if (parent_out) *parent_out = NULL;
+    if (name4_out) *name4_out = 0;
 
     ACPI_HANDLE p = parent ? (ACPI_HANDLE)parent : ACPI_ROOT_OBJECT;
     ACPI_HANDLE out = NULL;
@@ -240,6 +256,12 @@ int acpi_ns_step(void *parent, void *prev, void **next,
         return 0;
     }
     if (next) *next = (void *)out;
+
+    {
+        ACPI_NAMESPACE_NODE *n = (ACPI_NAMESPACE_NODE *)out;
+        if (parent_out) *parent_out = (void *)n->Parent;
+        if (name4_out) *name4_out = n->Name.Integer;
+    }
 
     ACPI_OBJECT_TYPE t = ACPI_TYPE_ANY;
     if (ACPI_SUCCESS(AcpiGetType(out, &t)) && type_out) *type_out = (int)t;
@@ -831,10 +853,170 @@ typedef struct { int nodes; int devices; int with_bcl; } NyxNsCount;
 //   60 = about to enter AcpiWalkNamespace with an inert callback
 //   61 = the walk RETURNED  -> traversal is fine; the fault was the re-entrant calls above
 //   dies at 60             -> AcpiNsWalkNamespace itself is broken, independent of any callback
+extern void nyx_walk_at(unsigned int kind, unsigned int level, unsigned int index,
+                        unsigned int name, unsigned long long node, unsigned long long parent);
+extern void nyx_walk_done(void);
+
+// ★★★ COUNT THE ROOT'S CHILD CHAIN AT EACH STAGE OF BRING-UP.
+//
+// This is the measurement that separates the two remaining stories, and nothing softer will do it —
+// three hypotheses in a row have died because they were reasoned out instead of measured.
+//
+// The facts: the DSDT declares ~1468 root-scope names (1353 field units + 115 top-level), the load
+// reports success with every AML table LOADED and no error in the log, yet the live chain is 637 long
+// and ends on a block that is not a node. So either
+//
+//   (a) the nodes were never created — the parse stopped and lied about it, or
+//   (b) they were created and something UNLINKED them afterwards.
+//
+// ⚠️ It cannot be settled with `AcpiGetHandle`, which was the obvious idea: name lookup walks the
+// same `Peer` chain via `AcpiNsSearchOneScope`, so a failure there means "not created" OR "chain
+// broken" and cannot tell them apart — and it would walk into the same garbage node and #GP.
+//
+// Counting the chain at three points does settle it. `AcpiInitializeObjects` executes `_INI` methods,
+// and AML execution creates temporary namespace nodes and DELETES them — `AcpiNsDeleteNode` unlinks
+// by walking the parent's child list and rewriting a `Peer`. That is the only code in the whole
+// sequence that writes a `Peer` after load, and it runs on a chain 1468 long.
+//
+// So: 1468 after load and 637 after objects-init points at deletion. Short at every stage points at
+// the parse. One number per stage, and it lands in the ACPICA log, which is open during bring-up.
+//
+// Walks nothing but `Peer` with a hard cap, validates as it goes, and stops at the first node that
+// is not one — so it cannot crash the machine it is trying to diagnose.
+static void acpi_log_root_count(const char *tag) {
+    char line[160];
+    ACPI_NAMESPACE_NODE *root = AcpiGbl_RootNode;
+    if (!root) {
+        snprintf(line, sizeof(line), "  root-count %s: NO ROOT NODE\n", tag);
+        nyx_acpi_log(line);
+        return;
+    }
+
+    unsigned int n = 0;
+    unsigned int bad = 0;
+    ACPI_NAMESPACE_NODE *last_good = NULL;
+    ACPI_NAMESPACE_NODE *node = root->Child;
+
+    while (node && n < 8192) {
+        // A real node is a child of this root with four printable name bytes. Anything else means we
+        // have left the list, and reading its `Peer` is the step that faults — so stop here.
+        unsigned int name = node->Name.Integer;
+        int name_ok = 1;
+        for (int i = 0; i < 4; i++) {
+            unsigned char b = (unsigned char)(name >> (i * 8));
+            if (!((b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_')) name_ok = 0;
+        }
+        if (node->Parent != root || !name_ok) { bad = 1; break; }
+        last_good = node;
+        n++;
+        node = node->Peer;
+    }
+
+    snprintf(line, sizeof(line),
+             "  root-count %s: %u children, tail %s, last %.4s\n",
+             tag, n,
+             bad ? "DANGLING (peer -> non-node)" : (node ? "CAPPED" : "clean NULL"),
+             last_good ? (const char *)&last_good->Name.Ascii[0] : "----");
+    nyx_acpi_log(line);
+}
+
+void acpi_log_root_count_tag(const char *tag) { acpi_log_root_count(tag); }
+
+// ★★★ The same count, on demand from userspace, because the three bring-up counts came back
+// **1802 children, clean NULL, at every stage** — and `acpi ls` then saw 637 and garbage.
+//
+// So the namespace is built correctly and something breaks it LATER. The only ACPI activity between
+// the end of bring-up and userspace typing a command is the thermal governor's per-tick calls, which
+// evaluate AML — and AML execution creates and deletes temporary namespace nodes. `AcpiNsDeleteNode`
+// unlinks by walking the parent's child list and rewriting a `Peer`, on a chain 1802 long.
+//
+// Run this repeatedly and watch the number. It turns "it is broken by the time I look" into "it
+// broke between these two ticks", which is the difference between a theory and a bisect.
+//
+// Same guarantees as the bring-up version: follows `Peer` only, validates every node, capped, stops
+// before dereferencing anything that is not a node. It cannot crash.
+int acpi_root_count(int *bad_out) {
+    ACPI_NAMESPACE_NODE *root = AcpiGbl_RootNode;
+    if (bad_out) *bad_out = 0;
+    if (!root) return -1;
+
+    int n = 0;
+    ACPI_NAMESPACE_NODE *node = root->Child;
+    while (node && n < 8192) {
+        unsigned int name = node->Name.Integer;
+        int name_ok = 1;
+        for (int i = 0; i < 4; i++) {
+            unsigned char b = (unsigned char)(name >> (i * 8));
+            if (!((b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_')) name_ok = 0;
+        }
+        if (node->Parent != root || !name_ok) { if (bad_out) *bad_out = 1; break; }
+        n++;
+        node = node->Peer;
+    }
+    return n;
+}
+
+// ★★ The callback now PUBLISHES THE NODE, and that is the point of this whole pass.
+//
+// A pure counter told us "it dies somewhere in the walk", which we already knew. The walker crosses
+// thousands of nodes and dies on one; the useful question is WHICH. `nyx_walk_at` writes the cursor
+// to plain kernel memory and `panic_screen::fatal` prints it, so the red screen now names the node —
+// one boot instead of one power cycle per depth guess. It deliberately does NOT go through the CMOS
+// breadcrumb: bytes 1 and 3 of that field read back as zero on this board.
 static ACPI_STATUS NyxCountCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **Ret) {
     NyxNsCount *c = (NyxNsCount *)Context;
+    ACPI_NAMESPACE_NODE *n = (ACPI_NAMESPACE_NODE *)Object;
+    nyx_walk_at(1, Level, (unsigned int)c->nodes, n ? n->Name.Integer : 0,
+                (unsigned long long)(ACPI_SIZE)n,
+                (unsigned long long)(ACPI_SIZE)(n ? n->Parent : NULL));
     c->nodes++;
     return AE_OK;
+}
+
+// ★★ THE SAME WALK BUILT ON THE STEPPER — the control experiment, and the likely replacement.
+//
+// ⚠️ FIRST, THE CORRECTION THAT MOTIVATES IT. The reasoning above rests on "`acpi ls` enumerated 512
+// root children with no crash, so traversal is sound" — and that is NOT a like-for-like comparison.
+// `acpi ls` enumerates the ROOT's children only: one chain of `->Peer` pointers at depth 1. It never
+// follows a single `->Child` pointer. `AcpiNsWalkNamespace` DESCENDS — it dereferences `->Child` on
+// every node and `->Parent` on the way back up — and those pointers have never been exercised by
+// anything that works.
+//
+// So "the only difference is the locking" was false, which is exactly why bypassing the reader lock
+// and then ACPI_NS_WALK_NO_UNLOCK each changed nothing. Neither was ever the difference. Descent is.
+//
+// This walk descends using ONLY the public stepper, so it isolates that one variable:
+//
+//   Survives where the ACPICA walker dies -> the walker is at fault, and this becomes the walk that
+//                                            `AcpiInstallAddressSpaceHandler` gets rebuilt on.
+//   Dies at the same node                 -> the NODE is at fault; the walker was the messenger, and
+//                                            the four-character name on the panic screen looks up
+//                                            directly in nyx-recv/dsdt.dsl.
+//
+// Recursion is bounded by `depth`, and the ACPI namespace is single-digit levels deep, so the kernel
+// stack is not at risk.
+static void NyxStepWalk(ACPI_HANDLE parent, UINT32 level, UINT32 max_depth, NyxNsCount *c) {
+    ACPI_HANDLE child = NULL;
+    while (ACPI_SUCCESS(AcpiGetNextObject(ACPI_TYPE_ANY, parent, child, &child)) && child) {
+        ACPI_NAMESPACE_NODE *n = (ACPI_NAMESPACE_NODE *)child;
+        nyx_walk_at(2, level, (unsigned int)c->nodes, n ? n->Name.Integer : 0,
+                    (unsigned long long)(ACPI_SIZE)n,
+                    (unsigned long long)(ACPI_SIZE)parent);
+        c->nodes++;
+        if (level < max_depth) {
+            NyxStepWalk(child, level + 1, max_depth, c);
+        }
+    }
+}
+
+void acpi_count_nodes_stepper(int depth, int *nodes) {
+    NyxNsCount c = { 0, 0, 0 };
+    UINT32 d = (depth <= 0) ? ACPI_UINT32_MAX : (UINT32)depth;
+    nyx_mark(90);
+    NyxStepWalk(ACPI_ROOT_OBJECT, 1, d, &c);
+    nyx_walk_done();
+    nyx_mark(91);
+    if (nodes) *nodes = c.nodes;
 }
 
 // `depth` bounds the descent, so the failure can be bisected from userspace WITHOUT a rebuild.
@@ -851,6 +1033,11 @@ void acpi_count_nodes(int depth, int *nodes, int *devices, int *with_bcl) {
     UINT32 d = (depth <= 0) ? ACPI_UINT32_MAX : (UINT32)depth;
     nyx_mark((unsigned char)(60 + (depth > 0 && depth < 16 ? depth : 0)));
 
+    // ⚠️⚠️ THE TWO PARAGRAPHS BELOW ARE KEPT AS A RECORD OF A WRONG TURN. Both experiments they
+    // describe were run, both cost a power cycle, and neither changed anything — because the premise
+    // they share is false. "`acpi ls` enumerated 512 root children, so traversal is sound" compares
+    // a walk that DESCENDS against one that never left depth 1. See `NyxStepWalk` above.
+    //
     // ★ AcpiNsWalkNamespace DIRECTLY — deliberately skipping AcpiWalkNamespace's reader lock.
     //
     // `acpi ls` enumerated 512 root children with no crash, so traversal is sound. It steps with
@@ -881,6 +1068,7 @@ void acpi_count_nodes(int depth, int *nodes, int *devices, int *with_bcl) {
                             NyxCountCallback, NULL, &c, NULL);
         (void) AcpiUtReleaseMutex(ACPI_MTX_NAMESPACE);
     }
+    nyx_walk_done();
     nyx_mark((unsigned char)(80 + (depth > 0 && depth < 16 ? depth : 0)));
     if (nodes) *nodes = c.nodes;
     if (devices) *devices = c.devices;

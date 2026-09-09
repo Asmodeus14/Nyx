@@ -5,6 +5,9 @@ pub mod parser;
 pub mod ir;
 pub mod qir;
 pub mod codegen;
+pub mod program;      // QIR -> the straight line of quantum ops a circuit is (portable).
+pub mod statevector;  // The EXACT output distribution of a program (portable; no rand, no noise).
+pub mod highlight;    // Source -> the three tones the design's code pane sets it in (portable).
 pub mod semantics;
 pub mod error;
 #[cfg(feature = "sim")]

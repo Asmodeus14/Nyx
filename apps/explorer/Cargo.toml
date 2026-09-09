@@ -6,4 +6,10 @@ edition = "2021"
 [dependencies]
 nyx-api = { path = "../../libs/api" }
 nyx-gui = { path = "../../libs/gui" }
+# Meridian step 10 — the Files interior. The tokens, the navigation/file-row geometry (`panes`),
+# the CPU type-and-icon path (`text`), and Inter via `font::register_text()`, which installs the
+# three faces an app interior sets type in and leaves out the two it does not (see that function
+# for the size argument). The atlas is the shell's business; this app draws through nyx-gui's CPU
+# rasterizer, the same way `apps/terminal` does for step 11.
+nyx-meridian = { path = "../../libs/meridian" }
 linked_list_allocator = "0.10.5"

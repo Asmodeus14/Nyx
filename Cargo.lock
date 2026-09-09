@@ -24,7 +24,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
 dependencies = [
  "crypto-common",
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -146,18 +146,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 dependencies = [
  "derive_arbitrary",
-]
-
-[[package]]
-name = "as-slice"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45403b49e3954a4b8428a0ac21a4b7afadccf92bfd96273f1a58cd4812496ae0"
-dependencies = [
- "generic-array 0.12.4",
- "generic-array 0.13.3",
- "generic-array 0.14.7",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -295,7 +283,7 @@ version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -488,21 +476,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "compositor"
-version = "0.1.0"
-dependencies = [
- "embedded-io",
- "embedded-tls",
- "linked_list_allocator 0.10.6",
- "noto-sans-mono-bitmap",
- "nyx-api",
- "nyx-gui",
- "nyx-image",
- "pc-keyboard",
- "rand_core",
-]
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -606,7 +579,7 @@ version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
  "rand_core",
  "subtle",
  "zeroize",
@@ -618,7 +591,7 @@ version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
  "typenum",
 ]
 
@@ -808,7 +781,7 @@ dependencies = [
  "crypto-bigint",
  "digest",
  "ff",
- "generic-array 0.14.7",
+ "generic-array",
  "group",
  "hkdf",
  "pem-rfc7468",
@@ -817,43 +790,6 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "embedded-io"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
-
-[[package]]
-name = "embedded-io-async"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff09972d4073aa8c299395be75161d582e7629cd663171d62af73c8d50dba3f"
-dependencies = [
- "embedded-io",
-]
-
-[[package]]
-name = "embedded-tls"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6efb76fdd004a4ef787640177237b83449e6c5847765ea50bf15900061fd601"
-dependencies = [
- "aes-gcm",
- "atomic-polyfill",
- "digest",
- "embedded-io",
- "embedded-io-async",
- "generic-array 0.14.7",
- "heapless 0.6.1",
- "heapless 0.8.0",
- "hkdf",
- "hmac",
- "p256",
- "rand_core",
- "sha2",
- "typenum",
 ]
 
 [[package]]
@@ -1073,24 +1009,6 @@ dependencies = [
 
 [[package]]
 name = "generic-array"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffdf9f34f1447443d37393cc6c2b8313aebddcd96906caf34e54c68d8e57d7bd"
-dependencies = [
- "typenum",
-]
-
-[[package]]
-name = "generic-array"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f797e67af32588215eaaab8327027ee8e71b9dd0b2b26996aedf20c030fce309"
-dependencies = [
- "typenum",
-]
-
-[[package]]
-name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
@@ -1164,27 +1082,9 @@ dependencies = [
 
 [[package]]
 name = "hash32"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4041af86e63ac4298ce40e5cca669066e75b6f1aa3390fe2561ffa5e1d9f4cc"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
-name = "hash32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0c35f58762feb77d74ebe43bdbc3210f09be9fe6742234d573bacc26ed92b67"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
-name = "hash32"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
 dependencies = [
  "byteorder",
 ]
@@ -1197,36 +1097,14 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "heapless"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "634bd4d29cbf24424d0a4bfcbf80c6960129dc24424752a7d1d1390607023422"
-dependencies = [
- "as-slice",
- "generic-array 0.14.7",
- "hash32 0.1.1",
- "stable_deref_trait",
-]
-
-[[package]]
-name = "heapless"
 version = "0.7.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdc6457c0eb62c71aac4bc17216026d8410337c4126773b9c5daba343f17964f"
 dependencies = [
  "atomic-polyfill",
- "hash32 0.2.1",
+ "hash32",
  "rustc_version",
  "spin",
- "stable_deref_trait",
-]
-
-[[package]]
-name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32 0.3.1",
  "stable_deref_trait",
 ]
 
@@ -1517,7 +1395,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -1890,6 +1768,10 @@ name = "nyx-api"
 version = "0.1.0"
 
 [[package]]
+name = "nyx-crypto"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-entity"
 version = "0.1.0"
 
@@ -1900,6 +1782,7 @@ dependencies = [
  "linked_list_allocator 0.10.6",
  "nyx-api",
  "nyx-gui",
+ "nyx-meridian",
 ]
 
 [[package]]
@@ -1947,6 +1830,7 @@ dependencies = [
  "nyx-api",
  "nyx-gui",
  "nyx-image",
+ "nyx-meridian",
 ]
 
 [[package]]
@@ -1970,6 +1854,7 @@ dependencies = [
  "linked_list_allocator 0.9.1",
  "log",
  "noto-sans-mono-bitmap",
+ "nyx-crypto",
  "pc-keyboard",
  "pic8259",
  "sha3",
@@ -1988,6 +1873,7 @@ dependencies = [
  "libm",
  "nyx-api",
  "nyx-gui",
+ "qclang_compiler",
  "spin",
  "ttf-parser",
 ]
@@ -2009,6 +1895,7 @@ dependencies = [
  "linked_list_allocator 0.10.6",
  "nyx-api",
  "nyx-gui",
+ "nyx-meridian",
 ]
 
 [[package]]
@@ -2018,6 +1905,7 @@ dependencies = [
  "linked_list_allocator 0.10.6",
  "nyx-api",
  "nyx-gui",
+ "nyx-meridian",
 ]
 
 [[package]]
@@ -2025,15 +1913,6 @@ name = "nyx-toolchains"
 version = "0.1.0"
 dependencies = [
  "qclang_compiler",
-]
-
-[[package]]
-name = "nyx-wifi"
-version = "0.1.0"
-dependencies = [
- "linked_list_allocator 0.10.6",
- "nyx-api",
- "nyx-gui",
 ]
 
 [[package]]
@@ -2693,7 +2572,7 @@ checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
 dependencies = [
  "base16ct",
  "der",
- "generic-array 0.14.7",
+ "generic-array",
  "pkcs8",
  "subtle",
  "zeroize",
@@ -2854,6 +2733,8 @@ version = "0.1.0"
 dependencies = [
  "linked_list_allocator 0.10.6",
  "nyx-api",
+ "nyx-crypto",
+ "nyx-entity",
  "nyx-gui",
  "nyx-meridian",
 ]
@@ -2902,7 +2783,7 @@ dependencies = [
  "byteorder",
  "cfg-if",
  "defmt 0.3.100",
- "heapless 0.7.17",
+ "heapless",
  "log",
  "managed",
 ]

@@ -22,12 +22,30 @@ pub struct WindowHeader {
     /// it once and uses it for the window's taskbar button. Empty = no icon; the button falls back
     /// to the window's initial letter, so an app that never sets this still gets a usable button.
     pub icon: [u8; 96],
+    /// Meridian step 15: the **caption context** — the secondary, dimmer run the window server draws
+    /// after the window's name, `.w-cap .ctx`. NUL-padded, re-read every frame.
+    ///
+    /// The design's own words: *"Every text editor spends a strip of its own window telling you the
+    /// filename, the word count and whether there are unsaved changes. Here all three are already
+    /// outside the surface."* That is only true if a window can say those things, and until this
+    /// field the protocol carried exactly one string per window — set once, at creation. Text is the
+    /// application that makes the gap unavoidable, but it is not specific to it: QCLang's
+    /// `sample.ql · 2 qubits · depth 3` and Files' path belong here too.
+    ///
+    /// ⚠️ Unlike `title`, this is **read live from the mapped header each frame**, the same way
+    /// `content_h`/`scroll_off` are. A context that could only be set at creation would be a title
+    /// with extra steps.
+    pub context: [u8; 64],
+    /// Non-zero when the window has unsaved changes. Drawn as the same 3px accent tick a folded
+    /// window uses — the design asks for exactly that, and reusing the mark means "there is
+    /// something here you have not dealt with" has one appearance in the system.
+    pub dirty: u32,
     // U4: pad the header so the pixel data that follows (`shm + size_of::<WindowHeader>()`) is
     // PAGE-ALIGNED. The GPU compositor binds that pixel region as a sampled texture, and every proven
     // texture surface in the render engine uses a 4KB-aligned base — this makes window surfaces match,
     // with zero alignment risk. All apps compute the pixel offset via size_of, so this is transparent.
-    // Fixed part is now 192 bytes (8×u32 + 64 title + 96 icon), so pad to keep the total exactly 4096.
-    pub _pad: [u8; 4096 - 192],
+    // Fixed part is now 260 bytes (9×u32 + 64 title + 96 icon + 64 context), so pad to 4096.
+    pub _pad: [u8; 4096 - 260],
 }
 
 // U4 invariant: the header MUST stay exactly one page so the pixel data after it is 4KB-aligned for
@@ -83,6 +101,31 @@ pub const MSG_MOUSE_MOVE: u64 = 11;
 /// modal shell surface (the Command, the Entity) takes the pointer, and when a shell gesture —
 /// drag, resize, scrollbar — captures it.
 pub const MSG_MOUSE_LEAVE: u64 = 12;
+
+/// Shell → app: the theme changed. `data1` is 1 for dark, 0 for light.
+///
+/// Sent to every client when the theme is switched, and once to a new client just after
+/// `MSG_WINDOW_CREATED` so an app that starts up mid-session is not the only light window on a dark
+/// desktop.
+///
+/// Until this existed there was **no way at all for an app to learn the shell's theme** — no message,
+/// no header field, no syscall — so every ported interior hardcoded `Theme::dark()` and a light-mode
+/// shell left all of them dark. The design's whole claim about the light ramp is that it is "one
+/// design with eight token values swapped", which is only true if the swap reaches the applications.
+pub const MSG_THEME_CHANGED: u64 = 13;
+
+/// App → shell: please switch the theme. `data1` is 1 for dark, 0 for light, 2 for "toggle".
+///
+/// A request, not a command: the shell owns the theme (it has to regenerate the wallpaper texture),
+/// and it answers with a `MSG_THEME_CHANGED` broadcast that the requesting app receives like anyone
+/// else. So an app never sets its own theme directly — it asks, and then it is told, which keeps the
+/// shell the single source of truth even when the request came from Settings.
+pub const MSG_SET_THEME: u64 = 14;
+
+/// `data1` for the two messages above.
+pub const THEME_LIGHT: u64 = 0;
+pub const THEME_DARK: u64 = 1;
+pub const THEME_TOGGLE: u64 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -277,6 +320,46 @@ pub fn sys_execve(path: &str) -> i64 {
     syscall(SYS_EXECVE, path.as_ptr() as u64, path.len() as u64, 0, 0, 0, 0) as i64
 }
 
+/// `execve` with a single argument — the file the new program should open.
+///
+/// This is what makes "open this with that application" expressible: Files hands a PNG's path to
+/// the Image Viewer. It reaches the new program two ways, and both are the same string: as
+/// **`argv[1]`** on the SysV entry stack (so a std binary sees it in `std::env::args()`), and
+/// through [`sys_launch_arg`] (so a `no_std` binary, whose `_start` cannot reach its own argv, can
+/// ask for it).
+///
+/// One argument, not a vector: that is what the system can currently produce, and every pointer in
+/// an array of pointers is a separate unvalidated user read in the syscall path. Widen it when
+/// there is a caller that needs it.
+pub fn sys_execve_arg(path: &str, arg: &str) -> i64 {
+    syscall(
+        SYS_EXECVE,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        arg.as_ptr() as u64,
+        arg.len() as u64,
+        0,
+        0,
+    ) as i64
+}
+
+/// The argument this process was launched with, written into `buf`; returns how many bytes.
+///
+/// Zero means "launched without one" — the normal case for anything started from the dock or the
+/// Command. Truncates rather than failing if `buf` is short, so a too-small buffer surfaces as a
+/// path that fails to open with a name the app can print, rather than as an indistinguishable
+/// "no argument".
+///
+/// A `no_std` app cannot read its own `argv`: its `_start` is a plain `extern "C" fn`, and Rust's
+/// prologue has already moved RSP by the time any of its code runs. Hence a syscall rather than the
+/// stack. A std binary can use either this or `std::env::args()`.
+pub fn sys_launch_arg(buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    syscall(SYS_LAUNCH_ARG, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0) as usize
+}
+
 pub fn sys_fork() -> i64 {
     syscall(SYS_FORK, 0, 0, 0, 0, 0, 0) as i64
 }
@@ -417,6 +500,25 @@ pub struct RtcTime {
     pub year: u16,
 }
 
+impl RtcTime {
+    /// Seconds since 1970-01-01, or `0` when the RTC read failed (`year == 0`).
+    ///
+    /// Added for `libs/entity`, whose `born_unix` and hourly tick want an absolute instant rather
+    /// than a calendar. Zero is a legitimate answer here and not a sentinel to be worked around: a
+    /// machine with no working RTC has no birthday to record, and recording an invented one would be
+    /// worse than recording none.
+    pub fn unix(&self) -> u64 {
+        if self.year == 0 {
+            return 0;
+        }
+        let secs = days_from_civil(self.year as i64, self.month as i64, self.day as i64) * 86_400
+            + self.hour as i64 * 3600
+            + self.min as i64 * 60
+            + self.sec as i64;
+        secs.max(0) as u64
+    }
+}
+
 /// Read the hardware wall clock. Unpacks the kernel's packed u64
 /// (year<<40 | month<<32 | day<<24 | hour<<16 | min<<8 | sec).
 pub fn sys_get_rtc() -> RtcTime {
@@ -458,6 +560,12 @@ pub fn sys_get_rtc_local() -> RtcTime {
         + utc.min as i64 * 60
         + utc.sec as i64
         + off * 60;
+    civil_from_unix(secs)
+}
+
+/// The civil date for a unix instant. The public face of [`civil_from_unix`], which the Entity's
+/// birth date needs and which nothing else outside this file could reach.
+pub fn civil_from_unix_public(secs: i64) -> RtcTime {
     civil_from_unix(secs)
 }
 
@@ -617,6 +725,18 @@ pub fn sys_acpi_log(buf: &mut [u8]) -> usize {
 
 pub const SYS_EC_DUMP: u64 = 565;
 
+/// ⚠️ Duplicate syscall numbers are SILENT — `#![allow(warnings)]` suppresses
+/// `unreachable_patterns`, so a reused number shadows the original with no error. 501-567 are all
+/// taken; the next free is **568**. Before claiming one, run:
+///
+/// ```text
+/// grep -oE "pub const SYS_[A-Z_0-9]+: u64 = [0-9]+" libs/api/src/lib.rs | awk '{print $NF}' | sort -n | uniq -d
+/// ```
+pub const SYS_LAUNCH_ARG: u64 = 566;
+
+/// Whole-machine metrics for System Monitor — see [`SysMetrics`] and [`sys_get_metrics`].
+pub const SYS_SYS_METRICS: u64 = 567;
+
 /// Raw EC register space, captured by `acpi probe 7`. Returns `(ok, data_port, cmd_port, bytes)`.
 ///
 /// This is deliberately raw. ACPI's `_BIF`/`_BST` give a vendor-neutral battery layout, but they
@@ -652,11 +772,41 @@ pub struct AcpiNode {
     pub name: [u8; 96],
     pub name_len: usize,
     pub obj_type: i32,
+    /// The node's own `Parent` pointer. **Every genuine sibling shares one**, so the first node
+    /// whose parent differs from the first node's parent is where a chain left the real child list.
+    pub parent: u64,
+    /// The raw four-byte ACPI name field, one load, unprocessed.
+    pub name4: u32,
 }
 
 impl AcpiNode {
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("<non-utf8>")
+    }
+
+    /// The raw name as four characters, non-printables shown as `?`.
+    ///
+    /// ⚠️ Prefer this over [`name_str`] when auditing a suspect chain. `name_str` is built by
+    /// `AcpiGetName(ACPI_FULL_PATHNAME)`, which walks `Parent` upward — so on a node that is not
+    /// really in the tree it either fails or assembles a plausible path out of garbage. This is one
+    /// load of the node's own name field and cannot do that.
+    pub fn name4_chars(&self) -> [char; 4] {
+        let mut out = ['?'; 4];
+        for (i, c) in out.iter_mut().enumerate() {
+            let b = (self.name4 >> (i * 8)) as u8;
+            if b.is_ascii_graphic() {
+                *c = b as char;
+            }
+        }
+        out
+    }
+
+    /// A real ACPI name is four printable characters, `_` padded. Anything else is not a node.
+    pub fn name_looks_real(&self) -> bool {
+        (0..4).all(|i| {
+            let b = (self.name4 >> (i * 8)) as u8;
+            b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'
+        })
     }
     /// ACPI object type name.
     pub fn type_name(&self) -> &'static str {
@@ -680,10 +830,16 @@ pub fn sys_acpi_ns_step(parent: u64, prev: u64) -> Option<AcpiNode> {
     if ok != 1 { return None; }
     let handle = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
     let obj_type = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    let l = (buf[12] as usize).min(96);
+    // ⚠️ Fixed offsets, AHEAD of the variable-length name. Keep in step with the writer in
+    // `interrupts.rs`; these two are the only places that know this record's shape.
+    let parent = u64::from_le_bytes([
+        buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+    ]);
+    let name4 = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+    let l = (buf[24] as usize).min(96);
     let mut name = [0u8; 96];
-    name[..l].copy_from_slice(&buf[13..13 + l]);
-    Some(AcpiNode { handle, name, name_len: l, obj_type })
+    name[..l].copy_from_slice(&buf[25..25 + l]);
+    Some(AcpiNode { handle, name, name_len: l, obj_type, parent, name4 })
 }
 
 /// Resolve an absolute ACPI path (e.g. `\_SB.PCI0`) to a handle. 0 = not found.
@@ -1141,12 +1297,219 @@ pub fn sys_wifi_status() -> Option<WifiStatus> {
     if rc == 0 { Some(st) } else { None }
 }
 
+// ── The radio-operation request, Meridian step 20 ────────────────────────────
+//
+// ★ Why this exists at all.
+//
+// Meridian retires `apps/wifi` and moves the network picker into a drill-down on the Entity
+// surface — which is drawn by `apps/shell`, and `apps/shell` IS the window server. Four of the six
+// Wi-Fi syscalls BLOCK for seconds: `sys_wifi_scan` (~7 s of channel dwell), `sys_wifi_connect`
+// (~10-15 s of association, 4-way handshake and DHCP), `sys_wifi_disconnect` and
+// `sys_wifi_set_radio` (firmware teardown). Calling any of them from the shell stops compositing
+// for that whole time, and on this machine that is not merely ugly — it is a bug with two heads:
+//
+//   1. The hardware cursor is driven from the mouse IRQ, so it keeps moving over a frozen desktop.
+//      That is the exact signature of the GL-runtime freeze, and indistinguishable from it.
+//   2. The shell's 1 Hz full-frame heartbeat is what keeps the render engine out of RC6. Fifteen
+//      seconds without it loses MOCS and forcewake, and the first composite afterwards hangs.
+//
+// So the shell never makes those calls. It hands the operation to a short-lived helper —
+// `apps/wifiagent`, which already existed to do exactly one of them at boot — through
+// [`sys_execve_arg`], and then polls `sys_wifi_status` / `sys_wifi_list`, which read a published
+// snapshot and never touch the driver lock (see the kernel's own note on syscall 544). The desktop
+// keeps drawing at full rate for the entire join.
+//
+// This block is the wire format between those two processes. It lives in `nyx-api` because that is
+// what `nyx-api` is for — the shell and the agent both already depend on it, and neither can afford
+// to depend on the other. It is round-tripped by tests in `nyx-meridian`, which is the nearest
+// crate with a host test harness.
+
+/// One radio operation the shell wants performed on its behalf.
+///
+/// Deliberately NOT `Forget`: forgetting only rewrites `wifi.conf`, blocks on nothing, and the
+/// shell does it itself. Only operations that enter the driver are worth a process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WifiOp {
+    /// Re-sweep every channel. Refused by the kernel while associated.
+    Scan,
+    /// Join a network and remember it, so the boot agent reconnects next time. Carries the SSID and
+    /// passphrase.
+    Join,
+    /// Join without writing `wifi.conf`.
+    ///
+    /// Exactly one network is remembered — saving overwrites — so joining a café network the normal
+    /// way would quietly cost you the one your machine comes back to at home. That is what the old
+    /// picker's "Connect to this network automatically" checkbox was for, and it is why this is a
+    /// separate verb rather than a flag: the helper must not be able to mistake one for the other.
+    JoinOnce,
+    /// Leave the current network.
+    Leave,
+    /// Turn the radio on.
+    RadioOn,
+    /// Turn the radio off.
+    RadioOff,
+}
+
+impl WifiOp {
+    /// The verb as it appears on the wire. One place, so the encoder and the decoder cannot drift.
+    pub fn verb(self) -> &'static str {
+        match self {
+            WifiOp::Scan => "scan",
+            WifiOp::Join => "join",
+            WifiOp::JoinOnce => "join-once",
+            WifiOp::Leave => "leave",
+            WifiOp::RadioOn => "radio-on",
+            WifiOp::RadioOff => "radio-off",
+        }
+    }
+
+    /// Every verb, so the decoder and the tests cannot fall behind a new variant.
+    pub const ALL: [WifiOp; 6] = [
+        WifiOp::Scan,
+        WifiOp::Join,
+        WifiOp::JoinOnce,
+        WifiOp::Leave,
+        WifiOp::RadioOn,
+        WifiOp::RadioOff,
+    ];
+
+    /// Whether this op carries an SSID and passphrase.
+    pub fn is_join(self) -> bool {
+        matches!(self, WifiOp::Join | WifiOp::JoinOnce)
+    }
+
+    fn from_verb(v: &[u8]) -> Option<WifiOp> {
+        for op in WifiOp::ALL {
+            if op.verb().as_bytes() == v {
+                return Some(op);
+            }
+        }
+        None
+    }
+
+    /// Roughly how long the kernel call behind this takes, in milliseconds. The shell uses it as a
+    /// backstop only — the *outcome* always comes from `sys_wifi_status`, never from a timer — so
+    /// these are deliberately generous. Being slow to stop saying "Connecting…" is a much smaller
+    /// lie than saying "Couldn't connect" about a join that is still in flight.
+    pub fn budget_ms(self) -> usize {
+        match self {
+            WifiOp::Scan => 20_000,
+            WifiOp::Join | WifiOp::JoinOnce => 40_000,
+            WifiOp::Leave | WifiOp::RadioOn | WifiOp::RadioOff => 15_000,
+        }
+    }
+}
+
+/// The largest a request can be: a verb, a 32-byte SSID, a 63-character passphrase, two separators.
+pub const WIFI_OP_MAX: usize = 16 + 32 + 63 + 2;
+
+/// Encode a request into `buf`, returning its length. `ssid`/`psk` are ignored for every op but
+/// [`WifiOp::Join`].
+///
+/// The format is line-oriented — `verb\nssid\npsk` — because the argument reaches the helper as a
+/// `&str` either way, and a self-describing text line is the one encoding that stays debuggable on
+/// a machine with no serial console: the whole request can be printed.
+///
+/// ⚠️ An SSID may legally contain a newline. One that did would be truncated here rather than
+/// mis-parsed there, because the decoder splits on the FIRST two newlines and takes the rest
+/// verbatim as the passphrase — so a stray newline in an SSID moves bytes into the passphrase and
+/// the join simply fails authentication. It cannot forge a different verb, which is the property
+/// that actually matters.
+pub fn wifi_op_encode(buf: &mut [u8], op: WifiOp, ssid: &str, psk: &str) -> usize {
+    let mut n = 0usize;
+    let mut put = |src: &[u8], n: &mut usize| {
+        for &b in src {
+            if *n < buf.len() {
+                buf[*n] = b;
+                *n += 1;
+            }
+        }
+    };
+    put(op.verb().as_bytes(), &mut n);
+    if op.is_join() {
+        put(b"\n", &mut n);
+        put(ssid.as_bytes(), &mut n);
+        put(b"\n", &mut n);
+        put(psk.as_bytes(), &mut n);
+    }
+    n
+}
+
+/// Decode a request. Returns `(op, ssid, psk)`; the two strings are empty for every op but Join.
+///
+/// `None` for an unrecognised verb — which is also what an *empty* argument decodes to, and that is
+/// load-bearing: `apps/wifiagent` is still spawned by init with no argument at all, and must fall
+/// through to its original boot behaviour rather than treat "nothing" as an operation.
+pub fn wifi_op_decode(arg: &str) -> Option<(WifiOp, &str, &str)> {
+    let b = arg.as_bytes();
+    let end = b.iter().position(|&c| c == b'\n').unwrap_or(b.len());
+    let op = WifiOp::from_verb(&b[..end])?;
+    if !op.is_join() || end == b.len() {
+        return Some((op, "", ""));
+    }
+    let rest = &arg[end + 1..];
+    match rest.as_bytes().iter().position(|&c| c == b'\n') {
+        Some(i) => Some((op, &rest[..i], &rest[i + 1..])),
+        None => Some((op, rest, "")),
+    }
+}
+
+// ─────────────────────────── Power ───────────────────────────
+
+pub const SYS_POWER: u64 = 568;
+
+/// Switch the machine off through ACPI S5.
+pub const POWER_OFF: u64 = 0;
+/// Restart. The FADT reset register, then `0xCF9`, then the 8042, then a triple fault.
+pub const POWER_RESTART: u64 = 1;
+
+/// Shut down or restart. **Does not return on success.**
+///
+/// ⚠️ There is no `POWER_SLEEP`, and adding one would be a lie. Nyx implements no ACPI S3: nothing
+/// saves or restores device state, and the GPU's wake path is the RC6/MOCS hazard that has already
+/// cost this project a run of freezes. What Meridian calls sleep is a *shell* state — the panel
+/// drops to 15% and the desktop shows the Entity — and it is deliberately described as the machine
+/// staying awake with the screen dimmed, because that is what it is.
+///
+/// The return value is only ever an error: `EIO` if the firmware declined S5, `EINVAL` for an
+/// action that does not exist.
+pub fn sys_power(action: u64) -> i64 {
+    syscall(SYS_POWER, action, 0, 0, 0, 0, 0) as i64
+}
+
 pub fn sys_alloc_pages(pages: usize) -> u64 {
     syscall(519, pages as u64, 0, 0, 0, 0, 0)
 }
 
 pub fn sys_get_system_info(info_ptr: *mut SystemInfo) -> u64 {
     syscall(524, info_ptr as u64, 0, 0, 0, 0, 0)
+}
+
+/// Whole-machine metrics, for System Monitor. Separate from `SystemInfo` because that struct carries
+/// a 64-entry task array (several KB) and these are three scalars a monitor wants every second.
+///
+/// `repr(C)`, and the kernel writes these bytes directly, so field order here IS the ABI — it is
+/// mirrored in `interrupts.rs`. Append only.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct SysMetrics {
+    /// CPU busy percentage over the last governor cycle (0-100), published once a second by
+    /// `thermal.rs`. A *sampled* figure, not an instantaneous one: the share of scheduler ticks that
+    /// went to a non-idle task across the whole second.
+    pub cpu_pct: u32,
+    pub _reserved: u32,
+    /// Physical RAM handed out by the frame allocator, and the total it can ever hand out. The total
+    /// counts only bootloader-`Usable` regions, so it reads lower than the installed RAM — firmware
+    /// and MMIO holes are not memory this kernel can allocate.
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+}
+
+/// Read the machine's live metrics. `None` if the kernel rejected the buffer.
+pub fn sys_get_metrics() -> Option<SysMetrics> {
+    let mut m = SysMetrics::default();
+    let rc = syscall(SYS_SYS_METRICS, (&mut m as *mut SysMetrics) as u64, 0, 0, 0, 0, 0) as i64;
+    if rc == 0 { Some(m) } else { None }
 }
 
 pub fn sys_sleep_ms(ms: u64) {

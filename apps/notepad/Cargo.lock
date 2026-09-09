@@ -50,6 +50,7 @@ version = "0.1.0"
 dependencies = [
  "nyx-api",
  "nyx-gui",
+ "nyx-meridian",
 ]
 
 [[package]]
@@ -71,6 +72,18 @@ dependencies = [
  "linked_list_allocator",
  "noto-sans-mono-bitmap",
  "nyx-api",
+ "spin",
+ "ttf-parser",
+]
+
+[[package]]
+name = "nyx-meridian"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "libm",
+ "nyx-api",
+ "nyx-gui",
  "spin",
  "ttf-parser",
 ]

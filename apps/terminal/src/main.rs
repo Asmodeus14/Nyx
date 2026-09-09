@@ -66,12 +66,31 @@ const PAD_Y: usize = 24;
 const CUR_W: usize = 7;
 const CUR_H: usize = 15;
 
-/// `#0B0C0E` — the design gives the terminal its own ground, one step below `--surface`, so a
-/// console reads as a recessed well rather than another panel. Taken literally from the CSS.
-const TERM_BG_DARK: u32 = 0xFF0B_0C0E;
+/// Which theme the shell last told us about. Read by the painter, written by the message pump; an
+/// app is single-threaded, so a plain atomic is the whole synchronisation story.
+///
+/// Meridian step 13 added `MSG_THEME_CHANGED` / `NyxApp::on_theme` precisely so an app could stop
+/// guessing, and the terminal was the last one still hardcoding dark — for no better reason than
+/// that it was ported before the message existed.
+static DARK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 fn theme() -> nyx_meridian::tokens::Theme {
-    nyx_meridian::tokens::Theme::dark()
+    if DARK.load(core::sync::atomic::Ordering::Relaxed) {
+        nyx_meridian::tokens::Theme::dark()
+    } else {
+        nyx_meridian::tokens::Theme::light()
+    }
+}
+
+/// The console's own ground: one step below `--surface`, so it reads as a recessed well rather than
+/// another panel.
+///
+/// This used to be a hardcoded `0xFF0B_0C0E` "taken literally from the CSS" — which is byte for byte
+/// `Theme::dark().sunken`, so it was the same colour written down twice with only one of them able
+/// to follow a theme. It is the token now, which is also what gives the light theme its ground for
+/// free instead of needing a second literal invented to match.
+fn term_bg() -> u32 {
+    theme().sunken
 }
 
 /// JetBrains Mono's slot in `nyx_gui::font`'s registry.
@@ -346,6 +365,148 @@ impl TerminalApp {
         }
     }
 
+    /// `wifi …` — the whole radio, from a prompt.
+    ///
+    /// ★ Meridian step 20 retires `apps/wifi`, the standalone picker, and with it the only graphical
+    /// way to *join* a network that existed outside the shell. The Entity's drill-down replaces it
+    /// inside Meridian; this replaces it everywhere else. That matters more than it sounds: on a
+    /// laptop whose only working link is the radio, "the desktop did not come up" and "the machine
+    /// cannot get online" must not be the same sentence.
+    ///
+    /// Unlike the shell, this app may block. It is not the window server — a ten-second join costs
+    /// this window's responsiveness and nothing else — so it calls the kernel directly rather than
+    /// going through the agent. The shell's reasons for not doing that are in `nyx_api::WifiOp`.
+    fn do_wifi(&mut self, arg: &str) {
+        let arg = arg.trim();
+        if arg.is_empty() || arg == "status" {
+            let s = self.link_summary();
+            self.output_history.push_str(&s);
+            let mut buf = [0u8; 160];
+            match wifi_load_network(&mut buf) {
+                Some((slen, _)) => {
+                    let name = core::str::from_utf8(&buf[..slen]).unwrap_or("?").to_string();
+                    self.output_history
+                        .push_str(&format!("remembered: {:?} (rejoined at boot)\n", name));
+                }
+                None => self.output_history.push_str("remembered: none\n"),
+            }
+            return;
+        }
+
+        if arg == "list" || arg == "scan" {
+            // `scan` re-sweeps and BLOCKS ~7 s; `list` just reads the last sweep. Both then print
+            // the same table, because "what did that just find" is the only reason to run either.
+            if arg == "scan" {
+                self.output_history
+                    .push_str("Scanning every channel (about seven seconds)...\n");
+                sys_wifi_scan();
+            }
+            let mut buf = [WifiNetwork::default(); 48];
+            let n = sys_wifi_list(&mut buf);
+            if n == 0 {
+                self.output_history.push_str("no networks in range\n");
+                return;
+            }
+            let mut nets: Vec<WifiNetwork> = buf[..n].to_vec();
+            nets.sort_by(|a, b| a.name().cmp(b.name()));
+            for e in &nets {
+                let band = if e.band == 1 { "2.4GHz" } else { "5GHz" };
+                // Named the same way the drill-down names them, because a person reading both
+                // should not have to work out that "Mixed mode" and "TKIP" are the same network.
+                let sec = if e.needs_tkip() {
+                    "WPA2/TKIP mixed - UNJOINABLE"
+                } else if e.is_legacy_security() {
+                    "WEP/WPA1 - UNJOINABLE"
+                } else if e.is_secure() {
+                    "WPA2"
+                } else {
+                    "open"
+                };
+                self.output_history.push_str(&format!(
+                    "{}{:<24} {:>7} ch{:<4} {}\n",
+                    if e.is_current() { "* " } else { "  " },
+                    e.name(), band, e.channel, sec,
+                ));
+            }
+            return;
+        }
+
+        if arg == "on" || arg == "off" {
+            let want = arg == "on";
+            let got = sys_wifi_set_radio(want) != WIFI_RADIO_OFF;
+            // Believe the return value, not the request: the kernel refuses while another operation
+            // owns the radio and hands back the state unchanged.
+            self.output_history.push_str(if got != want {
+                "the radio is busy with another operation - try again\n"
+            } else if want {
+                "radio on (nothing rejoined; use `wifi join`)\n"
+            } else {
+                "radio off\n"
+            });
+            return;
+        }
+
+        if arg == "leave" || arg == "disconnect" {
+            sys_wifi_disconnect();
+            self.output_history.push_str("disconnected\n");
+            return;
+        }
+
+        if arg == "forget" {
+            self.output_history.push_str(if wifi_forget_network() {
+                "forgotten - this machine will not reconnect on its own\n"
+            } else {
+                "could not rewrite the saved-network file\n"
+            });
+            return;
+        }
+
+        if let Some(rest) = arg.strip_prefix("join ") {
+            // `join <ssid> [passphrase]`. The SSID is everything up to the LAST space when there is
+            // a passphrase, because an SSID may contain spaces and a WPA2 passphrase may not be
+            // shorter than eight characters — so the split is decidable without quoting rules.
+            let rest = rest.trim();
+            let (ssid, psk) = match rest.rfind(' ') {
+                Some(i) if rest.len() - i - 1 >= 8 => (&rest[..i], &rest[i + 1..]),
+                _ => (rest, ""),
+            };
+            if ssid.is_empty() {
+                self.output_history.push_str("usage: wifi join <ssid> [passphrase]\n");
+                return;
+            }
+            // ⚠️ Said out loud, every time. The passphrase was typed in the clear and is now in the
+            // scrollback, and `wifi.conf` is plain text on an unencrypted filesystem.
+            self.output_history.push_str(&format!(
+                "Joining {:?}. This blocks for ten seconds or so.\n\
+                 The passphrase is in this window's scrollback and, once saved, in\n\
+                 /mnt/nvme/wifi.conf in plain text. Nyx has no disk encryption.\n",
+                ssid
+            ));
+            let rc = sys_wifi_connect(ssid, psk);
+            self.output_history.push_str(match rc {
+                WIFI_CONNECTED => "connected\n",
+                WIFI_AUTH_FAILED => "the password was rejected\n",
+                WIFI_NO_LEASE => "joined, but the router never offered an address\n",
+                WIFI_HW_FAILED => "the adapter refused to tune to that network\n",
+                _ => "the join did not complete\n",
+            });
+            if rc == WIFI_CONNECTED {
+                // Saved only on success, so the boot agent can never inherit a typo — the same rule
+                // the agent itself follows.
+                if wifi_save_network(ssid, psk) {
+                    self.output_history.push_str("remembered; it will be rejoined at boot\n");
+                }
+            }
+            let s = self.link_summary();
+            self.output_history.push_str(&s);
+            return;
+        }
+
+        self.output_history.push_str(
+            "usage: wifi [status] | list | scan | join <ssid> [pass] | leave | on | off | forget\n",
+        );
+    }
+
     /// `fetch <url>` — the end-to-end proof that userspace networking reaches the internet.
     ///
     /// Exercises the whole stack in one command: DNS on the active link, a routed TCP socket, the
@@ -482,6 +643,96 @@ impl TerminalApp {
             self.do_date();
         } else {
             self.output_history.push_str("that is not a real UTC offset\n");
+        }
+    }
+
+    /// `passwd <phrase>` / `passwd off` — set or clear the Meridian lock's passphrase.
+    ///
+    /// ⚠️ **The passphrase is typed in the clear and stays in the scrollback.** That is honest for
+    /// what this is: a `no_std`-derived shell with no `read_password`, no terminal echo control and
+    /// no `getpass`. It is called out here rather than hidden because the alternative — a prompt
+    /// that *looks* private on a terminal that cannot make it private — would be worse. Run
+    /// `clear` afterwards.
+    ///
+    /// ⚠️ And say plainly what it buys: Nyx has no disk encryption, so `auth.bin` gates a drawing
+    /// routine and nothing else. This stops a person borrowing your desk. It does not stop a person
+    /// with a screwdriver.
+    fn do_passwd(&mut self, arg: &str) {
+        const PATH: &str = "/mnt/nvme/auth.bin";
+        if arg.is_empty() {
+            let set = std::fs::metadata(PATH).is_ok();
+            self.output_history.push_str(if set {
+                "A lock passphrase is set. The lock appears when the machine wakes from idle.\n"
+            } else {
+                "No lock passphrase is set, so the machine never locks.\n"
+            });
+            self.output_history.push_str("usage: passwd <phrase>   |   passwd off\n");
+            self.output_history.push_str(
+                "NOTE: typed in the clear and left in the scrollback — run `clear` afterwards.\n",
+            );
+            self.output_history.push_str(
+                "NOTE: Nyx has no disk encryption. This gates the screen, not the disk.\n",
+            );
+            return;
+        }
+        if arg == "off" {
+            match std::fs::remove_file(PATH) {
+                Ok(_) => self.output_history.push_str("Passphrase cleared. The machine no longer locks.\n"),
+                Err(_) => self.output_history.push_str("No passphrase was set.\n"),
+            }
+            return;
+        }
+
+        // Calibrate the iteration count on THIS CPU rather than copying WPA2's 4096, which is
+        // calibrated for a handshake a radio is waiting on and is far too low for a password store.
+        // Measure a probe, scale to the target, and write the count into the file so it can be
+        // raised later without invalidating the passphrase that is already stored.
+        const PROBE: u32 = 20_000;
+        const TARGET_MS: usize = 250;
+        let t0 = nyx_api::sys_get_time();
+        let _ = nyx_crypto::pbkdf2_sha1(arg.as_bytes(), b"calibrate", PROBE, 32);
+        let probe_ms = nyx_api::sys_get_time().saturating_sub(t0).max(1);
+        // Clamp hard at both ends. A clock that returned nonsense must not write an iteration count
+        // that makes every future unlock take a minute, nor one that makes it free.
+        let iters = ((PROBE as usize * TARGET_MS / probe_ms) as u32).clamp(20_000, 4_000_000);
+
+        // The salt has to differ per installation or two machines with the same passphrase get the
+        // same stored key. The RTC is the only entropy this box will answer with — there is no
+        // getrandom and no RDRAND wrapper — so it is stretched through SHA-1 with the machine's own
+        // SMBIOS string, which is the same construction `Seed::strike` uses for the Entity.
+        let mut hw = [0u8; 256];
+        let n = nyx_api::sys_get_hw_info(&mut hw);
+        let mut seed_src = Vec::new();
+        seed_src.extend_from_slice(&raw_unix_now().to_le_bytes());
+        seed_src.extend_from_slice(&(nyx_api::sys_get_time() as u64).to_le_bytes());
+        seed_src.extend_from_slice(&hw[..n]);
+        let salt = &nyx_crypto::sha1(&seed_src)[..16];
+
+        let key = nyx_crypto::pbkdf2_sha1(arg.as_bytes(), salt, iters, 32);
+
+        let mut buf = Vec::with_capacity(53);
+        buf.push(1u8); // version
+        buf.extend_from_slice(&iters.to_le_bytes());
+        buf.extend_from_slice(salt);
+        buf.extend_from_slice(&key);
+
+        match std::fs::write(PATH, &buf) {
+            Ok(_) => {
+                self.output_history.push_str(&format!(
+                    "Passphrase set. {} iterations (~{} ms to derive on this CPU).\n",
+                    iters, TARGET_MS
+                ));
+                self.output_history.push_str(
+                    "The lock appears the next time the machine wakes from idle.\n",
+                );
+                self.output_history.push_str(
+                    "Run `clear` — the phrase you just typed is still in the scrollback.\n",
+                );
+            }
+            Err(e) => {
+                self.output_history
+                    .push_str(&format!("Could not write {}: {}\n", PATH, e));
+            }
         }
     }
 
@@ -859,7 +1110,10 @@ fn replace_ext(path: &str, new_ext: &str) -> String {
 
 impl NyxApp for TerminalApp {
     fn icon_path(&self) -> &str { "/mnt/nvme/apps/Terminal.nyx/icon.png" }
-    fn title(&self) -> &str { "Nyx Matrix Terminal" }
+    // "Nyx Matrix Terminal" until now — the last trace of the green-on-black identity the rest of
+    // this file already gave up. The caption line is set in the shell's own type beside every other
+    // window's name; a product name there reads as branding on a surface that carries none.
+    fn title(&self) -> &str { "Terminal" }
     fn initial_width(&self) -> usize { 640 }
     fn initial_height(&self) -> usize { 400 }
 
@@ -880,6 +1134,13 @@ impl NyxApp for TerminalApp {
         true
     }
 
+    /// The shell announces its theme on connect and on every toggle (Meridian step 13). Returning
+    /// true only on a real change keeps a redundant announcement from costing a repaint.
+    fn on_theme(&mut self, dark: bool) -> bool {
+        use core::sync::atomic::Ordering;
+        DARK.swap(dark, Ordering::Relaxed) != dark
+    }
+
     fn update(&mut self) -> bool {
         self.blink_timer += 1;
         if self.blink_timer > 30 {
@@ -892,7 +1153,7 @@ impl NyxApp for TerminalApp {
 
     fn draw(&mut self, canvas: &mut Canvas) {
         let t = theme();
-        canvas.fill_rect(0, 0, canvas.width, canvas.height, TERM_BG_DARK);
+        canvas.fill_rect(0, 0, canvas.width, canvas.height, term_bg());
 
         // One advance for the whole face — JetBrains Mono is fixed-pitch, and asking per glyph would
         // take the font mutex once per character of an 8000-character scrollback, every frame.
@@ -1014,6 +1275,12 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  fault segv        - child derefs null   -> amber banner, desktop survives\n");
                 self.output_history.push_str("  fault ud          - child runs ud2      -> amber banner, desktop survives\n");
                 self.output_history.push_str("  fault panic       - KILLS THE MACHINE   -> full red screen, then power cycle\n");
+                self.output_history.push_str("  passwd [phrase]   - set/show the lock passphrase ('passwd off' clears it)\n");
+                self.output_history.push_str("Network (this is the whole radio; the graphical picker was retired in step 20):\n");
+                self.output_history.push_str("  wifi              - link state, lease and which network is remembered\n");
+                self.output_history.push_str("  wifi list / scan  - the last sweep / a fresh one (scan BLOCKS ~7 s, refused while joined)\n");
+                self.output_history.push_str("  wifi join <ssid> [pass]  - join and remember. BLOCKS ~10 s. Passphrase goes in the clear\n");
+                self.output_history.push_str("  wifi leave | on | off | forget\n");
             } else if cmd == "clear" {
                 self.output_history.clear();
             } else if cmd == "toolchains" {
@@ -1028,6 +1295,10 @@ impl NyxApp for TerminalApp {
                 self.do_get(arg);
             } else if let Some(arg) = cmd.strip_prefix("dns ") {
                 self.do_dns(arg);
+            } else if cmd == "wifi" || cmd.starts_with("wifi ") {
+                self.do_wifi(cmd["wifi".len()..].trim());
+            } else if cmd == "passwd" || cmd.starts_with("passwd ") {
+                self.do_passwd(cmd["passwd".len()..].trim());
             } else if cmd == "date" {
                 self.do_date();
             } else if cmd == "tz" {
@@ -1208,7 +1479,9 @@ impl NyxApp for TerminalApp {
                     match step_txt.parse::<u8>() {
                         // 7 is the EC dump — added after this range check was written, so
                         // `acpi probe 7` was silently rejected and the dump never ran.
-                        Ok(s) if (1..=7).contains(&s) => {
+                        // 8 is the stepper walk — the control for step 1. Extend this range when a
+                        // step is added; 7 was silently rejected for a while and its dump never ran.
+                        Ok(s) if (1..=8).contains(&s) => {
                             sys_acpi_probe(s, depth);
                             if s == 1 {
                                 self.output_history.push_str(&format!(
@@ -1218,6 +1491,18 @@ impl NyxApp for TerminalApp {
                                     60 + if depth < 16 { depth } else { 0 },
                                     80 + if depth < 16 { depth } else { 0 },
                                 ));
+                            }
+                            if s == 1 || s == 8 {
+                                // ★ The point of this pass: a walk that dies no longer needs a
+                                // power cycle to be located. The cursor is in kernel memory and the
+                                // panic screen prints it.
+                                self.output_history.push_str(
+                                    "If it dies, the RED SCREEN now names the node: walker, node \
+                                     index, depth, the 4-char ACPI name, and both pointers.\n\
+                                     \x20 Look that name up in nyx-recv/dsdt.dsl.\n\
+                                     \x20 Run `acpi probe 8` after `acpi probe 1` — same walk, \
+                                     stepper-driven. Same node = bad data, not a bad walker.\n",
+                                );
                             }
                             self.output_history.push_str(&format!(
                                 "Queued ACPI step {} for the next governor tick (~1s).\n\
@@ -1265,10 +1550,28 @@ impl NyxApp for TerminalApp {
                         // near the cap means the sibling chain is not ending, and WHY matters:
                         //   same handle repeating  -> AcpiGetNextObject is not advancing
                         //   handles cycling        -> the Peer chain is circular (real corruption)
-                        //   all distinct           -> the tree is genuinely that wide
+                        //   all distinct           -> RUNAWAY — measured 2026-09-09, see below
                         let mut seen: Vec<u64> = Vec::new();
                         let mut verdict = String::new();
-                        while n < 512 {
+                        // ★★ The parent of the FIRST node. Every genuine sibling shares it.
+                        //
+                        // This is the check the 512-distinct-handles result demanded. "All distinct,
+                        // no repeat" ruled out a cycle but not a runaway, and the two need different
+                        // fixes. A node whose `Parent` is not this one is not in this child list at
+                        // all — so the index where that first happens is the exact length of the real
+                        // chain, and everything after it is memory the walk has no business in.
+                        //
+                        // ⚠️ Compared against node 0's parent rather than `parent`, because for the
+                        // root case userspace holds the ACPI_ROOT_OBJECT sentinel, not the address of
+                        // the actual root node. Siblings agreeing with each other is the same test
+                        // and needs no such knowledge.
+                        let mut first_parent: Option<u64> = None;
+                        // ⚠️ Was 512, and that number did real damage: it was quoted for weeks as
+                        // "the root has 512 children", which is a CAP being mistaken for a COUNT and
+                        // is what made a corrupt namespace look like a broken walker. 4096 is high
+                        // enough that hitting it means something is very wrong, and the verdict below
+                        // now says so in words instead of leaving a number to be misread.
+                        while n < 4096 {
                             match sys_acpi_ns_step(parent, prev) {
                                 Some(node) => {
                                     if let Some(i) = seen.iter().position(|&h| h == node.handle) {
@@ -1287,11 +1590,39 @@ impl NyxApp for TerminalApp {
                                         );
                                         break;
                                     }
-                                    // Handle printed too: names can collide, handles cannot.
+                                    // ★ The moment the chain leaves the real child list.
+                                    let p0 = *first_parent.get_or_insert(node.parent);
+                                    if verdict.is_empty()
+                                        && (node.parent != p0 || !node.name_looks_real())
+                                    {
+                                        let c = node.name4_chars();
+                                        verdict = format!(
+                                            "  ★ CHAIN RAN AWAY at index {}\n\
+                                             \x20   raw name {}{}{}{} ({:#010x}) — {}\n\
+                                             \x20   parent   {:#x}, but every node before it had \
+                                             {:#x}\n\
+                                             \x20   So the real child list is {} long and the walk \
+                                             is now in unowned memory.\n",
+                                            n, c[0], c[1], c[2], c[3], node.name4,
+                                            if node.name_looks_real() {
+                                                "a real-looking name, but the wrong parent"
+                                            } else {
+                                                "not a valid ACPI name — this is not a node"
+                                            },
+                                            node.parent, p0, n,
+                                        );
+                                    }
+                                    // Handle printed too: names can collide, handles cannot. The raw
+                                    // name sits beside the pathname because on a runaway node
+                                    // `AcpiGetName` builds a plausible string out of garbage, and
+                                    // seeing the two disagree is the tell.
+                                    let c = node.name4_chars();
                                     self.output_history.push_str(&format!(
-                                        "  {:<10} {:#012x}  {}\n",
+                                        "  {:<10} {:#012x}  p={:#012x}  {}{}{}{}  {}\n",
                                         node.type_name(),
                                         node.handle,
+                                        node.parent,
+                                        c[0], c[1], c[2], c[3],
                                         node.name_str()
                                     ));
                                     seen.push(node.handle);
