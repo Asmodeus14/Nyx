@@ -15,3 +15,10 @@ ttf-parser = { version = "0.25", default-features = false, features = ["no-std-f
 ab_glyph_rasterizer = { version = "0.1", default-features = false, features = ["libm"] }
 libm = "0.2"
 spin = "0.9"
+
+[dev-dependencies]
+# For `examples/qclang_preview.rs` only. The preview's whole value is that it draws a circuit from a
+# REAL compile rather than from a fixture, so it needs the compiler — and a dev-dependency is
+# host-only, so not a byte of this reaches a Nyx binary. `default-features = false` keeps it to the
+# portable core (logos + thiserror), the same subset apps/qcstudio links.
+qclang_compiler = { path = "../../tools/compiler", default-features = false }

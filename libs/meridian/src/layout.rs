@@ -4,6 +4,11 @@
 //!
 //! Two reasons, and both are lessons this codebase already paid for.
 //!
+//!
+//! ⚠️ `nyx_gui::ui` is cited by name several times below and **no longer exists** — it was
+//! the old desktop's widget set and was deleted with `apps/compositor` at Meridian step 20
+//! (2026-09-08). Those citations are history, not directions: they record what this module
+//! replaced and why, and `git log libs/gui/src/ui.rs` is where to read the original.
 //! **One source of truth.** `nyx_gui::ui` carries a comment above `ctl_btn_rect` explaining that the
 //! window controls' drawn plates and clickable regions "used to be five hand-copied literal rects,
 //! which is how [they] drifted apart in the first place". Every rect here is computed by exactly one
@@ -45,6 +50,12 @@ use crate::tokens::{RADIUS_SURFACE, RADIUS_WINDOW};
 pub fn caption_h() -> i32 { sc(CAPTION_H) }
 /// `.w-cap { padding: 0 2px }`
 pub fn caption_pad_x() -> i32 { sc(CAPTION_PAD_X) }
+/// `.w-cap { gap: 9px }` — between the name, the separator dot and the context run.
+pub fn caption_gap() -> i32 { sc(CAPTION_GAP) }
+/// `.w-cap .sep { width: 2px; height: 2px; border-radius: 1px }` — the dot that separates a
+/// window's name from its context. Floored at 1px: at scale 1.0 it is two pixels, and rounding a
+/// two-pixel mark away on some panel would silently delete the punctuation.
+pub fn caption_sep() -> i32 { sc(CAPTION_SEP).max(1) }
 /// The glyph inside a window control's 18px plate.
 pub fn ctl_icon() -> i32 { sc(CTL_ICON) }
 /// `.w-folded .tick { width: 3px }`
@@ -98,6 +109,78 @@ pub fn cmd_footer_h() -> i32 { sc(CMD_FOOTER_H) }
 pub fn cmd_footer_mark() -> i32 { sc(CMD_FOOTER_MARK) }
 /// The 11px label line height, for centring the footer hints.
 pub fn cmd_footer_line() -> i32 { sc(14) }
+
+// ── The power glyphs in the Command's footer ────────────────────────────────
+//
+// ★ An extension. Meridian was drawn for a desktop that is simply always on, so the design has no
+// power control anywhere — but a machine has to be able to stop, and until this existed the only way
+// to stop this one was to hold the power button with a live ext4 mount.
+//
+// They live at the right-hand end of the Command's footer, as **glyphs with no label**. That corner
+// already holds the one piece of chrome in the Command that is about the session rather than about
+// the query (`6 of 41 results`), the Command is what the Super key opens, and two 14px glyphs are
+// the smallest thing that can be a target without becoming a row in a list of applications.
+//
+// Deliberately NOT rows in the result list, which is where they started: a verb that ends the
+// session should not be reachable by typing three letters and hitting Return with the selection
+// still on the first match.
+
+/// `.cmd-f` power glyph, 14px like the key hints beside it.
+const CMD_POWER_ICON: i32 = 14;
+/// Gap between the two glyphs.
+const CMD_POWER_GAP: i32 = 16;
+/// Clear space between them and the result count to their left.
+const CMD_POWER_LEAD: i32 = 22;
+
+/// How many glyphs there are: shut down, restart.
+pub const CMD_POWER_SLOTS: usize = 2;
+
+pub fn cmd_power_icon() -> i32 { sc(CMD_POWER_ICON) }
+
+/// The hit box for power glyph `i`, counted from the RIGHT edge inward — so slot 0 is the rightmost.
+///
+/// Padded well past the glyph itself: a 14px square is a dare, and the footer band has nothing else
+/// in that corner to collide with. Draw and hit-test both go through here, which is the whole reason
+/// it is in this file at all.
+pub fn cmd_power_slot(screen_w: i32, body_h: i32, i: usize) -> Option<Rect> {
+    if i >= CMD_POWER_SLOTS {
+        return None;
+    }
+    let panel = command_panel(screen_w, body_h);
+    let f_y = panel.bottom() - sc(CMD_FOOTER_H);
+    let icon = sc(CMD_POWER_ICON);
+    let step = icon + sc(CMD_POWER_GAP);
+    let right = panel.right() - sc(CMD_Q_PAD_X);
+    // Pad to the full footer height vertically and half the gap horizontally.
+    let pad = sc(CMD_POWER_GAP) / 2;
+    Some(Rect::new(
+        right - (i as i32 + 1) * step + sc(CMD_POWER_GAP) - pad,
+        f_y,
+        icon + pad * 2,
+        sc(CMD_FOOTER_H),
+    ))
+}
+
+/// Where the glyph itself is drawn inside slot `i` — centred in its hit box.
+pub fn cmd_power_glyph(screen_w: i32, body_h: i32, i: usize) -> Option<Rect> {
+    let r = cmd_power_slot(screen_w, body_h, i)?;
+    let icon = sc(CMD_POWER_ICON);
+    Some(Rect::new(r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, icon))
+}
+
+/// Which power glyph is under `(mx, my)`.
+pub fn cmd_power_hit(screen_w: i32, body_h: i32, mx: i32, my: i32) -> Option<usize> {
+    (0..CMD_POWER_SLOTS)
+        .find(|&i| cmd_power_slot(screen_w, body_h, i).map_or(false, |r| r.contains(mx, my)))
+}
+
+/// The right edge the result count must stop at, so it cannot run under the power glyphs.
+pub fn cmd_footer_text_right(screen_w: i32, body_h: i32) -> i32 {
+    match cmd_power_slot(screen_w, body_h, CMD_POWER_SLOTS - 1) {
+        Some(r) => r.x - sc(CMD_POWER_LEAD),
+        None => command_panel(screen_w, body_h).right() - sc(CMD_Q_PAD_X),
+    }
+}
 
 /// A rectangle in screen pixels.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -228,16 +311,16 @@ pub fn dock_hit(screen_h: i32, mx: i32, my: i32) -> Option<usize> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `.ent { right: 40px; bottom: 32px }`
-const ENTITY_RIGHT: i32 = 40;
+pub(crate) const ENTITY_RIGHT: i32 = 40;
 const ENTITY_BOTTOM: i32 = 32;
 /// `.i-22 { width: 22px; height: 22px }` — the mark.
 const ENTITY_MARK: i32 = 22;
 /// `.ent { gap: 12px }` between the phrase and the mark.
 const ENTITY_GAP: i32 = 12;
 /// `.ent-s { width: 372px }`
-const ENTITY_SURFACE_W: i32 = 372;
+pub(crate) const ENTITY_SURFACE_W: i32 = 372;
 /// `.ent-s { bottom: 78px }`
-const ENTITY_SURFACE_BOTTOM: i32 = 78;
+pub(crate) const ENTITY_SURFACE_BOTTOM: i32 = 78;
 
 /// The 22px mark at bottom-right. This is the entire permanent chrome on that side of the screen —
 /// there is no tray, because this is the tray.
@@ -283,51 +366,123 @@ pub fn entity_surface(screen_w: i32, screen_h: i32, content_h: i32) -> Rect {
 // every row inside it, so it lives here with tests rather than inline in the renderer.
 
 /// `.ent-hd { padding: 26px 26px 22px }`
-const ENT_HD_PAD_TOP: i32 = 26;
-const ENT_HD_PAD_X: i32 = 26;
-const ENT_HD_PAD_BOTTOM: i32 = 22;
+pub(crate) const ENT_HD_PAD_TOP: i32 = 26;
+pub(crate) const ENT_HD_PAD_X: i32 = 26;
+pub(crate) const ENT_HD_PAD_BOTTOM: i32 = 22;
 /// `.ent-hd .st { margin-bottom: 6px }`
-const ENT_HD_GAP: i32 = 6;
+pub(crate) const ENT_HD_GAP: i32 = 6;
 /// `.ent-hd .st { line-height: 27px }` — the statement is one `d3` line.
-const ENT_STATEMENT_H: i32 = 27;
+pub(crate) const ENT_STATEMENT_H: i32 = 27;
 /// `.ent-hd .dt { line-height: 18px }`
-const ENT_DETAIL_LINE: i32 = 18;
+pub(crate) const ENT_DETAIL_LINE: i32 = 18;
 /// `.ent-m { padding: 18px 26px }`
-const ENT_M_PAD_Y: i32 = 18;
+pub(crate) const ENT_M_PAD_Y: i32 = 18;
 /// `.mrow { padding: 7px 0 }` around a 17px line.
-const ENT_MROW_H: i32 = 31;
+pub(crate) const ENT_MROW_H: i32 = 31;
 /// `.ent-c { padding: 8px 14px 12px }`
-const ENT_C_PAD_TOP: i32 = 8;
-const ENT_C_PAD_BOTTOM: i32 = 12;
-const ENT_C_PAD_X: i32 = 14;
+pub(crate) const ENT_C_PAD_TOP: i32 = 8;
+pub(crate) const ENT_C_PAD_BOTTOM: i32 = 12;
+pub(crate) const ENT_C_PAD_X: i32 = 14;
 /// `.crow { height: 40px; padding: 0 12px }`
-const ENT_CROW_H: i32 = 40;
-const ENT_CROW_PAD_X: i32 = 12;
+pub(crate) const ENT_CROW_H: i32 = 40;
+pub(crate) const ENT_CROW_PAD_X: i32 = 12;
 /// `.ent-f { padding: 14px 26px 18px }` around one 17px line.
-const ENT_F_PAD_TOP: i32 = 14;
-const ENT_F_PAD_BOTTOM: i32 = 18;
-const ENT_F_LINE_H: i32 = 17;
+pub(crate) const ENT_F_PAD_TOP: i32 = 14;
+pub(crate) const ENT_F_PAD_BOTTOM: i32 = 18;
+pub(crate) const ENT_F_LINE_H: i32 = 17;
+
+// ── The creature block, step 18 — `.ent-cr` ──────────────────────────────────
+//
+// `.ent-cr { padding: 26px 0 20px; display: grid; place-items: center;
+//            border-bottom: 1px solid var(--line); background: var(--sunken) }`
+// `.ent-cr .tag  { left: 20px; top: 16px }`      — "NYX ENTITY", `lb`, `--fg-4`
+// `.ent-cr .live { right: 20px; top: 16px }`     — a 4px accent pip + "ONLINE"
+
+const ENT_CR_PAD_TOP: i32 = 26;
+const ENT_CR_PAD_BOTTOM: i32 = 20;
+const ENT_CR_LABEL_INSET: i32 = 20;
+const ENT_CR_LABEL_TOP: i32 = 16;
+/// `.ent-cr .live i { width: 4px; height: 4px; border-radius: 2px }`
+const ENT_CR_PIP: i32 = 4;
+/// `.ent-cr .live { gap: 7px }`
+const ENT_CR_PIP_GAP: i32 = 7;
+
+/// ★ The creature's size, largest first — and **0 means the block is omitted entirely**.
+///
+/// 96 is the design's number and the one to use whenever it fits. It does not always fit, and that
+/// is not a rounding problem — it is a real conflict between the design and what ships:
+///
+/// **The design's own scene for step 18 has no controls block.** The shipping surface has four rows
+/// (Network, Power, Thermal, Brightness) at 40px each plus padding — about 140 design units the
+/// design never budgeted for, because in the document those rows live in a different scene. The
+/// creature block is another 142 on top of that.
+///
+/// The design's note forbids the obvious saving: *"Processor, memory, graphics and thermal stay
+/// exactly where they were, in the same row treatment, at the same size."* So the creature is the
+/// element that flexes. `appearance::blit` takes a cell size, so 72 and 48 are the same creature at
+/// 3px and 2px per cell — a genuinely smaller drawing, not a scaled bitmap.
+///
+/// On a screen where not even 48 fits (a 720-unit panel, once the controls and the identity rows are
+/// counted) the block is **dropped** and the surface is exactly what it was before this step. A
+/// creature is worth less than the statement, the measurements and the controls it would push off
+/// the top of the screen — and off the top is where they would go, because this surface grows upward
+/// and nothing clips it there.
+const CREATURE_SIZES: [i32; 3] = [96, 72, 48];
+
+// ── The identity rows, step 18 — `.ent-id`, `.idrow` ─────────────────────────
+//
+// ★ DEPARTURE, forced by the same conflict as the creature's size. The design stacks each fact as a
+// label above a value with a rule between rows:
+//
+//   .ent-id { padding: 4px 26px 20px }
+//   .idrow  { padding: 16px 0 0; border-top: 1px solid var(--line); margin-top: 16px }
+//   .idrow .k { margin-bottom: 7px }
+//
+// That is 219 units for three facts. The measurement rows immediately above them carry the same
+// amount of information in 31 units each, key left and value right — and with the controls block
+// present, the tall form does not leave room for a single line of the Entity's detail text on a
+// 1080-unit panel. The detail is the Entity's actual voice ("Nothing needs your attention. Last
+// thermal event 6 days ago."); three rules and some air are not worth losing it.
+//
+// So the identity rows use the `.mrow` treatment that already exists three inches above them, which
+// also reads as one continuous list of things the machine is telling you rather than as two blocks
+// in different styles.
+
+const ENT_ID_PAD_TOP: i32 = 4;
+const ENT_ID_PAD_BOTTOM: i32 = 18;
+/// The same 31 units as `ENT_MROW_H`, named separately so a change to one is a decision about it.
+const ENT_ID_ROW_H: i32 = 31;
+
+/// Seed, evolution, traits. *"Three facts and no statistics."* Fixed, because there is no fourth
+/// fact the design admits and no way to add one without inventing a statistic.
+pub const ENT_IDENTITY_ROWS: usize = 3;
 
 /// A resolved Entity surface. Every rect is in screen coordinates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EntityLayout {
     pub surface: Rect,
+    /// The creature block at the head — `.ent-cr`, on the sunken ground with a hairline under it.
+    pub creature: Rect,
     /// The statement — one `d3` line.
     pub statement: Rect,
     /// The detail paragraph, `detail_lines` lines of [`ENT_DETAIL_LINE`].
     pub detail: Rect,
     /// The measurements block, as a whole.
     pub measures: Rect,
+    /// The identity rows — seed, evolution, traits.
+    pub identity: Rect,
     /// The control rows, as a whole.
     pub controls: Rect,
     /// The time and date.
     pub footer: Rect,
+    /// The creature's drawn size in real pixels — 96 wherever it fits. See [`CREATURE_SIZES`].
+    creature_px: i32,
     n_measures: i32,
     n_controls: i32,
 }
 
 /// Clearance kept between the top of the Entity surface and the top of the screen.
-const ENT_TOP_MARGIN: i32 = 24;
+pub(crate) const ENT_TOP_MARGIN: i32 = 24;
 
 /// The most detail lines that fit on this screen.
 ///
@@ -363,11 +518,22 @@ pub fn entity_layout(
     };
     let head_h = sc(ENT_HD_PAD_TOP) + sc(ENT_STATEMENT_H) + detail_h + sc(ENT_HD_PAD_BOTTOM);
     let measures_h = sc(ENT_M_PAD_Y) * 2 + n_measures as i32 * sc(ENT_MROW_H);
+    let identity_h = sc(ENT_ID_PAD_TOP) + identity_rows_h() + sc(ENT_ID_PAD_BOTTOM);
     let controls_h = sc(ENT_C_PAD_TOP) + n_controls as i32 * sc(ENT_CROW_H) + sc(ENT_C_PAD_BOTTOM);
     let footer_h = sc(ENT_F_PAD_TOP) + sc(ENT_F_LINE_H) + sc(ENT_F_PAD_BOTTOM);
+    let fixed_h = head_h + measures_h + identity_h + controls_h + footer_h;
 
-    let mut surface =
-        entity_surface(screen_w, screen_h, head_h + measures_h + controls_h + footer_h);
+    // The creature takes whatever is left over, at the largest of its three sizes that fits — or is
+    // dropped entirely if none does. See `CREATURE_SIZES`.
+    //
+    // ⚠️ Sized against the surface WITHOUT its detail, deliberately. Sizing it against `fixed_h`
+    // would make the creature shrink a step the moment the Entity had a second line to say, so the
+    // picture would visibly change size in response to a sentence appearing. The detail is what
+    // `entity_max_detail_lines` caps instead, against the creature this picked.
+    let creature_px = creature_px_for(screen_h, n_measures, n_controls);
+    let creature_h = if creature_px > 0 { creature_px + creature_chrome_h() } else { 0 };
+
+    let mut surface = entity_surface(screen_w, screen_h, creature_h + fixed_h);
     // ★ Backstop. The surface is anchored to its BOTTOM and grows upward, so an over-long detail or
     // a large interface scale pushes it off the TOP of the screen — where nothing clips it, and the
     // statement is simply gone. Callers are expected to cap the detail with
@@ -377,13 +543,19 @@ pub fn entity_layout(
         surface.y = sc(ENT_TOP_MARGIN);
     }
     let inner_w = surface.w - sc(ENT_HD_PAD_X) * 2;
-    let stmt_y = surface.y + sc(ENT_HD_PAD_TOP);
-    let measures_y = surface.y + head_h;
-    let controls_y = measures_y + measures_h;
+    // The creature block is FIRST — "a new first section, not a new window".
+    let head_y = surface.y + creature_h;
+    let stmt_y = head_y + sc(ENT_HD_PAD_TOP);
+    let measures_y = head_y + head_h;
+    // Identity sits with the measurements, above the controls: both are things the machine is
+    // telling you, and a control is a thing you do.
+    let identity_y = measures_y + measures_h;
+    let controls_y = identity_y + identity_h;
     let footer_y = controls_y + controls_h;
 
     EntityLayout {
         surface,
+        creature: Rect::new(surface.x, surface.y, surface.w, creature_h),
         statement: Rect::new(surface.x + sc(ENT_HD_PAD_X), stmt_y, inner_w, sc(ENT_STATEMENT_H)),
         detail: Rect::new(
             surface.x + sc(ENT_HD_PAD_X),
@@ -392,14 +564,133 @@ pub fn entity_layout(
             (detail_h - sc(ENT_HD_GAP)).max(0),
         ),
         measures: Rect::new(surface.x, measures_y, surface.w, measures_h),
+        identity: Rect::new(surface.x, identity_y, surface.w, identity_h),
         controls: Rect::new(surface.x, controls_y, surface.w, controls_h),
         footer: Rect::new(surface.x + sc(ENT_HD_PAD_X), footer_y, inner_w, footer_h),
+        creature_px,
         n_measures: n_measures as i32,
         n_controls: n_controls as i32,
     }
 }
 
+/// The stacked height of the three identity rows.
+fn identity_rows_h() -> i32 {
+    ENT_IDENTITY_ROWS as i32 * sc(ENT_ID_ROW_H)
+}
+
+/// The creature block's padding and its hairline — everything but the creature itself.
+fn creature_chrome_h() -> i32 {
+    sc(ENT_CR_PAD_TOP) + sc(ENT_CR_PAD_BOTTOM) + 1
+}
+
+/// How big the creature is drawn on this screen, or **0 when there is no room for it at all**.
+///
+/// Public because `apps/shell` has to know before it generates a sprite: `appearance::blit` writes
+/// `cell * 24` pixels square, and rasterizing 96px to then draw 48 would be doing the work twice and
+/// throwing half of it away.
+///
+/// Reserves one detail line, so a machine that can only just fit the creature still has room for the
+/// Entity to say something. The creature is the new thing here; the sentence is the point of the
+/// surface.
+pub fn creature_px_for(screen_h: i32, n_measures: usize, n_controls: usize) -> i32 {
+    let bare = entity_layout_h(0, n_measures, n_controls);
+    let room = screen_h
+        - sc(ENTITY_SURFACE_BOTTOM)
+        - sc(ENT_TOP_MARGIN)
+        - bare
+        - sc(ENT_HD_GAP)
+        - sc(ENT_DETAIL_LINE);
+    CREATURE_SIZES
+        .iter()
+        .map(|&p| sc(p))
+        .find(|&p| p + creature_chrome_h() <= room)
+        .unwrap_or(0)
+}
+
+/// The surface's height excluding the creature block, for `detail_lines` of detail.
+fn entity_layout_h(detail_lines: i32, n_measures: usize, n_controls: usize) -> i32 {
+    let detail_h = if detail_lines > 0 {
+        sc(ENT_HD_GAP) + detail_lines * sc(ENT_DETAIL_LINE)
+    } else {
+        0
+    };
+    sc(ENT_HD_PAD_TOP)
+        + sc(ENT_STATEMENT_H)
+        + detail_h
+        + sc(ENT_HD_PAD_BOTTOM)
+        + sc(ENT_M_PAD_Y) * 2
+        + n_measures as i32 * sc(ENT_MROW_H)
+        + sc(ENT_ID_PAD_TOP)
+        + identity_rows_h()
+        + sc(ENT_ID_PAD_BOTTOM)
+        + sc(ENT_C_PAD_TOP)
+        + n_controls as i32 * sc(ENT_CROW_H)
+        + sc(ENT_C_PAD_BOTTOM)
+        + sc(ENT_F_PAD_TOP)
+        + sc(ENT_F_LINE_H)
+        + sc(ENT_F_PAD_BOTTOM)
+}
+
 impl EntityLayout {
+    /// The creature's drawn size in real pixels. 96 wherever it fits; see [`CREATURE_SIZES`].
+    pub fn creature_px(&self) -> i32 {
+        self.creature_px
+    }
+
+    /// The square the creature is blitted into — `place-items: center`, horizontally centred and
+    /// sitting on the block's own top padding.
+    pub fn creature_box(&self) -> Rect {
+        Rect::new(
+            self.creature.x + (self.creature.w - self.creature_px) / 2,
+            self.creature.y + sc(ENT_CR_PAD_TOP),
+            self.creature_px,
+            self.creature_px,
+        )
+    }
+
+    /// The hairline under the creature block — `.ent-cr { border-bottom: 1px solid var(--line) }`.
+    pub fn creature_rule(&self) -> Rect {
+        Rect::new(self.creature.x, self.creature.bottom() - 1, self.creature.w, 1)
+    }
+
+    /// `(x, y)` for the "NYX ENTITY" tag — `.tag { left: 20px; top: 16px }`, drawn in `lb`.
+    pub fn creature_tag(&self) -> (i32, i32) {
+        (self.creature.x + sc(ENT_CR_LABEL_INSET), self.creature.y + sc(ENT_CR_LABEL_TOP))
+    }
+
+    /// The right edge the "ONLINE" label is aligned to, and the accent pip that precedes it.
+    ///
+    /// `label_w` is the measured width of the word, because the pip sits `7px` to its left and the
+    /// pair is right-aligned as a unit — measuring outside and placing inside is the only way the
+    /// two cannot drift apart.
+    pub fn creature_live(&self, label_w: i32, label_h: i32) -> (Rect, i32, i32) {
+        let right = self.creature.right() - sc(ENT_CR_LABEL_INSET);
+        let text_x = right - label_w;
+        let top = self.creature.y + sc(ENT_CR_LABEL_TOP);
+        let pip = sc(ENT_CR_PIP).max(1);
+        let pip_rect = Rect::new(
+            text_x - sc(ENT_CR_PIP_GAP) - pip,
+            top + (label_h - pip) / 2,
+            pip,
+            pip,
+        );
+        (pip_rect, text_x, top)
+    }
+
+    /// Identity row `i` — a key on the left and a value right-aligned in the same rect, exactly like
+    /// [`measure_row`](Self::measure_row). See the note above [`ENT_ID_ROW_H`]'s constants.
+    pub fn identity_row(&self, i: usize) -> Option<Rect> {
+        if i >= ENT_IDENTITY_ROWS {
+            return None;
+        }
+        Some(Rect::new(
+            self.identity.x + sc(ENT_HD_PAD_X),
+            self.identity.y + sc(ENT_ID_PAD_TOP) + i as i32 * sc(ENT_ID_ROW_H),
+            self.identity.w - sc(ENT_HD_PAD_X) * 2,
+            sc(ENT_ID_ROW_H),
+        ))
+    }
+
     /// Measurement row `i` — a key on the left, a value right-aligned in the same rect.
     pub fn measure_row(&self, i: usize) -> Option<Rect> {
         if i as i32 >= self.n_measures {
@@ -434,8 +725,11 @@ impl EntityLayout {
     }
 
     /// The three hairlines: under the head, under the measurements, above the footer.
-    pub fn rules(&self) -> [i32; 3] {
-        [self.measures.y, self.controls.y, self.footer.y]
+    pub fn rules(&self) -> [i32; 4] {
+        // Not the creature block's own bottom rule — that one belongs to `.ent-cr` and is drawn with
+        // it, because it separates the sunken ground from the chrome above the head rather than
+        // dividing two sections of the same ground.
+        [self.measures.y, self.identity.y, self.controls.y, self.footer.y]
     }
 
     /// The level track for a control row that has one — today only Brightness.
@@ -785,6 +1079,152 @@ pub fn command_first(entries: &[CmdEntry]) -> Option<usize> {
     command_step(entries, None, 1)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SCROLLBAR
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ★ NOT IN THE DESIGN DOCUMENT. `ver3.0` never draws a scrollbar — every scene fits — so this is
+// an extension, written in the design's idiom the way `u-bright` was. The rules it follows:
+//
+//   * No container. A track box would be a card, and Meridian has no cards; the track is one
+//     translucent hairline token and the thumb is a rounded bar, so what you see is a mark on the
+//     ground rather than a widget stuck to the edge.
+//   * It is INSET, not flush. The design's windows are rounded surfaces with a hairline edge, and
+//     something touching that edge reads as breaking out of the window.
+//   * The tones are the standard tiers: `fg_4` at rest, `fg_3` under the pointer.
+//
+// The shipping bar before this was `nyx_gui::ui::draw_scrollbar` — 12px wide, square, flush against
+// the surface's right edge, drawn in the app palette. It was left alone deliberately while the app
+// interiors were unported (steps 10-16), and step 10 is where it stops being someone else's problem.
+
+/// The thumb's width. Narrow: it is a position indicator first and a grab target second, and
+/// [`scrollbar_hit`] widens the grab region well past the ink.
+const SB_THUMB_W: i32 = 4;
+/// How far the thumb's OUTER edge sits from the surface's right edge.
+///
+/// Now a taste value, which it was not before: it used to be stacked on top of `resize_band()` to
+/// keep the bar out of the resizer's way, which put it ~14px from the wall at this laptop's scale
+/// and made the gap read as a layout error. The scrollbar owns the edge now — see
+/// [`scrollbar_track`] — so this is just the breathing room between the bar and the window wall.
+const SB_EDGE_GAP: i32 = 3;
+/// Top and bottom inset, so the track clears the window's 6px rounded corners instead of running
+/// into them.
+const SB_PAD_Y: i32 = 8;
+/// Shortest the thumb may get. A 4px-wide, 6px-tall thumb on a very long list is not a target.
+const SB_MIN_THUMB: i32 = 28;
+/// How far to the LEFT of the thumb still counts as grabbing it.
+///
+/// Asymmetric, because the thumb is now near the wall and there is nothing to the right of it to
+/// claim. 8 + the 4px thumb gives a 12px target, the same as the old flush bar.
+const SB_GRAB_PAD: i32 = 8;
+
+/// Grab band just inside a surface's edge where a drag starts a resize.
+///
+/// Mirrors `apps/shell::resize_band`. Duplicated here on purpose: the scrollbar's relationship to it
+/// (it wins the middle of the right edge, and yields the corners) has to be checkable from the crate
+/// that owns the geometry rather than living only in a comment in the binary.
+pub fn resize_band() -> i32 {
+    sc(8)
+}
+
+/// The scrollbar's track inside a window's SURFACE rect.
+///
+/// ⚠️⚠️ **`apps/shell` tests the scrollbar BEFORE the resize edge**, and that ordering is what lets
+/// the bar sit here. It was originally the other way round, which meant anything drawn inside
+/// `resize_band()` belonged to the resizer — the pointer turned into a resize arrow and a drag
+/// resized the window instead of scrolling it. The first fix was to inset the bar past the band
+/// entirely, but that left the thumb floating `resize_band() + 3` from the wall: at this laptop's
+/// scale roughly fourteen pixels of dead air beside a four-pixel bar, which reads as a mistake.
+///
+/// So the bar now takes the right edge and the resizer yields to it — the standard arrangement, and
+/// the one a user expects when a window is visibly scrollable. The price is paid in
+/// [`scrollbar_hit`], not here: the top and bottom [`scrollbar_corner`] of the edge stay with the
+/// resizer so a window can always be resized diagonally, and a window with nothing to scroll never
+/// claims the edge at all.
+pub fn scrollbar_track(surface: Rect) -> Rect {
+    let w = sc(SB_THUMB_W);
+    let right = surface.right() - sc(SB_EDGE_GAP);
+    let pad = sc(SB_PAD_Y);
+    Rect::new(right - w, surface.y + pad, w, (surface.h - 2 * pad).max(0))
+}
+
+/// How much of a surface's right edge the scrollbar occupies, measured from the edge inward.
+///
+/// What an app must keep a right-aligned column clear of, so a metadata column does not run under
+/// the bar.
+pub fn scrollbar_reserve() -> i32 {
+    sc(SB_EDGE_GAP) + sc(SB_THUMB_W) + sc(SB_GRAB_PAD)
+}
+
+/// How much of the top and bottom of the right edge stays with the **resizer** rather than the
+/// scrollbar.
+///
+/// The scrollbar wins the right edge (see [`scrollbar_track`]), but it must not win all of it: with
+/// no exception the top-right and bottom-right corners would stop resizing, and the corners are the
+/// only place a window can be resized in two axes at once. Generous on purpose — a corner is aimed
+/// at, and this is the affordance being protected.
+pub fn scrollbar_corner() -> i32 {
+    sc(24)
+}
+
+/// The thumb inside `track`, for a viewport of `viewport` px showing `content` px at `scroll`.
+///
+/// Returns None when everything fits — there is no bar to draw and nothing to grab. One function
+/// for the draw and the hit-test, the `ctl_btn_rect` rule: a thumb you can see one pixel away from
+/// where you can grab it is the most irritating class of bug this module exists to prevent.
+pub fn scrollbar_thumb(track: Rect, content: i32, viewport: i32, scroll: i32) -> Option<Rect> {
+    if content <= viewport || track.h <= 0 || viewport <= 0 {
+        return None;
+    }
+    let min = sc(SB_MIN_THUMB).min(track.h);
+    let h = ((viewport * track.h) / content).clamp(min, track.h);
+    let max_scroll = content - viewport;
+    let off = scroll.clamp(0, max_scroll);
+    let y = if max_scroll == 0 { 0 } else { (track.h - h) * off / max_scroll };
+    Some(Rect::new(track.x, track.y + y, track.w, h))
+}
+
+/// True if `(mx, my)` is on the scrollbar — anywhere down the track, not just on the thumb, so a
+/// click above or below it jumps there.
+///
+/// This is tested **before** the resize edge, so returning true here takes the pixel away from the
+/// resizer. Three things keep that honest:
+///
+/// - It is false when there is nothing to scroll, so an unscrollable window keeps its whole edge.
+/// - It reserves [`scrollbar_corner`] at the top and bottom, so both right-hand corners still
+///   resize.
+/// - The grab region is padded to the LEFT of the 4px ink only. A 4px pointer target is a dare;
+///   padding right would run off the surface, and there is nothing out there to claim.
+pub fn scrollbar_hit(surface: Rect, content: i32, viewport: i32, mx: i32, my: i32) -> bool {
+    if content <= viewport {
+        return false;
+    }
+    let t = scrollbar_track(surface);
+    let corner = scrollbar_corner();
+    // A window too short to hold two corners plus a usable strip between them is all corner: the
+    // resizer keeps the edge and the bar is drawn but not grabbable. Scrolling still works from the
+    // wheel, and a 40px-tall window is not something anyone drags a thumb inside.
+    let (top, bottom) = (surface.y + corner, surface.bottom() - corner);
+    if bottom <= top {
+        return false;
+    }
+    mx >= t.x - sc(SB_GRAB_PAD) && mx <= surface.right() && my >= top && my < bottom
+}
+
+/// The scroll offset a click/drag at `my` means: centre the thumb on the pointer.
+pub fn scroll_from_mouse(surface: Rect, content: i32, viewport: i32, my: i32) -> i32 {
+    let t = scrollbar_track(surface);
+    let Some(thumb) = scrollbar_thumb(t, content, viewport, 0) else {
+        return 0;
+    };
+    let range = t.h - thumb.h;
+    if range <= 0 {
+        return 0;
+    }
+    let rel = (my - t.y - thumb.h / 2).clamp(0, range);
+    rel * (content - viewport) / range
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +1232,53 @@ mod tests {
 
     const SW: i32 = 1440;
     const SH: i32 = 900;
+
+    // ---- the Command footer's power glyphs ----
+
+    #[test]
+    fn the_power_glyphs_sit_in_the_footer_and_hit_where_they_draw() {
+        let body = 300;
+        let panel = command_panel(SW, body);
+        let f_y = panel.bottom() - cmd_footer_h();
+        let mut seen: alloc::vec::Vec<Rect> = alloc::vec::Vec::new();
+        for i in 0..CMD_POWER_SLOTS {
+            let slot = cmd_power_slot(SW, body, i).unwrap();
+            let glyph = cmd_power_glyph(SW, body, i).unwrap();
+            // Inside the footer band, inside the panel.
+            assert!(slot.y >= f_y && slot.bottom() <= panel.bottom(), "slot {i} left the footer");
+            assert!(slot.right() <= panel.right(), "slot {i} ran off the panel");
+            // The glyph is inside its own hit box. A target that does not contain what it looks
+            // like is precisely the `ctl_btn_rect` drift this module exists to prevent.
+            assert!(glyph.x >= slot.x && glyph.right() <= slot.right(), "glyph {i} escaped its box");
+            assert!(glyph.y >= slot.y && glyph.bottom() <= slot.bottom(), "glyph {i} escaped its box");
+            // Hit-testing agrees, at both corners inside the box.
+            assert_eq!(cmd_power_hit(SW, body, slot.x + 1, slot.y + 1), Some(i));
+            assert_eq!(cmd_power_hit(SW, body, slot.right() - 1, slot.bottom() - 1), Some(i));
+            for other in &seen {
+                assert!(slot.right() <= other.x || slot.x >= other.right(), "slots overlap");
+            }
+            seen.push(slot);
+        }
+        assert_eq!(cmd_power_slot(SW, body, CMD_POWER_SLOTS), None);
+        // Slot 0 is the RIGHTMOST — it is counted from the right edge inward.
+        assert!(seen[0].x > seen[1].x, "slot 0 should be the rightmost");
+        // And nothing outside them is a hit.
+        assert_eq!(cmd_power_hit(SW, body, panel.x + 4, f_y + 4), None);
+        assert_eq!(cmd_power_hit(SW, body, seen[0].right() + 8, f_y + 4), None);
+        assert_eq!(cmd_power_hit(SW, body, seen[0].x + 2, f_y - 20), None);
+    }
+
+    /// The result count shares the footer with the glyphs and must not run under them. It is
+    /// right-aligned, so without a hard limit it grows straight into that corner.
+    #[test]
+    fn the_footer_count_stops_clear_of_the_power_glyphs() {
+        for w in [1280, 1440, 1920, 2560] {
+            let right = cmd_footer_text_right(w, 300);
+            let last = cmd_power_slot(w, 300, CMD_POWER_SLOTS - 1).unwrap();
+            assert!(right < last.x, "{w}px: the count would overlap the glyphs");
+            assert!(right > command_panel(w, 300).x, "{w}px: no room left for the count");
+        }
+    }
 
     // ---- dock ----
 
@@ -921,15 +1408,18 @@ mod tests {
 
     // ---- the Entity surface's sections ----
 
-    /// The four sections must tile the surface exactly — no gap, no overlap. A one-pixel error here
+    /// Every section must tile the surface exactly — no gap, no overlap. A one-pixel error here
     /// puts a hairline on top of a row of text.
     #[test]
     fn the_sections_tile_the_surface_exactly() {
         for lines in 0..4 {
             let l = entity_layout(SW, SH, lines, 4, 3);
-            let head_h = l.measures.y - l.surface.y;
-            assert!(head_h > 0, "head has no height at {} detail lines", lines);
-            assert_eq!(l.controls.y, l.measures.bottom(), "gap between measures and controls");
+            // The creature block is FIRST, at the very top of the surface — "a new first section".
+            assert_eq!(l.creature.y, l.surface.y);
+            let head_y = l.creature.bottom();
+            assert!(l.measures.y > head_y, "head has no height at {} detail lines", lines);
+            assert_eq!(l.identity.y, l.measures.bottom(), "gap between measures and identity");
+            assert_eq!(l.controls.y, l.identity.bottom(), "gap between identity and controls");
             assert_eq!(l.footer.y, l.controls.bottom(), "gap between controls and footer");
             assert_eq!(
                 l.footer.bottom(),
@@ -937,6 +1427,88 @@ mod tests {
                 "the footer must end exactly at the surface's bottom edge"
             );
         }
+    }
+
+    /// The creature block's own furniture: the creature centred on the block's top padding, the
+    /// hairline on its last row, and the two labels inset 20px at 16px down.
+    #[test]
+    fn the_creature_block_matches_the_design_metrics() {
+        scale::force_for_test(1000);
+        let l = entity_layout(SW, SH, 0, 4, 3);
+        assert!(l.creature_px() > 0, "the fixture assumes the creature fits on {}", SH);
+
+        let b = l.creature_box();
+        assert_eq!((b.w, b.h), (l.creature_px(), l.creature_px()), "the box is not square");
+        assert_eq!(b.y, l.creature.y + 26, ".ent-cr padding-top");
+        // `place-items: center`, to the odd pixel integer centring cannot split.
+        assert!(((b.x - l.creature.x) - (l.creature.right() - b.right())).abs() <= 1);
+        // 20px of padding below it, then the rule on the block's last row.
+        assert_eq!(l.creature.bottom() - b.bottom(), 20 + 1);
+        assert_eq!(l.creature_rule().y, l.creature.bottom() - 1);
+        assert_eq!(l.creature_rule().h, 1);
+
+        assert_eq!(l.creature_tag(), (l.creature.x + 20, l.creature.y + 16));
+        let (pip, text_x, top) = l.creature_live(40, 14);
+        assert_eq!(text_x + 40, l.creature.right() - 20, "the label is not inset 20px");
+        assert_eq!(pip.right() + 7, text_x, ".live gap");
+        assert_eq!((pip.w, pip.h), (4, 4));
+        assert_eq!(top, l.creature.y + 16);
+    }
+
+    /// ★ The creature is sized from the screen ALONE, not from how much the Entity currently has to
+    /// say. Otherwise the picture visibly changes size the moment a sentence appears underneath it.
+    #[test]
+    fn the_creature_does_not_resize_when_the_entity_speaks() {
+        for &f in &[1000, 1250, 1500, 2000] {
+            scale::force_for_test(f);
+            let quiet = entity_layout(SW, SH, 0, 4, 3).creature_px();
+            for lines in 1..4 {
+                assert_eq!(
+                    entity_layout(SW, SH, lines, 4, 3).creature_px(),
+                    quiet,
+                    "the creature resized at {} detail lines, scale {}",
+                    lines, f
+                );
+            }
+        }
+        scale::force_for_test(1000);
+    }
+
+    /// ★ On a screen with no room for even the smallest creature the block is DROPPED, and the
+    /// surface is exactly what it was before this step. Growing off the top of the screen — where
+    /// nothing clips it — would cost the statement, the measurements and the controls to show a
+    /// picture.
+    #[test]
+    fn a_screen_with_no_room_drops_the_creature_block_rather_than_overflowing() {
+        scale::force_for_test(1000);
+        // Deliberately absurd, to reach the case a real panel might one day reach at a large scale.
+        let cramped = entity_layout(SW, 420, 0, 4, 3);
+        assert_eq!(cramped.creature_px(), 0, "a 420px screen cannot hold a creature");
+        assert_eq!(cramped.creature.h, 0, "a dropped block must take no space");
+        assert_eq!(cramped.creature.y, cramped.surface.y);
+        // ...and everything else still tiles.
+        assert_eq!(cramped.identity.y, cramped.measures.bottom());
+        assert_eq!(cramped.footer.bottom(), cramped.surface.bottom());
+    }
+
+    /// The identity rows stack inside their block without escaping it, in the same 31px rhythm as
+    /// the measurements they sit under.
+    #[test]
+    fn identity_rows_stack_inside_their_block() {
+        scale::force_for_test(1000);
+        let l = entity_layout(SW, SH, 1, 4, 3);
+        for i in 0..ENT_IDENTITY_ROWS {
+            let r = l.identity_row(i).expect("identity row");
+            assert!(r.y >= l.identity.y && r.bottom() <= l.identity.bottom(), "row {} escapes", i);
+            assert_eq!(r.h, ENT_MROW_H, "identity and measurement rows must share a rhythm");
+            if i > 0 {
+                assert_eq!(r.y, l.identity_row(i - 1).unwrap().bottom(), "row {} overlaps", i);
+            }
+            // Same inset as the measurement rows, or the two lists visibly step in and out.
+            assert_eq!(r.x, l.measure_row(0).unwrap().x);
+            assert_eq!(r.w, l.measure_row(0).unwrap().w);
+        }
+        assert_eq!(l.identity_row(ENT_IDENTITY_ROWS), None);
     }
 
     /// The surface grows UPWARD: its bottom edge is fixed relative to the mark, so more detail text
@@ -1035,7 +1607,7 @@ mod tests {
     #[test]
     fn the_rules_sit_on_the_section_boundaries() {
         let l = entity_layout(SW, SH, 2, 4, 3);
-        assert_eq!(l.rules(), [l.measures.y, l.controls.y, l.footer.y]);
+        assert_eq!(l.rules(), [l.measures.y, l.identity.y, l.controls.y, l.footer.y]);
         for y in l.rules() {
             assert!(y > l.surface.y && y < l.surface.bottom(), "rule at {} escapes the surface", y);
         }
@@ -1475,6 +2047,195 @@ pub fn osd_track(panel: Rect, has_value: bool) -> Option<Rect> {
 /// How much of the track is filled, for `pct` of 100.
 pub fn osd_fill_w(track: Rect, pct: i32) -> i32 {
     (track.w * pct.clamp(0, 100)) / 100
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+
+    /// A typical app surface: the caption is outside it, so this is pure content.
+    fn surface() -> Rect {
+        Rect::new(300, 120, 880, 512)
+    }
+
+    /// ★★ THE POINT OF THE WHOLE SECTION.
+    ///
+    /// `apps/shell` now tests the scrollbar BEFORE `resize_edges`, so the bar can sit near the wall
+    /// — but it must not swallow the whole edge. Both right-hand corners have to keep resizing,
+    /// because a corner is the only place a window resizes in two axes at once. Swept at every scale
+    /// step, since the corner and the grab region scale independently of each other.
+    #[test]
+    fn the_scrollbar_never_claims_a_resize_corner() {
+        for step in crate::scale::STEPS {
+            crate::scale::force_for_test(step);
+            let s = surface();
+            let corner = scrollbar_corner();
+            for mx in (s.right() - resize_band())..=s.right() {
+                for my in s.y..(s.y + corner) {
+                    assert!(
+                        !scrollbar_hit(s, 4000, s.h, mx, my),
+                        "scale {}: the bar took the TOP-right corner at ({}, {})",
+                        step, mx, my
+                    );
+                }
+                for my in (s.bottom() - corner)..s.bottom() {
+                    assert!(
+                        !scrollbar_hit(s, 4000, s.h, mx, my),
+                        "scale {}: the bar took the BOTTOM-right corner at ({}, {})",
+                        step, mx, my
+                    );
+                }
+            }
+        }
+        crate::scale::force_for_test(crate::scale::UNIT);
+    }
+
+    /// The reason the ordering was inverted at all: the user could see the gap. The thumb has to end
+    /// up genuinely near the wall, not merely nearer than it was.
+    #[test]
+    fn the_thumb_sits_against_the_wall_at_every_scale() {
+        for step in crate::scale::STEPS {
+            crate::scale::force_for_test(step);
+            let s = surface();
+            let gap = s.right() - scrollbar_track(s).right();
+            assert!(
+                gap <= sc(4),
+                "scale {}: {}px of dead air between a {}px bar and the window wall",
+                step, gap, sc(SB_THUMB_W)
+            );
+        }
+        crate::scale::force_for_test(crate::scale::UNIT);
+    }
+
+    /// A window with nothing to scroll must not take the edge away from the resizer at all.
+    #[test]
+    fn an_unscrollable_window_keeps_its_whole_right_edge() {
+        let s = surface();
+        for my in s.y..s.bottom() {
+            for mx in (s.right() - resize_band())..=s.right() {
+                assert!(!scrollbar_hit(s, s.h, s.h, mx, my), "claimed ({}, {}) with nothing to scroll", mx, my);
+            }
+        }
+    }
+
+    /// Between the corners the bar DOES own the edge — that is the trade being made, and it should
+    /// fail loudly if someone reinstates the old ordering.
+    #[test]
+    fn between_the_corners_the_bar_owns_the_edge() {
+        let s = surface();
+        let mid = s.y + s.h / 2;
+        assert!(scrollbar_hit(s, 4000, s.h, s.right(), mid), "the outermost column must scroll");
+        assert!(scrollbar_hit(s, 4000, s.h, s.right() - resize_band(), mid));
+        // ...and the app's content is still reachable well inside it.
+        assert!(!scrollbar_hit(s, 4000, s.h, s.right() - scrollbar_reserve() - 1, mid));
+    }
+
+    /// A window shorter than two corners is all corner. The bar must decline rather than hand back a
+    /// grab region that overlaps both of them.
+    #[test]
+    fn a_very_short_window_leaves_the_edge_to_the_resizer() {
+        let s = Rect::new(0, 0, 400, scrollbar_corner() * 2);
+        assert!(!scrollbar_hit(s, 4000, s.h, s.right(), s.y + s.h / 2));
+    }
+
+    /// It is a mark on the surface, not something stuck to the outside of it.
+    #[test]
+    fn the_track_sits_inside_the_window_on_every_edge() {
+        let s = surface();
+        let t = scrollbar_track(s);
+        assert!(t.x > s.x && t.right() < s.right(), "{:?} is not inside {:?}", t, s);
+        assert!(t.y > s.y && t.bottom() < s.bottom(), "the track runs into the rounded corners");
+        assert_eq!(t.w, 4, "the design's idiom is a hairline-weight mark, not a 12px widget");
+    }
+
+    #[test]
+    fn there_is_no_thumb_when_everything_fits() {
+        let t = scrollbar_track(surface());
+        assert!(scrollbar_thumb(t, 100, 512, 0).is_none());
+        assert!(scrollbar_thumb(t, 512, 512, 0).is_none());
+        assert!(scrollbar_thumb(t, 513, 512, 0).is_some());
+        assert!(!scrollbar_hit(surface(), 512, 512, 1000, 300), "nothing to grab");
+    }
+
+    /// The thumb has to stay a target however long the list gets, and must never leave its track.
+    #[test]
+    fn the_thumb_stays_grabbable_and_inside_its_track() {
+        let s = surface();
+        let t = scrollbar_track(s);
+        for content in [600, 1000, 5000, 200_000] {
+            for scroll in [0, 1, content / 3, content - s.h] {
+                let th = scrollbar_thumb(t, content, s.h, scroll).unwrap();
+                assert!(th.h >= 28.min(t.h), "content {}: thumb is {}px tall", content, th.h);
+                assert!(th.y >= t.y, "thumb above its track");
+                assert!(th.bottom() <= t.bottom(), "thumb below its track at scroll {}", scroll);
+                assert_eq!(th.x, t.x);
+            }
+        }
+    }
+
+    /// Both ends of the track must be reachable, and must mean the two ends of the content.
+    #[test]
+    fn the_ends_of_the_track_are_the_ends_of_the_content() {
+        let s = surface();
+        let t = scrollbar_track(s);
+        let content = 4000;
+        let max = content - s.h;
+
+        let top = scrollbar_thumb(t, content, s.h, 0).unwrap();
+        assert_eq!(top.y, t.y, "at scroll 0 the thumb is at the top");
+        let bottom = scrollbar_thumb(t, content, s.h, max).unwrap();
+        assert_eq!(bottom.bottom(), t.bottom(), "at max scroll the thumb is at the bottom");
+
+        assert_eq!(scroll_from_mouse(s, content, s.h, t.y - 100), 0, "above the track clamps to 0");
+        assert_eq!(scroll_from_mouse(s, content, s.h, t.bottom() + 100), max, "below clamps to max");
+    }
+
+    /// Dragging must never produce an offset outside the legal range, at any pointer position —
+    /// the app clamps too, but an out-of-range `MSG_SCROLL` would make the thumb and the content
+    /// disagree about where the list is.
+    #[test]
+    fn a_drag_anywhere_produces_a_legal_offset() {
+        let s = surface();
+        for content in [513, 900, 4000, 100_000] {
+            let max = content - s.h;
+            for my in (s.y - 50)..(s.bottom() + 50) {
+                let off = scroll_from_mouse(s, content, s.h, my);
+                assert!(off >= 0 && off <= max, "content {} my {} gave {}", content, my, off);
+            }
+        }
+    }
+
+    /// Clicking the track anywhere down its length is a jump, so the hit region is the whole column
+    /// between the corners rather than only the thumb.
+    ///
+    /// It used to be the full height of the surface. That changed deliberately when the bar took the
+    /// right edge from the resizer: the two [`scrollbar_corner`] bands are the price, and they are
+    /// the only place this returns false down the column.
+    #[test]
+    fn the_whole_column_between_the_corners_is_clickable_not_just_the_thumb() {
+        let s = surface();
+        let t = scrollbar_track(s);
+        let corner = scrollbar_corner();
+        for my in (s.y + corner)..(s.bottom() - corner) {
+            assert!(scrollbar_hit(s, 4000, s.h, t.x + 1, my), "dead at y={}", my);
+        }
+        let mid = s.y + s.h / 2;
+        assert!(scrollbar_hit(s, 4000, s.h, t.x - 5, mid), "the grab region is padded");
+        assert!(!scrollbar_hit(s, 4000, s.h, t.x - 40, mid), "but not unboundedly");
+    }
+
+    /// A window squeezed to nothing must not produce a negative track or panic the desktop.
+    #[test]
+    fn a_degenerate_surface_is_survivable() {
+        for (w, h) in [(0, 0), (1, 1), (208, 10), (208, 100)] {
+            let s = Rect::new(0, 0, w, h);
+            let t = scrollbar_track(s);
+            assert!(t.h >= 0, "{}x{} gave a negative track", w, h);
+            let _ = scrollbar_thumb(t, 10_000, h, 5);
+            let _ = scroll_from_mouse(s, 10_000, h, 50);
+            let _ = scrollbar_hit(s, 10_000, h, 5, 5);
+        }
+    }
 }
 
 #[cfg(test)]

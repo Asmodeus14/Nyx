@@ -519,6 +519,10 @@ name = "nyx-api"
 version = "0.1.0"
 
 [[package]]
+name = "nyx-crypto"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-gui"
 version = "0.1.0"
 dependencies = [
@@ -562,6 +566,7 @@ name = "nyx-terminal"
 version = "0.1.0"
 dependencies = [
  "nyx-api",
+ "nyx-crypto",
  "nyx-gui",
  "nyx-htmltext",
  "nyx-meridian",

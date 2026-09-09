@@ -31,6 +31,14 @@ pub const SYMBOLS: &[char] = &[
     '\u{21E5}', // ⇥  "⇥ refine"
     '\u{203A}', // ›  the terminal prompt: "~/src/bell ›"
     '\u{27E9}', // ⟩  QCLang ket notation: "|00⟩"
+    // ★ Both of these were being SET and not PACKED — found while adding the network drill-down
+    // (step 20), which wanted a third em dash and a fourth ellipsis of its own.
+    '\u{2014}', // —  the Command's own rows: "Network — Meridian", "Appearance — Light". Meridian
+    //             punctuates with an em dash constantly; it was missing from here from day one, so
+    //             those labels have been rendering with a hole where the dash should be.
+    '\u{2026}', // …  every ellipsized string in the shell. `apps/shell`'s `fit` appends this to any
+    //             title too long for its caption, so the character is reachable from any window
+    //             with a long name — and `Atlas::misses` has been counting it the whole time.
 ];
 
 /// Characters the `d1` display shelf (40px) packs.
@@ -112,6 +120,32 @@ mod tests {
         }
         for &c in SYMBOLS {
             assert!(Charset::Full.contains(c), "symbol {:?} should be in the full set", c);
+        }
+    }
+
+    /// Strings the shell composes at runtime, character for character.
+    ///
+    /// This is the test that would have caught the em dash and the ellipsis going missing: both were
+    /// in shipped labels and in `apps/shell`'s ellipsizer, and neither was packed, so those labels
+    /// rendered with a gap where the punctuation should be. A charset is only ever wrong in one
+    /// direction, and it is this one — nothing complains, the glyph is simply not there.
+    #[test]
+    fn full_covers_the_punctuation_the_shell_actually_composes() {
+        for s in [
+            "Network — Meridian",           // the Command's network row
+            "Appearance — Light",           // the theme row
+            "Brightness keys — F5 / F6",    // the rebind row
+            "Documents…",                   // anything `fit` had to ellipsize
+            "Scanning every channel…",      // the network view, mid-operation
+            "Connected · WPA2",             // the network view's state line
+            "82 °C",                        // the Entity's thermal row
+        ] {
+            for c in s.chars() {
+                assert!(
+                    Charset::Full.contains(c),
+                    "{c:?} from {s:?} is set by the shell but not packed"
+                );
+            }
         }
     }
 

@@ -6,4 +6,7 @@ edition = "2021"
 [dependencies]
 nyx-api = { path = "../../libs/api" }
 nyx-gui = { path = "../../libs/gui" }
+# Meridian step 13 — the Settings interior. Reuses the SAME `.nav` pane as Files, plus the settings
+# list (`panes::setting_row` / `segment` / `track`) and `font::register_text()`.
+nyx-meridian = { path = "../../libs/meridian" }
 linked_list_allocator = "0.10.5"

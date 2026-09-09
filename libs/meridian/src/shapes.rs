@@ -2,6 +2,11 @@
 //!
 //! ## The bug this fixes
 //!
+//!
+//! ⚠️ `nyx_gui::ui` is cited by name several times below and **no longer exists** — it was
+//! the old desktop's widget set and was deleted with `apps/compositor` at Meridian step 20
+//! (2026-09-08). Those citations are history, not directions: they record what this module
+//! replaced and why, and `git log libs/gui/src/ui.rs` is where to read the original.
 //! `nyx_gui::ui::round_rect_corners` carves a window's square corners into a rounded outline with a
 //! hard distance test: a pixel is outside, on the arc, or inside, with nothing in between. At the
 //! 12px radius the current desktop uses, on a light surface, that is tolerable. Meridian uses a

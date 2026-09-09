@@ -6,4 +6,9 @@ edition = "2024"
 [dependencies]
 nyx-api = { path = "../../libs/api" }
 nyx-gui = { path = "../../libs/gui" }
+# Meridian step 12 — the System Monitor interior. The metric-grid geometry (`panes::metric_cell` /
+# `spark_bar`), the CPU type-and-icon path (`text`), and Inter via `font::register_text()` plus
+# `font::register_display()` — this is the one app in the design that sets `d1` (40px/200), so it is
+# also the only one that pays for the ExtraLight face.
+nyx-meridian = { path = "../../libs/meridian" }
 linked_list_allocator = "0.10.5"
