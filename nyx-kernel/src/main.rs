@@ -240,6 +240,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         smbios::note_acpi_oem(rsdp_addr);
         acpi::init(rsdp_addr);
         acpi::init_intel_acpica();
+        // ★ Baseline. Bring-up's own last count said 1802 with a clean NULL tail, so any
+        // checkpoint below that reads lower names the stage that destroyed it.
+        acpi::boot_checkpoint("acpica-done");
         acpi::scan_for_modern_inputs();
         apic::init();
         
@@ -258,9 +261,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // 🔥 THE FIX: Route the RTL8168 MSI Vector (0x30 = 48) directly to the CPU!
         crate::ioapic::route_irq(11, bsp_apic_id, 48); 
         
+        acpi::boot_checkpoint("pre-smp");
         smp::init_aps(&apic_ids);
+        acpi::boot_checkpoint("post-smp");
         crate::boot_screen::milestone(crate::boot_screen::Milestone::Acpi);
         pci::enumerate_pci();
+        acpi::boot_checkpoint("post-pci");
         crate::boot_screen::milestone(crate::boot_screen::Milestone::Pci);
     } else {
         crate::vga_println!("[BOOT] WARN: ACPI Tables missing! Attempting degraded boot.");
@@ -276,6 +282,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // NVME HARDWARE DRIVER INITIALIZATION
     // ==========================================
     unsafe { crate::fs::GLOBAL_NVME = crate::drivers::nvme::NvmeDriver::init(); }
+    crate::acpi::boot_checkpoint("post-nvme");
     
     unsafe {
         if let Some(ref mut driver) = crate::fs::GLOBAL_NVME { 
@@ -283,6 +290,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         crate::entity::awaken_entity(&mut crate::fs::GLOBAL_NVME);
     }
+    crate::acpi::boot_checkpoint("post-entity");
     crate::boot_screen::milestone(crate::boot_screen::Milestone::Storage);
 
     // ==========================================
@@ -420,9 +428,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // B2: hand init a proper SysV entry stack (argc/argv/envp/auxv) so a std runtime can start.
     let stack_top = unsafe {
-        crate::process::build_initial_stack(stack_top, "/mnt/nvme/apps/Init.nyx/run.bin", &loaded)
+        // PID 1 takes no argument — nothing launched it.
+        crate::process::build_initial_stack(stack_top, "/mnt/nvme/apps/Init.nyx/run.bin", None, &loaded)
     };
 
+    crate::acpi::boot_checkpoint("pre-syscalls");
     interrupts::init_syscalls();
     unsafe { percpu.user_rsp = stack_top; } 
     unsafe {
@@ -434,6 +444,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 🔥 ADDED HERE: Safe Hardware Timer Initialization
     crate::apic::init_timer(0x40);
+    crate::acpi::boot_checkpoint("post-timer");
 
     crate::vga_println!("[BOOT] Jumping to Ring 3 Natively (Entry: {:#x})...", entry_point);
 
@@ -444,6 +455,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // screen on its first frame; blanking here would put a black flash between the mark and the
     // desktop, which is precisely the "splash torn down, shell put up" seam the design exists to
     // avoid. What is left on screen until that first frame is the identity, which is correct.
+    crate::acpi::boot_checkpoint("pre-userspace");
     crate::boot_screen::milestone(crate::boot_screen::Milestone::Userspace);
     crate::boot_screen::end();
 

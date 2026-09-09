@@ -284,6 +284,49 @@ pub fn end() {
     ACTIVE.store(false, Ordering::Relaxed);
 }
 
+/// ★★ The shutdown screen — the cold-start screen's mirror, at the other end of the session.
+///
+/// Until now, choosing Shut down left the desktop on screen while the kernel did ACPI work, and the
+/// only feedback was `[ACPI]` lines appearing over the top of it. That reads as a crash, not as a
+/// machine going away. Every other OS answers the button at once and then gets on with it.
+///
+/// **Painted by the KERNEL, not the shell.** The shell is blocked inside `SYS_POWER` and cannot draw
+/// after asking — and more importantly, if the shell were the painter then a shutdown reached by any
+/// other route (the terminal, the thermal governor's 95 °C emergency) would show nothing at all. The
+/// kernel owns the last moments, so the kernel draws them.
+///
+/// Deliberately the SAME block geometry as [`begin`]: the same mark, in the same place, on the same
+/// black. The machine ends where it began. ⚠️ **No progress rule** — the cold-start rule advances on
+/// seven real milestones, and a bar that fills for decoration on the way out would be inventing
+/// progress nothing is measuring.
+///
+/// Claims the screen as well, so a compositor still running on another core cannot paint the desktop
+/// back over it. Same problem as the panic path, same fix.
+pub fn farewell(label: &str) {
+    crate::panic_screen::PANICKING.store(true, Ordering::SeqCst);
+    ACTIVE.store(false, Ordering::Relaxed);
+    let Some(s) = live_surface() else { return };
+    let (w, h) = s.size();
+    let l = Layout::for_screen(w, h);
+    s.clear(GROUND);
+    blit(&s, &brand_gen::MARK, l.mark_x, l.mark_y, IDENTITY, STRENGTH_READY);
+    blit(&s, &brand_gen::WORDMARK, l.word_x, l.word_y, IDENTITY, STRENGTH_READY);
+    centred(&s, l.label_y, label, LABEL);
+}
+
+/// The shutdown screen's second state: the firmware refused.
+///
+/// Reached only when the direct PM1_CNT write AND the full ACPICA path have both failed. At that
+/// point the machine is not going anywhere, and the person in front of it needs an instruction
+/// rather than a logo.
+pub fn farewell_failed(what: &str) {
+    let Some(s) = live_surface() else { return };
+    let (w, h) = s.size();
+    let l = Layout::for_screen(w, h);
+    centred(&s, l.label_y, what, ATTENTION);
+    centred(&s, l.label_y + 20, "HOLD THE POWER BUTTON", LABEL);
+}
+
 // ── layout ──────────────────────────────────────────────────────────────────
 
 struct Layout {

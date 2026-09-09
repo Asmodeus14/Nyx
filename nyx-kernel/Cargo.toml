@@ -41,6 +41,10 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # Cryptography
 sha3 = { version = "0.10", default-features = false }
+# SHA-1 / HMAC-SHA1 / PBKDF2-SHA1 for the WPA2 four-way handshake. These used to be private
+# functions inside `iwlwifi.rs`; Meridian's lock needs the same key derivation, so they were lifted
+# rather than copied. One implementation, two callers, and the vectors are host-tested.
+nyx-crypto = { path = "../libs/crypto" }
 
 aml = "0.16.4"
 

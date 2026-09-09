@@ -211,12 +211,44 @@ impl Geom {
         let (b0, b1, b2) = if self.rgb { (c.0, c.1, c.2) } else { (c.2, c.1, c.0) };
         let y1 = (y0 + rows).min(self.h);
         let word = u32::from_le_bytes([b0, b1, b2, 0xFF]);
+        let pitch = self.stride * self.bpp;
 
-        // ⚠️ The fast row-walk below assumes a scanline is contiguous, which is only true on a
-        // LINEAR plane. Under tiling, consecutive pixels in a row jump between 4 KB tiles, so
-        // striding a pointer across the row is precisely what produced the banding. Fall back to
-        // per-pixel `put`, which knows the swizzle. Slower, but a fill nobody can read is worthless.
+        // ★★ A SOLID COLOUR IS SWIZZLE-INVARIANT. Fill the BYTES, not the pixels.
+        //
+        // This replaces a per-pixel `put` loop that walked `0..w` × `y0..y1` through `byte_offset`,
+        // and the photograph of the last red screen is why. It came up as red with hundreds of short
+        // dark dashes punched through it — leftover desktop — and dashes across the glyph rows made
+        // the one diagnostic on the screen barely transcribable.
+        //
+        // A per-pixel tiled fill only covers the bytes that `byte_offset` maps some (x, y) onto. Any
+        // error in `stride`, any padding row inside the last tile row, any mismatch between the
+        // plane's real pitch and ours, and those bytes are never written — so they keep whatever the
+        // compositor left there. The pixels are all "covered" and the screen is still dirty.
+        //
+        // But red is red at every address. If the fill covers the whole byte extent linearly, the
+        // swizzle cannot matter: whatever permutation the display engine applies, it is permuting a
+        // buffer that is uniformly the fill colour. So a full-surface fill needs no tiling knowledge
+        // at all, and gains none of the ways to be wrong about it.
+        //
+        // Text still goes through `put`, which does need the swizzle — but a glyph landing a few
+        // pixels off is legible, and a background full of holes is not.
         if self.tiling != TILE_LINEAR {
+            if y0 == 0 && y1 >= self.h && self.bpp == 4 {
+                // Tile rows are 8 scanlines on X, 32 on Y, and the surface's allocation is padded up
+                // to a whole number of them. Rounding UP is what reaches the bytes belonging to
+                // pixels in the final partial tile row — the ones a `0..h` pixel loop cannot name.
+                let tile_h = if self.tiling == TILE_X { 8 } else { 32 };
+                let rows = self.h.div_ceil(tile_h) * tile_h;
+                let words = (pitch / 4) * rows;
+                let mut p = self.base as *mut u32;
+                for _ in 0..words {
+                    core::ptr::write_volatile(p, word);
+                    p = p.add(1);
+                }
+                return;
+            }
+            // A partial fill genuinely is a rectangle of pixels, so it has to know the swizzle.
+            // Nothing on the fatal path takes this branch.
             for y in y0..y1 {
                 for x in 0..self.w {
                     self.put(x, y, c);
@@ -445,15 +477,77 @@ pub fn fatal(title: &str, body: fmt::Arguments) {
     // have. Turning a red screen into a triple fault would be a poor trade, so: flag first.
     PANICKING.store(true, Ordering::SeqCst);
 
-    let mut s = Screen::all(TEXT, FATAL_BG);
-    for t in s.targets.iter().flatten() {
-        unsafe { t.fill(0, t.h, FATAL_BG) };
+    // ★ PAINT THE WHOLE REPORT TWICE, with a pause between. The last painter wins.
+    //
+    // Setting the flag above stops the other cores from STARTING a present. It does nothing about
+    // one already inside the syscall, past the check, holding a pointer into this buffer — and
+    // nothing at all about a GPU batch that was submitted before the fault and is still retiring.
+    // Either lands on top of the report, which is how the last red screen came back with dark runs
+    // punched through the text.
+    //
+    // The thorough fix is a broadcast NMI whose handler halts the other cores, and that needs an IDT
+    // entry this kernel does not have. This is the cheap ninety percent: by the second pass the flag
+    // has been globally visible for millions of cycles, so no new present can have begun, and
+    // whatever landed during the first pass gets overwritten. A report that has to be photographed
+    // and transcribed is worth painting twice.
+    for pass in 0..2 {
+        let mut s = Screen::all(TEXT, FATAL_BG);
+        for t in s.targets.iter().flatten() {
+            unsafe { t.fill(0, t.h, FATAL_BG) };
+        }
+        s.y = 96;
+        s.puts(title);
+        s.newline();
+        s.newline();
+        let _ = s.write_fmt(body);
+        report_trailer(&mut s);
+        if pass == 0 {
+            // Long enough for an in-flight present to finish and for the flag to be seen everywhere;
+            // short enough that nobody watching thinks the machine hung before the screen appeared.
+            for _ in 0..40_000_000u64 {
+                core::hint::spin_loop();
+            }
+        }
     }
-    s.y = 96;
-    s.puts(title);
-    s.newline();
-    s.newline();
-    let _ = s.write_fmt(body);
+}
+
+/// The part of a fatal report that is not the panic message: subsystem cursors that say what the
+/// machine was doing. Its own function so `fatal` can paint the whole report twice — see there.
+fn report_trailer(s: &mut Screen) {
+    // ★ If an ACPI namespace walk was in progress, name the node it died on.
+    //
+    // This is the whole diagnostic for the walk bug. A kernel #GP inside ACPICA otherwise reports an
+    // IP inside `nswalk.c` and nothing else — true, and useless, because the walker is fine on
+    // thousands of nodes and dies on one. The cursor says WHICH one, and the four-character ACPI
+    // name looks up directly in `nyx-recv/dsdt.dsl`.
+    //
+    // ⚠️ Printed AFTER the body, so a fault that has nothing to do with ACPI is unaffected, and only
+    // if a walk is actually live — a stale cursor claiming credit for an unrelated panic would be
+    // worse than saying nothing.
+    if crate::c_stubs::walk_trace::ACTIVE.load(Ordering::Relaxed) {
+        use core::sync::atomic::Ordering::Relaxed as R;
+        let n = crate::c_stubs::walk_trace::name_chars();
+        s.newline();
+        s.newline();
+        let _ = s.write_fmt(format_args!(
+            // ⚠️ The raw name word is printed as well as the four characters. On the first boot with
+            // this report the characters came back `????` — every byte non-printable, which is
+            // already the answer — but "not printable" does not say whether it was zeroed, poisoned,
+            // or a valid pointer read at the wrong offset. The hex does.
+            "ACPI WALK DIED HERE\n  walker  {}\n  node    #{} at depth {}\n  name    {}{}{}{}  raw {:#010x}\n  node@   {:#x}\n  parent@ {:#x}",
+            match crate::c_stubs::walk_trace::KIND.load(R) {
+                1 => "AcpiNsWalkNamespace",
+                2 => "stepper (AcpiGetNextObject)",
+                _ => "unknown",
+            },
+            crate::c_stubs::walk_trace::INDEX.load(R),
+            crate::c_stubs::walk_trace::LEVEL.load(R),
+            n[0], n[1], n[2], n[3],
+            crate::c_stubs::walk_trace::NAME.load(R),
+            crate::c_stubs::walk_trace::NODE.load(R),
+            crate::c_stubs::walk_trace::PARENT.load(R),
+        ));
+    }
 }
 
 /// Set once a fatal report owns the screen. Read by the present/composite syscalls.

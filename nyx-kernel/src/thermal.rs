@@ -174,8 +174,24 @@ fn sample_tasks(out: &mut [CpuSample; CPU_TRACK]) -> usize {
 /// The IDLE task is reported first and deliberately: it is the single most informative number here.
 /// A desktop sitting untouched should be almost entirely idle; if idle is near zero while nothing is
 /// on screen, the kernel's own poll path is the suspect rather than any application.
-fn report_cpu_share(prev: &[CpuSample; CPU_TRACK], prev_n: usize,
-                    cur: &[CpuSample; CPU_TRACK], cur_n: usize, temp: u8) {
+/// CPU busy percentage over the last governor cycle, published for the System Monitor.
+///
+/// Read by the metrics syscall, which must not walk the scheduler itself: `sample_tasks` reaches
+/// into `PER_CPU[..].scheduler.tasks` on every core, and doing that from a syscall arm at IF=0 while
+/// the scheduler is live is a race at best. The governor already samples this once a second on a
+/// preemptible task, and it is the version with the "sum EVERY idle task" fix in it — see below.
+/// One producer, one number, no second implementation to drift.
+pub static CPU_BUSY_PCT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Compute the per-task CPU share for the cycle. Returns `(busy_pct, deltas, n)`, sorted descending.
+///
+/// Split out from the reporting below because the percentage is now wanted **every** cycle (the
+/// monitor polls it) while the log line is still wanted only when something is wrong. Before this
+/// split the arithmetic lived inside the printer and therefore only ran at `temp >= 70` or once a
+/// minute — a monitor reading it in between would have shown a number up to 60 seconds stale.
+fn compute_cpu_share(prev: &[CpuSample; CPU_TRACK], prev_n: usize,
+                     cur: &[CpuSample; CPU_TRACK], cur_n: usize)
+                     -> (u64, [(u64, u64, [u8; 16], bool); CPU_TRACK], usize) {
     let mut deltas = [(0u64, 0u64, [0u8; 16], false); CPU_TRACK];
     let mut n = 0;
     let mut total = 0u64;
@@ -201,8 +217,13 @@ fn report_cpu_share(prev: &[CpuSample; CPU_TRACK], prev_n: usize,
     let idle: u64 = deltas.iter().take(n).filter(|d| d.3).map(|d| d.0).sum();
     let busy = total.saturating_sub(idle);
     let pct = if total == 0 { 0 } else { busy * 100 / total };
-    crate::serial_println!("[Thermal] {}C | cpu {}% busy ({} of {} ticks), idle {}",
-        temp, pct, busy, total, idle);
+    CPU_BUSY_PCT.store(pct as u32, core::sync::atomic::Ordering::Relaxed);
+    (pct, deltas, n)
+}
+
+/// Log who actually burned the CPU. Printing only; the arithmetic is above.
+fn report_cpu_share(pct: u64, deltas: &[(u64, u64, [u8; 16], bool); CPU_TRACK], n: usize, temp: u8) {
+    crate::serial_println!("[Thermal] {}C | cpu {}% busy", temp, pct);
     for d in deltas.iter().take(n).take(4) {
         if d.3 { continue; }
         let nm = core::str::from_utf8(&d.2).unwrap_or("?");
@@ -258,8 +279,11 @@ pub extern "C" fn nyx_task_manager_daemon() {
         let mut cur = [blank; CPU_TRACK];
         let cur_n = sample_tasks(&mut cur);
         cycle = cycle.wrapping_add(1);
+        // Compute unconditionally — this is what publishes CPU_BUSY_PCT for the monitor. Only the
+        // log line stays gated.
+        let (pct, deltas, dn) = compute_cpu_share(&prev, prev_n, &cur, cur_n);
         if temp >= 70 || cycle % 60 == 0 {
-            report_cpu_share(&prev, prev_n, &cur, cur_n, temp);
+            report_cpu_share(pct, &deltas, dn, temp);
         }
         prev = cur;
         prev_n = cur_n;

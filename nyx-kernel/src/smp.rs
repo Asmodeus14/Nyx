@@ -21,6 +21,18 @@ pub fn init_aps(apic_ids: &[u32]) {
         );
     }
 
+    // ★ `pre-smp` read 1802 and `post-smp` read 637, so the namespace dies inside this function.
+    // Split it further: the trampoline copy, then one mark per AP brought up. If the count is still
+    // 1802 after the copy and drops on the first AP, it is something an AP does in `ap_main` — and
+    // the smashed block held a `0xFFFF_9000_...` value, which is the kernel-stack region.
+    crate::acpi::boot_checkpoint("smp-trampoline");
+
+    /// Per-AP checkpoint tags. `boot_checkpoint` takes a `&'static str`, and a fixed table is the
+    /// cheapest way to get one per core without formatting in a path this delicate.
+    const AP_TAGS: [&str; 8] = [
+        "smp-ap0", "smp-ap1", "smp-ap2", "smp-ap3", "smp-ap4", "smp-ap5", "smp-ap6", "smp-ap7",
+    ];
+
     let trampoline_vector = (trampoline_phys >> 12) as u8;
     let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
 
@@ -58,6 +70,12 @@ pub fn init_aps(apic_ids: &[u32]) {
             crate::vga_println!("      -> Core {} ONLINE!", logical_id);
         } else {
             crate::vga_println!("      -> ERR: Core {} FAILED (Timeout)", logical_id);
+        }
+        // After this core has finished `ap_main` (or timed out). The first tag that shows a drop
+        // names the core, and one core dropping it means the damage is per-AP work — the idle-task
+        // allocation, the GS write, or the stack the trampoline handed it.
+        if let Some(t) = AP_TAGS.get(logical_id) {
+            crate::acpi::boot_checkpoint(t);
         }
     }
     

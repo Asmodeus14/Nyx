@@ -2347,6 +2347,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 thread.parent_pid = Some(parent.pid);
                 thread.mmap_bump = parent.mmap_bump;
                 thread.cwd = parent.cwd.clone();
+                // A thread is the same program, so it was launched with the same argument.
+                thread.launch_arg = parent.launch_arg.clone();
                 for i in 0..FD_MAX {
                     if let Some(fd) = &parent.fd_table[i] { thread.fd_table[i] = Some(fd.clone()); }
                 }
@@ -2436,6 +2438,9 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 // cwd is inherited, not reset — a child that silently starts at / would resolve
                 // every relative path somewhere its parent never intended.
                 child.cwd = parent.cwd.clone();
+                // Same for the launch argument: until the child execve's it is still running the
+                // parent's program, and that program's argument is still the one that describes it.
+                child.launch_arg = parent.launch_arg.clone();
 
                 // 1. Share memory frames (CoW implementation). Fallible: on OOM mid-walk, tear the
                 // half-built child address space back down and fail the fork gracefully.
@@ -2632,6 +2637,35 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 return;
             };
 
+            // 1b. The optional single argument — the file the new program is asked to open.
+            // `arg3`/`arg4` are a (ptr, len) pair like the path; zero length means none.
+            //
+            // ★ Validated with exactly the same three checks as the path above, and copied out
+            // BEFORE `clear_user_address_space` runs. Both matter. An unvalidated user pointer read
+            // in kernel mode panics the MACHINE rather than killing the caller, and this string
+            // lives in the memory that is about to be shredded — reading it afterwards would be a
+            // use-after-free of the caller's address space.
+            let arg_ptr = arg3 as *const u8;
+            let arg_len = arg4 as usize;
+            let launch_arg = if arg_len == 0 {
+                alloc::string::String::new()
+            } else if arg_len > 4096
+                || !is_valid_user_ptr(arg_ptr, arg_len)
+                || !unsafe { crate::memory::user_addr_mapped(arg3) }
+            {
+                crate::serial_println!("[EXEC] refused: bad argument pointer/len");
+                frame.rax = EFAULT as u64;
+                return;
+            } else {
+                match core::str::from_utf8(unsafe { core::slice::from_raw_parts(arg_ptr, arg_len) }) {
+                    Ok(s) => alloc::string::String::from(s.trim_matches(char::from(0)).trim()),
+                    Err(_) => {
+                        frame.rax = (-1i64) as u64;
+                        return;
+                    }
+                }
+            };
+
             // 2. Read the file using the safe Kernel String
             // Logged either side: execve reaches read_file_alloc but never reaches load_elf_full for
             // one particular binary, so the read itself is the remaining suspect and this says
@@ -2678,9 +2712,15 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
 
                         // B2: build the SysV entry stack (argc/argv/envp/auxv) in the freshly loaded
                         // address space so a std runtime can start. We're already on the task's CR3.
+                        let arg = if launch_arg.is_empty() { None } else { Some(launch_arg.as_str()) };
                         let entry_rsp = unsafe {
-                            crate::process::build_initial_stack(stack_top, &path_str, &loaded)
+                            crate::process::build_initial_stack(stack_top, &path_str, arg, &loaded)
                         };
+                        // Also kept on the task, because a `no_std` app cannot read its own argv —
+                        // see `Process::launch_arg`. REPLACED, not merged: this describes the
+                        // program that is about to run, and the previous one's argument is gone
+                        // along with its address space.
+                        task.launch_arg = launch_arg.clone();
 
                         // Override the Syscall Return Frame!
                         frame.rcx = entry_point;    // Jump to the new App's _start
@@ -3668,6 +3708,47 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     }
                 }
             }
+
+            // ★ The runtime chain watch. Bring-up hands over 1802 children with a clean NULL tail;
+            // userspace later sees 637 and a dangling one. These lines name the governor tick, and
+            // the call inside it, where the number moved.
+            //
+            // ⚠️ OUTSIDE the match, and that is the whole point. It was written inside the
+            // `Some(c) =>` arm and printed NOTHING, because that arm is only reached once a probe has
+            // run — the earlier "not probed this boot" arm matched first and swallowed it. This data
+            // has no dependence on the cache at all; it is three atomics written by the governor, and
+            // gating a diagnostic on an unrelated precondition is how a boot gets spent on a blank
+            // line.
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let brk = crate::acpi::ROOT_BREAK_TICK.load(Relaxed);
+                s.push_str(&alloc::format!(
+                    "  root chain: first {} now {}{}\n",
+                    crate::acpi::ROOT_FIRST.load(Relaxed),
+                    crate::acpi::ROOT_NOW.load(Relaxed),
+                    if crate::acpi::ROOT_DANGLING.load(Relaxed) {
+                        "   ** DANGLING TAIL SEEN **"
+                    } else {
+                        ""
+                    },
+                ));
+                if brk != 0 {
+                    s.push_str(&alloc::format!(
+                        "  broke on tick {}: before {} -> after ec_install {} -> after ec_battery {}\n",
+                        brk,
+                        crate::acpi::ROOT_BREAK_BEFORE.load(Relaxed),
+                        crate::acpi::ROOT_BREAK_MID.load(Relaxed),
+                        crate::acpi::ROOT_BREAK_AFTER.load(Relaxed),
+                    ));
+                } else {
+                    s.push_str("  the chain has not moved since boot\n");
+                }
+                // ★ Where in BOOT it went. The governor watch above said `first == now`, i.e. the
+                // chain was already short on the first tick — so the damage is earlier, and these
+                // are the stages between ACPICA coming up and userspace starting.
+                s.push_str("  boot checkpoints:\n");
+                s.push_str(&crate::acpi::boot_marks_report());
+            }
             s.push_str(&crate::acpi::init_report());
 
             let bytes = s.as_bytes();
@@ -3690,19 +3771,27 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             // the namespace mutex is now a real semaphore whose wait is bounded (returns AE_TIME
             // rather than spinning forever), so it cannot wedge the core the way an AML call could.
             //
-            // Layout at out_ptr: [0..8] next handle, [8..12] type, [12] name len, [13..] name.
+            // Layout at out_ptr: [0..8] next handle, [8..12] type, [12..20] the node's own Parent,
+            // [20..24] the raw 4-byte name, [24] name len, [25..] the full pathname.
+            //
+            // ⚠️ The two new fields were inserted BEFORE the name rather than appended after it,
+            // because the name is variable-length — a field at "13 + len" is a field whose offset
+            // userspace has to recompute, and the one thing this record must not do is disagree with
+            // its reader about where a pointer starts.
             let mut buf = [0u8; 128];
             let r = crate::acpi::ns_step(arg1, arg2);
             match r {
                 Some(n) => {
                     buf[0..8].copy_from_slice(&n.handle.to_le_bytes());
                     buf[8..12].copy_from_slice(&n.obj_type.to_le_bytes());
+                    buf[12..20].copy_from_slice(&n.parent.to_le_bytes());
+                    buf[20..24].copy_from_slice(&n.name4.to_le_bytes());
                     let l = n.name_len.min(96);
-                    buf[12] = l as u8;
-                    buf[13..13 + l].copy_from_slice(&n.name[..l]);
+                    buf[24] = l as u8;
+                    buf[25..25 + l].copy_from_slice(&n.name[..l]);
                     if arg3 != 0 {
                         unsafe {
-                            core::ptr::copy_nonoverlapping(buf.as_ptr(), arg3 as *mut u8, 13 + l)
+                            core::ptr::copy_nonoverlapping(buf.as_ptr(), arg3 as *mut u8, 25 + l)
                         };
                     }
                     frame.rax = 1;
@@ -3711,6 +3800,97 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
         },
 
+        566 => {
+            // SYS_LAUNCH_ARG(out_ptr, cap) -> bytes written, or 0 if this process was launched
+            // without one. See `Process::launch_arg` for why this exists alongside argv[1].
+            //
+            // Truncates rather than failing when `cap` is short: the caller gets a prefix of a path,
+            // which fails to open with a name it can print. Returning an error instead would make a
+            // too-small buffer indistinguishable from "no argument", and those want opposite
+            // responses from the app.
+            let out = arg1 as *mut u8;
+            let cap = arg2 as usize;
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            let arg = percpu.scheduler.tasks[curr_idx].launch_arg.clone();
+            let n = arg.len().min(cap);
+            if n == 0 || !is_valid_user_ptr(out, n) || !unsafe { crate::memory::user_addr_mapped(arg1) } {
+                frame.rax = 0;
+                return;
+            }
+            unsafe { core::ptr::copy_nonoverlapping(arg.as_ptr(), out, n) };
+            frame.rax = n as u64;
+        }
+        567 => {
+            // SYS_SYS_METRICS(out_ptr) -> 0 on success. Mirrors `nyx_api::SysMetrics`; field order
+            // here IS the ABI.
+            //
+            // Every value is read from a published atomic. Deliberately: this is polled once a
+            // second by a monitoring app, and the two obvious sources are both hazards from a
+            // syscall arm at IF=0 — `MEMORY_MANAGER` is the bare spin lock the page-fault handler
+            // takes, and walking `PER_CPU[..].scheduler.tasks` races the live scheduler. The
+            // producers (the frame allocator, the thermal governor) each publish, and this arm only
+            // copies. No lock is taken, so this cannot join a deadlock cycle.
+            let out = arg1 as *mut u8;
+            let len = core::mem::size_of::<u32>() * 2 + core::mem::size_of::<u64>() * 2;
+            if !is_valid_user_ptr(out, len) || !unsafe { crate::memory::user_addr_mapped(arg1) } {
+                frame.rax = u64::MAX;
+                return;
+            }
+            let (used, total) = crate::memory::memory_usage();
+            let cpu = crate::thermal::CPU_BUSY_PCT.load(core::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                let p = out;
+                core::ptr::write_unaligned(p as *mut u32, cpu);
+                core::ptr::write_unaligned(p.add(4) as *mut u32, 0u32); // _reserved
+                core::ptr::write_unaligned(p.add(8) as *mut u64, used);
+                core::ptr::write_unaligned(p.add(16) as *mut u64, total);
+            }
+            frame.rax = 0;
+        }
+        568 => {
+            // SYS_POWER(action) — 0 = shut down, 1 = restart. Does not return on success.
+            //
+            // ★ Until now this machine had no way to turn itself off. The ACPI S5 path has existed
+            // since the thermal governor needed an emergency shutdown at 95 °C, but nothing in
+            // userspace could reach it, so the only way to stop the machine was to hold the power
+            // button — which on a box with a live ext4 mount is how a filesystem gets damaged.
+            //
+            // ⚠️ There is NO sleep action, and there must not be a fake one. Nyx implements no S3:
+            // `acpi.rs` has `AcpiEnterSleepState` for S5 only, nothing saves or restores device
+            // state, and the GPU's own wake path is the RC6/MOCS hazard that has already cost this
+            // project a run of freezes. Meridian's "sleep" is a shell state that dims the panel to
+            // 15% and says so — see `libs/meridian/src/idle.rs`. An S3 button that parked the
+            // machine somewhere it could not wake from would be worse than no button.
+            //
+            // Interrupts are ENABLED first. Both paths evaluate AML (S5 via ACPICA) or spin for
+            // whole milliseconds between reset attempts, and a SYSCALL arm runs at IF=0 — holding
+            // that across either one starves the thermal governor and every other core.
+            unsafe { x86_64::instructions::interrupts::enable(); }
+            match arg1 {
+                0 => {
+                    // ★ The screen answers FIRST, before any ACPI work. Shutdown takes a moment, and
+                    // a desktop sitting there unchanged while it happens reads as a hang — which is
+                    // exactly what it looked like before this line existed.
+                    crate::boot_screen::farewell("SHUTTING DOWN");
+                    crate::acpi::poweroff();
+                    // Only reachable if the firmware declined S5. Say so ON THE SCREEN — this box
+                    // has no serial console, and a machine that silently refuses to switch off looks
+                    // exactly like one that has hung.
+                    crate::boot_screen::farewell_failed("THE FIRMWARE REFUSED TO SHUT DOWN");
+                    frame.rax = EINVAL as u64;
+                }
+                1 => {
+                    crate::boot_screen::farewell("RESTARTING");
+                    crate::acpi::restart();
+                    crate::boot_screen::farewell_failed("THE FIRMWARE REFUSED TO RESTART");
+                    frame.rax = EINVAL as u64;
+                }
+                _ => {
+                    unsafe { x86_64::instructions::interrupts::disable(); }
+                    frame.rax = EINVAL as u64;
+                }
+            }
+        }
         565 => {
             // SYS_EC_DUMP(out_ptr, cap): the raw EC register space captured by `acpi probe 7`.
             //

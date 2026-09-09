@@ -268,81 +268,14 @@ pub enum LinkState {
 }
 
 // ===================== WPA2 crypto primitives (P6c 4-way handshake) =====================
-// From-scratch SHA1 / HMAC-SHA1 / PBKDF2-SHA1 / IEEE-802.11 PRF. no_std, alloc-only.
-
-fn sha1_block(h: &mut [u32; 5], blk: &[u8]) {
-    let mut w = [0u32; 80];
-    for i in 0..16 {
-        w[i] = u32::from_be_bytes([blk[i * 4], blk[i * 4 + 1], blk[i * 4 + 2], blk[i * 4 + 3]]);
-    }
-    for i in 16..80 {
-        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-    }
-    let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
-    for (i, &wi) in w.iter().enumerate() {
-        let (f, k) = if i < 20 { ((b & c) | ((!b) & d), 0x5A82_7999u32) }
-            else if i < 40 { (b ^ c ^ d, 0x6ED9_EBA1) }
-            else if i < 60 { ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC) }
-            else { (b ^ c ^ d, 0xCA62_C1D6) };
-        let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
-        e = d; d = c; c = b.rotate_left(30); b = a; a = t;
-    }
-    h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b); h[2] = h[2].wrapping_add(c);
-    h[3] = h[3].wrapping_add(d); h[4] = h[4].wrapping_add(e);
-}
-
-fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h = [0x6745_2301u32, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
-    let ml = (data.len() as u64) * 8;
-    let mut i = 0;
-    while i + 64 <= data.len() { sha1_block(&mut h, &data[i..i + 64]); i += 64; }
-    let rem = data.len() - i;
-    let mut last = [0u8; 128];
-    last[..rem].copy_from_slice(&data[i..]);
-    last[rem] = 0x80;
-    let total = if rem + 1 + 8 <= 64 { 64 } else { 128 };
-    last[total - 8..total].copy_from_slice(&ml.to_be_bytes());
-    sha1_block(&mut h, &last[..64]);
-    if total == 128 { sha1_block(&mut h, &last[64..128]); }
-    let mut out = [0u8; 20];
-    for j in 0..5 { out[j * 4..j * 4 + 4].copy_from_slice(&h[j].to_be_bytes()); }
-    out
-}
-
-fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
-    let mut k = [0u8; 64];
-    if key.len() > 64 { k[..20].copy_from_slice(&sha1(key)); }
-    else { k[..key.len()].copy_from_slice(key); }
-    let mut inner = alloc::vec::Vec::with_capacity(64 + msg.len());
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 { inner.push(0x36 ^ k[i]); opad[i] ^= k[i]; }
-    inner.extend_from_slice(msg);
-    let ih = sha1(&inner);
-    let mut outer = [0u8; 84];
-    outer[..64].copy_from_slice(&opad);
-    outer[64..].copy_from_slice(&ih);
-    sha1(&outer)
-}
-
-fn pbkdf2_sha1(password: &[u8], salt: &[u8], iters: u32, dklen: usize) -> alloc::vec::Vec<u8> {
-    let mut out = alloc::vec::Vec::new();
-    let mut bi = 1u32;
-    while out.len() < dklen {
-        let mut si = alloc::vec::Vec::with_capacity(salt.len() + 4);
-        si.extend_from_slice(salt);
-        si.extend_from_slice(&bi.to_be_bytes());
-        let mut u = hmac_sha1(password, &si);
-        let mut t = u;
-        for _ in 1..iters {
-            u = hmac_sha1(password, &u);
-            for k in 0..20 { t[k] ^= u[k]; }
-        }
-        out.extend_from_slice(&t);
-        bi += 1;
-    }
-    out.truncate(dklen);
-    out
-}
+// SHA1 / HMAC-SHA1 / PBKDF2-SHA1 moved to `libs/crypto` for Meridian step 19 — the lock screen needs
+// a key derivation function and importing one from a Wi-Fi driver is the wrong shape. Pure code
+// motion: the bodies are byte-identical and the known-answer vectors that `wpa_crypto_selftest` used
+// to check once per boot are now host tests in that crate, where they run on every `cargo test`.
+//
+// The 802.11 PRF below stays here. It is not general-purpose cryptography — it is one specific
+// key-expansion schedule from IEEE 802.11, and it has exactly one caller.
+use nyx_crypto::{hmac_sha1, pbkdf2_sha1, sha1};
 
 /// IEEE 802.11 PRF: repeatedly HMAC-SHA1(key, label || 0x00 || data || counter).
 fn sha1_prf(key: &[u8], label: &[u8], data: &[u8], out_len: usize) -> alloc::vec::Vec<u8> {

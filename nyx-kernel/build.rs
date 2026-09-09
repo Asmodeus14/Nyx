@@ -3,6 +3,24 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
+    // ★★ A BUILD STAMP, because "is the machine running the image I just built?" has now cost a
+    // power cycle — and on a box with no serial console, bare metal only, that is the most expensive
+    // question there is. It was asked and answered wrongly: the panic/diagnostic output was
+    // identical between two boots, which looked like a code bug and was actually a stale flash.
+    //
+    // The image file is a fixed size every build (24,182,784 bytes), so neither its size nor its
+    // timestamp is a reliable tell at a glance. A stamp printed on screen is.
+    //
+    // ⚠️ `rerun-if-changed` on a path that does not exist makes cargo re-run this script on EVERY
+    // build. That is deliberate and required: a stamp that is only refreshed when some other file
+    // changes is a stamp that lies, which is worse than not having one.
+    println!("cargo:rerun-if-changed=.nyx-always-rebuild");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=NYX_BUILD_STAMP={}", stamp);
+
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=acpica-core");
     println!("cargo:rerun-if-changed=acpica-includes");
