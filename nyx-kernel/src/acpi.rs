@@ -523,6 +523,7 @@ pub fn refresh_cache() {
     // vendor-neutral `_BIF`/`_BST` once they have proven themselves on this boot, and falls back to
     // the raw map permanently if anything about that goes wrong. See `battery_current`.
     let bat = battery_current(ec_ok);
+    if ec_ok { thermal_refresh(); }
     let after = root_count();
     note_root_counts(before, mid, after);
 
@@ -919,6 +920,63 @@ fn battery_source_init() {
         "[ACPI] battery source: {}",
         if good { "AML _BIF/_BST (vendor-neutral)" } else { "raw EC map (AML declined)" },
     );
+}
+
+// ── Thermal sensors for sysmon ─────────────────────────────────────────────────────────────────
+//
+// Degrees C, 0 = no reading. Four EC sensors that the package MSR cannot see: memory, chassis skin
+// and the M.2, plus a second opinion on the CPU.
+static THERMAL_C: [core::sync::atomic::AtomicU8; 4] = [
+    core::sync::atomic::AtomicU8::new(0), core::sync::atomic::AtomicU8::new(0),
+    core::sync::atomic::AtomicU8::new(0), core::sync::atomic::AtomicU8::new(0),
+];
+static THERMAL_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static THERMAL_TICK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn thermal_c() -> [u8; 4] {
+    let mut o = [0u8; 4];
+    for i in 0..4 { o[i] = THERMAL_C[i].load(core::sync::atomic::Ordering::Relaxed); }
+    o
+}
+
+/// Re-read `_TMP` on the governor. Same auto-disarm as the battery promotion: marks 80..=84 are this
+/// code, so if the previous boot stopped in there we never evaluate `_TMP` again.
+fn thermal_refresh() {
+    match THERMAL_STATE.load(core::sync::atomic::Ordering::Relaxed) {
+        2 => return,
+        0 => {
+            let prev = crate::postmortem::prev_user_mark();
+            if (80..=84).contains(&prev) {
+                THERMAL_STATE.store(2, core::sync::atomic::Ordering::Relaxed);
+                crate::vga_println!(
+                    "[ACPI] thermal: last boot stopped at mark {} inside _TMP — sensors disabled",
+                    prev,
+                );
+                return;
+            }
+            THERMAL_STATE.store(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    // ⚠️ Pointless without ECRD: `_TMP`'s Else branch returns a hardcoded 0x0BB8 for every sensor.
+    let mut ecrd: u64 = 0;
+    if unsafe { acpi_ec_ecrd_read(&mut ecrd) } != 1 || ecrd == 0 { return; }
+
+    // Every 4th tick. Four AML evaluations a second, each two EC transactions with timeouts, is real
+    // work to spend on numbers a human reads at 1 Hz at best.
+    let t = THERMAL_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if t % 4 != 0 { return; }
+
+    unsafe { acpi_thermal_read() };
+    let mut dk = [0i32; 4];
+    unsafe { acpi_thermal_fetch(dk.as_mut_ptr(), 4) };
+    for i in 0..4 {
+        // ★ 3000 dK is the `_TMP` stub, not 26.85 C. Publish 0 = "no reading" instead, so a sensor
+        // that is not really answering shows as a gap rather than a plausible idle temperature.
+        let c = if dk[i] == 3000 || dk[i] <= 2732 { 0 } else { (((dk[i] - 2732) / 10).min(255)) as u8 };
+        THERMAL_C[i].store(c, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// What the Entity shows. AML when it has proven itself this boot, the verified raw map otherwise.
