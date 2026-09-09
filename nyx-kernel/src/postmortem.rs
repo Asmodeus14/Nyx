@@ -342,6 +342,17 @@ pub fn lock_watched<T>(m: &spin::Mutex<T>, site: u8) -> spin::MutexGuard<'_, T> 
 }
 
 /// Drop a userspace breadcrumb (syscall 551). `0` clears it.
+/// The breadcrumb the *previous* boot died on, snapshotted by `boot_report` before anything this
+/// boot overwrites it.
+///
+/// ⚠️ Zero means "no mark recorded", not "the last boot was fine" — the register is cleared on a
+/// clean path. Treat it as evidence only when it names a range you care about.
+static PREV_USER_MARK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn prev_user_mark() -> u8 {
+    PREV_USER_MARK.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn user_mark(v: u8) {
     x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         write_reg(REG_USER_MARK, v);
@@ -482,6 +493,11 @@ pub fn report_and_clear() -> Option<Death> {
     let user_mark_v = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         read_reg(REG_USER_MARK)
     });
+    // ★ Kept for the rest of this boot, not just printed. A subsystem that arms something risky on an
+    // automatic path can then ask "did the last boot die doing exactly this?" and refuse to try
+    // again — which is the difference between a bad experiment and a machine that needs reflashing
+    // to become bootable. See `acpi::battery_source_init`.
+    PREV_USER_MARK.store(user_mark_v, core::sync::atomic::Ordering::Relaxed);
     if user_mark_v != 0 {
         say!("[USERMARK] last userspace breadcrumb before the stop: {}", user_mark_v as u32);
         say!("[USERMARK]   `time sync` legend: 1=entered 2=DNS+connect+GET returned");

@@ -239,7 +239,7 @@ impl Monitor {
             // this window disagreeing with the kernel about the machine it is describing.
             Metric::Thermal => {
                 let t = self.info.current_temp;
-                if t == 0 {
+                let mut s = if t == 0 {
                     String::new()
                 } else if t >= 95 {
                     String::from("Critical \u{00B7} emergency halt")
@@ -247,7 +247,22 @@ impl Monitor {
                     String::from("Throttling")
                 } else {
                     String::from("Within envelope")
+                };
+                // The EC's sensors, which the package MSR above physically cannot reach: memory,
+                // chassis skin and the M.2. Real readings via `_TMP` through the ACPI EC handler.
+                //
+                // ⚠️ CPU is deliberately omitted. `current_temp` is already the CPU, from the MSR,
+                // and showing a second slightly different number for the same part just invites the
+                // reader to work out which one is lying.
+                //
+                // `ec_sensors()` skips zeroes, and 0 means "no reading" rather than cold — this
+                // firmware's `_TMP` returns a convincing 26.85 C stub when it has nothing to say, so
+                // a silent sensor has to show as a gap, not as a plausible temperature.
+                for (name, c) in self.info.ec_sensors().filter(|(n, _)| *n != "CPU") {
+                    if !s.is_empty() { s.push_str(" \u{00B7} "); }
+                    s.push_str(&alloc::format!("{} {}\u{00B0}", name, c));
                 }
+                s
             }
         }
     }

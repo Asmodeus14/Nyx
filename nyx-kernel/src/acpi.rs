@@ -184,6 +184,10 @@ extern "C" {
     fn acpi_log_root_count_tag(tag: *const u8);
     fn acpi_root_count(bad_out: *mut i32) -> i32;
     fn acpi_battery_read(out: *mut i32, max: i32) -> i32;
+    fn acpi_battery_fetch(out: *mut i32, max: i32) -> i32;
+    fn acpi_ec_ac_status(ac_online: *mut i32, batt_present: *mut i32) -> i32;
+    fn acpi_thermal_read() -> i32;
+    fn acpi_thermal_fetch(out: *mut i32, max: i32) -> i32;
     fn acpi_ec_install(out_data: *mut u32, out_cmd: *mut u32) -> i32;
     fn acpi_ns_step(parent: *mut core::ffi::c_void, prev: *mut core::ffi::c_void,
                     next: *mut *mut core::ffi::c_void,
@@ -192,6 +196,13 @@ extern "C" {
     fn acpi_ns_handle(path: *const u8) -> *mut core::ffi::c_void;
     fn acpi_ec_read_range(offset: i32, len: i32, out: *mut u8) -> i32;
     fn acpi_ec_last_status() -> i32;
+    fn acpi_ec_handler_state(status_out: *mut u32) -> i32;
+    fn acpi_ec_reg_state(status_out: *mut u32) -> i32;
+    fn acpi_ec_ecrd_read(val_out: *mut u64) -> i32;
+    fn acpi_ec_force_ecrd() -> i32;
+    fn acpi_stack_probe(vals5: *mut u64) -> i32;
+    fn acpi_ec_install_handler() -> i32;
+    fn acpi_ec_run_reg() -> i32;
     fn acpi_ec_battery(out: *mut i32, max: i32) -> i32;
 }
 
@@ -508,7 +519,11 @@ pub fn refresh_cache() {
     let before = root_count();
     let (ec_ok, dport, cport) = ec_install();
     let mid = root_count();
-    let bat = if ec_ok { ec_battery() } else { Battery::default() };
+    // ★ Was `ec_battery()` — the Dell-specific register map — unconditionally. Now prefers the
+    // vendor-neutral `_BIF`/`_BST` once they have proven themselves on this boot, and falls back to
+    // the raw map permanently if anything about that goes wrong. See `battery_current`.
+    let bat = battery_current(ec_ok);
+    if ec_ok { thermal_refresh(); }
     let after = root_count();
     note_root_counts(before, mid, after);
 
@@ -562,6 +577,54 @@ pub fn refresh_cache() {
                 c.with_bcl = with_bcl;
                 c.ready = true;
             }
+        }
+        9 => {
+            // ★ Install the EmbeddedControl handler — the thing `_BIF`/`_BST` need.
+            //
+            // ⚠️ A PROBE, not automatic, and that is the lesson from the boot it cost: this call
+            // lived in `ec_install()` for one build, `ec_install()` runs on every governor tick, and
+            // the machine panicked the instant ring 3 started. An unproven ACPI call on a
+            // once-a-second path is a machine you cannot boot to turn it off again.
+            let ok = unsafe { acpi_ec_install_handler() };
+            crate::vga_println!("[ACPI] EC handler attach -> {}", if ok == 1 { "ok" } else { "failed" });
+        }
+        10 => {
+            // ⚠️ The other half of a normal install, and the more dangerous half: `_REG` is real AML
+            // that re-enters our own handler. Only try this once step 9 has come back ok.
+            //
+            // ⚠️⚠️ HARDWARE RESULT 2026-09-09: THIS DIES. Mark 57, no 58 — `AcpiExecuteRegMethods`
+            // never returns. `_REG` tail-calls `ECIN()`, which does a `Notify`, a cross-tree call
+            // into `GFX0.GLID`, and two SMI-mailbox round trips through a SystemMemory region built
+            // from an NVS base. Kept as a probe because it names the failure, but the working route
+            // is step 11, which sets the one variable `_REG` exists to set and runs no AML at all.
+            let ok = unsafe { acpi_ec_run_reg() };
+            crate::vga_println!("[ACPI] EC _REG -> {}", if ok == 1 { "ok" } else { "failed" });
+        }
+        12 => {
+            // ★ `_TMP` on all four sensors. Needs ECRD (probe 11) or every one of them returns the
+            // hardcoded 0x0BB8 = 26.85 C stub — see acpi_thermal_read for why that is worse than a
+            // failure. Marks 80..83 per sensor, 84 on completion.
+            let n = unsafe { acpi_thermal_read() };
+            crate::vga_println!("[ACPI] _TMP sensors read: {}", n);
+        }
+        11 => {
+            // ★★ The way around a fatal `_REG`: set `\ECRD` directly.
+            //
+            // `ECR1` — the primitive under every EC read — branches on `ECRD`, and `_REG` is the only
+            // AML that ever sets it. Everything else `_REG` does is LID/AC notification housekeeping
+            // that a battery read does not need. So write the integer and skip the ceremony.
+            //
+            // The precedent is the raw-port battery, which has been reading these exact registers
+            // correctly (hardware-verified against Fedora) with no `_REG` for the life of the
+            // project. The EC does not need `ECIN()` to answer; AML just needs permission to ask.
+            let ok = unsafe { acpi_ec_force_ecrd() };
+            let mut v: u64 = 0;
+            let readable = unsafe { acpi_ec_ecrd_read(&mut v) };
+            crate::vga_println!(
+                "[ACPI] force ECRD -> {}  (ECRD now {})",
+                if ok == 1 { "ok" } else { "failed" },
+                if readable == 1 { v as i64 } else { -1 },
+            );
         }
         8 => {
             // ★ The control for step 1: the same descent, driven by `AcpiGetNextObject`.
@@ -633,11 +696,103 @@ pub fn refresh_cache() {
             }
             crate::postmortem::user_mark(51);
 
+            // ★★ THE GUARD WAS READING THE WRONG FLAG, AND HAS BEEN SINCE IT WAS WRITTEN.
+            //
+            // `ec_install()` returns `nyx_ec_installed`, which means "the EC's ports are known".
+            // The condition this guard is *for* — documented on `ec_install` itself — is that
+            // `_STA`/`_BIF`/`_BST` read through `OperationRegion(EmbeddedControl)` and must not be
+            // evaluated with **no address-space handler registered**. That is `nyx_ec_handler_ok`,
+            // a different variable answering a different question.
+            //
+            // So every `acpi probe 5` ever run evaluated battery AML with no handler attached,
+            // which is the crash the guard was written to prevent. It read as "the EC is up" and
+            // the two meanings of that phrase have been conflated in this subsystem before; here it
+            // was load-bearing.
+            //
+            // ⚠️ The handler is NOT installed from here. It is `acpi probe 9`, deliberately opt-in,
+            // because an unproven ACPI call on an automatic path already took this machine down at
+            // ring 3 once. Probe 5 now reports the missing precondition instead of crashing on it.
+            let mut handler_st: u32 = 0;
+            if unsafe { acpi_ec_handler_state(&mut handler_st) } != 1 {
+                crate::postmortem::user_mark(59);
+                if let Some(mut c) = CACHE.try_lock() {
+                    c.battery = Battery::default();
+                }
+                return;
+            }
+
+            // ★★★ AND AN ATTACHED HANDLER IS STILL NOT ENOUGH — `_REG` HAS TO HAVE RUN.
+            //
+            // Proven from the DSDT after breadcrumb 61 said `_STA` itself was faulting. `ECR1`, the
+            // primitive under every EC read, branches on `ECRD`, which is `Name (ECRD, Zero)` and is
+            // set to One in exactly one place in the whole table: the EC device's `_REG`. With it
+            // still zero, AML does not touch the EmbeddedControl region at all — it detours through
+            // `EISC` -> `GENS` -> `SMBF`, which builds a SystemMemory region from an NVS base and
+            // fires an SMI. Our handler is never called; we just take a wild physical access.
+            //
+            // ⚠️ Gated on `ECRD` ITSELF, not on "did we call `_REG`". `acpi probe 10` then died at
+            // mark 57 — `_REG` never returned, because it tail-calls `ECIN()`, which does a `Notify`,
+            // a cross-tree graphics call and two SMI-mailbox round trips. So `_REG` is not available
+            // on this machine, and a flag meaning "we ran it" would be the wrong question anyway.
+            //
+            // `\ECRD` is a root-scope integer we can read directly, and it is the exact condition
+            // `ECR1` branches on. Ask the firmware's own variable rather than tracking a proxy for
+            // it — two flags in this subsystem have already drifted from what they claimed.
+            // `acpi probe 11` sets it without executing any AML.
+            let mut ecrd: u64 = 0;
+            if unsafe { acpi_ec_ecrd_read(&mut ecrd) } != 1 || ecrd == 0 {
+                crate::postmortem::user_mark(68);
+                if let Some(mut c) = CACHE.try_lock() {
+                    c.battery = Battery::default();
+                }
+                return;
+            }
+
             crate::postmortem::user_mark(52);
             let bat = battery();
+            crate::postmortem::user_mark(74);
+
+            // ★★ PRINT BEFORE STORING, AND BEFORE ANYTHING ELSE CAN DIE.
+            //
+            // `_BST` returned (mark 66) and then the machine stopped before the probe finished, so
+            // the one thing this whole arc is for — do `_BIF`/`_BST` yield real numbers — was
+            // collected and then lost with the power cycle. The screen is the only channel on this
+            // laptop, so put the answer on it the instant it exists rather than at the end of a
+            // sequence that has not yet been survived.
+            crate::vga_println!(
+                "[ACPI] _BIF/_BST present={} unit={} design={} full={} mV={} state={} rate={} rem={} bif={} bst={}",
+                bat.present as u8, bat.power_unit, bat.design_cap, bat.last_full_cap,
+                bat.design_voltage, bat.state, bat.present_rate, bat.remaining_cap,
+                bat.have_bif as u8, bat.have_bst as u8,
+            );
+
+            // ★ How deep did the interpreter actually go? `rsp_min` is the lowest RSP our EC handler
+            // was ever entered at, which sits below every AML frame; `unpack` is where we were when
+            // the crash range begins. Their difference is the stack `_BIF`/`_BST` consumed, and
+            // 32 KiB is all a kernel stack gets here — so this either indicts the overflow theory or
+            // retires it, instead of leaving it as the plausible story it currently is.
+            let mut w = [0u64; 5];
+            if unsafe { acpi_stack_probe(w.as_mut_ptr()) } == 1 {
+                crate::vga_println!(
+                    "[ACPI] frame: rsp in {:#x} out {:#x} {}",
+                    w[0], w[1],
+                    if w[0] == w[1] { "SAME" } else { "** MOVED **" },
+                );
+                crate::vga_println!(
+                    "[ACPI] stack: handler min {:#x}  interpreter used {} B of 32768",
+                    w[2], w[0].saturating_sub(w[2]),
+                );
+                crate::vga_println!(
+                    "[ACPI] out ptr: in {:#x} out {:#x} {}",
+                    w[3], w[4],
+                    if w[3] == w[4] { "SAME" } else { "** CHANGED **" },
+                );
+            }
+
             if let Some(mut c) = CACHE.try_lock() {
                 c.battery = bat;
             }
+            crate::postmortem::user_mark(75);
         }
 
         7 => {
@@ -703,9 +858,155 @@ pub fn request_probe(step: u8, arg: u32) {
 /// Extra parameter for the requested step. For step 1 this is the walk depth (0 = unlimited).
 static PROBE_ARG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// ── Which battery path the Entity actually reads ───────────────────────────────────────────────
+//
+// 0 = not yet decided, 1 = AML (`_BIF`/`_BST`), 2 = raw register map, latched.
+//
+// ★ The raw map is hardware-verified against Fedora but is a decode of THIS Dell and nothing else.
+// `_BIF`/`_BST` are the vendor-neutral layout and now work, so prefer them — but never at the cost
+// of the working path: any failure latches to 2 and never retries.
+static BATT_SOURCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Breadcrumbs for the one-shot promotion. If a boot dies inside this range, the NEXT boot sees it
+/// in the surviving CMOS byte and refuses to arm — see `battery_source_init`.
+const PROMO_MARKS: core::ops::RangeInclusive<u8> = 85..=89;
+
+/// Decide once, on the governor, whether AML can supply the battery.
+///
+/// ⚠️⚠️ THIS PUTS ACPI CALLS ON AN AUTOMATIC PATH, WHICH HAS TAKEN THIS MACHINE DOWN BEFORE.
+/// `acpi_ec_install` briefly did the handler install on this same once-a-second tick and the box
+/// panicked the instant it reached ring 3 — unbootable, no serial console, no way to opt out short
+/// of a rebuild. What makes it defensible now: attach (9) and the `ECRD` write (11) have each run
+/// clean on hardware, and `_REG` — the one that is actually fatal — is not called.
+///
+/// ★ And it disarms itself. `postmortem::prev_user_mark()` is the byte that survived the last power
+/// cycle; if it names this range, the previous boot died in here and we do not try again. That turns
+/// the worst case from "reflash to boot" into "one bad boot, then raw forever".
+fn battery_source_init() {
+    if BATT_SOURCE.load(core::sync::atomic::Ordering::Relaxed) != 0 { return; }
+
+    let prev = crate::postmortem::prev_user_mark();
+    if PROMO_MARKS.contains(&prev) {
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        crate::vga_println!(
+            "[ACPI] battery: last boot stopped at mark {} inside AML promotion — staying on the raw map",
+            prev,
+        );
+        return;
+    }
+
+    crate::postmortem::user_mark(85);
+    if unsafe { acpi_ec_install_handler() } != 1 {
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    crate::postmortem::user_mark(86);
+    if unsafe { acpi_ec_force_ecrd() } != 1 {
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    // Prove it end-to-end before committing. `bif`/`bst` mean the PACKAGES PARSED — the methods
+    // returning without faulting is not the same claim, and the two were conflated in this subsystem
+    // once already.
+    crate::postmortem::user_mark(87);
+    let probe = battery();
+    let good = probe.present && probe.have_bif && probe.have_bst && probe.last_full_cap > 0;
+    crate::postmortem::user_mark(88);
+
+    BATT_SOURCE.store(if good { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+    crate::vga_println!(
+        "[ACPI] battery source: {}",
+        if good { "AML _BIF/_BST (vendor-neutral)" } else { "raw EC map (AML declined)" },
+    );
+}
+
+// ── Thermal sensors for sysmon ─────────────────────────────────────────────────────────────────
+//
+// Degrees C, 0 = no reading. Four EC sensors that the package MSR cannot see: memory, chassis skin
+// and the M.2, plus a second opinion on the CPU.
+static THERMAL_C: [core::sync::atomic::AtomicU8; 4] = [
+    core::sync::atomic::AtomicU8::new(0), core::sync::atomic::AtomicU8::new(0),
+    core::sync::atomic::AtomicU8::new(0), core::sync::atomic::AtomicU8::new(0),
+];
+static THERMAL_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static THERMAL_TICK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn thermal_c() -> [u8; 4] {
+    let mut o = [0u8; 4];
+    for i in 0..4 { o[i] = THERMAL_C[i].load(core::sync::atomic::Ordering::Relaxed); }
+    o
+}
+
+/// Re-read `_TMP` on the governor. Same auto-disarm as the battery promotion: marks 80..=84 are this
+/// code, so if the previous boot stopped in there we never evaluate `_TMP` again.
+fn thermal_refresh() {
+    match THERMAL_STATE.load(core::sync::atomic::Ordering::Relaxed) {
+        2 => return,
+        0 => {
+            let prev = crate::postmortem::prev_user_mark();
+            if (80..=84).contains(&prev) {
+                THERMAL_STATE.store(2, core::sync::atomic::Ordering::Relaxed);
+                crate::vga_println!(
+                    "[ACPI] thermal: last boot stopped at mark {} inside _TMP — sensors disabled",
+                    prev,
+                );
+                return;
+            }
+            THERMAL_STATE.store(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    // ⚠️ Pointless without ECRD: `_TMP`'s Else branch returns a hardcoded 0x0BB8 for every sensor.
+    let mut ecrd: u64 = 0;
+    if unsafe { acpi_ec_ecrd_read(&mut ecrd) } != 1 || ecrd == 0 { return; }
+
+    // Every 4th tick. Four AML evaluations a second, each two EC transactions with timeouts, is real
+    // work to spend on numbers a human reads at 1 Hz at best.
+    let t = THERMAL_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if t % 4 != 0 { return; }
+
+    unsafe { acpi_thermal_read() };
+    let mut dk = [0i32; 4];
+    unsafe { acpi_thermal_fetch(dk.as_mut_ptr(), 4) };
+    for i in 0..4 {
+        // ★ 3000 dK is the `_TMP` stub, not 26.85 C. Publish 0 = "no reading" instead, so a sensor
+        // that is not really answering shows as a gap rather than a plausible idle temperature.
+        let c = if dk[i] == 3000 || dk[i] <= 2732 { 0 } else { (((dk[i] - 2732) / 10).min(255)) as u8 };
+        THERMAL_C[i].store(c, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What the Entity shows. AML when it has proven itself this boot, the verified raw map otherwise.
+pub fn battery_current(ec_ok: bool) -> Battery {
+    if !ec_ok { return Battery::default(); }
+    battery_source_init();
+
+    if BATT_SOURCE.load(core::sync::atomic::Ordering::Relaxed) == 1 {
+        let b = battery();
+        // ⚠️ Re-checked every tick, not just at promotion. A source that silently degrades to zeroes
+        // would show a plausible 0% rather than a gap, which is the failure this project keeps
+        // deciding is worse than admitting ignorance.
+        if b.present && b.have_bif && b.have_bst && b.last_full_cap > 0 {
+            return b;
+        }
+        BATT_SOURCE.store(2, core::sync::atomic::Ordering::Relaxed);
+        crate::vga_println!("[ACPI] battery: AML read went bad — latching to the raw map");
+    }
+    ec_battery()
+}
+
 pub fn battery() -> Battery {
     let mut v = [0i32; 11];
-    let found = unsafe { acpi_battery_read(v.as_mut_ptr(), 11) };
+    // ★ Two calls on purpose. `acpi_battery_read` evaluates the AML and parks its result in a static;
+    // `acpi_battery_fetch` copies it here afterwards. Writing into `v` from inside the first call —
+    // i.e. through a caller pointer while interpreter frames were still unwinding — faulted on three
+    // consecutive boots with a pointer that was demonstrably valid, unchanged and high-half. The
+    // split is what turns that into a testable difference rather than a fourth theory.
+    unsafe { acpi_battery_read(core::ptr::null_mut(), 0) };
+    let found = unsafe { acpi_battery_fetch(v.as_mut_ptr(), 11) };
     Battery {
         present: found == 1,
         power_unit: v[1],
@@ -888,6 +1189,109 @@ pub fn init_report() -> alloc::string::String {
                           step(i.load)));
     out.push_str(&format!("    enable    {}\n", step(i.enable)));
     out.push_str(&format!("    objects   {}\n", step(i.objects)));
+    // ★ The EmbeddedControl handler. Re-enabled 2026-09-09 once the heap corruption that made every
+    // namespace walk #GP was fixed — `AcpiInstallAddressSpaceHandler` walks internally, which is the
+    // whole reason it was skipped for the life of the project.
+    //
+    // ⚠️ Reported separately from "the EC works", because that has meant two different things here:
+    // the ports being readable (which the raw-port battery has always had) versus AML being able to
+    // reach the EC, which is what `_BIF`/`_BST` need and what this line is about.
+    let mut ec_st: u32 = 0;
+    let ec_ok = unsafe { acpi_ec_handler_state(&mut ec_st) };
+    out.push_str(&format!(
+        "  EC address-space handler: {}  ({})\n",
+        if ec_ok == 1 { "INSTALLED" } else { "not installed" },
+        acpi_status_name(ec_st),
+    ));
+    // ⚠️ This line used to read "AML can reach the EC — try `acpi probe 5`" as soon as the handler
+    // attached. That was wrong, and it sent a boot into a #GP: on this firmware `ECR1` gates every EC
+    // access on `ECRD`, which only `_REG` sets, so an attached-but-unREG'd handler is never consulted
+    // and AML detours onto an SMI path instead. Attached is a precondition, not the answer.
+    // ★ `\ECRD` read live from the namespace, because it — not any flag of ours — is what `ECR1`
+    // branches on. `_REG` is the only AML that sets it and `_REG` is fatal here (mark 57), so
+    // `acpi probe 11` writes it directly. Reporting the firmware's own variable means this line
+    // cannot drift from reality the way `nyx_ec_installed` did.
+    let mut ecrd: u64 = 0;
+    let ecrd_ok = unsafe { acpi_ec_ecrd_read(&mut ecrd) };
+    out.push_str(&format!(
+        "  ECRD (EC region enabled): {}\n",
+        if ecrd_ok != 1 { alloc::string::String::from("unreadable") } else { format!("{}", ecrd) },
+    ));
+    // ★★ WHAT THE LAST AML READ ACTUALLY RETURNED, read straight out of the static that
+    // `acpi_battery_read` fills. This is the only way to tell the two battery paths apart:
+    // `_BIF`/`_BST` and the raw-port map produce IDENTICAL numbers on this machine (2131/4474/11400),
+    // so `battery` showing the right values proves nothing about which route supplied them.
+    //
+    // ⚠️ It exists because the line that was supposed to answer this went to `vga_println!`, i.e. the
+    // kernel boot log, which is invisible once the desktop is up. Putting the answer somewhere the
+    // screen never shows it is the same mistake as writing it to a serial port this laptop does not
+    // have. `bif`/`bst` are the load-bearing flags: they mean the PACKAGES PARSED, not merely that
+    // the methods returned without faulting.
+    // ★ Which path the Entity is ACTUALLY reading. On screen, because the promotion announces itself
+    // via `vga_println!` — the kernel boot log, invisible once the desktop is up. Same mistake as
+    // "serial still has it" on a laptop with no serial port, and it has now been made twice here.
+    out.push_str(&format!(
+        "  battery source: {}\n",
+        match BATT_SOURCE.load(core::sync::atomic::Ordering::Relaxed) {
+            1 => "AML _BIF/_BST (vendor-neutral)",
+            2 => "raw EC map (Dell-specific, latched)",
+            _ => "not decided yet",
+        },
+    ));
+
+    let mut av = [0i32; 11];
+    let aml_present = unsafe { acpi_battery_fetch(av.as_mut_ptr(), 11) };
+    if av.iter().all(|&x| x == 0) {
+        out.push_str("  last AML battery read: never run this boot (`acpi probe 5`)\n");
+    } else {
+        out.push_str(&format!(
+            "  last AML battery read: present={} bif={} bst={}\n    design={} full={} mV={} rem={} rate={} state={}\n",
+            aml_present, av[9], av[10], av[2], av[3], av[4], av[7], av[6], av[5],
+        ));
+    }
+
+    // ★ AC adapter — a raw EC read, no AML. `_PSR` is `ECG5() & 1` and `ECG5()` is `ECRB(0x06)`, so
+    // the register holds the answer; evaluating `_PSR` would additionally fire `PNOT()` on every
+    // state change, which is work we do not need to poll.
+    let (mut ac, mut bp) = (0i32, 0i32);
+    if unsafe { acpi_ec_ac_status(&mut ac, &mut bp) } == 1 {
+        out.push_str(&format!(
+            "  AC adapter: {}   battery present: {}   (EC 0x06)\n",
+            if ac == 1 { "ONLINE" } else { "on battery" },
+            if bp == 1 { "yes" } else { "no" },
+        ));
+    }
+
+    // ★★ Thermal. Deci-Kelvin from `_TMP`; 2732 dK = 0 C.
+    //
+    // ⚠️ 3000 dK (26.85 C) on every sensor is NOT a reading — it is the `Else` branch of `_TMP`
+    // firing because `ECRD` is zero. Flagged explicitly, because a plausible constant is the one
+    // failure mode that never looks like one.
+    let mut tz = [0i32; 4];
+    let tzn = unsafe { acpi_thermal_fetch(tz.as_mut_ptr(), 4) };
+    if tzn > 0 {
+        let names = ["CPU", "MEM", "SKN", "M.2"];
+        let mut line = alloc::string::String::from("  thermal (_TMP):");
+        for (i, &dk) in tz.iter().enumerate() {
+            if dk > 0 {
+                line.push_str(&format!(" {} {}C", names[i], (dk - 2732) / 10));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
+        if tz.iter().filter(|&&d| d > 0).all(|&d| d == 3000) {
+            out.push_str("    ** all 3000 dK = the _TMP stub, not a reading: ECRD is 0 **\n");
+        }
+    } else {
+        out.push_str("  thermal (_TMP): not read this boot (`acpi probe 12`)\n");
+    }
+
+    out.push_str(match (ec_ok, ecrd_ok == 1 && ecrd != 0) {
+        (1, true) => "    AML can reach the EC — `acpi probe 5` for _BIF/_BST.\n",
+        (1, false) => "    Handler attached but ECRD is 0: AML would take the SMI path, not ours.\n\
+                       \x20   Run `acpi probe 11` (sets ECRD, no AML) before `acpi probe 5`.\n",
+        _ => "    Run `acpi probe 9` (attach), then 11 (ECRD), then 5 (battery).\n",
+    });
     out
 }
 

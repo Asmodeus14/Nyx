@@ -73,6 +73,14 @@ pub struct SystemInfo {
     /// as unknown, the reason is "we have no driver for THIS machine", and naming the machine is what
     /// turns that from a shrug into something actionable.
     pub machine: [u8; 80],
+    /// EC thermal sensors in degrees C: `[CPU, memory, skin, M.2]`. **0 means no reading**, not a
+    /// cold part — the same convention `current_temp` already uses.
+    ///
+    /// These come from `_TMP` through the EC address-space handler, so they are sensors the package
+    /// MSR behind `current_temp` physically cannot see. ⚠️ Appended at the END of this struct on
+    /// purpose: it is `#[repr(C)]` and mirrored in `libs/api`, so adding anywhere else silently
+    /// shifts every field for one of the two sides.
+    pub ec_temps: [u8; 4],
 }
 
 use crate::process::FD_MAX;
@@ -4689,7 +4697,10 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 let temp = crate::thermal::get_intel_silicon_temp();
                 (*info_ptr).current_temp = temp;
                 (*info_ptr).active_cooling = if temp >= 75 { 1 } else { 0 };
-                
+                // The EC's own sensors, republished by the governor. `current_temp` above is the
+                // package MSR; these are memory, skin and the M.2, which it cannot reach.
+                (*info_ptr).ec_temps = crate::acpi::thermal_c();
+
                 // 2. Hardware Fan Telemetry (SMM)
                 // FAN_RPM_UNKNOWN when we have no way to read the tachometer. Reporting 0 here was
                 // worse than reporting nothing: 0 RPM is a plausible-looking measurement, so it read

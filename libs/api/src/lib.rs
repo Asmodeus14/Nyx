@@ -156,9 +156,27 @@ pub struct SystemInfo {
     /// SMBIOS manufacturer + product ("Dell Inc. Latitude 5410"), NUL-padded, empty when the
     /// firmware reported no identity. See `machine_name()`.
     pub machine: [u8; 80],
+    /// EC thermal sensors in degrees C: `[CPU, memory, skin, M.2]`. **0 means no reading.**
+    ///
+    /// From `_TMP` via the EC address-space handler — sensors the package MSR behind `current_temp`
+    /// cannot see. ⚠️ Must stay LAST and must match `nyx-kernel/src/interrupts.rs`: this is
+    /// `#[repr(C)]` written through a raw pointer by the kernel, so a field inserted above here on
+    /// one side only shifts everything after it on the other.
+    pub ec_temps: [u8; 4],
 }
 
 impl SystemInfo {
+    /// Named EC sensors that actually reported, ready to display. Skips zeroes, because 0 is "no
+    /// reading" and a sensor that is not answering should show as a gap, never as a plausible
+    /// temperature — the firmware's own `_TMP` stub returns a convincing 26.85 C when it has nothing.
+    pub fn ec_sensors(&self) -> impl Iterator<Item = (&'static str, u8)> + '_ {
+        const NAMES: [&str; 4] = ["CPU", "Memory", "Skin", "M.2"];
+        self.ec_temps
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| t > 0)
+            .map(|(i, &t)| (NAMES[i], t))
+    }
     /// The SMBIOS machine name, or "" when unknown.
     pub fn machine_name(&self) -> &str {
         let end = self.machine.iter().position(|&b| b == 0).unwrap_or(self.machine.len());

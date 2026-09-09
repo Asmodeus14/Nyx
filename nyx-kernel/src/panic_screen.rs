@@ -362,7 +362,21 @@ impl Screen {
     /// Every surface we know about. For a fatal report, where the machine is not coming back and
     /// guessing wrong means the message is lost.
     fn all(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> Screen {
-        Screen { targets: [SCANOUT.get(), FIRMWARE.get()], x: MARGIN_X, y: 0, fg, bg }
+        let scan = SCANOUT.get();
+        let fw = FIRMWARE.get();
+        // ⚠️ NEVER paint the same memory twice through two different geometries.
+        //
+        // `SCANOUT` and `FIRMWARE` can describe the SAME pages — that happens whenever P1a's plane
+        // scan or allocation fell back and left the plane pointed at the firmware buffer. They are
+        // registered with different tiling, so painting both would write one swizzle over the other:
+        // a clean fill followed by a scrambled one. That is a precise match for the red screens this
+        // machine produces — legible-ish text with runs punched through it — and it is a bug that
+        // only appears on the one path where nobody can debug it.
+        let fw = match (&scan, &fw) {
+            (Some(a), Some(b)) if a.base == b.base => None,
+            _ => fw,
+        };
+        Screen { targets: [scan, fw], x: MARGIN_X, y: 0, fg, bg }
     }
 
     /// Just the surface most likely to be live. Used by the non-fatal banner, which runs inside a
@@ -498,9 +512,67 @@ pub fn fatal(title: &str, body: fmt::Arguments) {
         s.y = 96;
         s.puts(title);
         s.newline();
+        // ★ What this report was painted ONTO, printed before anything else.
+        //
+        // Two boots have now been spent on a red screen that came up with the desktop showing
+        // through it, and both fixes were guesses because nothing on screen said what geometry was
+        // being used. These four numbers per target settle it without another cycle: a wrong
+        // `tiling` scrambles everything, a wrong `stride` shears it, and two targets sharing a
+        // `base` means we painted the same pages twice through different swizzles.
+        //
+        // Placed second, right under the title, because that is the part of the screen that has
+        // stayed legible in every photograph of this failure so far.
+        // Snapshotted before the loop: `write_fmt` needs `&mut s` and iterating `s.targets` holds an
+        // immutable borrow of the same value.
+        let described: [Option<(u64, usize, usize, usize, usize, u32)>; 2] = [
+            s.targets[0].as_ref().map(|g| (g.base as u64, g.w, g.h, g.stride, g.bpp, g.tiling)),
+            s.targets[1].as_ref().map(|g| (g.base as u64, g.w, g.h, g.stride, g.bpp, g.tiling)),
+        ];
+        for (i, d) in described.iter().enumerate() {
+            match d {
+                Some((base, w, h, stride, bpp, tiling)) => {
+                    let _ = s.write_fmt(format_args!(
+                        "\nsurface {}: base {:#x} {}x{} stride {} bpp {} tiling {}",
+                        i, base, w, h, stride, bpp, tiling,
+                    ));
+                }
+                None => {
+                    let _ = s.write_fmt(format_args!("\nsurface {}: none", i));
+                }
+            }
+        }
+        s.newline();
         s.newline();
         let _ = s.write_fmt(body);
         report_trailer(&mut s);
+
+        // ★★★★ PUSH THE PIXELS OUT OF THE CACHES. This is very likely the actual bug.
+        //
+        // Four attempts have left the report legible-ish with the desktop showing through as short
+        // dark runs, and the runs are about SIXTEEN PIXELS wide. At 32bpp that is 64 bytes — ONE
+        // CACHE LINE — and cache-line granularity is not something a drawing bug produces. It is the
+        // signature of memory that has been written but not written BACK.
+        //
+        // We paint with the CPU; the display engine scans physical RAM. If the framebuffer is mapped
+        // write-back, our stores sit in L1/L2 and reach RAM when the hardware feels like it, so the
+        // panel shows a mix of new content (lines already evicted) and whatever was there before
+        // (lines still dirty in cache) — in exactly 64-byte runs. Write-combining fails the same way
+        // with partially filled WC buffers.
+        //
+        // It also explains why "paint it twice" helped inconsistently: that changed the TIMING of
+        // eviction without ever forcing it, which is why the earlier geometry theories (tiling,
+        // stride, aliased surfaces) all measured clean and none of them fixed anything.
+        //
+        // `sfence` drains the write-combining buffers; `wbinvd` writes back and invalidates every
+        // cache line. Both are single instructions and take NO LOCKS — the entire requirement for
+        // this path, where the panicking core may already hold any lock in the kernel. `wbinvd`
+        // costs milliseconds and flushes the whole hierarchy; on a machine that is not coming back
+        // that is not a cost, and legibility is the only thing still worth anything.
+        unsafe {
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+            core::arch::asm!("wbinvd", options(nostack, preserves_flags));
+        }
+
         if pass == 0 {
             // Long enough for an in-flight present to finish and for the flag to be seen everywhere;
             // short enough that nobody watching thinks the machine hung before the screen appeared.
@@ -580,4 +652,16 @@ pub fn fault_banner(what: &str, body: fmt::Arguments) {
     s.puts(what);
     s.newline();
     let _ = s.write_fmt(body);
+
+    // Same cache-writeback problem as `fatal` — see the long note there. A band that is half in L2
+    // is exactly as unreadable as a report that is.
+    //
+    // ⚠️ `wbinvd` here and not just `sfence`, despite this path running per dying process rather
+    // than once at the end of the world. A process fault is an exceptional event, not a hot path,
+    // and an illegible banner has no value at all — so the milliseconds are worth it. If something
+    // ever crash-loops hard enough for this to matter, the flush is not the problem worth fixing.
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+        core::arch::asm!("wbinvd", options(nostack, preserves_flags));
+    }
 }

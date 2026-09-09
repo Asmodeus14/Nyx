@@ -313,13 +313,49 @@ void *acpi_ns_handle(const char *path) {
 #define EC_CMD_READ     0x80
 #define EC_CMD_WRITE    0x81
 
-/* Bounded spin. The EC is slow (tens of microseconds) but must never hang the governor: a wedged
- * core takes scheduling down with it, which is exactly how this path failed before. */
-#define EC_TIMEOUT      100000
+/* Bounded spin, in iterations of `AcpiOsStall(1)`. The EC is slow (tens of microseconds) but must
+ * never hang the governor: a wedged core takes scheduling down with it, which is exactly how this
+ * path failed before.
+ *
+ * ★ 100000 -> 10000, alongside the `AcpiOsGetTimer` fix, and the two go together. This was written
+ * when `AcpiOsStall(1)` actually waited ~0.5 us, so the loop was a ~50 ms budget that nobody had
+ * costed; with the timer corrected each iteration is a real microsecond and the SAME constant would
+ * silently become 100 ms per wait. `nyx_ec_read_byte` performs three waits, so a single failing
+ * register read would spin for 300 ms — on the 1 Hz governor tick, and 300x over on a transaction
+ * the ACPI spec and Linux both budget in single-digit milliseconds.
+ *
+ * 10 ms is still generous for hardware that answers in tens of microseconds, and it is now an
+ * honest number: iterations x 1 us. ⚠️ An iteration count is not a timeout unless the per-iteration
+ * delay is real — this one was not, for the life of the file. */
+#define EC_TIMEOUT      10000
 
 static UINT32 nyx_ec_data_port = 0;
 static UINT32 nyx_ec_cmd_port  = 0;
 static int    nyx_ec_installed = 0;
+/* Whether the EmbeddedControl address-space handler registered, and what ACPICA said. Separate from
+ * `nyx_ec_installed`, which only means "the ports are known": the direct-port battery works without
+ * a handler, AML does not. Two different claims, and they were conflated. */
+static int    nyx_ec_handler_ok = 0;
+static ACPI_STATUS nyx_ec_handler_status = AE_NOT_EXIST;
+/* `_REG` is run as its own step; AE_NOT_EXIST means it has not been attempted this boot. */
+static ACPI_STATUS nyx_ec_reg_status = AE_NOT_EXIST;
+/* Has `_REG(3, 1)` actually been evaluated? NOT the same question as "is a handler attached", and on
+ * this firmware it is the one that decides whether AML uses the EC at all. See acpi_ec_run_reg. */
+static int    nyx_ec_reg_done = 0;
+/* Stack-depth witnesses. See acpi_stack_probe / acpi_battery_read.
+ *
+ * ⚠️ `volatile` on purpose. The point of `nyx_out_ptr_entry` vs `nyx_out_ptr` is to catch the caller's
+ * own parameter changing across a call — which is undefined-behaviour territory the optimiser is
+ * entitled to assume cannot happen, and would happily fold the comparison to a constant false. */
+static volatile unsigned long long nyx_rsp_at_entry = 0;
+static volatile unsigned long long nyx_rsp_at_unpack = 0;
+static volatile unsigned long long nyx_rsp_min_handler = 0;
+static volatile unsigned long long nyx_out_ptr_entry = 0;
+static volatile unsigned long long nyx_out_ptr = 0;
+/* Where a battery read lands its result, so nothing has to be written through a caller's pointer
+ * while an AML interpreter frame is still unwinding beneath us. See acpi_battery_fetch. */
+static volatile int nyx_batt_vals[11];
+static volatile int nyx_batt_present = 0;
 
 /// Last raw EC status byte, kept so a timeout can say WHAT it saw rather than just "timed out".
 /// 0xFF means nothing is decoding that port; 0x00 means the EC is idle but never raised OBF.
@@ -381,6 +417,15 @@ static int nyx_ec_write_byte(UINT8 addr, UINT8 val) {
 static ACPI_STATUS NyxEcSpaceHandler(UINT32 Function, ACPI_PHYSICAL_ADDRESS Address,
                                      UINT32 BitWidth, UINT64 *Value,
                                      void *HandlerContext, void *RegionContext) {
+    /* ★ The deepest point we ever get to observe. AML calls this from the bottom of the interpreter's
+     * recursion, so the low-water mark here bounds how much stack `_BIF`/`_BST` actually consume —
+     * the number needed to confirm or kill the overflow theory, rather than reasoning about it. */
+    {
+        unsigned long long rsp;
+        __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp));
+        if (nyx_rsp_min_handler == 0 || rsp < nyx_rsp_min_handler) nyx_rsp_min_handler = rsp;
+    }
+
     if (!Value || BitWidth == 0 || (BitWidth & 0x07)) return AE_BAD_PARAMETER;
     if (Address > 0xFF) return AE_BAD_ADDRESS;
 
@@ -474,24 +519,215 @@ int acpi_ec_install(unsigned int *out_data, unsigned int *out_cmd) {
         return 0;
     }
 
-    // ★ THE HANDLER INSTALL IS DELIBERATELY SKIPPED.
+    // ★★★ THE HANDLER INSTALL IS BACK (2026-09-09). THE WALK BUG IS FIXED.
     //
-    // `AcpiInstallAddressSpaceHandler` walks the device subtree internally (evhandler.c), and walks
-    // #GP this kernel — proven at mark 55, and the walk bug survived every structural fix
-    // (reader-lock bypass, NO_UNLOCK, a real OS layer, an inert callback). Registering the handler
-    // is what lets *AML* reach the EC, i.e. what `_BIF`/`_BST` need. We do not need AML: the ports
-    // are known and `nyx_ec_read_byte` talks to them directly.
+    // This was skipped for the life of the project on the grounds that
+    // `AcpiInstallAddressSpaceHandler` walks the device subtree internally (evhandler.c) and "walks
+    // #GP this kernel". That was true, and it was never an ACPI bug: the kernel heap was backed by
+    // physical memory below 1 MB and AP bring-up wrote the SMP trampoline through it. See
+    // `memory::LOW_MEM_RESERVED`. Namespace walks are sound now.
     //
-    // What that costs, stated plainly: `_BIF`/`_BST` give a vendor-neutral battery layout, and
-    // reading EC registers directly does not — the offsets are model-specific and undocumented, so
-    // whatever we hardcode is a map for THIS Dell and nothing else. That is a real downgrade, taken
-    // knowingly because the correct path is blocked behind a bug that has already cost many boots.
+    // Registering this is what lets AML reach the EC, which is what `_BIF`/`_BST` need. The raw-port
+    // path stays as the fallback and is still what the Entity reads today — it is hardware-verified
+    // against Fedora, and replacing something that works with something newly re-enabled, on a
+    // machine that costs a power cycle per test, is not a trade worth making blind.
     //
-    // If the walk bug is ever fixed, restore the install and `acpi_battery_read` works unchanged.
+    // What the AML path buys if it holds: `_BIF`/`_BST` are a vendor-neutral battery layout, where
+    // the raw offsets are a map for THIS Dell and nothing else.
+    //
+    // ⚠️ A failure here is NOT fatal and must not be. `nyx_ec_installed` is still set either way, so
+    // the direct-port battery keeps working exactly as before; only the AML route is lost. The
+    // status is recorded rather than discarded so `acpi ec` can report which of the two is live —
+    // "the EC works" has meant two different things in this project and they should be separable.
+    // ⚠️⚠️ NOT INSTALLED HERE. See `acpi_ec_install_handler` below.
+    //
+    // It was, for exactly one build, and the machine kernel-panicked the instant it reached ring 3.
+    // This function runs on the thermal governor's tick — once a second, starting as soon as
+    // userspace does — so putting a newly re-enabled, unproven ACPI call in it meant the very first
+    // tick took the machine down, on a box with no serial console and no way to opt out without a
+    // rebuild. The install is now a deliberate, one-shot request.
     nyx_ec_installed = 1;
     if (out_data) *out_data = nyx_ec_data_port;
     if (out_cmd)  *out_cmd  = nyx_ec_cmd_port;
     return 1;
+}
+
+/* ★★ Register the EmbeddedControl address-space handler. OPT-IN, one shot, never automatic.
+ *
+ * This is what lets AML reach the EC, i.e. what `_BIF`/`_BST` need. It was blocked for the life of
+ * the project because the install walks the device subtree and walks #GP'd this kernel — which was
+ * never an ACPI bug, but the sub-1 MB heap corruption (see `memory::LOW_MEM_RESERVED`).
+ *
+ * ⚠️ With walks fixed it STILL panicked the machine, immediately on reaching ring 3. So the walk was
+ * not the only thing wrong with this path, and the remaining suspect is what the install does after
+ * walking: `AcpiEvExecuteRegMethods` evaluates **`_REG`** for every EmbeddedControl region. That is
+ * real AML telling the firmware "the OS owns the EC now", and on this class of laptop it does
+ * substantial work — and every EC access it makes is routed straight back into `NyxEcSpaceHandler`,
+ * whose poll loop leans on `AcpiOsStall`, which is known to be wrong by a factor of ~250 (it treats
+ * a raw TSC as 100 ns units). Re-entering our own half-finished handler from inside its own
+ * installation is a plausible way to hang or fault.
+ *
+ * So: deliberate only, `acpi probe 9`, with breadcrumbs on both sides. The machine boots either way,
+ * and the raw-port battery — which is hardware-verified — is untouched by this succeeding or failing.
+ */
+int acpi_ec_install_handler(void) {
+    if (nyx_ec_handler_ok) return 1;
+    if (!nyx_ec_installed) return 0;
+
+    ACPI_HANDLE ec = NULL;
+    if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)"\\_SB.PCI0.LPCB.ECDV", &ec)) || !ec) return 0;
+
+    /* ★★ SPLIT IN TWO, because the first breadcrumb pair could not tell them apart.
+     *
+     * The boot said mark 55 — died inside `AcpiInstallAddressSpaceHandler` — and I had claimed that
+     * meant "the install itself, not `_REG`". Wrong: `_REG` runs INSIDE that call.
+     * `AcpiInstallAddressSpaceHandlerInternal` attaches the handler and then, if Run_Reg, calls
+     * `AcpiEvExecuteRegMethods` before returning. So one pair of marks around the whole thing
+     * covered both candidates and distinguished nothing.
+     *
+     * ACPICA supports exactly this separation, and its own header recommends it:
+     *
+     *   "To avoid this problem pass FALSE for Run_Reg and later on call AcpiExecuteRegMethods()"
+     *
+     * So: attach the handler (55 -> 56), then run _REG as its own step (57 -> 58).
+     *
+     *   dies at 55 -> attaching the handler is fatal: the internal walk, or the region setup
+     *   dies at 57 -> `_REG` is fatal: real AML, which now re-enters NyxEcSpaceHandler
+     *
+     * ★ And this may be more than a bisect. `_REG` failing is survivable — it tells the firmware the
+     * OS owns the EC, and plenty of AML reads work without it — so if 55->56 completes we have a
+     * registered handler even if _REG has to stay off. */
+    nyx_mark(55);
+    nyx_ec_handler_status = AcpiInstallAddressSpaceHandlerNo_Reg(
+        ec, ACPI_ADR_SPACE_EC, NyxEcSpaceHandler, NULL, NULL);
+    nyx_mark(56);
+    nyx_ec_handler_ok = ACPI_SUCCESS(nyx_ec_handler_status) ? 1 : 0;
+    if (!nyx_ec_handler_ok) return 0;
+
+    /* Separate probe step, so a fatal _REG does not cost the handler as well. */
+    return 1;
+}
+
+/* Run `_REG` for the EC address space — the second half of a normal handler install, split out.
+ *
+ * Its own probe step (`acpi probe 10`) so that a fatal `_REG` does not also cost the handler
+ * registration, and so the two can be attributed separately. This is real AML: it tells the firmware
+ * the OS now owns the EC, and every EC access it makes routes back into `NyxEcSpaceHandler`.
+ *
+ * ★★★ NOT OPTIONAL ON THIS MACHINE, AND THE DSDT SAYS SO OUTRIGHT (2026-09-09).
+ *
+ * I had written that "`_REG` is survivable to skip — plenty of AML reads work without it". That is
+ * true in general and **false for this firmware**. Decompiled, `_STA` on BAT0 reaches the EC like so:
+ *
+ *     _STA -> ECG5() -> ECRB(0x06) -> \_SB.PCI0.LPCB.ECDV.ECR1(0x06)
+ *
+ *     Method (ECR1, 1, Serialized) {
+ *         If ((ECRD == Zero)) { Return (EISC (0x80, Arg0, Zero)) }   // SMI mailbox
+ *         ... Local0 = EC00 / EC01 / ... / EC06 ...                  // the EC region
+ *     }
+ *
+ * `Name (ECRD, Zero)` — it defaults to zero, and the ONLY assignment of `ECRD = One` anywhere in the
+ * DSDT is inside `Method (_REG, 2)` on the EC device. So until `_REG(3, 1)` runs, `ECRD` is zero and
+ * **every** EC access takes the other branch: `EISC` -> `GENS(0x08, ...)` -> `SMBF`, which builds a
+ * dynamic `OperationRegion (WWPR, SystemMemory, SMBA + 4, 4)` from an NVS-supplied base and then
+ * fires an SMI via `ASMI()`. That is a different mechanism entirely, and a bad `SMBA` there
+ * dereferences a wild physical address — which is the non-canonical #GP(0) that `acpi probe 5` dies
+ * with, at breadcrumb 61, inside the very first method.
+ *
+ * ⚠️ So installing the handler WITHOUT `_REG` does not merely leave the firmware uninformed — it
+ * leaves `NyxEcSpaceHandler` **never consulted at all**, while AML quietly takes an SMI path we have
+ * no business on. Attaching alone is not a safe half-measure here; it is a trap that looks like one. */
+int acpi_ec_run_reg(void) {
+    if (!nyx_ec_handler_ok) return 0;
+    ACPI_HANDLE ec = NULL;
+    if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)"\\_SB.PCI0.LPCB.ECDV", &ec)) || !ec) return 0;
+    nyx_mark(57);
+    ACPI_STATUS st = AcpiExecuteRegMethods(ec, ACPI_ADR_SPACE_EC);
+    nyx_mark(58);
+    nyx_ec_reg_status = st;
+    nyx_ec_reg_done = ACPI_SUCCESS(st) ? 1 : 0;
+    return nyx_ec_reg_done;
+}
+
+/* Did `_REG` run, and what did it return? Separate from acpi_ec_handler_state on purpose: on this
+ * firmware the handler being attached says nothing about whether AML will use it (see above). */
+int acpi_ec_reg_state(unsigned int *status_out) {
+    if (status_out) *status_out = (unsigned int)nyx_ec_reg_status;
+    return nyx_ec_reg_done;
+}
+
+/* ★★★ Read `\ECRD` straight out of the namespace.
+ *
+ * GROUND TRUTH, not a flag we maintain. `ECRD` is the single bit that decides whether AML reads the
+ * EC through our address-space handler or detours onto the SMI mailbox, so the honest question is
+ * never "did we call something" but "what does that integer say right now". Two flags in this file
+ * already drifted apart from what they claimed; this one cannot, because it is the firmware's own.
+ *
+ * `Scope (\)` at dsdt.dsl:65054 declares `Name (ECRD, Zero)` — root scope, hence the leading `\\`. */
+int acpi_ec_ecrd_read(unsigned long long *val_out) {
+    ACPI_HANDLE h = NULL;
+    if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)"\\ECRD", &h)) || !h) return 0;
+    ACPI_OPERAND_OBJECT *obj = AcpiNsGetAttachedObject((ACPI_NAMESPACE_NODE *)h);
+    if (!obj || obj->Common.Type != ACPI_TYPE_INTEGER) return 0;
+    if (val_out) *val_out = (unsigned long long)obj->Integer.Value;
+    return 1;
+}
+
+/* ★★★★ Set `\ECRD = 1` WITHOUT running `_REG`. The way past a fatal `_REG` on this machine.
+ *
+ * `acpi probe 10` died at mark 57: `AcpiExecuteRegMethods` went in and never returned. Look at what
+ * `_REG` actually does and that is unsurprising — it is two lines of bookkeeping followed by a call
+ * into `ECIN()`, which is where all the risk lives:
+ *
+ *     ECRD = One                      <- the ONLY part we need
+ *     ECIN ()
+ *         LIDS = ECG3 ()              <- EC read, fine, that is our handler
+ *         ^^^GFX0.GLID (LIDS)         <- cross-tree call into the graphics device
+ *         Notify (LID0, 0x80)         <- needs AcpiOsExecute to queue work
+ *         ECS3 () / ECS2 (ACOS, ACSE)
+ *         GENS (0x2D, Zero, Zero)     <- SMI mailbox: SystemMemory region from NVS + ASMI()
+ *         EISC (0x81, 0xB8, ...)      <- SMI mailbox again
+ *
+ * Note it still takes the SMI path AFTER setting ECRD, so `_REG` cannot be made safe by fixing the
+ * EC side alone. Three independent ways to die, and bisecting them costs a power cycle each.
+ *
+ * ★ But none of that is a precondition for reading a battery. `ECIN` is LID/AC notification
+ * housekeeping — it tells the OS about a lid switch and pokes the firmware over SMI. `_STA`, `_BIF`
+ * and `_BST` only need `ECRD != 0` so that `ECR1` reads `EC00..EC06` from the EmbeddedControl region
+ * instead of detouring. That integer lives at root scope and we can simply set it.
+ *
+ * ⚠️ This is a deliberate lie to the firmware: we assert "the OS owns the EC" without performing the
+ * handshake that normally accompanies it. What we skip is notification, not initialisation of the
+ * data path — the raw-port battery has been reading these same registers, correctly and
+ * hardware-verified against Fedora, with no `_REG` at all for the life of the project. So the EC
+ * does not need `ECIN()` to answer; the AML just needs permission to ask it directly.
+ *
+ * ⚠️ Requires the handler. Setting ECRD with nothing registered would point AML at an
+ * EmbeddedControl region that has no handler at all, which is strictly worse than the SMI detour. */
+int acpi_ec_force_ecrd(void) {
+    if (!nyx_ec_handler_ok) return 0;
+    ACPI_HANDLE h = NULL;
+    if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)"\\ECRD", &h)) || !h) return 0;
+    ACPI_OPERAND_OBJECT *obj = AcpiNsGetAttachedObject((ACPI_NAMESPACE_NODE *)h);
+    if (!obj || obj->Common.Type != ACPI_TYPE_INTEGER) return 0;
+
+    /* 69 -> about to write, 71 -> written and survived. A plain integer store should be incapable of
+     * faulting, which is exactly the kind of assumption this project keeps being wrong about. */
+    nyx_mark(69);
+    obj->Integer.Value = 1;
+    nyx_mark(71);
+
+    unsigned long long v = 0;
+    return (acpi_ec_ecrd_read(&v) && v == 1) ? 1 : 0;
+}
+
+/* Did the EmbeddedControl handler register, and what did ACPICA say?
+ *
+ * Reported rather than inferred: "the EC works" has meant two different things in this project —
+ * ports readable, versus AML able to reach it — and only the second one makes `_BIF`/`_BST` work. */
+int acpi_ec_handler_state(unsigned int *status_out) {
+    if (status_out) *status_out = (unsigned int)nyx_ec_handler_status;
+    return nyx_ec_handler_ok;
 }
 
 // Read `len` bytes from EC space starting at `offset`, straight off the ports.
@@ -623,19 +859,37 @@ static ACPI_STATUS NyxBatteryCallback(ACPI_HANDLE Object, UINT32 Level, void *Co
     NyxBattery *b = (NyxBattery *)Context;
     if (b->present) return AE_OK;          // first battery wins
 
+    // ★ One mark per AML evaluation, because "died somewhere in battery()" is not an answer.
+    //
+    // Mark 52 brackets this whole function, which evaluates three unrelated methods through the EC.
+    // That is the same too-coarse bracket that made mark 55 useless for the handler install: a pair
+    // of breadcrumbs only bisects if what sits between them is one thing. The CMOS byte is the only
+    // post-mortem field that reads back reliably on this machine, so spend it finely rather than
+    // buying the same ambiguity with another power cycle.
+    //
+    //   61 -> into _STA     62 -> _STA returned
+    //   63 -> into _BIF     64 -> _BIF returned
+    //   65 -> into _BST     66 -> _BST returned
+    //
+    // An even mark means AML completed and we faulted in our own unpacking; an odd one means the
+    // interpreter did not come back, and the next question is which OperationRegion it was in.
+
     // _STA bit 4 (0x10) is "battery present". A bay with no battery still publishes the device.
     ACPI_BUFFER r; ACPI_OBJECT *o;
     UINT64 sta = 0;
     r.Length = ACPI_ALLOCATE_BUFFER; r.Pointer = NULL;
+    nyx_mark(61);
     if (ACPI_SUCCESS(AcpiEvaluateObject(Object, (char*)"_STA", NULL, &r)) && r.Pointer) {
         o = (ACPI_OBJECT *)r.Pointer;
         if (o->Type == ACPI_TYPE_INTEGER) sta = o->Integer.Value;
         AcpiOsFree(r.Pointer);
     }
+    nyx_mark(62);
     if (!(sta & 0x10)) return AE_OK;
     b->present = 1;
 
     r.Length = ACPI_ALLOCATE_BUFFER; r.Pointer = NULL;
+    nyx_mark(63);
     if (ACPI_SUCCESS(AcpiEvaluateObject(Object, (char*)"_BIF", NULL, &r)) && r.Pointer) {
         o = (ACPI_OBJECT *)r.Pointer;
         b->have_bif = nyx_pkg_int(o, 0, &b->power_unit)
@@ -644,8 +898,10 @@ static ACPI_STATUS NyxBatteryCallback(ACPI_HANDLE Object, UINT32 Level, void *Co
                     & nyx_pkg_int(o, 4, &b->design_voltage);
         AcpiOsFree(r.Pointer);
     }
+    nyx_mark(64);
 
     r.Length = ACPI_ALLOCATE_BUFFER; r.Pointer = NULL;
+    nyx_mark(65);
     if (ACPI_SUCCESS(AcpiEvaluateObject(Object, (char*)"_BST", NULL, &r)) && r.Pointer) {
         o = (ACPI_OBJECT *)r.Pointer;
         b->have_bst = nyx_pkg_int(o, 0, &b->state)
@@ -654,27 +910,184 @@ static ACPI_STATUS NyxBatteryCallback(ACPI_HANDLE Object, UINT32 Level, void *Co
                     & nyx_pkg_int(o, 3, &b->voltage);
         AcpiOsFree(r.Pointer);
     }
+    nyx_mark(66);
     return AE_OK;
 }
 
 // Fills 11 ints in the NyxBattery order above. Returns 1 if a present battery was found.
 int acpi_battery_read(int *out, int max) {
     NyxBattery b;
+    /* Snapshot the parameter and the frame BEFORE any AML runs. Everything after this point is
+     * compared against these two numbers, so "the interpreter smashed our frame" stops being a story
+     * and becomes a subtraction. */
+    nyx_out_ptr_entry = (unsigned long long)out;
+    {
+        unsigned long long rsp;
+        __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp));
+        nyx_rsp_at_entry = rsp;
+    }
     memset(&b, 0, sizeof(b));
 
     // ★ Direct path, same reasoning as the EC above: walks crash this kernel, direct handles do not.
     // `Device (BAT0)` is in `Scope (\_SB)` at dsdt.dsl:66042 with `_HID` = PNP0C0A. There is a BAT1
     // too, but this laptop has one bay and Fedora reports only BAT0.
     ACPI_HANDLE bat = NULL;
+    // 60 = the handle resolved. Separates "BAT0 could not be looked up" from "we got into the
+    // methods", which mark 52 alone could not.
     if (ACPI_SUCCESS(AcpiGetHandle(NULL, (char*)"\\_SB.BAT0", &bat)) && bat) {
+        nyx_mark(60);
         NyxBatteryCallback(bat, 0, &b, NULL);
     }
 
-    int vals[11] = { b.present, b.power_unit, b.design_cap, b.last_full_cap, b.design_voltage,
-                     b.state, b.present_rate, b.remaining_cap, b.voltage, b.have_bif, b.have_bst };
-    int n = (max < 11) ? max : 11;
-    for (int i = 0; i < n; i++) out[i] = vals[i];
+    unsigned long long rsp;
+    __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp));
+    nyx_rsp_at_unpack = rsp;
+    nyx_out_ptr = (unsigned long long)out;
+
+    nyx_mark(72);
+
+    /* ★★★★ STOP WRITING THROUGH THE CALLER'S POINTER FROM INSIDE THE AML CONTEXT.
+     *
+     * Three boots narrowed this and each one came back "not that":
+     *
+     *   72, no 73   -> the fault is in the unpack
+     *   77, no 73   -> `out` is non-NULL and canonical (test was too weak)
+     *   77, no 73   -> `out` is ALSO unchanged across the call AND high-half
+     *
+     * So the pointer is correct, correctly shaped, and the same one we were handed — and writing 44
+     * bytes through it still faults. It names a Rust local in the caller's live frame, on the stack
+     * we are currently executing on, which cannot be unmapped in any story I can construct. Every
+     * `AcpiOs*` wait is a bounded spin, so no task switch moved us. I am out of theories that
+     * survive contact with the evidence, and a fourth guess costs another power cycle.
+     *
+     * So change the shape of the problem instead of guessing again: land the result in a STATIC and
+     * let the caller collect it afterwards, outside the AML context, via `acpi_battery_fetch`. No
+     * caller pointer is dereferenced here at all.
+     *
+     * ★ This is a candidate FIX and the experiment at once, which is why it is worth the boot:
+     *     - crash gone  -> the problem is specifically writing to the caller's frame after AML, and
+     *                      we ALSO finally get the battery values
+     *     - crash stays -> `out` was never the issue and the fault is elsewhere in this range
+     *
+     * ⚠️ The static is `volatile` and written field-by-field: it must not become a memcpy from a
+     * local that the compiler is free to sink back onto the stack. */
+    nyx_batt_vals[0]  = b.present;
+    nyx_batt_vals[1]  = b.power_unit;
+    nyx_batt_vals[2]  = b.design_cap;
+    nyx_batt_vals[3]  = b.last_full_cap;
+    nyx_batt_vals[4]  = b.design_voltage;
+    nyx_batt_vals[5]  = b.state;
+    nyx_batt_vals[6]  = b.present_rate;
+    nyx_batt_vals[7]  = b.remaining_cap;
+    nyx_batt_vals[8]  = b.voltage;
+    nyx_batt_vals[9]  = b.have_bif;
+    nyx_batt_vals[10] = b.have_bst;
+    nyx_batt_present  = b.present;
+
+    nyx_mark(73);
+    (void)out; (void)max;
     return b.present;
+}
+
+/* Collect what the last `acpi_battery_read` found. Pure copy out of a static — no AML, no namespace,
+ * no interpreter frame anywhere beneath it. Deliberately a separate call so the write into the
+ * caller's memory happens well after the ACPI context has been left. */
+int acpi_battery_fetch(int *out, int max) {
+    if (!out || max <= 0) return 0;
+    int n = (max < 11) ? max : 11;
+    for (int i = 0; i < n; i++) out[i] = nyx_batt_vals[i];
+    return nyx_batt_present;
+}
+
+/* ── AC adapter ────────────────────────────────────────────────────────────────────────────────
+ *
+ * No AML, and deliberately so. The DSDT hands us the answer directly:
+ *
+ *     Method (_PSR) { Local0 = ECG5 (); Local0 &= One;  ... Return (Local0) }   // AC online
+ *     Method (BAT0._STA) { Local0 = ECG5 (); Local0 &= 0x02; ... }              // battery present
+ *
+ * and `ECG5()` is `ECRB(0x06)`. So both bits live in EC register 0x06 and a raw read gets them with
+ * no interpreter, no handler and no risk. ⚠️ `_PSR` additionally calls `PNOT()` whenever the state
+ * differs from `PWRS` — a Serialized method that notifies every power consumer — which is real work
+ * we neither need nor want on a poll. Reading the register is the whole of the information.
+ *
+ * No bank select here: 0x03 selects the BATTERY window, and `ECG5` does not touch it. */
+int acpi_ec_ac_status(int *ac_online, int *batt_present) {
+    UINT8 v = 0;
+    if (!nyx_ec_read_byte(0x06, &v)) return 0;
+    if (ac_online)    *ac_online    = (v & 0x01) ? 1 : 0;
+    if (batt_present) *batt_present = (v & 0x02) ? 1 : 0;
+    return 1;
+}
+
+/* ── Thermal ───────────────────────────────────────────────────────────────────────────────────
+ *
+ * ★★★ THIS IS THE CLEAREST PAYOFF OF SETTING `ECRD`, AND THE MOST DANGEROUS THING TO GET WRONG.
+ *
+ *     Method (_TMP, 0, Serialized) {
+ *         If (\ECRD) { Local0 = ECDV.KDRT (n); Return ((0x0AAC + (Local0 * 0x0A))) }
+ *         Else       { Return (0x0BB8) }
+ *     }
+ *
+ * ⚠️⚠️ With `ECRD` clear, every sensor on this machine returns **0x0BB8 = 3000 deci-Kelvin =
+ * 26.85 C** — a hardcoded constant that looks exactly like a plausible idle temperature. A thermal
+ * stack built against that would have looked like it worked, forever, on a laptop that overheats.
+ * `26.85 C` (or a suspiciously round 3000) is the tell that `ECRD` is zero, NOT a reading.
+ *
+ * Units are deci-Kelvin: 0x0AAC = 2732 = 273.2 K = 0 C, and `KDRT` returns whole degrees C, so
+ * degrees C = (dK - 2732) / 10. Values are parked in a static and collected by
+ * `acpi_thermal_fetch`, for the same reason the battery is — see acpi_battery_read. */
+static const char *NYX_TZ_PATHS[4] = {
+    "\\_SB.PCI0.B0D4",              /* package / CPU  (KDRT 0) */
+    "\\_SB.PCI0.LPCB.ECDV.TMEM",    /* memory         (KDRT 2) */
+    "\\_SB.PCI0.LPCB.ECDV.TSKN",    /* skin                    */
+    "\\_SB.PCI0.LPCB.ECDV.NGFF",    /* M.2 / SSD               */
+};
+static volatile int nyx_tz_dk[4];
+static volatile int nyx_tz_found = 0;
+
+int acpi_thermal_read(void) {
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        nyx_tz_dk[i] = 0;
+        ACPI_HANDLE h = NULL;
+        if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)NYX_TZ_PATHS[i], &h)) || !h) continue;
+        ACPI_BUFFER r; r.Length = ACPI_ALLOCATE_BUFFER; r.Pointer = NULL;
+        /* 80..83, one per sensor: four evaluations bracketed by a single pair would repeat the
+         * mark-55 mistake of bracketing several things and distinguishing none. */
+        nyx_mark((unsigned char)(80 + i));
+        if (ACPI_SUCCESS(AcpiEvaluateObject(h, (char*)"_TMP", NULL, &r)) && r.Pointer) {
+            ACPI_OBJECT *o = (ACPI_OBJECT *)r.Pointer;
+            if (o->Type == ACPI_TYPE_INTEGER) {
+                nyx_tz_dk[i] = (int)(o->Integer.Value & 0x7FFFFFFF);
+                n++;
+            }
+            AcpiOsFree(r.Pointer);
+        }
+    }
+    nyx_mark(84);
+    nyx_tz_found = n;
+    return n;
+}
+
+int acpi_thermal_fetch(int *out, int max) {
+    if (!out || max <= 0) return 0;
+    int n = (max < 4) ? max : 4;
+    for (int i = 0; i < n; i++) out[i] = nyx_tz_dk[i];
+    return nyx_tz_found;
+}
+
+/* Stack depth observed across the AML evaluation, so the overflow theory can be checked rather than
+ * argued. `rsp_min` is the deepest point our handler was ever called at — the interpreter's own
+ * recursion sits below the governor frame, and this is the only place we get to see it. */
+int acpi_stack_probe(unsigned long long *vals5) {
+    if (!vals5) return 0;
+    vals5[0] = nyx_rsp_at_entry;    /* frame on the way in                     */
+    vals5[1] = nyx_rsp_at_unpack;   /* frame on the way out — must be identical */
+    vals5[2] = nyx_rsp_min_handler; /* deepest the interpreter took us          */
+    vals5[3] = nyx_out_ptr_entry;   /* the caller's pointer on the way in       */
+    vals5[4] = nyx_out_ptr;         /* and on the way out                       */
+    return 1;
 }
 
 // ==========================================

@@ -1479,9 +1479,11 @@ impl NyxApp for TerminalApp {
                     match step_txt.parse::<u8>() {
                         // 7 is the EC dump — added after this range check was written, so
                         // `acpi probe 7` was silently rejected and the dump never ran.
-                        // 8 is the stepper walk — the control for step 1. Extend this range when a
-                        // step is added; 7 was silently rejected for a while and its dump never ran.
-                        Ok(s) if (1..=8).contains(&s) => {
+                        // 8 is the stepper walk, 9 attaches the EC address-space handler, 10 runs
+                        // `_REG` (which is fatal on this machine — mark 57) and 11 sets `ECRD`
+                        // directly, which is what `_REG` exists to do. Extend this range when a step
+                        // is added; 7 was silently rejected for a while and its dump never ran.
+                        Ok(s) if (1..=12).contains(&s) => {
                             sys_acpi_probe(s, depth);
                             if s == 1 {
                                 self.output_history.push_str(&format!(
