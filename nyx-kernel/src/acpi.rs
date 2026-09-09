@@ -192,6 +192,9 @@ extern "C" {
     fn acpi_ns_handle(path: *const u8) -> *mut core::ffi::c_void;
     fn acpi_ec_read_range(offset: i32, len: i32, out: *mut u8) -> i32;
     fn acpi_ec_last_status() -> i32;
+    fn acpi_ec_handler_state(status_out: *mut u32) -> i32;
+    fn acpi_ec_install_handler() -> i32;
+    fn acpi_ec_run_reg() -> i32;
     fn acpi_ec_battery(out: *mut i32, max: i32) -> i32;
 }
 
@@ -563,6 +566,22 @@ pub fn refresh_cache() {
                 c.ready = true;
             }
         }
+        9 => {
+            // ★ Install the EmbeddedControl handler — the thing `_BIF`/`_BST` need.
+            //
+            // ⚠️ A PROBE, not automatic, and that is the lesson from the boot it cost: this call
+            // lived in `ec_install()` for one build, `ec_install()` runs on every governor tick, and
+            // the machine panicked the instant ring 3 started. An unproven ACPI call on a
+            // once-a-second path is a machine you cannot boot to turn it off again.
+            let ok = unsafe { acpi_ec_install_handler() };
+            crate::vga_println!("[ACPI] EC handler attach -> {}", if ok == 1 { "ok" } else { "failed" });
+        }
+        10 => {
+            // ⚠️ The other half of a normal install, and the more dangerous half: `_REG` is real AML
+            // that re-enters our own handler. Only try this once step 9 has come back ok.
+            let ok = unsafe { acpi_ec_run_reg() };
+            crate::vga_println!("[ACPI] EC _REG -> {}", if ok == 1 { "ok" } else { "failed" });
+        }
         8 => {
             // ★ The control for step 1: the same descent, driven by `AcpiGetNextObject`.
             //
@@ -888,6 +907,23 @@ pub fn init_report() -> alloc::string::String {
                           step(i.load)));
     out.push_str(&format!("    enable    {}\n", step(i.enable)));
     out.push_str(&format!("    objects   {}\n", step(i.objects)));
+    // ★ The EmbeddedControl handler. Re-enabled 2026-09-09 once the heap corruption that made every
+    // namespace walk #GP was fixed — `AcpiInstallAddressSpaceHandler` walks internally, which is the
+    // whole reason it was skipped for the life of the project.
+    //
+    // ⚠️ Reported separately from "the EC works", because that has meant two different things here:
+    // the ports being readable (which the raw-port battery has always had) versus AML being able to
+    // reach the EC, which is what `_BIF`/`_BST` need and what this line is about.
+    let mut ec_st: u32 = 0;
+    let ec_ok = unsafe { acpi_ec_handler_state(&mut ec_st) };
+    out.push_str(&format!(
+        "  EC address-space handler: {}  ({})\n",
+        if ec_ok == 1 { "INSTALLED" } else { "not installed" },
+        acpi_status_name(ec_st),
+    ));
+    if ec_ok == 1 {
+        out.push_str("    AML can reach the EC — try `acpi probe 5` for _BIF/_BST.\n");
+    }
     out
 }
 

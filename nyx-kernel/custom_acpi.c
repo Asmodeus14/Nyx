@@ -313,13 +313,32 @@ void *acpi_ns_handle(const char *path) {
 #define EC_CMD_READ     0x80
 #define EC_CMD_WRITE    0x81
 
-/* Bounded spin. The EC is slow (tens of microseconds) but must never hang the governor: a wedged
- * core takes scheduling down with it, which is exactly how this path failed before. */
-#define EC_TIMEOUT      100000
+/* Bounded spin, in iterations of `AcpiOsStall(1)`. The EC is slow (tens of microseconds) but must
+ * never hang the governor: a wedged core takes scheduling down with it, which is exactly how this
+ * path failed before.
+ *
+ * ★ 100000 -> 10000, alongside the `AcpiOsGetTimer` fix, and the two go together. This was written
+ * when `AcpiOsStall(1)` actually waited ~0.5 us, so the loop was a ~50 ms budget that nobody had
+ * costed; with the timer corrected each iteration is a real microsecond and the SAME constant would
+ * silently become 100 ms per wait. `nyx_ec_read_byte` performs three waits, so a single failing
+ * register read would spin for 300 ms — on the 1 Hz governor tick, and 300x over on a transaction
+ * the ACPI spec and Linux both budget in single-digit milliseconds.
+ *
+ * 10 ms is still generous for hardware that answers in tens of microseconds, and it is now an
+ * honest number: iterations x 1 us. ⚠️ An iteration count is not a timeout unless the per-iteration
+ * delay is real — this one was not, for the life of the file. */
+#define EC_TIMEOUT      10000
 
 static UINT32 nyx_ec_data_port = 0;
 static UINT32 nyx_ec_cmd_port  = 0;
 static int    nyx_ec_installed = 0;
+/* Whether the EmbeddedControl address-space handler registered, and what ACPICA said. Separate from
+ * `nyx_ec_installed`, which only means "the ports are known": the direct-port battery works without
+ * a handler, AML does not. Two different claims, and they were conflated. */
+static int    nyx_ec_handler_ok = 0;
+static ACPI_STATUS nyx_ec_handler_status = AE_NOT_EXIST;
+/* `_REG` is run as its own step; AE_NOT_EXIST means it has not been attempted this boot. */
+static ACPI_STATUS nyx_ec_reg_status = AE_NOT_EXIST;
 
 /// Last raw EC status byte, kept so a timeout can say WHAT it saw rather than just "timed out".
 /// 0xFF means nothing is decoding that port; 0x00 means the EC is idle but never raised OBF.
@@ -474,24 +493,118 @@ int acpi_ec_install(unsigned int *out_data, unsigned int *out_cmd) {
         return 0;
     }
 
-    // ★ THE HANDLER INSTALL IS DELIBERATELY SKIPPED.
+    // ★★★ THE HANDLER INSTALL IS BACK (2026-09-09). THE WALK BUG IS FIXED.
     //
-    // `AcpiInstallAddressSpaceHandler` walks the device subtree internally (evhandler.c), and walks
-    // #GP this kernel — proven at mark 55, and the walk bug survived every structural fix
-    // (reader-lock bypass, NO_UNLOCK, a real OS layer, an inert callback). Registering the handler
-    // is what lets *AML* reach the EC, i.e. what `_BIF`/`_BST` need. We do not need AML: the ports
-    // are known and `nyx_ec_read_byte` talks to them directly.
+    // This was skipped for the life of the project on the grounds that
+    // `AcpiInstallAddressSpaceHandler` walks the device subtree internally (evhandler.c) and "walks
+    // #GP this kernel". That was true, and it was never an ACPI bug: the kernel heap was backed by
+    // physical memory below 1 MB and AP bring-up wrote the SMP trampoline through it. See
+    // `memory::LOW_MEM_RESERVED`. Namespace walks are sound now.
     //
-    // What that costs, stated plainly: `_BIF`/`_BST` give a vendor-neutral battery layout, and
-    // reading EC registers directly does not — the offsets are model-specific and undocumented, so
-    // whatever we hardcode is a map for THIS Dell and nothing else. That is a real downgrade, taken
-    // knowingly because the correct path is blocked behind a bug that has already cost many boots.
+    // Registering this is what lets AML reach the EC, which is what `_BIF`/`_BST` need. The raw-port
+    // path stays as the fallback and is still what the Entity reads today — it is hardware-verified
+    // against Fedora, and replacing something that works with something newly re-enabled, on a
+    // machine that costs a power cycle per test, is not a trade worth making blind.
     //
-    // If the walk bug is ever fixed, restore the install and `acpi_battery_read` works unchanged.
+    // What the AML path buys if it holds: `_BIF`/`_BST` are a vendor-neutral battery layout, where
+    // the raw offsets are a map for THIS Dell and nothing else.
+    //
+    // ⚠️ A failure here is NOT fatal and must not be. `nyx_ec_installed` is still set either way, so
+    // the direct-port battery keeps working exactly as before; only the AML route is lost. The
+    // status is recorded rather than discarded so `acpi ec` can report which of the two is live —
+    // "the EC works" has meant two different things in this project and they should be separable.
+    // ⚠️⚠️ NOT INSTALLED HERE. See `acpi_ec_install_handler` below.
+    //
+    // It was, for exactly one build, and the machine kernel-panicked the instant it reached ring 3.
+    // This function runs on the thermal governor's tick — once a second, starting as soon as
+    // userspace does — so putting a newly re-enabled, unproven ACPI call in it meant the very first
+    // tick took the machine down, on a box with no serial console and no way to opt out without a
+    // rebuild. The install is now a deliberate, one-shot request.
     nyx_ec_installed = 1;
     if (out_data) *out_data = nyx_ec_data_port;
     if (out_cmd)  *out_cmd  = nyx_ec_cmd_port;
     return 1;
+}
+
+/* ★★ Register the EmbeddedControl address-space handler. OPT-IN, one shot, never automatic.
+ *
+ * This is what lets AML reach the EC, i.e. what `_BIF`/`_BST` need. It was blocked for the life of
+ * the project because the install walks the device subtree and walks #GP'd this kernel — which was
+ * never an ACPI bug, but the sub-1 MB heap corruption (see `memory::LOW_MEM_RESERVED`).
+ *
+ * ⚠️ With walks fixed it STILL panicked the machine, immediately on reaching ring 3. So the walk was
+ * not the only thing wrong with this path, and the remaining suspect is what the install does after
+ * walking: `AcpiEvExecuteRegMethods` evaluates **`_REG`** for every EmbeddedControl region. That is
+ * real AML telling the firmware "the OS owns the EC now", and on this class of laptop it does
+ * substantial work — and every EC access it makes is routed straight back into `NyxEcSpaceHandler`,
+ * whose poll loop leans on `AcpiOsStall`, which is known to be wrong by a factor of ~250 (it treats
+ * a raw TSC as 100 ns units). Re-entering our own half-finished handler from inside its own
+ * installation is a plausible way to hang or fault.
+ *
+ * So: deliberate only, `acpi probe 9`, with breadcrumbs on both sides. The machine boots either way,
+ * and the raw-port battery — which is hardware-verified — is untouched by this succeeding or failing.
+ */
+int acpi_ec_install_handler(void) {
+    if (nyx_ec_handler_ok) return 1;
+    if (!nyx_ec_installed) return 0;
+
+    ACPI_HANDLE ec = NULL;
+    if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)"\\_SB.PCI0.LPCB.ECDV", &ec)) || !ec) return 0;
+
+    /* ★★ SPLIT IN TWO, because the first breadcrumb pair could not tell them apart.
+     *
+     * The boot said mark 55 — died inside `AcpiInstallAddressSpaceHandler` — and I had claimed that
+     * meant "the install itself, not `_REG`". Wrong: `_REG` runs INSIDE that call.
+     * `AcpiInstallAddressSpaceHandlerInternal` attaches the handler and then, if Run_Reg, calls
+     * `AcpiEvExecuteRegMethods` before returning. So one pair of marks around the whole thing
+     * covered both candidates and distinguished nothing.
+     *
+     * ACPICA supports exactly this separation, and its own header recommends it:
+     *
+     *   "To avoid this problem pass FALSE for Run_Reg and later on call AcpiExecuteRegMethods()"
+     *
+     * So: attach the handler (55 -> 56), then run _REG as its own step (57 -> 58).
+     *
+     *   dies at 55 -> attaching the handler is fatal: the internal walk, or the region setup
+     *   dies at 57 -> `_REG` is fatal: real AML, which now re-enters NyxEcSpaceHandler
+     *
+     * ★ And this may be more than a bisect. `_REG` failing is survivable — it tells the firmware the
+     * OS owns the EC, and plenty of AML reads work without it — so if 55->56 completes we have a
+     * registered handler even if _REG has to stay off. */
+    nyx_mark(55);
+    nyx_ec_handler_status = AcpiInstallAddressSpaceHandlerNo_Reg(
+        ec, ACPI_ADR_SPACE_EC, NyxEcSpaceHandler, NULL, NULL);
+    nyx_mark(56);
+    nyx_ec_handler_ok = ACPI_SUCCESS(nyx_ec_handler_status) ? 1 : 0;
+    if (!nyx_ec_handler_ok) return 0;
+
+    /* Separate probe step, so a fatal _REG does not cost the handler as well. */
+    return 1;
+}
+
+/* Run `_REG` for the EC address space — the second half of a normal handler install, split out.
+ *
+ * Its own probe step (`acpi probe 10`) so that a fatal `_REG` does not also cost the handler
+ * registration, and so the two can be attributed separately. This is real AML: it tells the firmware
+ * the OS now owns the EC, and every EC access it makes routes back into `NyxEcSpaceHandler`. */
+int acpi_ec_run_reg(void) {
+    if (!nyx_ec_handler_ok) return 0;
+    ACPI_HANDLE ec = NULL;
+    if (ACPI_FAILURE(AcpiGetHandle(NULL, (char*)"\\_SB.PCI0.LPCB.ECDV", &ec)) || !ec) return 0;
+    nyx_mark(57);
+    ACPI_STATUS st = AcpiExecuteRegMethods(ec, ACPI_ADR_SPACE_EC);
+    nyx_mark(58);
+    nyx_ec_reg_status = st;
+    return ACPI_SUCCESS(st) ? 1 : 0;
+}
+
+/* Did the EmbeddedControl handler register, and what did ACPICA say?
+ *
+ * Reported rather than inferred: "the EC works" has meant two different things in this project —
+ * ports readable, versus AML able to reach it — and only the second one makes `_BIF`/`_BST` work. */
+int acpi_ec_handler_state(unsigned int *status_out) {
+    if (status_out) *status_out = (unsigned int)nyx_ec_handler_status;
+    return nyx_ec_handler_ok;
 }
 
 // Read `len` bytes from EC space starting at `offset`, straight off the ports.

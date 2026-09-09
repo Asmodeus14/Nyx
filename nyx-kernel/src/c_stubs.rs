@@ -441,13 +441,34 @@ pub unsafe extern "C" fn AcpiOsGetThreadId() -> usize {
     ((cpu + 1) << 32) | (task + 1)
 }
 
+/// Time in **100-nanosecond units**, which is ACPICA's documented contract for this function.
+///
+/// ★★ FIXED 2026-09-09. It was `tsc / 100`, which hardcodes a **1 GHz** TSC: for the result to be
+/// 100 ns units the divisor must be *TSC ticks per 100 ns*, i.e. `TSC_MHZ / 10`. This machine
+/// calibrates around 2000 MHz, so the divisor should be ~200 and every ACPICA delay was running
+/// **about twice as short as asked for** — `AcpiOsStall(1)` waiting roughly 0.5 µs instead of 1 µs.
+///
+/// ⚠️ An earlier note in this project put the error at "~250x, about 4 ns". That was wrong, and it
+/// was wrong in the direction that makes you stop looking — a 250x error sounds like a smoking gun
+/// worth chasing and a 2x error sounds ignorable, when the truth is a 2x error that had never been
+/// arithmetic-checked. Recomputed here from `TSC_MHZ` rather than restated.
+///
+/// This is the sole time source for `AcpiOsStall` and `AcpiOsSleep`, so fixing it fixes both — their
+/// own arithmetic (`us * 10`, `ms * 10_000`) was always correct *given* a conforming timer.
+///
+/// ⚠️ ACPICA is initialised BEFORE `time::calibrate_tsc()` runs (`main.rs`), so bring-up uses the
+/// 2000 MHz default. That is a reasonable estimate and far closer than the 1 GHz this assumed;
+/// anything needing better must not run during table load.
 #[no_mangle]
 pub unsafe extern "C" fn AcpiOsGetTimer() -> u64 {
     let mut lo: u32;
     let mut hi: u32;
     core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi);
     let tsc = ((hi as u64) << 32) | (lo as u64);
-    tsc / 100 
+    let mhz = crate::time::TSC_MHZ.load(core::sync::atomic::Ordering::Relaxed).max(1);
+    // `tsc * 10 / mhz`, not `tsc / (mhz / 10)`: the latter truncates the divisor and loses precision
+    // on any TSC that is not a multiple of 10 MHz. Overflow needs decades of uptime at these rates.
+    tsc.saturating_mul(10) / mhz
 }
 
 #[no_mangle]
