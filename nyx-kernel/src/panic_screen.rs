@@ -362,7 +362,21 @@ impl Screen {
     /// Every surface we know about. For a fatal report, where the machine is not coming back and
     /// guessing wrong means the message is lost.
     fn all(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> Screen {
-        Screen { targets: [SCANOUT.get(), FIRMWARE.get()], x: MARGIN_X, y: 0, fg, bg }
+        let scan = SCANOUT.get();
+        let fw = FIRMWARE.get();
+        // ⚠️ NEVER paint the same memory twice through two different geometries.
+        //
+        // `SCANOUT` and `FIRMWARE` can describe the SAME pages — that happens whenever P1a's plane
+        // scan or allocation fell back and left the plane pointed at the firmware buffer. They are
+        // registered with different tiling, so painting both would write one swizzle over the other:
+        // a clean fill followed by a scrambled one. That is a precise match for the red screens this
+        // machine produces — legible-ish text with runs punched through it — and it is a bug that
+        // only appears on the one path where nobody can debug it.
+        let fw = match (&scan, &fw) {
+            (Some(a), Some(b)) if a.base == b.base => None,
+            _ => fw,
+        };
+        Screen { targets: [scan, fw], x: MARGIN_X, y: 0, fg, bg }
     }
 
     /// Just the surface most likely to be live. Used by the non-fatal banner, which runs inside a
@@ -497,6 +511,36 @@ pub fn fatal(title: &str, body: fmt::Arguments) {
         }
         s.y = 96;
         s.puts(title);
+        s.newline();
+        // ★ What this report was painted ONTO, printed before anything else.
+        //
+        // Two boots have now been spent on a red screen that came up with the desktop showing
+        // through it, and both fixes were guesses because nothing on screen said what geometry was
+        // being used. These four numbers per target settle it without another cycle: a wrong
+        // `tiling` scrambles everything, a wrong `stride` shears it, and two targets sharing a
+        // `base` means we painted the same pages twice through different swizzles.
+        //
+        // Placed second, right under the title, because that is the part of the screen that has
+        // stayed legible in every photograph of this failure so far.
+        // Snapshotted before the loop: `write_fmt` needs `&mut s` and iterating `s.targets` holds an
+        // immutable borrow of the same value.
+        let described: [Option<(u64, usize, usize, usize, usize, u32)>; 2] = [
+            s.targets[0].as_ref().map(|g| (g.base as u64, g.w, g.h, g.stride, g.bpp, g.tiling)),
+            s.targets[1].as_ref().map(|g| (g.base as u64, g.w, g.h, g.stride, g.bpp, g.tiling)),
+        ];
+        for (i, d) in described.iter().enumerate() {
+            match d {
+                Some((base, w, h, stride, bpp, tiling)) => {
+                    let _ = s.write_fmt(format_args!(
+                        "\nsurface {}: base {:#x} {}x{} stride {} bpp {} tiling {}",
+                        i, base, w, h, stride, bpp, tiling,
+                    ));
+                }
+                None => {
+                    let _ = s.write_fmt(format_args!("\nsurface {}: none", i));
+                }
+            }
+        }
         s.newline();
         s.newline();
         let _ = s.write_fmt(body);
