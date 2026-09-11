@@ -72,6 +72,26 @@ const HBUS_TARG_MEM_RDAT:     usize = 0x41C;
 // fw is alive to publish the posted free RBDs so the fw can DMA notifications. Pre-BZ restock path.
 const RFH_Q0_FRBDCB_WIDX_TRG: usize = 0x1C80;
 
+/// Entries in the RX free/used BD rings: `IWL_NUM_RBDS_NON_HE` for this Wireless-AC 9462 (JF), which
+/// is what the context-info `cb_size = ilog2(512) = 9` declares to the firmware.
+///
+/// ★ Both ring indices MUST be kept modulo this. The firmware's `closed_rb_num` is a producer index
+/// that wraps here, and `poll_next_rx` decides a frame is waiting by testing it for INEQUALITY
+/// against our consumer index. A consumer index that wraps anywhere else — a bare `u32`, say —
+/// agrees with the producer only until it first laps, and then never again: every poll reports a
+/// frame that is not there, forever. Measured on hardware, the consumer reached 50,258,330 while the
+/// firmware sat at 247, and the loop consuming those phantom frames ran with interrupts masked,
+/// which is a dead machine rather than a slow one.
+/// Read a big-endian u32 from a DHCP option value. Option values are network byte order; reading
+/// them little-endian yields a plausible-looking wrong duration rather than an obvious error.
+#[inline]
+fn be32<F: Fn(usize) -> u8>(rd: F, at: usize) -> u32 {
+    ((rd(at) as u32) << 24) | ((rd(at + 1) as u32) << 16) | ((rd(at + 2) as u32) << 8) | rd(at + 3) as u32
+}
+
+const RX_RING_ENTRIES: u32 = 512;
+const RX_RING_MASK: u32 = RX_RING_ENTRIES - 1;
+
 // --- P4b: gen2 host-command TX path (Linux iwl_pcie_gen2_enqueue_hcmd + iwl_txq_inc_wr_ptr) ---
 // The command queue is pre-configured by the fw from the context-info hcmd_cfg; post-ALIVE the host
 // builds an iwl_tfh_tfd in the ring, puts the command bytes (wide header + payload) in a slot, and
@@ -511,6 +531,14 @@ pub struct IntelWifiDriver {
     pub dhcp_router: [u8; 4],         // default gateway (option 3)
     pub dhcp_dns: [u8; 4],            // first DNS server (option 6)
     pub dhcp_done: bool,              // true once we hold a lease
+    // ── Lease timers (RFC 2131 §4.4.5) ──────────────────────────────────────────────────────────
+    /// Lease duration in seconds (option 51), or 0 when the server did not say.
+    pub dhcp_lease_secs: u32,
+    /// T1/T2 as given by options 58/59. Zero means "not supplied" — derive from the lease.
+    pub dhcp_t1_secs: u32,
+    pub dhcp_t2_secs: u32,
+    /// `UPTIME_MS` when the lease was granted, so remaining time is computable.
+    pub dhcp_acquired_ms: u64,
 
     // --- Phase 7: smoltcp Device ---
     ap_bssid: [u8; 6],                // the AP we're associated with (RA for every TX)
@@ -518,6 +546,84 @@ pub struct IntelWifiDriver {
     rx_diag: u32,                     // how many data frames we've dumped for diagnosis
     rx_seen: u32,                     // MPDUs seen by the Device path
     rx_passed: u32,                   // MPDUs converted to Ethernet frames
+    // ★ Two counters for the failure that has no other symptom: a frame that arrives and is then
+    // dropped inside this parser looks, from every layer above, exactly like a frame that never
+    // arrived. `rx_seen - rx_passed` is the size of that gap; these two say where it went.
+    rx_amsdu: u32,                    // aggregates seen — of which only the FIRST subframe is kept
+    rx_nosnap: u32,                   // dropped because the LLC/SNAP signature was not found
+    /// Of those, the ones addressed to a group (broadcast/multicast).
+    ///
+    /// ★ Split out because the two are different bugs wearing one number. Group-addressed frames
+    /// arrive encrypted under the GTK (KeyID 1) and this driver does not decrypt them, so they can
+    /// never carry a SNAP signature and are dropped forever — that is background ARP/mDNS noise and
+    /// costs us nothing we asked for. A drop of an INDIVIDUALLY-addressed frame is our own traffic
+    /// going missing, which is the only one that can break a TCP transfer. Counting them together
+    /// meant a constant, harmless broadcast drop rate masked the number that matters.
+    rx_nosnap_group: u32,
+    // ── The hardware side of the RX ring ────────────────────────────────────────────────────────
+    /// MPDU buffers `poll_next_rx` handed to the parser. Compare with `rx_seen`: everything the
+    /// hardware reported but the parser never saw is lost between the two.
+    rx_handed: u32,
+    /// Buffers that did not carry the RX_MPDU signature (cmd 0xC1/group 0x00) — i.e. slots that
+    /// were handed over but held something other than a received frame. A large count here means
+    /// the ring is being read at the wrong place, not that the air is quiet.
+    rx_badsig: u32,
+    /// The last `closed_rb_num` read from the firmware's status block, beside our own read pointer.
+    ///
+    /// ★ These two are the whole point. `closed` is a 12-bit field (0..4095); `rx_read_ptr` is a
+    /// u32 advanced with `wrapping_add(1)`, so it wraps at 2^32. They are compared for INEQUALITY
+    /// to decide whether a frame is waiting. Once `rx_read_ptr` climbs past 4095 the two can never
+    /// be equal again, `poll_next_rx` reports a frame every time it is asked, and `rx_ethernet`
+    /// loops forever over stale slots — inside a syscall, at IF=0, taking no timer.
+    rx_last_closed: u32,
+    // ── TX, and the bytes actually delivered ────────────────────────────────────────────────────
+    /// Ethernet frames handed to the hardware, and their total size.
+    ///
+    /// Read against `rx_bytes` and the wall time a transfer took, these give frames-per-KB and
+    /// bytes-per-second. A download is mostly ACKs outbound, so `tx_frames` climbing roughly in
+    /// step with received segments is healthy; `tx_frames` far exceeding them means retransmission
+    /// or duplicate ACKs, which is what a slow link looks like from the inside.
+    tx_frames: u32,
+    tx_bytes: u32,
+    /// `transmit()` refused because the AP queue or BSSID was not ready. smoltcp treats that as
+    /// backpressure and drops the packet, so a climbing count is lost outbound traffic.
+    tx_nospace: u32,
+    /// Bytes in the Ethernet frames the parser delivered upward — the payload side of `rx_passed`.
+    rx_bytes: u32,
+    /// Frames the firmware did NOT decrypt, dropped without searching them.
+    ///
+    /// ★ `status` bit 11 (`IWL_RX_MPDU_STATUS_DECRYPTED`) says whether the firmware decrypted the
+    /// frame. Every frame previously counted as NOSNAP was a group-addressed one encrypted under the
+    /// GTK that we never decrypt — and we discovered that by hunting for an LLC/SNAP signature that
+    /// could not possibly be there. One bit-test replaces the search, and the counter now states the
+    /// actual reason instead of a symptom of it.
+    rx_undecrypted: u32,
+    /// Payload located from the descriptor's own header-length field (the fast, correct path).
+    rx_desc_hit: u32,
+    /// The descriptor's claimed header length, and where the scan actually found the payload.
+    ///
+    /// ★ Measured `desc=0 scan=26`: the descriptor-derived offset never matched. Rather than guess
+    /// again, record both numbers — the difference between what `mac_flags2` claims and the truth is
+    /// the whole answer, and it costs one boot instead of a theory.
+    rx_last_desc_hdr: u32,
+    rx_last_true_hdr: u32,
+    /// Payload located only by scanning for the SNAP signature (the old fallback).
+    ///
+    /// Non-zero means the descriptor-derived offset was wrong for that frame. Kept precisely so a
+    /// bad assumption shows up as a number rather than as lost traffic.
+    rx_scan_hit: u32,
+    /// Times the parser's loop hit its iteration cap — see `rx_ethernet`. Non-zero means the
+    /// runaway above actually happened and was contained.
+    rx_runaway: u32,
+    /// The first few frames dropped for want of a SNAP signature, kept verbatim.
+    ///
+    /// Four records of 40 bytes: fc0, fc1, hlen, ccmp, mpdu_len (2, LE), then the first 34 bytes of
+    /// the 802.11 frame. The driver already dumped exactly this to serial — and this laptop has no
+    /// serial cable, so the one artifact that explains the drop has never been readable. A fixed
+    /// array rather than a ring: the FIRST failures are the informative ones, and they are all
+    /// alike after that.
+    rx_nosnap_dump: [u8; 160],
+    rx_nosnap_dumped: u32,
     tx_count: u32,                    // Ethernet frames handed to the firmware
 
     // --- Phase 8: userspace-driven connect ---
@@ -615,11 +721,33 @@ impl IntelWifiDriver {
             dhcp_router: [0; 4],
             dhcp_dns: [0; 4],
             dhcp_done: false,
+            dhcp_lease_secs: 0,
+            dhcp_t1_secs: 0,
+            dhcp_t2_secs: 0,
+            dhcp_acquired_ms: 0,
             ap_bssid: [0; 6],
             rx_desc_size: 0,
             rx_diag: 0,
             rx_seen: 0,
             rx_passed: 0,
+            rx_amsdu: 0,
+            rx_nosnap: 0,
+            rx_nosnap_group: 0,
+            rx_undecrypted: 0,
+            rx_desc_hit: 0,
+            rx_scan_hit: 0,
+            rx_last_desc_hdr: 0,
+            rx_last_true_hdr: 0,
+            rx_handed: 0,
+            rx_badsig: 0,
+            rx_last_closed: 0,
+            rx_runaway: 0,
+            tx_frames: 0,
+            tx_bytes: 0,
+            tx_nospace: 0,
+            rx_bytes: 0,
+            rx_nosnap_dump: [0u8; 160],
+            rx_nosnap_dumped: 0,
             tx_count: 0,
             link_state: LinkState::Idle,
             cur_ssid: [0; 32],
@@ -838,7 +966,7 @@ impl IntelWifiDriver {
         }
         crate::serial_println!("[WIFI]   rx_buffers   count={} (x 4KiB)", self.rx_buffers.len());
         // Free-RBD producer starts past the posted buffers; restocking advances it as we consume.
-        self.free_write_ptr = self.rx_buffers.len() as u32;
+        self.free_write_ptr = (self.rx_buffers.len() as u32) & RX_RING_MASK;
 
         // Host-command TX queue (gen2). TFD ring = 32 × sizeof(iwl_tfh_tfd)=256 = 8 KiB (2 pg);
         // command backing = 32 × 256B slots = 8 KiB (2 pg); first-TB buffers = 32 × 64B (1 pg).
@@ -1295,12 +1423,18 @@ impl IntelWifiDriver {
         // smoltcp Device polls this on every receive() and must never stall).
         let mut left = timeout_ms;
         loop {
-            let closed = (read_volatile(rb_stts.virt as *const u16) & 0x0FFF) as u32;
+            // Read the 12-bit field, then bring it into the ring's modulus — the same one the
+            // consumer index below is kept in, which is the whole point.
+            let closed = (read_volatile(rb_stts.virt as *const u16) & 0x0FFF) as u32 & RX_RING_MASK;
+            self.rx_last_closed = closed;
             if closed != self.rx_read_ptr {
-                let slot = (self.rx_read_ptr & 0x1FF) as usize; // 512-entry used ring
+                let slot = (self.rx_read_ptr & RX_RING_MASK) as usize;
                 let ub = read_volatile((used.virt as *const u32).add(slot));
                 let vid = (ub & 0x0FFF) as usize;
-                self.rx_read_ptr = self.rx_read_ptr.wrapping_add(1);
+                // ★ Wrap with the ring, not with the integer type. `wrapping_add(1)` on a u32
+                // wraps at 2^32 and so leaves this index permanently ahead of a producer that wraps
+                // at 512 — see RX_RING_ENTRIES. This is the fix for that.
+                self.rx_read_ptr = (self.rx_read_ptr + 1) & RX_RING_MASK;
                 let buf = if vid >= 1 && vid <= self.rx_buffers.len() {
                     self.last_rx_vid = vid; // recycle on the next poll
                     self.rx_buffers[vid - 1]
@@ -1310,6 +1444,7 @@ impl IntelWifiDriver {
                 } else {
                     return None;
                 };
+                self.rx_handed += 1;
                 return Some(buf.virt);
             }
             if left == 0 { return None; }
@@ -1327,10 +1462,13 @@ impl IntelWifiDriver {
         if vid < 1 || vid > self.rx_buffers.len() { return; }
         let free = match self.rx_free { Some(f) => f, None => return };
         let phys = self.rx_buffers[vid - 1].phys;
-        let slot = (self.free_write_ptr & 0x1FF) as usize; // 512-entry free ring
+        let slot = (self.free_write_ptr & RX_RING_MASK) as usize;
         write_volatile((free.virt as *mut u64).add(slot), phys | (vid as u64));
-        self.free_write_ptr = self.free_write_ptr.wrapping_add(1);
-        self.write32(RFH_Q0_FRBDCB_WIDX_TRG, self.free_write_ptr & 0x1FF);
+        // Kept in the ring's modulus for the same reason as the consumer index. This one was only
+        // ever *used* masked, so it was not itself broken — but leaving one of a pair of ring
+        // indices unwrapped is how the other one came to be wrong.
+        self.free_write_ptr = (self.free_write_ptr + 1) & RX_RING_MASK;
+        self.write32(RFH_Q0_FRBDCB_WIDX_TRG, self.free_write_ptr);
     }
 
     /// P4: consume + parse the firmware's ALIVE notification from the RX ring. cmd=0x1/group=0;
@@ -2413,6 +2551,10 @@ impl IntelWifiDriver {
             self.tx_data_frame(&f[..n], 24, 0x0);
             if self.wait_dhcp(bssid, 5) {
                 self.dhcp_done = true;
+                self.dhcp_acquired_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+                crate::serial_println!(
+                    "[WIFI] P6d: lease {} s (T1 {} s, T2 {} s)",
+                    self.dhcp_lease_secs, self.t1_secs(), self.t2_secs());
                 crate::serial_println!(
                     "[WIFI] P6d: *** DHCP ACK — ONLINE! leased IP {}.{}.{}.{} ***",
                     self.dhcp_ip[0], self.dhcp_ip[1], self.dhcp_ip[2], self.dhcp_ip[3]);
@@ -2481,6 +2623,16 @@ impl IntelWifiDriver {
                         1  if len == 4 => for k in 0..4 { self.dhcp_mask[k] = rd(i + 2 + k); },
                         3  if len >= 4 => for k in 0..4 { self.dhcp_router[k] = rd(i + 2 + k); },
                         6  if len >= 4 => for k in 0..4 { self.dhcp_dns[k] = rd(i + 2 + k); },
+                        // ★ RFC 2131 lease timers, all big-endian seconds. Never parsed before, so
+                        // a lease was taken once and held forever: when the server's lease expired
+                        // it simply stopped routing, with nothing on this side able to notice.
+                        //
+                        //   51  lease time
+                        //   58  T1, when to start RENEWING  (default 0.5  x lease)
+                        //   59  T2, when to start REBINDING (default 0.875 x lease)
+                        51 if len == 4 => self.dhcp_lease_secs = be32(rd, i + 2),
+                        58 if len == 4 => self.dhcp_t1_secs = be32(rd, i + 2),
+                        59 if len == 4 => self.dhcp_t2_secs = be32(rd, i + 2),
                         _ => {}
                     }
                     i += 2 + len;
@@ -3470,6 +3622,35 @@ impl IntelWifiDriver {
     // =====================================================================================
 
     /// True once we hold a DHCP lease, i.e. the link is usable for IP traffic.
+    /// T1 — when a client should begin RENEWING, unicast to the leasing server.
+    ///
+    /// Option 58 when the server supplied it, else RFC 2131 §4.4.5's default of half the lease.
+    pub fn t1_secs(&self) -> u32 {
+        if self.dhcp_t1_secs != 0 { self.dhcp_t1_secs } else { self.dhcp_lease_secs / 2 }
+    }
+
+    /// T2 — when a client should begin REBINDING, broadcast to any server.
+    ///
+    /// Option 59, else the spec's 0.875 x lease. Computed as `lease * 7 / 8` in integer arithmetic;
+    /// the lease is seconds and never near overflow.
+    pub fn t2_secs(&self) -> u32 {
+        if self.dhcp_t2_secs != 0 { self.dhcp_t2_secs } else { self.dhcp_lease_secs / 8 * 7 }
+    }
+
+    /// Seconds left on the lease, or `None` when the server never gave a duration.
+    ///
+    /// ⚠️ Nothing renews it yet — see `docs/network-audit.md` M1. This exists so the condition is
+    /// *visible* instead of silent: a lease that expires server-side currently just stops routing,
+    /// and "the network died for no reason" is the least debuggable failure there is.
+    pub fn lease_remaining_secs(&self) -> Option<u32> {
+        if !self.dhcp_done || self.dhcp_lease_secs == 0 {
+            return None;
+        }
+        let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+        let elapsed = now.saturating_sub(self.dhcp_acquired_ms) / 1000;
+        Some((self.dhcp_lease_secs as u64).saturating_sub(elapsed) as u32)
+    }
+
     pub fn is_online(&self) -> bool { self.dhcp_done && self.rx_desc_size != 0 }
 
     /// The leased address / mask / gateway / DNS, for configuring the smoltcp interface.
@@ -3486,17 +3667,55 @@ impl IntelWifiDriver {
     /// the LLC/SNAP header whose last 2 bytes are the EtherType — exactly what 802.3 wants.
     unsafe fn rx_ethernet(&mut self) -> Option<alloc::vec::Vec<u8>> {
         if self.rx_desc_size == 0 { return None; }
+        // ★ Bounded, and the bound is a survival guard rather than a tuning knob.
+        //
+        // The exit from this loop is `poll_next_rx` returning None, which happens only when our read
+        // pointer equals the firmware's `closed_rb_num`. Those two are compared for inequality while
+        // living in different moduli (12-bit vs u32), so they can fall permanently out of step — and
+        // then this loop never ends. It runs inside a syscall with interrupts masked, so "never
+        // ends" is not a slow driver, it is a dead machine that has to be power-cycled.
+        //
+        // 512 is the whole used-BD ring: having walked every slot once, anything further is a second
+        // lap over frames already consumed, so there is nothing to lose by stopping.
+        let mut guard = 0u32;
         loop {
+            guard += 1;
+            if guard > 512 {
+                self.rx_runaway += 1;
+                return None;
+            }
             let v = self.poll_next_rx(0)?;          // non-blocking probe
             let p = v as *const u8;
             let rd = |o: usize| read_volatile(p.add(o));
-            if rd(4) != 0xC1 || rd(5) != 0x00 { continue; }   // not an RX_MPDU
+            if rd(4) != 0xC1 || rd(5) != 0x00 {
+                self.rx_badsig += 1;
+                continue;                                     // not an RX_MPDU
+            }
 
-            // mpdu_len is the first field of iwl_rx_mpdu_desc; the frame follows the descriptor.
+            // ★ iwl_rx_mpdu_desc, common header — the same layout for the v1 and v3 variants,
+            // because every field below sits BEFORE the union that differs between them. The
+            // descriptor starts at p+8 (an 8-byte notification header precedes it), which is
+            // independently confirmed by `mpdu_len` at p+8 having worked since this driver was
+            // written. Offsets from the Linux fw/api/rx.h definitions — see
+            // docs/linux-cross-reference.md.
+            //
+            //   +0  mpdu_len    __le16
+            //   +2  mac_flags1  u8
+            //   +3  mac_flags2  u8      header length (in 2-byte words) | PAD | AMSDU
+            //   +4  amsdu_info  u8      subframe index | LAST_SUBFRAME
+            //   +12 status      __le32  DECRYPTED is bit 11
             let mpdu_len = read_volatile(p.add(8) as *const u16) as usize;
+            let mac_flags2 = rd(11);
+            let status = read_volatile(p.add(20) as *const u32);
             let f = 8 + self.rx_desc_size;
             let total = (read_volatile(p as *const u32) & 0x3FFF) as usize + 4;
             if mpdu_len < 32 || f + mpdu_len > total { continue; }
+
+            // Drop what the firmware could not decrypt, cheaply and with the right label. A frame
+            // marked Protected whose DECRYPTED bit is clear is ciphertext: no signature can be
+            // found in it at any offset, so searching is wasted work that then reports the wrong
+            // reason. This is every group-addressed frame on this link (GTK, CCMP KeyID 1).
+            const STATUS_DECRYPTED: u32 = 1 << 11;
 
             let (fc0, fc1) = (rd(f), rd(f + 1));
             if (fc0 >> 2) & 0x3 != 2 { continue; }            // data frames only
@@ -3514,23 +3733,95 @@ impl IntelWifiDriver {
             }
             let ccmp = if fc1 & 0x40 != 0 { 8 } else { 0 };   // CCMP header (fw decrypts in place)
 
+            // Protected, and the firmware did not decrypt it: ciphertext. Nothing to find.
+            if fc1 & 0x40 != 0 && status & STATUS_DECRYPTED == 0 {
+                self.rx_undecrypted += 1;
+                continue;
+            }
+
             // Locate LLC/SNAP by signature rather than by arithmetic. Two things shift it and
             // neither is reliably predictable from the frame alone: the device inserts 2 padding
             // bytes after the header to 4-byte-align the payload (IWL_RX_MPDU_MFLG2_PAD), and an
             // A-MSDU prefixes a 14-byte subframe header. Requiring the full 6-byte signature
             // aa aa 03 00 00 00 makes a false match effectively impossible.
-            let snap6 = |o: usize| rd(o) == 0xaa && rd(o + 1) == 0xaa && rd(o + 2) == 0x03
-                                && rd(o + 3) == 0x00 && rd(o + 4) == 0x00 && rd(o + 5) == 0x00;
+            //
+            // Two encapsulations are legal and both must be accepted: RFC1042 (`…00 00 00`) and the
+            // bridge-tunnel variant (`…00 00 f8`). Only the first was recognised, so the second was
+            // being discarded as if it were not a SNAP header at all.
+            let snap6 = |o: usize| {
+                rd(o) == 0xaa
+                    && rd(o + 1) == 0xaa
+                    && rd(o + 2) == 0x03
+                    && rd(o + 3) == 0x00
+                    && rd(o + 4) == 0x00
+                    && (rd(o + 5) == 0x00 || rd(o + 5) == 0xf8)
+            };
             let base = f + hlen + ccmp;
             let limit = f + mpdu_len + 2;                      // +2 covers device padding
             let mut s = 0usize;
             let mut d = 0usize;
-            while d <= 20 {
-                if base + d + 8 > limit { break; }
-                if snap6(base + d) { s = base + d; break; }
-                d += 1;
+
+            // ★ Ask the descriptor first. `mac_flags2 & 0x1f` is the 802.11 header length in 2-byte
+            // words and `& 0x20` flags the 2 padding bytes the device inserts to 4-byte-align the
+            // payload — the two facts the scan below was reverse-engineering one byte at a time.
+            // Computing the offset also covers header layouts the hand-arithmetic never modelled,
+            // HT Control (+4 on a QoS frame with the Order bit) being the obvious one.
+            //
+            // Verified rather than trusted: if the signature is not where the descriptor says, fall
+            // through to the scan. A wrong assumption then costs nothing and shows up as
+            // `scan_hit` climbing, instead of silently losing traffic.
+            let desc_hdr = (mac_flags2 & 0x1f) as usize * 2;
+            let desc_pad = if mac_flags2 & 0x20 != 0 { 2 } else { 0 };
+            if desc_hdr >= 24 {
+                // ★ NO `+ ccmp`. The descriptor's header length ALREADY includes the security
+                // header — measured on hardware: claimed 34 = 24 base + 2 QoS + 8 CCMP, against a
+                // true payload offset of 26 + 8 + 2 pad. Adding `ccmp` again double-counted it by
+                // exactly 8 bytes, which is why the descriptor path matched zero frames.
+                let cand = f + desc_hdr + desc_pad;
+                if cand + 8 <= limit && snap6(cand) {
+                    s = cand;
+                    self.rx_desc_hit += 1;
+                }
+            }
+
+            if s == 0 {
+                while d <= 20 {
+                    if base + d + 8 > limit { break; }
+                    if snap6(base + d) {
+                        s = base + d;
+                        self.rx_scan_hit += 1;
+                        // What the descriptor claimed vs. where it actually is, both measured from
+                        // the start of the 802.11 frame and excluding the CCMP header.
+                        self.rx_last_desc_hdr = desc_hdr as u32;
+                        self.rx_last_true_hdr = (s - f) as u32;
+                        break;
+                    }
+                    d += 1;
+                }
             }
             if s == 0 {
+                self.rx_nosnap += 1;
+                // Bit 0 of the first address byte is the group bit (802.11 / 802.3 alike).
+                if rd(f + 4) & 0x01 != 0 {
+                    self.rx_nosnap_group += 1;
+                }
+                // Capture the header verbatim. `base`/`limit` are where the scan looked; fc0/fc1
+                // and the lengths say where it SHOULD have looked, and the raw bytes settle it.
+                if self.rx_nosnap_dumped < 4 {
+                    let rec = (self.rx_nosnap_dumped as usize) * 40;
+                    self.rx_nosnap_dumped += 1;
+                    self.rx_nosnap_dump[rec] = fc0;
+                    self.rx_nosnap_dump[rec + 1] = fc1;
+                    self.rx_nosnap_dump[rec + 2] = hlen as u8;
+                    self.rx_nosnap_dump[rec + 3] = ccmp as u8;
+                    self.rx_nosnap_dump[rec + 4] = (mpdu_len & 0xFF) as u8;
+                    self.rx_nosnap_dump[rec + 5] = ((mpdu_len >> 8) & 0xFF) as u8;
+                    for k in 0..34usize {
+                        if f + k < total {
+                            self.rx_nosnap_dump[rec + 6 + k] = rd(f + k);
+                        }
+                    }
+                }
                 // Dump the first few misses — the raw header says exactly what the layout is.
                 if self.rx_diag < 4 {
                     self.rx_diag += 1;
@@ -3546,6 +3837,9 @@ impl IntelWifiDriver {
 
             // Destination/source. For an A-MSDU they come from the subframe header immediately
             // before the SNAP; otherwise from the 802.11 addresses, per the DS bits.
+            if amsdu {
+                self.rx_amsdu += 1;
+            }
             let (da, sa, payload_len) = if amsdu && s >= f + 14 {
                 let sub_len = ((rd(s - 2) as usize) << 8) | rd(s - 1) as usize;
                 if sub_len < 8 { continue; }
@@ -3568,6 +3862,7 @@ impl IntelWifiDriver {
             for k in 0..payload_len { eth.push(rd(s + 8 + k)); }
 
             self.rx_passed += 1;
+            self.rx_bytes = self.rx_bytes.saturating_add(eth.len() as u32);
             if self.rx_passed <= 6 {
                 crate::serial_println!(
                     "[WIFI] P7: rx eth #{} type={:02x}{:02x} len={} (hlen={} ccmp={} pad={} amsdu={})",
@@ -3621,14 +3916,38 @@ impl smoltcp::phy::Device for IntelWifiDriver {
 
     fn transmit<'a>(&'a mut self, _t: smoltcp::time::Instant) -> Option<Self::TxToken<'a>> {
         // The AP station's queue must exist and we must know which AP to address.
-        if self.tx_data_ring.is_none() || self.ap_bssid == [0; 6] { return None; }
+        if self.tx_data_ring.is_none() || self.ap_bssid == [0; 6] {
+            // smoltcp reads None as backpressure and DROPS the packet, so this is lost outbound
+            // traffic rather than a deferral — worth counting, not just refusing.
+            self.tx_nospace = self.tx_nospace.saturating_add(1);
+            return None;
+        }
         Some(WifiTxToken(self))
     }
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
         caps.max_transmission_unit = 1500;
-        caps.max_burst_size = Some(1);
+        // ★ This is the advertised TCP RECEIVE WINDOW, not a transmit hint — and at 1 it was a
+        // thousand-fold throughput bug.
+        //
+        // smoltcp CLAMPS the window it advertises to `max_burst_size * mss`, in a block its own
+        // author labels "a terrible hack" (iface/interface/mod.rs). The hack exists for devices
+        // with a handful of Ethernet buffers behind a much larger TCP buffer, where a peer filling
+        // the window would cause severe loss.
+        //
+        // At `Some(1)` we advertised 1 x 1460 = **1460 bytes**, so a sender could hold exactly ONE
+        // segment in flight and had to wait a full round trip for every 1460 bytes. Measured on
+        // hardware: ~5 KB/s on a 30 Mbps link, with 253 of 258 socket reads timing out while
+        // waiting for the next single segment. It is also why a large page never finished and why
+        // an HTTPS server completed the handshake and then hung up mid-response.
+        //
+        // The hack's premise does not hold here: this driver posts **128 RX buffers of 4 KiB**
+        // (512 KiB of ring), while a TCP socket's receive buffer is 32 KiB — about 22 segments.
+        // 32 puts the ceiling just above that, leaving the socket buffer as the binding constraint
+        // (as it should be) with the ring still an order of magnitude larger than anything that can
+        // be in flight.
+        caps.max_burst_size = Some(32);
         caps
     }
 }
@@ -3644,6 +3963,51 @@ impl<'a> smoltcp::phy::TxToken for WifiTxToken<'a> {
         let mut buf = alloc::vec![0u8; len];
         let result = f(&mut buf);
         unsafe { self.0.tx_ethernet(&buf); }
+        self.0.tx_frames = self.0.tx_frames.saturating_add(1);
+        self.0.tx_bytes = self.0.tx_bytes.saturating_add(len as u32);
         result
+    }
+}
+
+impl IntelWifiDriver {
+    /// The RX parser's counters: `(seen, passed, amsdu, nosnap)`.
+    ///
+    /// Exported because they are the only way to tell, from userspace, whether a stalled transfer is
+    /// "the peer sent nothing" or "the peer sent it and this driver dropped it" — and those have
+    /// nothing in common except the symptom. They were already being printed to serial, which this
+    /// laptop has no cable for.
+    pub fn rx_counters(&self) -> (u32, u32, u32, u32) {
+        (self.rx_seen, self.rx_passed, self.rx_nosnap_group, self.rx_nosnap)
+    }
+
+    /// The hardware side: `(read_ptr, closed, handed, badsig, runaway)`.
+    pub fn rx_ring_state(&self) -> (u32, u32, u32, u32, u32) {
+        (self.rx_read_ptr, self.rx_last_closed, self.rx_handed, self.rx_badsig, self.rx_runaway)
+    }
+
+    /// Where the payload was located, and what was skipped: `(desc_hit, scan_hit, undecrypted)`.
+    pub fn rx_parse_stats(&self) -> (u32, u32, u32) {
+        (self.rx_desc_hit, self.rx_scan_hit, self.rx_undecrypted)
+    }
+
+    /// `(desc_size, claimed_hdr_len, true_hdr_len, lease_remaining_secs)` — the numbers needed to
+    /// correct the descriptor offset, plus the lease clock.
+    pub fn rx_offsets(&self) -> (u32, u32, u32, u32) {
+        (
+            self.rx_desc_size as u32,
+            self.rx_last_desc_hdr,
+            self.rx_last_true_hdr,
+            self.lease_remaining_secs().unwrap_or(0),
+        )
+    }
+
+    /// Throughput counters: `(tx_frames, tx_bytes, tx_nospace, rx_bytes)`.
+    pub fn traffic(&self) -> (u32, u32, u32, u32) {
+        (self.tx_frames, self.tx_bytes, self.tx_nospace, self.rx_bytes)
+    }
+
+    /// The captured NOSNAP frame headers, and how many of the four slots are filled.
+    pub fn rx_nosnap_dump(&self) -> (&[u8; 160], u32) {
+        (&self.rx_nosnap_dump, self.rx_nosnap_dumped)
     }
 }
