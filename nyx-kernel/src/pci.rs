@@ -302,6 +302,9 @@ fn enumerate_pci_legacy() {
 
                         let mut config = Config::new();
                         config.hardware_addr = Some(hw_addr);
+                        // smoltcp derives TCP initial sequence numbers and DNS query IDs from this.
+                        // At its default of 0 both are identical on every boot — see random::seed_u64.
+                        config.random_seed = crate::random::seed_u64();
                         
                         let iface = Interface::new(config, &mut eth_driver);
 
@@ -489,7 +492,11 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
 
                                     let mut config = Config::new();
                                     config.hardware_addr = Some(hw_addr);
-                                    
+                                    // smoltcp derives TCP initial sequence numbers and DNS query
+                                    // IDs from this. At its default of 0 both are identical on
+                                    // every boot — see random::seed_u64.
+                                    config.random_seed = crate::random::seed_u64();
+
                                     let iface = Interface::new(config, &mut eth_driver);
 
                                     *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);

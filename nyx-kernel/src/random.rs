@@ -213,3 +213,20 @@ pub fn fill(buf: &mut [u8]) -> bool {
     }
     true
 }
+
+/// A random `u64` for seeding a protocol state machine.
+///
+/// ★ Used for smoltcp's `Config::random_seed`, which is not a nicety: smoltcp derives **TCP initial
+/// sequence numbers** and **DNS query IDs** from it. Left at its `Default` of 0 — as both Nyx
+/// stacks did — those become predictable across every boot, which is the precondition for DNS cache
+/// poisoning (guess the ID, race the real answer) and for off-path TCP sequence-number attacks.
+///
+/// Falls back to the weak path rather than failing: an unpredictable-ish seed is enormously better
+/// than a constant one, and refusing to build an interface because RDSEED was busy would take the
+/// machine off the network entirely. Callers that need attested entropy must use
+/// [`is_cryptographic`].
+pub fn seed_u64() -> u64 {
+    let mut b = [0u8; 8];
+    let _ = fill(&mut b);
+    u64::from_le_bytes(b)
+}
