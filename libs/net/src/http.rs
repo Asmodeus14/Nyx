@@ -732,6 +732,7 @@ fn read_head<R: Read>(transport: &mut R, deadline: Deadline) -> Result<(Vec<u8>,
         let n = match transport.read(&mut chunk) {
             Ok(0) => return Err(Error::Protocol("connection closed before headers".into())),
             Ok(n) => n,
+            Err(e) if is_interrupted(&e) => continue,
             Err(e) if is_clean_eof(&e) => {
                 return Err(Error::Protocol("connection closed before headers".into()));
             }
@@ -821,7 +822,8 @@ fn read_body<R: Read>(
             match transport.read(&mut chunk[..want]) {
                 Ok(0) => break, // short body; return what arrived rather than losing it
                 Ok(n) => body.extend_from_slice(&chunk[..n]),
-                Err(e) if is_clean_eof(&e) => break,
+                Err(e) if is_interrupted(&e) => continue,
+            Err(e) if is_clean_eof(&e) => break,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -841,6 +843,7 @@ fn read_body<R: Read>(
                     return Err(Error::TooLarge("body"));
                 }
             }
+            Err(e) if is_interrupted(&e) => continue,
             Err(e) if is_clean_eof(&e) => break,
             Err(e) => return Err(e.into()),
         }
@@ -884,7 +887,8 @@ fn read_chunked<R: Read>(
             match transport.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => pending.extend_from_slice(&chunk[..n]),
-                Err(e) if is_clean_eof(&e) => break,
+                Err(e) if is_interrupted(&e) => continue,
+            Err(e) if is_clean_eof(&e) => break,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -917,6 +921,7 @@ fn take_line<R: Read>(
         match transport.read(&mut chunk) {
             Ok(0) => return Ok(None),
             Ok(n) => pending.extend_from_slice(&chunk[..n]),
+            Err(e) if is_interrupted(&e) => continue,
             Err(e) if is_clean_eof(&e) => return Ok(None),
             Err(e) => return Err(e.into()),
         }
@@ -928,6 +933,16 @@ fn take_line<R: Read>(
 
 /// A server that closes without a TLS `close_notify` is extremely common with `Connection: close`,
 /// and rustls surfaces that as `UnexpectedEof`. Treating it as a hard error would fail most fetches.
+/// A signal arrived mid-read. Not a failure — ask again.
+///
+/// ★ Newly reachable: the kernel's socket loops could not be interrupted at all until they learned
+/// to check for a pending signal, so `Interrupted` never used to appear here. Treating it as fatal
+/// would turn any signal into a failed fetch, which is why every `Read` implementation retries on
+/// it instead.
+pub(crate) fn is_interrupted(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4)
+}
+
 pub(crate) fn is_clean_eof(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::UnexpectedEof
 }

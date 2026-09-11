@@ -5209,6 +5209,21 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                                 }
                             }
 
+                            // ★ The second legal exit. `poll` has checked this since it was
+                            // written; these loops never did, so a process parked in a socket read
+                            // could not be interrupted by anything — `kill` it and nothing happened
+                            // until the fd happened to wake up. Checked here, before blocking, and
+                            // only when nothing has been transferred yet: both loops return on the
+                            // FIRST successful transfer, so at this point the count is zero and
+                            // EINTR loses no data, which is what POSIX requires.
+                            //
+                            // `signal_would_interrupt` honours disposition — an IGNORED signal must
+                            // not interrupt, or every program that spawns children would see
+                            // spurious EINTR from SIGCHLD.
+                            if unsafe { signal_would_interrupt() } {
+                                return EINTR as isize;
+                            }
+
                             // Yield thread safely while waiting for new hardware frames
                             unsafe {
                                 x86_64::instructions::interrupts::enable();
@@ -5325,6 +5340,12 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
                                 if now.saturating_sub(start_ms) > timeout_ms {
                                     return ETIMEDOUT as isize;
                                 }
+                            }
+
+                            // See the read loop: nothing has been sent at this point, so EINTR is
+                            // free of partial-write ambiguity.
+                            if unsafe { signal_would_interrupt() } {
+                                return EINTR as isize;
                             }
 
                             unsafe {
@@ -5530,6 +5551,15 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize, t
                     return ETIMEDOUT;
                 }
 
+                // ⚠️ EINTR from connect leaves the handshake RUNNING — POSIX says so, and smoltcp
+                // agrees: the socket stays in SynSent and completes or fails on its own. The caller
+                // must not retry `connect` on this fd; it should poll for writability instead.
+                // Reported anyway, because a connect that cannot be interrupted is a process that
+                // cannot be killed for the kernel's full 10 s deadline.
+                if unsafe { signal_would_interrupt() } {
+                    return EINTR;
+                }
+
                 // Yield the CPU core to other threads while waiting for the network card interrupt
                 unsafe {
                     x86_64::instructions::interrupts::enable();
@@ -5702,6 +5732,21 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
             // retransmitting it forever, and every `poll_stack` (which every blocking socket
             // syscall calls in a tight loop) walks the whole list. Enough timeouts and the machine
             // spends all its time re-sending dead lookups.
+            crate::drivers::net::with_sockets(stack, gen, |sockets| {
+                sockets
+                    .get_mut::<smoltcp::socket::dns::Socket>(dns_handle)
+                    .cancel_query(query_handle);
+            });
+            return 0;
+        }
+
+        // This syscall returns a packed address with 0 for failure, so there is no errno channel
+        // to put EINTR in. Cancel and report failure: the caller sees "could not resolve", which is
+        // true, and the alternative is a process that cannot be killed for five seconds.
+        //
+        // Cancelling matters — see the timeout path below. A query left Pending is not merely a
+        // leaked slot: smoltcp retransmits it forever and every poll walks the list.
+        if unsafe { signal_would_interrupt() } {
             crate::drivers::net::with_sockets(stack, gen, |sockets| {
                 sockets
                     .get_mut::<smoltcp::socket::dns::Socket>(dns_handle)

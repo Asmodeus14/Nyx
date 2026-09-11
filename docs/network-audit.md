@@ -268,10 +268,36 @@ was fixed in the same pass despite never having been observed to panic.
 `poll_network_locked`, which runs from the idle task with interrupts masked. smoltcp's route storage
 is fixed-capacity; a full table would panic the kernel. Low likelihood, fatal consequence.
 
-### M3 — no `EINTR` in socket read/write/connect/DNS · **OPEN**
+### M3 — no `EINTR` in socket read/write/connect/DNS · **FIXED**
 
-`poll` checks for pending signals (`interrupts.rs:576`); the socket loops do not. A blocked read
-cannot be interrupted. This is also the known blocker on the POSIX floor's Ladybird work.
+`poll` checked for a pending signal; the four blocking socket loops never did. A process parked in
+a socket read could not be interrupted by anything — `kill` it and nothing happened until the fd
+happened to wake up. This is also the stated blocker on the POSIX floor's Ladybird gate 3, since an
+event loop is built precisely on being woken by a signal.
+
+`signal_would_interrupt()` already existed and was already correct — it honours *disposition*, so an
+IGNORED signal does not interrupt (`SIGCHLD` defaults to ignore and arrives whenever a child exits;
+the naive `sigpending & !sigmask` test would make every blocking call return spurious `EINTR` in any
+program that spawns processes). It simply had two callers instead of six.
+
+**Where the check goes matters.** It sits immediately before the yield, and both the read and write
+loops return on the **first** successful transfer — so at that point the transferred count is zero
+and `EINTR` cannot lose data. That is what POSIX requires: a call that has already moved bytes must
+report the count, not the interruption.
+
+Two cases are not clean, and are documented rather than hidden:
+
+- **connect** — `EINTR` leaves the handshake *running*; POSIX says so and smoltcp agrees (the socket
+  stays in `SynSent`). The caller must poll for writability, not re-`connect`. Reported anyway,
+  because a connect that cannot be interrupted is a process that cannot be killed for 10 s.
+- **DNS** — `sys_dns_resolve` returns a packed address with 0 for failure and has no errno channel,
+  so it cancels the query and reports failure. Cancelling is not optional: a query left `Pending` is
+  not merely a leaked slot, smoltcp retransmits it forever and every poll walks the list.
+
+⚠️ **This made `ErrorKind::Interrupted` reachable in userspace for the first time**, and `libs/net`
+would have treated it as fatal — turning any signal into a failed page load. `would_block()` and the
+five blocking read loops in `http.rs` now retry on it, which is the convention every `Read`
+implementation follows.
 
 ### M4 — non-contiguous netmasks accepted · **OPEN**
 

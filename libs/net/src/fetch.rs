@@ -817,6 +817,14 @@ fn resolve_candidates(url: &Url) -> Result<Vec<std::net::SocketAddr>, Error> {
 fn would_block(e: &std::io::Error) -> bool {
     const ETIMEDOUT: i32 = 110;
     const EAGAIN: i32 = 11;
-    matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
-        || matches!(e.raw_os_error(), Some(ETIMEDOUT) | Some(EAGAIN))
+    // ★ EINTR belongs here, and it is new: the kernel's socket loops could not be interrupted at
+    // all until they learned to check for a pending signal. Now that they can, a signal arriving
+    // mid-read surfaces as `Interrupted` — which is NOT a failure, it is "ask again", and treating
+    // it as fatal would turn any signal into a broken page load. Retrying on `Interrupted` is the
+    // convention every `Read` implementation follows for exactly this reason.
+    const EINTR: i32 = 4;
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) || matches!(e.raw_os_error(), Some(ETIMEDOUT) | Some(EAGAIN) | Some(EINTR))
 }
