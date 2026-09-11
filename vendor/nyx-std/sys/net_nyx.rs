@@ -66,6 +66,21 @@ unsafe fn sys3(n: usize, a1: usize, a2: usize, a3: usize) -> isize {
     ret
 }
 
+/// Four-argument form. `r10` is the fourth slot in the kernel's syscall ABI — NOT `rcx`, which the
+/// `syscall` instruction clobbers with the return address.
+unsafe fn sys4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") n => ret,
+            in("rdi") a1, in("rsi") a2, in("rdx") a3, in("r10") a4,
+            out("rcx") _, out("r11") _, options(nostack),
+        );
+    }
+    ret
+}
+
 /// Kernel error returns are negative Linux errnos (-9 EBADF, -111 ECONNREFUSED, -110 ETIMEDOUT...).
 #[inline]
 fn err(ret: isize) -> io::Error {
@@ -122,6 +137,11 @@ impl TcpStream {
     }
 
     fn connect_addr(addr: &SocketAddr) -> io::Result<TcpStream> {
+        // 0 = the kernel's default handshake deadline.
+        TcpStream::connect_addr_timeout(addr, 0)
+    }
+
+    fn connect_addr_timeout(addr: &SocketAddr, timeout_ms: u64) -> io::Result<TcpStream> {
         let v4 = match addr {
             SocketAddr::V4(v4) => *v4,
             SocketAddr::V6(_) => {
@@ -155,11 +175,12 @@ impl TcpStream {
             sin_zero: [0; 8],
         };
         let ret = unsafe {
-            sys3(
+            sys4(
                 SYS_CONNECT,
                 stream.fd,
                 &sa as *const SockAddrIn as usize,
                 core::mem::size_of::<SockAddrIn>(),
+                timeout_ms as usize,
             )
         };
         if ret != 0 {
@@ -168,10 +189,23 @@ impl TcpStream {
         Ok(stream)
     }
 
-    /// The kernel already gives up on a handshake after 10 s, but it will not take a caller's
-    /// deadline, so this cannot honour `timeout` and says so rather than ignoring it.
-    pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
-        unsupported()
+    /// Connect with a caller-supplied handshake deadline.
+    ///
+    /// ★ Previously `unsupported()`, on the grounds that the kernel would not take a deadline. It
+    /// does now (syscall 42 gained a fourth argument), and that matters for exactly one reason: a
+    /// client that walks a name's several addresses looking for one that answers needs to give up
+    /// on each quickly. At the old fixed 10 s, four unreachable addresses cost forty seconds.
+    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        let ms = timeout.as_millis();
+        if ms == 0 {
+            return Err(io::const_error!(
+                io::ErrorKind::InvalidInput,
+                "cannot set a 0 duration timeout",
+            ));
+        }
+        // Saturate rather than wrap: an enormous duration means "effectively no deadline", and
+        // wrapping it into a small number would turn that into an instant failure.
+        TcpStream::connect_addr_timeout(addr, ms.min(u64::MAX as u128) as u64)
     }
 
     /// ★ The kernel holds ONE deadline per socket covering both directions, so setting either of

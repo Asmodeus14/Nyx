@@ -1315,6 +1315,95 @@ pub fn sys_wifi_status() -> Option<WifiStatus> {
     if rc == 0 { Some(st) } else { None }
 }
 
+/// The WiFi RX parser's counters: `(seen, passed, amsdu, nosnap)`.
+///
+/// `seen` is data frames the driver looked at; `passed` is the ones that became Ethernet frames.
+/// A gap between them is a frame that arrived and was thrown away inside the driver — which from
+/// every layer above is indistinguishable from a frame that was never sent at all.
+///
+/// `amsdu` counts aggregates, and it is the one to watch during a stalled bulk transfer: the RX path
+/// keeps only the FIRST subframe of an aggregate and drops the rest, and aggregation is precisely
+/// what an access point turns on for bulk traffic like a certificate chain.
+///
+/// Each field saturates at 65535 — these are for spotting a gap, not for accounting.
+pub fn sys_wifi_rx_counters() -> (u32, u32, u32, u32) {
+    let p = syscall(569, 0, 0, 0, 0, 0, 0);
+    (
+        (p & 0xFFFF) as u32,
+        ((p >> 16) & 0xFFFF) as u32,
+        ((p >> 32) & 0xFFFF) as u32,
+        ((p >> 48) & 0xFFFF) as u32,
+    )
+}
+
+/// The frames the WiFi RX parser discarded for want of an LLC/SNAP signature, verbatim.
+///
+/// Four 40-byte records: `fc0, fc1, hlen, ccmp, mpdu_len` (u16 LE), then 34 raw frame bytes.
+/// Returns how many records are valid. No counter can say *why* the scan missed — only the bytes.
+pub fn sys_wifi_nosnap_dump(out: &mut [u8; 160]) -> u32 {
+    syscall(570, out.as_mut_ptr() as u64, 0, 0, 0, 0, 0) as u32
+}
+
+/// The WiFi RX ring's hardware state: `(read_ptr, closed, handed, badsig, runaway)`.
+///
+/// `closed` is the firmware's producer index, a 12-bit field (0..4095). `read_ptr` is the driver's
+/// consumer index, a u32. `poll_next_rx` decides a frame is waiting by testing the two for
+/// INEQUALITY — so once `read_ptr` climbs past 4095 they can never agree again, every poll claims a
+/// frame, and the parser walks stale ring slots without end.
+///
+/// **`read_ptr > 4095` while `closed` is small is the bug, visible directly.** `badsig` counts slots
+/// handed over that held no RX_MPDU (the stale ones), and `runaway` counts times the parser's loop
+/// had to be cut off to keep the machine alive.
+pub fn sys_wifi_rx_ring() -> WifiRing {
+    let mut out = [0u32; 16];
+    if syscall(571, out.as_mut_ptr() as u64, 0, 0, 0, 0, 0) == 0 {
+        return WifiRing::default();
+    }
+    WifiRing {
+        read_ptr: out[0], closed: out[1], handed: out[2], badsig: out[3], runaway: out[4],
+        tx_frames: out[5], tx_bytes: out[6], tx_nospace: out[7], rx_bytes: out[8],
+        desc_hit: out[9], scan_hit: out[10], undecrypted: out[11],
+        desc_size: out[12], claimed_hdr: out[13], true_hdr: out[14], lease_secs: out[15],
+    }
+}
+
+/// The WiFi RX ring and traffic counters.
+///
+/// `read_ptr` vs `closed` is the pair that matters for correctness: the firmware's producer index
+/// wraps at the ring size and the driver's consumer index must share that modulus, or every poll
+/// reports a frame that is not there (see the RX ring memory). `runaway` counts times the parser's
+/// loop had to be cut off; it should be 0.
+///
+/// The rest is throughput. `tx_frames`/`rx_bytes` against wall time give bytes-per-second, and
+/// `tx_nospace` is outbound traffic DROPPED because the AP queue was not ready — smoltcp reads a
+/// refused `transmit()` as backpressure and discards the packet rather than retrying it.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct WifiRing {
+    pub read_ptr: u32,
+    pub closed: u32,
+    pub handed: u32,
+    pub badsig: u32,
+    pub runaway: u32,
+    pub tx_frames: u32,
+    pub tx_bytes: u32,
+    pub tx_nospace: u32,
+    pub rx_bytes: u32,
+    /// Payload located from the RX descriptor's own header-length field — the correct path.
+    pub desc_hit: u32,
+    /// Payload located only by scanning for the LLC/SNAP signature. Non-zero means the descriptor's
+    /// header length was wrong for that frame, which is the thing worth knowing.
+    pub scan_hit: u32,
+    /// Frames the firmware did not decrypt, skipped without searching them.
+    pub undecrypted: u32,
+    /// Calibrated `iwl_rx_mpdu_desc` size, and the claimed vs actual 802.11 header length of the
+    /// last frame the scan had to rescue. `claimed != true` names the descriptor-offset error.
+    pub desc_size: u32,
+    pub claimed_hdr: u32,
+    pub true_hdr: u32,
+    /// Seconds left on the DHCP lease, or 0 when the server gave no duration.
+    pub lease_secs: u32,
+}
+
 // ── The radio-operation request, Meridian step 20 ────────────────────────────
 //
 // ★ Why this exists at all.
