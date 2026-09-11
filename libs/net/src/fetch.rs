@@ -19,15 +19,54 @@ use std::time::{Duration, Instant};
 use crate::http::{Error, Response};
 use crate::url::Url;
 
-/// How long a single socket operation may block. This is the worst case for one frame, so it sets
-/// the floor on how responsive the window stays while loading: 150 ms means at least ~7 repaints a
-/// second even when the server has gone quiet.
-const SOCKET_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long a single socket operation may block once the body is streaming.
+///
+/// ★ Was 150 ms, on the reasoning that it bounded a frame's worst case. It did — and it also capped
+/// THROUGHPUT at one read per frame, because it is longer than [`POLL_BUDGET`]: the first read that
+/// found no data blocked 150 ms, blew the budget, and ended the poll. Measured on hardware, an 86 KB
+/// page took 19 polls at 208 ms each — 8 KB/s on a 30 Mbps link, with the network never once the
+/// limiting factor.
+///
+/// Short is better on both counts. A poll that finds nothing now costs 20 ms instead of 150, so the
+/// window repaints *more* often, and a poll that finds data keeps draining until the socket is
+/// actually empty (see `Stage::Body`).
+const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
+/// The budget for a single socket operation *while the TLS handshake is still running*.
+///
+/// Much longer than [`SOCKET_TIMEOUT`], and the reason is a real failure: at 150 ms a handshake
+/// against a distant server never completed. A handshake is not like a body — a body arrives in
+/// pieces and every piece is progress you keep, whereas a handshake flight is only useful once it is
+/// complete, so a deadline that keeps cutting it off makes no progress to keep. It is also bounded
+/// (one or two round trips), which a body is not, so spending a whole second inside one poll costs
+/// at most one visibly dropped frame instead of an unbounded freeze.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How much wall time one `poll` may spend before handing the frame back. Larger means fewer
 /// repaints but better throughput.
 const POLL_BUDGET: Duration = Duration::from_millis(120);
 /// Whole-request deadline, across every redirect.
 const TOTAL_DEADLINE: Duration = Duration::from_secs(45);
+/// How many of a name's addresses to try before giving up.
+///
+/// A large site publishes several A records and some are routinely unreachable from any given
+/// network — so the first one is a coin flip, and a client that cannot walk past it fails where
+/// every browser succeeds. Bounded because each attempt costs the kernel's 10 s connect deadline,
+/// and four is already past the point where the address is plausibly the problem.
+const MAX_ADDR_ATTEMPTS: usize = 3;
+/// How long a peer may stay completely silent after we have written to it.
+///
+/// Distinct from every other deadline here because it detects a distinct failure: a host that
+/// completes a TCP handshake and then sends **nothing at all**. Measured on hardware against one of
+/// Google's frontends — connect succeeded, a 238-byte ClientHello went out, and 43 consecutive
+/// reads returned zero bytes until the 45 s whole-request deadline expired.
+///
+/// A TLS ServerHello arrives in one round trip. Zero bytes after ten seconds is not a slow server,
+/// it is a dead path — a blackholed route, or a middlebox that accepts the connection and discards
+/// what follows. The useful response is the one a failed connect already gets: abandon this address
+/// and try the next, rather than spending the entire request budget on silence.
+///
+/// Armed only while NOTHING has arrived. A server that has sent one byte is talking to us, and is
+/// governed by `TOTAL_DEADLINE` from then on.
+const SILENT_PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a fetch is doing before any payload arrives.
 ///
@@ -114,6 +153,49 @@ pub struct Fetch {
     framing: Framing,
     body: Vec<u8>,
     total: Option<usize>,
+
+    // ── Instrumentation ─────────────────────────────────────────────────────────────────────────
+    // A fetch that stalls looks exactly like a fetch that is slow, and this machine has no serial
+    // console — the `trace!` lines in `http.rs` are written and never read. So the counters that
+    // distinguish the two have to be able to reach the screen. See `Fetch::diagnostic`.
+    /// The address DNS gave us, kept past the connect so a failure can name what it dialled.
+    ///
+    /// Without it, "connect timed out" cannot be told apart from "connect timed out *to the wrong
+    /// address*" — and a resolver that returns a plausible-looking wrong address is exactly the
+    /// failure that looks like a network problem and is not one.
+    addr: Option<std::net::SocketAddr>,
+    /// How many times `poll` has been called.
+    polls: usize,
+    /// Plaintext bytes handed up by the transport. NOT socket bytes — for TLS this stays at zero
+    /// for the whole handshake by design, which is why `sock` exists beside it.
+    bytes_in: usize,
+    /// The raw socket's counters. This is the one that answers "is the peer replying at all".
+    sock: Option<std::sync::Arc<crate::http::SockStats>>,
+    /// When the current connection was established, for [`SILENT_PEER_TIMEOUT`].
+    connected_at: Option<Instant>,
+    /// This request is running on a connection taken from the idle slot.
+    ///
+    /// ★ Kept because a reused connection can fail in a way a fresh one cannot: the server may have
+    /// closed it while it sat idle, and we only find out when the read after our request returns
+    /// EOF having produced nothing. That is not a real failure — it is the expected race in every
+    /// keep-alive implementation — and the answer is to reconnect and send it again ONCE. A GET is
+    /// idempotent, so replaying it is safe.
+    on_reused: bool,
+    /// Whether that retry has already been spent.
+    reused_retry_done: bool,
+    /// Every address the name resolved to, and which one is being tried.
+    ///
+    /// ★ Held here rather than re-resolved on each failure. Going back to DNS to find the next
+    /// candidate costs a round trip we do not need — the whole list arrived in the first answer —
+    /// and, worse, a transient resolver failure on the retry then reported "cannot resolve" for a
+    /// name that had *already resolved*, burying the connect failure that was the real cause.
+    candidates: Vec<std::net::SocketAddr>,
+    candidate_idx: usize,
+    /// The last error a read produced, kept as a string because `io::Error` is not `Clone`.
+    last_err: Option<String>,
+    /// How many times a failed connect has sent us back to re-resolve. Bounded, so a host that is
+    /// genuinely unreachable fails instead of looping.
+    connect_retries: u8,
 }
 
 impl Fetch {
@@ -137,7 +219,58 @@ impl Fetch {
             framing: Framing::ToEof,
             body: Vec::new(),
             total: None,
+            addr: None,
+            sock: None,
+            connected_at: None,
+            on_reused: false,
+            reused_retry_done: false,
+            candidates: Vec::new(),
+            candidate_idx: 0,
+            polls: 0,
+            bytes_in: 0,
+            last_err: None,
+            connect_retries: 0,
         }
+    }
+
+    /// One line saying what this fetch is actually doing, for a UI to put on screen.
+    ///
+    /// Deliberately dense and unpolished: it is a diagnostic, and the thing it has to do is let
+    /// someone photograph a stalled window and know from the photograph which of three failures it
+    /// is — nothing arriving, arriving but the handshake not completing, or completing but the
+    /// response never framing.
+    pub fn diagnostic(&self) -> String {
+        let stage = match self.stage {
+            Stage::Resolve => "resolve",
+            Stage::Connect(_) => "connect",
+            Stage::Head => "head",
+            Stage::Body => "body",
+            Stage::Finished => "done",
+        };
+        let tls = match self.transport.as_ref().and_then(|t| t.tls_progress()) {
+            Some((hs, wr, ww)) => format!(
+                " tls[hs={} r={} w={}]",
+                if hs { "YES" } else { "no" },
+                wr as u8,
+                ww as u8
+            ),
+            None => String::new(),
+        };
+        let addr = match self.addr {
+            Some(a) => format!(" addr={a}"),
+            None => " addr=UNRESOLVED".to_string(),
+        };
+        let sock = match self.sock.as_ref() {
+            Some(s) => format!(" {}", s.summary()),
+            None => String::new(),
+        };
+        format!(
+            "{stage}{addr} polls={} plain={}B body={}B{tls}{sock} last={}",
+            self.polls,
+            self.bytes_in,
+            self.body.len(),
+            self.last_err.as_deref().unwrap_or("-")
+        )
     }
 
     /// The URL currently being fetched, which is not the one asked for once a redirect is taken.
@@ -147,6 +280,7 @@ impl Fetch {
 
     /// Do one frame's worth of work.
     pub fn poll(&mut self) -> Progress {
+        self.polls += 1;
         if self.started.elapsed() > TOTAL_DEADLINE {
             self.stage = Stage::Finished;
             return Progress::Failed(Error::Io(std::io::Error::new(
@@ -187,28 +321,112 @@ impl Fetch {
                 // DNS is a blocking syscall with its own 5 s deadline in the kernel; splitting it
                 // out from the TCP connect is what makes "stuck looking up" distinguishable from
                 // "stuck connecting", which are different faults with different fixes.
-                let addr = resolve(&self.url)?;
-                self.enter(Stage::Connect(addr));
+                let addrs = resolve_candidates(&self.url)?;
+                let first = addrs[0];
+                self.candidates = addrs;
+                self.candidate_idx = 0;
+                self.addr = Some(first);
+                self.enter(Stage::Connect(first));
                 Ok(Progress::Connecting(Phase::Connecting))
             }
             Stage::Connect(addr) => {
+                // A kept connection skips DNS, the TCP handshake AND the TLS handshake — which on
+                // this machine is the dominant cost of following a link, since the certificate is
+                // verified in software.
+                if let Some(mut transport) = crate::http::take_idle(&self.url) {
+                    transport.set_timeout(SOCKET_TIMEOUT)?;
+                    transport.queue_request(&crate::http::request_line(&self.url, true))?;
+                    self.sock = Some(transport.stats());
+                    self.connected_at = Some(Instant::now());
+                    self.transport = Some(transport);
+                    self.on_reused = true;
+                    self.enter(Stage::Head);
+                    return Ok(Progress::Connecting(Phase::Headers));
+                }
+
                 if self.announcing() {
                     return Ok(Progress::Connecting(Phase::Connecting));
                 }
-                let mut transport = crate::http::Transport::connect(&self.url, addr, &self.started)?;
-                // Long enough to survive a slow first response, short enough that a dead peer costs
-                // one frame. The whole-request deadline is what actually bounds a stall.
-                transport.set_timeout(SOCKET_TIMEOUT)?;
-                transport.queue_request(&crate::http::request_line(&self.url))?;
+                let mut transport = match crate::http::Transport::connect(&self.url, addr, &self.started)
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // A cached address that will not answer is worse than no cache: it turns
+                        // one unlucky DNS reply into ten minutes of certain failure. Drop it and
+                        // ask again — a name with several A records (which any large site has) will
+                        // usually hand back a different one.
+                        // This address did not answer. That says nothing about the OTHERS the
+                        // resolver gave us, so drop only this one and come back for the next —
+                        // which is what every mainstream client does and why a phone succeeds on a
+                        // network where a one-address client fails.
+                        crate::dns::forget_addr(&self.url.host, addr.ip());
+                        if self.advance_candidate() {
+                            self.last_err =
+                                Some(format!("{} refused; trying the next address", addr.ip()));
+                            return Ok(Progress::Connecting(Phase::Connecting));
+                        }
+                        return Err(e);
+                    }
+                };
+                // The handshake gets the long budget; the body gets the short one, set when we
+                // enter `Stage::Body` below. A handshake flight cut off part-way leaves nothing
+                // behind to resume from, so slicing it finely does not buy responsiveness, it just
+                // prevents it finishing.
+                transport.set_timeout(HANDSHAKE_TIMEOUT)?;
+                transport.queue_request(&crate::http::request_line(&self.url, true))?;
+                self.on_reused = false;
+                self.sock = Some(transport.stats());
+                self.connected_at = Some(Instant::now());
                 self.transport = Some(transport);
                 self.enter(Stage::Head);
                 Ok(Progress::Connecting(self.head_phase()))
             }
             Stage::Head => {
+                // A peer that took the connection and has since said nothing is a dead path. Move
+                // on to the next address rather than spending the whole request budget on silence.
+                if self.silent_too_long() {
+                    let addr = self.addr;
+                    if let Some(a) = addr {
+                        crate::dns::forget_addr(&self.url.host, a.ip());
+                    }
+                    if self.advance_candidate() {
+                        self.last_err = Some(format!(
+                            "{} went silent; trying the next",
+                            addr.map(|a| a.ip().to_string()).unwrap_or_default()
+                        ));
+                        return Ok(Progress::Connecting(Phase::Connecting));
+                    }
+                    return Err(Error::Connect {
+                        addr: self.addr.map(|a| a.to_string()).unwrap_or_default(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "accepted the connection then sent nothing",
+                        ),
+                    });
+                }
+
                 // EOF here is fatal and must be reported. Ignoring it left the fetch announcing
                 // "Connecting" every frame against a closed socket until the 45 s whole-request
                 // deadline — which reads as a hang, and hides the real fault.
-                if !self.fill()? {
+                if self.fill_n()?.is_none() {
+                    // The keep-alive race: the server closed this connection while it was idle, and
+                    // said so only by hanging up on the request we just sent. Reconnect and send it
+                    // once more. Bounded to a single retry so a server that closes every connection
+                    // cannot loop us.
+                    if self.on_reused && !self.reused_retry_done && self.bytes_in == 0 {
+                        self.reused_retry_done = true;
+                        self.on_reused = false;
+                        self.transport = None;
+                        self.sock = None;
+                        self.connected_at = None;
+                        self.pending.clear();
+                        self.cursor = 0;
+                        self.scanned = 0;
+                        self.last_err = Some("kept connection was closed; reconnecting".into());
+                        let addr = self.addr.unwrap_or(self.candidates[self.candidate_idx]);
+                        self.enter(Stage::Connect(addr));
+                        return Ok(Progress::Connecting(Phase::Connecting));
+                    }
                     return Err(Error::Protocol("connection closed before any reply".into()));
                 }
                 let Some(end) = self.find_head_end() else {
@@ -225,6 +443,11 @@ impl Fetch {
                     Framing::Length(n) => Some(n),
                     _ => None,
                 };
+                // Headers are in, so the handshake is long done: drop back to the short budget so
+                // the body streams at frame rate.
+                if let Some(t) = self.transport.as_mut() {
+                    t.set_timeout(SOCKET_TIMEOUT)?;
+                }
                 self.enter(Stage::Body);
                 Ok(Progress::Receiving { got: 0, total: self.total })
             }
@@ -232,7 +455,7 @@ impl Fetch {
                 let deadline = Instant::now();
                 loop {
                     if self.decode_body()? {
-                        return self.finish();
+                        return self.finish(true);
                     }
                     if deadline.elapsed() > POLL_BUDGET {
                         return Ok(Progress::Receiving {
@@ -240,10 +463,25 @@ impl Fetch {
                             total: self.total,
                         });
                     }
-                    // EOF with an unfinished body is not an error: a truncated page still renders,
-                    // and `Connection: close` responses end exactly this way by design.
-                    if !self.fill()? {
-                        return self.finish();
+                    match self.fill_n()? {
+                        // EOF with an unfinished body is not an error: a truncated page still
+                        // renders, and `Connection: close` responses end exactly this way.
+                        None => return self.finish(false),
+                        // Nothing waiting *this instant*. Keep asking until the budget is gone
+                        // rather than handing the frame back.
+                        //
+                        // ★ This used to return immediately, and that was measured: a 486 KB
+                        // Wikipedia page took 336 reads of which 303 timed out, and roughly 11 of
+                        // its 14.5 seconds were spent idle — ~20 ms of a 120 ms budget used, then a
+                        // 16 ms frame sleep, repeated. An empty socket means no data arrived in the
+                        // last 20 ms, NOT that none will arrive in the next 100.
+                        //
+                        // Safe only because `SOCKET_TIMEOUT` is short. It is the pairing that
+                        // matters: at the old 150 ms this loop would blow the budget on one read.
+                        Some(0) => {}
+                        // Data arrived, and where there is one segment there are usually more:
+                        // keep draining within the budget instead of surrendering the frame.
+                        Some(_) => {}
                     }
                 }
             }
@@ -251,10 +489,56 @@ impl Fetch {
         }
     }
 
-    /// Before the first byte of an HTTPS reply arrives we are still shaking hands — rustls defers
-    /// the handshake into the first read, so "no bytes yet" and "handshaking" are the same state.
+    /// Move to the next resolved address, if there is one left within the attempt budget.
+    ///
+    /// Clears the per-connection state so the next attempt starts clean — a stale `sock` would make
+    /// [`Self::silent_too_long`] judge the new connection by the old one's byte count.
+    fn advance_candidate(&mut self) -> bool {
+        self.candidate_idx += 1;
+        if self.candidate_idx >= self.candidates.len()
+            || self.candidate_idx >= MAX_ADDR_ATTEMPTS
+        {
+            return false;
+        }
+        let next = self.candidates[self.candidate_idx];
+        self.addr = Some(next);
+        self.transport = None;
+        self.connected_at = None;
+        self.sock = None;
+        self.pending.clear();
+        self.cursor = 0;
+        self.scanned = 0;
+        self.enter(Stage::Connect(next));
+        true
+    }
+
+    /// True when the peer has sent nothing at all for longer than [`SILENT_PEER_TIMEOUT`].
+    ///
+    /// Counts RAW socket bytes, not plaintext: during a TLS handshake `plain` stays at zero even
+    /// when the server is answering perfectly, so testing plaintext here would abandon healthy
+    /// connections.
+    fn silent_too_long(&self) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+        let Some(since) = self.connected_at else { return false };
+        let Some(sock) = self.sock.as_ref() else { return false };
+        sock.read_bytes.load(Relaxed) == 0 && since.elapsed() > SILENT_PEER_TIMEOUT
+    }
+
+    /// Whether we are still shaking hands, or waiting on the reply.
+    ///
+    /// ★ Ask rustls, do not infer. This used to guess from `pending.is_empty()`, on the reasoning
+    /// that "no bytes yet" and "handshaking" are the same state. They are not: once the handshake
+    /// completes, `pending` is still empty until the first byte of the *reply* arrives, so a fetch
+    /// that had finished its handshake and was waiting on the server kept reporting "Securing
+    /// connection to…" — pointing every diagnosis at TLS when TLS was already done.
     fn head_phase(&self) -> Phase {
-        if self.url.scheme == crate::url::Scheme::Https && self.pending.is_empty() {
+        let handshaking = self
+            .transport
+            .as_ref()
+            .and_then(|t| t.tls_progress())
+            .map(|(hs, _, _)| hs)
+            .unwrap_or(false);
+        if handshaking {
             Phase::Handshake
         } else {
             Phase::Headers
@@ -262,13 +546,26 @@ impl Fetch {
     }
 
     /// Hand back the response, or follow a redirect by restarting against the new URL.
-    fn finish(&mut self) -> Result<Progress, Error> {
+    /// Hand back the response.
+    ///
+    /// `framed` says the body ended where its framing said it would — `Content-Length` satisfied or
+    /// the zero chunk seen — rather than because the peer hung up. Only a framed body leaves the
+    /// connection in a known state, and only a known state may be reused.
+    fn finish(&mut self, framed: bool) -> Result<Progress, Error> {
         let redirecting = matches!(self.status, 301 | 302 | 303 | 307 | 308);
         let location = self
             .headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("location"))
             .map(|(_, v)| v.clone());
+
+        // Offer the connection back before anything drops it. A redirect to the same origin — which
+        // `http://x` -> `https://www.x/` is not, but `/a` -> `/b` very much is — then costs nothing.
+        if crate::http::response_is_reusable(&self.headers, framed) {
+            if let Some(t) = self.transport.take() {
+                crate::http::put_idle(&self.url, t);
+            }
+        }
 
         if let (true, Some(location)) = (redirecting, location) {
             if self.redirects >= 8 {
@@ -285,10 +582,14 @@ impl Fetch {
         }
 
         self.stage = Stage::Finished;
+        let headers = core::mem::take(&mut self.headers);
+        // Inflate before handing the response over, so `Progress::Done` means the same thing here as
+        // `http::get` does — a caller must never have to ask which of the two produced a body.
+        let body = crate::http::decode_content_encoding(&headers, core::mem::take(&mut self.body))?;
         Ok(Progress::Done(Box::new(Response {
             status: self.status,
-            headers: core::mem::take(&mut self.headers),
-            body: core::mem::take(&mut self.body),
+            headers,
+            body,
             url: self.url.clone(),
         })))
     }
@@ -308,20 +609,42 @@ impl Fetch {
         }
     }
 
-    /// Read once from the socket. `false` means the peer closed; a timeout is *not* a close, it is
-    /// simply this frame's answer.
-    fn fill(&mut self) -> Result<bool, Error> {
-        let Some(transport) = self.transport.as_mut() else { return Ok(false) };
+    /// Read once from the socket, reporting how much arrived.
+    ///
+    /// `None` means the peer closed. `Some(0)` means nothing was available this time — which is a
+    /// different answer from "the peer is gone", and the caller needs to tell them apart in order to
+    /// know whether to keep draining or come back next frame. Collapsing both into a bool is what
+    /// made a bulk transfer read exactly once per poll.
+    fn fill_n(&mut self) -> Result<Option<usize>, Error> {
+        let Some(transport) = self.transport.as_mut() else { return Ok(None) };
         let mut chunk = [0u8; 16 * 1024];
-        match transport.read(&mut chunk) {
-            Ok(0) => Ok(false),
-            Ok(n) => {
-                self.pending.extend_from_slice(&chunk[..n]);
-                Ok(true)
+        let result = transport.read(&mut chunk);
+        match result {
+            Ok(0) => {
+                self.last_err = Some("eof".into());
+                Ok(None)
             }
-            Err(e) if would_block(&e) => Ok(true),
-            Err(e) if crate::http::is_clean_eof(&e) => Ok(false),
-            Err(e) => Err(e.into()),
+            Ok(n) => {
+                self.bytes_in += n;
+                self.last_err = None;
+                self.pending.extend_from_slice(&chunk[..n]);
+                Ok(Some(n))
+            }
+            Err(e) if would_block(&e) => {
+                // Not a failure: this is the frame's answer, and it is the expected one most of the
+                // time. Recorded anyway, because "every read timed out" and "reads are succeeding"
+                // are the two halves of the stall diagnosis.
+                self.last_err = Some(format!("timeout({:?})", e.raw_os_error()));
+                Ok(Some(0))
+            }
+            Err(e) if crate::http::is_clean_eof(&e) => {
+                self.last_err = Some("clean-eof".into());
+                Ok(None)
+            }
+            Err(e) => {
+                self.last_err = Some(format!("{:?}/{:?}", e.kind(), e.raw_os_error()));
+                Err(e.into())
+            }
         }
     }
 
@@ -459,15 +782,36 @@ impl Fetch {
 /// Deliberately separate from `TcpStream::connect((host, port))`, which does both in one opaque
 /// blocking call. Keeping them apart costs nothing and buys the ability to say which one hung.
 pub(crate) fn resolve_host(url: &Url) -> Result<std::net::SocketAddr, Error> {
-    resolve(url)
+    // The blocking path in `http.rs` takes one address; the stepped path walks the whole list.
+    resolve_candidates(url).map(|v| v[0])
 }
 
-fn resolve(url: &Url) -> Result<std::net::SocketAddr, Error> {
-    use std::net::ToSocketAddrs;
-    (url.host.as_str(), url.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::Protocol(format!("{} has no address", url.host)))
+fn resolve_candidates(url: &Url) -> Result<Vec<std::net::SocketAddr>, Error> {
+    // The cache is checked first because the miss path is genuinely expensive: the kernel's resolver
+    // busy-polls the network stack until an answer arrives or five seconds elapse, so a repeat
+    // lookup does not merely cost a round trip, it costs a round trip of spinning. See `crate::dns`.
+    //
+    // The FIRST of the cached set, not the only one: a connect failure drops just that address (see
+    // `Stage::Connect`), so the next attempt naturally advances to the next candidate.
+    if let Some(hit) = crate::dns::lookup_all(&url.host, url.port) {
+        if !hit.is_empty() {
+            return Ok(hit);
+        }
+    }
+
+    // An IP literal is not a name and must not be cached under one — the cache would then be full of
+    // entries mapping an address to itself.
+    if let Ok(ip) = url.host.parse::<std::net::IpAddr>() {
+        return Ok(vec![std::net::SocketAddr::new(ip, url.port)]);
+    }
+
+    let addrs = crate::dns::resolve_all(&url.host);
+    if addrs.is_empty() {
+        return Err(Error::Dns { host: url.host.clone() });
+    }
+    let out = addrs.iter().map(|ip| std::net::SocketAddr::new(*ip, url.port)).collect();
+    crate::dns::remember_all(&url.host, addrs);
+    Ok(out)
 }
 
 fn would_block(e: &std::io::Error) -> bool {

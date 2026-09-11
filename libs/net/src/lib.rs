@@ -14,6 +14,8 @@
 //! # Ok::<(), nyx_net::Error>(())
 //! ```
 
+mod body;
+pub mod dns;
 pub mod fetch;
 pub mod http;
 mod rng;
