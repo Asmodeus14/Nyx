@@ -171,6 +171,17 @@ pub struct Fetch {
     bytes_in: usize,
     /// The raw socket's counters. This is the one that answers "is the peer replying at all".
     sock: Option<std::sync::Arc<crate::http::SockStats>>,
+    /// `(read_bytes, write_bytes)` on the socket at the moment THIS request started.
+    ///
+    /// ★ Without it the counters lie on a reused connection, and not harmlessly. `SockStats` is
+    /// created once in `Transport::connect` and lives with the connection, so a kept-alive socket
+    /// carries the previous request's totals. `silent_too_long` tested `read_bytes == 0`, which on
+    /// any reused connection is false forever — so the ten-second watchdog was disabled on exactly
+    /// the connections most likely to be half-dead. A server that closed its end while idle then
+    /// produced no bytes and no EOF, and the fetch ran to the 45 s whole-request deadline instead of
+    /// being abandoned after ten and retried on a fresh socket. Measured: the first of three
+    /// back-to-back fetches timing out at exactly 45 s.
+    sock_baseline: (usize, usize),
     /// When the current connection was established, for [`SILENT_PEER_TIMEOUT`].
     connected_at: Option<Instant>,
     /// This request is running on a connection taken from the idle slot.
@@ -193,9 +204,6 @@ pub struct Fetch {
     candidate_idx: usize,
     /// The last error a read produced, kept as a string because `io::Error` is not `Clone`.
     last_err: Option<String>,
-    /// How many times a failed connect has sent us back to re-resolve. Bounded, so a host that is
-    /// genuinely unreachable fails instead of looping.
-    connect_retries: u8,
 }
 
 impl Fetch {
@@ -221,6 +229,7 @@ impl Fetch {
             total: None,
             addr: None,
             sock: None,
+            sock_baseline: (0, 0),
             connected_at: None,
             on_reused: false,
             reused_retry_done: false,
@@ -229,7 +238,6 @@ impl Fetch {
             polls: 0,
             bytes_in: 0,
             last_err: None,
-            connect_retries: 0,
         }
     }
 
@@ -261,11 +269,15 @@ impl Fetch {
             None => " addr=UNRESOLVED".to_string(),
         };
         let sock = match self.sock.as_ref() {
-            Some(s) => format!(" {}", s.summary()),
+            Some(s) => format!(" {}", s.summary_since(self.sock_baseline)),
             None => String::new(),
         };
+        // Whether this request rode a kept-alive connection. Three back-to-back fetches produced no
+        // evidence at all about the feature under suspicion, because nothing in the output said
+        // which of them reused anything.
+        let reused = if self.on_reused { " REUSED" } else { "" };
         format!(
-            "{stage}{addr} polls={} plain={}B body={}B{tls}{sock} last={}",
+            "{stage}{addr}{reused} polls={} plain={}B body={}B{tls}{sock} last={}",
             self.polls,
             self.bytes_in,
             self.body.len(),
@@ -336,7 +348,11 @@ impl Fetch {
                 if let Some(mut transport) = crate::http::take_idle(&self.url) {
                     transport.set_timeout(SOCKET_TIMEOUT)?;
                     transport.queue_request(&crate::http::request_line(&self.url, true))?;
-                    self.sock = Some(transport.stats());
+                    let stats = transport.stats();
+                    // The counters are cumulative for the life of the connection; record where this
+                    // request starts so everything below measures THIS request.
+                    self.sock_baseline = stats.totals();
+                    self.sock = Some(stats);
                     self.connected_at = Some(Instant::now());
                     self.transport = Some(transport);
                     self.on_reused = true;
@@ -373,9 +389,15 @@ impl Fetch {
                 // behind to resume from, so slicing it finely does not buy responsiveness, it just
                 // prevents it finishing.
                 transport.set_timeout(HANDSHAKE_TIMEOUT)?;
-                transport.queue_request(&crate::http::request_line(&self.url, true))?;
+                // Ask for a persistent connection only when we would actually keep one.
+                transport.queue_request(&crate::http::request_line(
+                    &self.url,
+                    crate::http::keep_alive_enabled(),
+                ))?;
                 self.on_reused = false;
-                self.sock = Some(transport.stats());
+                let stats = transport.stats();
+                self.sock_baseline = stats.totals();
+                self.sock = Some(stats);
                 self.connected_at = Some(Instant::now());
                 self.transport = Some(transport);
                 self.enter(Stage::Head);
@@ -518,10 +540,10 @@ impl Fetch {
     /// when the server is answering perfectly, so testing plaintext here would abandon healthy
     /// connections.
     fn silent_too_long(&self) -> bool {
-        use core::sync::atomic::Ordering::Relaxed;
         let Some(since) = self.connected_at else { return false };
         let Some(sock) = self.sock.as_ref() else { return false };
-        sock.read_bytes.load(Relaxed) == 0 && since.elapsed() > SILENT_PEER_TIMEOUT
+        // Bytes received since THIS request began — see `sock_baseline`.
+        sock.read_bytes_since(self.sock_baseline.0) == 0 && since.elapsed() > SILENT_PEER_TIMEOUT
     }
 
     /// Whether we are still shaking hands, or waiting on the reply.

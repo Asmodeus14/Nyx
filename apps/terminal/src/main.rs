@@ -1969,6 +1969,47 @@ impl TerminalApp {
         }
     }
 
+    /// `keepalive [on|off]` — switch HTTP connection reuse at runtime.
+    ///
+    /// A debug switch, deliberately: every hardware test here costs a power cycle, so deciding
+    /// whether a feature helps by building it twice costs two. Keep-alive is currently *suspected of
+    /// making things worse* — three back-to-back fetches ran 45 s, 30 s and 25 s against 12.5 s for
+    /// an isolated one — and with this the comparison is four commands in one boot:
+    ///
+    /// ```text
+    /// keepalive off ; get <url> ; get <url>
+    /// keepalive on  ; get <url> ; get <url>
+    /// ```
+    fn do_keepalive(&mut self, arg: &str) {
+        match arg {
+            "" => {
+                let state = if nyx_net::http::keep_alive_enabled() { "on" } else { "off" };
+                self.output_history
+                    .push_str(&format!("keepalive is {state} (usage: keepalive on|off)
+"));
+            }
+            "on" | "off" => {
+                let on = arg == "on";
+                nyx_net::http::set_keep_alive(on);
+                self.output_history.push_str(&format!(
+                    "keepalive {arg} — {}
+",
+                    if on {
+                        "connections may be reused between requests"
+                    } else {
+                        // set_keep_alive(false) also drops whatever is currently held, so the very
+                        // next `get` dials fresh rather than inheriting a connection from before.
+                        "every request dials a fresh connection; any held one was closed"
+                    }
+                ));
+            }
+            other => self
+                .output_history
+                .push_str(&format!("keepalive: expected on|off, got {other:?}
+")),
+        }
+    }
+
     // D4: `toolchains` — enumerate the registry's installed language backends. This is the single
     // place the terminal learns what languages it can build; adding one is a one-line change in
     // Registry::with_defaults(), no terminal edit needed.
@@ -2223,6 +2264,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  find <text>       - search THIS PAGE (not the scrollback)   next | n - the following hit\n");
                 self.output_history.push_str("  reader            - drop nav/sidebar/footer chrome, re-render with no refetch\n");
                 self.output_history.push_str("  page              - re-print the loaded page   stop - abandon a load in flight\n");
+                self.output_history.push_str("  keepalive on|off  - reuse connections between requests (debug switch; off dials fresh)\n");
                 self.output_history.push_str("  Up / Down arrows  - command history (there is no Ctrl-R on this machine)\n");
                 self.output_history.push_str("  dns <host>        - resolve a name, with timing (says WHY a lookup failed)\n");
                 self.output_history.push_str("  dns cache | flush - what is cached / drop it (do this after joining a new network)\n");
@@ -2299,6 +2341,8 @@ impl NyxApp for TerminalApp {
                 self.do_reader();
             } else if cmd == "stop" {
                 self.do_stop();
+            } else if cmd == "keepalive" || cmd.starts_with("keepalive ") {
+                self.do_keepalive(cmd["keepalive".len()..].trim());
             } else if cmd == "page" {
                 // Re-print what is already loaded, for when the page has scrolled out of reach.
                 self.render_current();

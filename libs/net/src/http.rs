@@ -302,6 +302,36 @@ pub struct SockStats {
 }
 
 impl SockStats {
+    /// `(read_bytes, write_bytes)` right now — a baseline a caller can subtract later.
+    ///
+    /// These counters live for the life of the CONNECTION, not the request, so anything reporting
+    /// per-request numbers on a kept-alive socket must difference them. See `Fetch::sock_baseline`.
+    pub fn totals(&self) -> (usize, usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (self.read_bytes.load(Relaxed), self.write_bytes.load(Relaxed))
+    }
+
+    /// Bytes received since `baseline`. Saturating, because a connection that was reset underneath
+    /// us could in principle hand back a smaller figure, and a panic in a diagnostic is absurd.
+    pub fn read_bytes_since(&self, baseline: usize) -> usize {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.read_bytes.load(Relaxed).saturating_sub(baseline)
+    }
+
+    /// The same one-line summary, counted from `baseline` rather than from the connection's birth.
+    pub fn summary_since(&self, baseline: (usize, usize)) -> String {
+        use core::sync::atomic::Ordering::Relaxed;
+        format!(
+            "sock[rd={}/{}B wr={}/{}B to={} errno={}]",
+            self.reads.load(Relaxed),
+            self.read_bytes.load(Relaxed).saturating_sub(baseline.0),
+            self.writes.load(Relaxed),
+            self.write_bytes.load(Relaxed).saturating_sub(baseline.1),
+            self.timeouts.load(Relaxed),
+            self.last_errno.load(Relaxed),
+        )
+    }
+
     pub fn summary(&self) -> String {
         use core::sync::atomic::Ordering::Relaxed;
         format!(
@@ -514,6 +544,31 @@ pub(crate) struct Idle {
 
 static IDLE: std::sync::Mutex<Option<Idle>> = std::sync::Mutex::new(None);
 
+/// Whether connection reuse is enabled at all.
+///
+/// ★ A runtime switch rather than a build-time one, and the reason is the machine: there is no QEMU
+/// here, so every experiment costs a power cycle. Bisecting a suspect feature by rebuilding twice
+/// costs two. This makes it `keepalive off; get; get` against `keepalive on; get; get` inside a
+/// single boot.
+///
+/// It exists because keep-alive is currently *suspected of making things worse* — three back-to-back
+/// fetches ran 45 s (deadline), 30 s and 25 s against 12.5 s for an isolated one — and a feature
+/// under suspicion should be cheap to switch off.
+static KEEP_ALIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Turn connection reuse on or off. Also drops any connection currently held, so switching off
+/// takes effect immediately rather than after the next request.
+pub fn set_keep_alive(on: bool) {
+    KEEP_ALIVE.store(on, core::sync::atomic::Ordering::Relaxed);
+    if !on {
+        close_idle();
+    }
+}
+
+pub fn keep_alive_enabled() -> bool {
+    KEEP_ALIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// How long a kept connection is trusted before being dropped unused.
 ///
 /// Servers close idle connections on their own schedule — commonly 5 to 60 seconds — and without
@@ -526,6 +581,9 @@ const IDLE_MAX: Duration = Duration::from_secs(15);
 /// Matched on scheme AND host AND port. Scheme is part of the identity: an http and an https
 /// connection to the same host:port are not interchangeable — one is wrapped in TLS.
 pub(crate) fn take_idle(url: &Url) -> Option<Transport> {
+    if !keep_alive_enabled() {
+        return None;
+    }
     let mut slot = IDLE.lock().ok()?;
     let ok = match slot.as_ref() {
         Some(i) => {
@@ -550,6 +608,9 @@ pub(crate) fn take_idle(url: &Url) -> Option<Transport> {
 /// protocol desynchronisation, which produces garbage that reads like a parser bug rather than like
 /// a connection bug. `Fetch::finish` is the only caller, and only on the framed-and-complete path.
 pub(crate) fn put_idle(url: &Url, transport: Transport) {
+    if !keep_alive_enabled() {
+        return; // dropping `transport` here closes it, which is the whole intent
+    }
     if let Ok(mut slot) = IDLE.lock() {
         *slot = Some(Idle {
             transport,
@@ -956,6 +1017,64 @@ pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// ★ The stale-counter defect, as pure logic.
+    ///
+    /// `SockStats` lives with the CONNECTION, so on a reused one `read_bytes` is already non-zero
+    /// before the request starts. The silent-peer watchdog tested `read_bytes == 0`, which is then
+    /// false forever — so the watchdog was dead on exactly the connections most likely to be
+    /// half-dead, and such a fetch ran to the 45 s whole-request deadline instead of being retried
+    /// after ten. Differencing against a per-request baseline is what makes it fire again.
+    #[test]
+    fn silent_peer_is_detected_on_a_reused_connection() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let stats = SockStats::default();
+
+        // A previous request on this connection moved real traffic.
+        stats.read_bytes.store(8192, Relaxed);
+        stats.write_bytes.store(300, Relaxed);
+        let baseline = stats.totals();
+        assert_eq!(baseline, (8192, 300));
+
+        // This request has been answered with nothing. The old test could not see that.
+        assert_ne!(stats.read_bytes.load(Relaxed), 0, "the pre-fix condition, for contrast");
+        assert_eq!(stats.read_bytes_since(baseline.0), 0, "but nothing arrived for THIS request");
+
+        // One byte back and the peer is no longer silent.
+        stats.read_bytes.store(8193, Relaxed);
+        assert_eq!(stats.read_bytes_since(baseline.0), 1);
+    }
+
+    /// The diagnostic line must describe this request, not the connection's whole life.
+    #[test]
+    fn summary_since_reports_the_delta() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let stats = SockStats::default();
+        stats.read_bytes.store(1000, Relaxed);
+        stats.write_bytes.store(100, Relaxed);
+        let baseline = stats.totals();
+        stats.read_bytes.store(1500, Relaxed);
+        stats.write_bytes.store(180, Relaxed);
+
+        let s = stats.summary_since(baseline);
+        assert!(s.contains("rd=0/500B"), "{s}");
+        assert!(s.contains("wr=0/80B"), "{s}");
+        assert!(stats.summary().contains("1500B"), "the cumulative form still exists");
+    }
+
+    /// Turning reuse off must actually stop a connection being handed out, and must drop the one
+    /// being held — otherwise `keepalive off` only takes effect one request late, which is useless
+    /// for a bisect.
+    #[test]
+    fn keep_alive_toggle_gates_the_idle_slot() {
+        assert!(keep_alive_enabled(), "reuse is on by default");
+        set_keep_alive(false);
+        assert!(!keep_alive_enabled());
+        let url = Url::parse("https://example.com/").unwrap();
+        assert!(take_idle(&url).is_none(), "nothing is handed out while off");
+        set_keep_alive(true);
+        assert!(keep_alive_enabled());
+    }
+
     use super::*;
 
     #[test]
