@@ -17,6 +17,31 @@ pub static WIFI_DRIVER: Mutex<Option<crate::drivers::net::iwlwifi::IntelWifiDriv
 pub static WIFI_IFACE: Mutex<Option<Interface>> = Mutex::new(None);
 pub static WIFI_SOCKETS: Mutex<Option<SocketSet<'static>>> = Mutex::new(None);
 pub static WIFI_DNS_HANDLE: Mutex<Option<SocketHandle>> = Mutex::new(None);
+/// smoltcp's DHCP client for the WiFi link — the thing that RENEWS the lease.
+///
+/// ★ The driver still performs the first exchange itself, over raw 802.11 frames, and that is not
+/// redundant: it is what proves the encrypted link carries traffic AND what calibrates
+/// `rx_desc_size` (see `scan_rx_for_us`), both of which must happen before an IP stack can exist at
+/// all. What it never did was renew — option 51 was not parsed, so the lease was held forever and
+/// the link silently stopped routing when the server expired it.
+///
+/// So the two are sequential, never concurrent: the driver bootstraps, smoltcp takes over. The
+/// original objection to a smoltcp DHCP socket — "two clients bidding for the same MAC" — applies
+/// to running them at the same time, which this does not do. The server hands the same address back
+/// to the same MAC, so the handover is invisible.
+pub static WIFI_DHCP_HANDLE: Mutex<Option<SocketHandle>> = Mutex::new(None);
+/// Whether smoltcp's DHCP client has ever produced a configuration for this link.
+///
+/// ★ Guards against its OPENING event. A freshly created `dhcpv4::Socket` emits `Deconfigured` on
+/// its first poll — it is announcing "you have no lease from me yet", not reporting that one was
+/// lost. Acting on that tore down the static bootstrap lease the driver had just negotiated, which
+/// left the interface with no source address while the boot-proof DNS query was still pending, and
+/// smoltcp's DNS dispatch does `cx.get_source_address(dst).unwrap()`. That is a KERNEL PANIC, and
+/// it is how this was found.
+///
+/// So `Deconfigured` is only honoured once a `Configured` has actually been seen.
+static WIFI_DHCP_CONFIGURED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static WIFI_DNS_QUERY: Mutex<Option<smoltcp::socket::dns::QueryHandle>> = Mutex::new(None);
 static WIFI_DNS_TRIES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static NET_IFACE: Mutex<Option<Interface>> = Mutex::new(None);
@@ -123,6 +148,64 @@ pub fn wifi_end() {
 }
 
 /// The LinkState from the last published snapshot, for callers that couldn't run.
+/// The WiFi RX parser's counters: `(seen, passed, amsdu, nosnap)`, or zeros if there is no adapter.
+///
+/// `try_lock` on purpose: this is a diagnostic, and a diagnostic that can block behind `poll_wifi`
+/// would be able to wedge the caller it is meant to be explaining.
+pub fn wifi_rx_counters() -> (u32, u32, u32, u32) {
+    match WIFI_DRIVER.try_lock() {
+        Some(g) => g.as_ref().map(|w| w.rx_counters()).unwrap_or((0, 0, 0, 0)),
+        None => (0, 0, 0, 0),
+    }
+}
+
+/// Copy the captured NOSNAP frame headers out. Returns how many 40-byte records are valid.
+pub fn wifi_nosnap_dump(out: &mut [u8; 160]) -> u32 {
+    match WIFI_DRIVER.try_lock() {
+        Some(g) => match g.as_ref() {
+            Some(w) => {
+                let (buf, n) = w.rx_nosnap_dump();
+                out.copy_from_slice(buf);
+                n
+            }
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// The WiFi RX ring's hardware state: `(read_ptr, closed, handed, badsig, runaway)`.
+pub fn wifi_rx_ring_state() -> (u32, u32, u32, u32, u32) {
+    match WIFI_DRIVER.try_lock() {
+        Some(g) => g.as_ref().map(|w| w.rx_ring_state()).unwrap_or((0, 0, 0, 0, 0)),
+        None => (0, 0, 0, 0, 0),
+    }
+}
+
+/// Throughput counters: `(tx_frames, tx_bytes, tx_nospace, rx_bytes)`.
+pub fn wifi_traffic() -> (u32, u32, u32, u32) {
+    match WIFI_DRIVER.try_lock() {
+        Some(g) => g.as_ref().map(|w| w.traffic()).unwrap_or((0, 0, 0, 0)),
+        None => (0, 0, 0, 0),
+    }
+}
+
+/// Where the RX parser located each payload: `(desc_hit, scan_hit, undecrypted)`.
+pub fn wifi_parse_stats() -> (u32, u32, u32) {
+    match WIFI_DRIVER.try_lock() {
+        Some(g) => g.as_ref().map(|w| w.rx_parse_stats()).unwrap_or((0, 0, 0)),
+        None => (0, 0, 0),
+    }
+}
+
+/// `(desc_size, claimed_hdr, true_hdr, lease_remaining_secs)`.
+pub fn wifi_offsets() -> (u32, u32, u32, u32) {
+    match WIFI_DRIVER.try_lock() {
+        Some(g) => g.as_ref().map(|w| w.rx_offsets()).unwrap_or((0, 0, 0, 0)),
+        None => (0, 0, 0, 0),
+    }
+}
+
 pub fn wifi_cached_state() -> u32 {
     // Masked for the same reason as the publish below: this is reachable from both sides of the
     // preemption boundary, and the read is two words.
@@ -464,10 +547,12 @@ fn drain_reaps(stack: NetStack, gen: u64, sockets: &mut SocketSet<'static>) {
     }
 }
 
-/// Bring the WiFi link up as an IP interface, using the lease the driver already negotiated with
-/// its own DHCP exchange. Configuring statically (rather than adding a smoltcp DHCP socket) avoids
-/// two DHCP clients bidding for the same MAC, and means any traffic that flows is proof the
-/// 802.11⟷802.3 translation is correct. Called once, after connect() reports a lease.
+/// Bring the WiFi link up as an IP interface.
+///
+/// Seeded with the lease the driver already negotiated, so connectivity is immediate and any traffic
+/// that flows is proof the 802.11⟷802.3 translation is correct — then a smoltcp DHCP socket is
+/// added to own the lease from here on, which is what makes it RENEW. See `WIFI_DHCP_HANDLE`.
+/// Called once, after connect() reports a lease.
 pub fn init_wifi_iface() {
     use smoltcp::iface::Config;
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
@@ -482,6 +567,9 @@ pub fn init_wifi_iface() {
     let prefix = mask.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
 
     let mut config = Config::new();
+    // smoltcp derives TCP initial sequence numbers and DNS query IDs from this. At its default of
+    // 0 both are identical on every boot — see random::seed_u64.
+    config.random_seed = crate::random::seed_u64();
     config.hardware_addr = Some(HardwareAddress::Ethernet(
         EthernetAddress::from_bytes(&driver.mac_addr)));
     let mut iface = Interface::new(config, driver);
@@ -502,6 +590,11 @@ pub fn init_wifi_iface() {
         Ipv4Address::new(server[0], server[1], server[2], server[3]))];
     let mut sockets = SocketSet::new(alloc::vec![]);
     let dns_handle = sockets.add(DnsSocket::new(&servers[..], alloc::vec![]));
+    // The renewing DHCP client. It will run its own DISCOVER/REQUEST and be handed the same address
+    // back (same MAC), after which it owns T1/T2 and the lease can no longer silently expire.
+    let dhcp_handle = sockets.add(smoltcp::socket::dhcpv4::Socket::new());
+    *WIFI_DHCP_HANDLE.lock() = Some(dhcp_handle);
+    WIFI_DHCP_CONFIGURED.store(false, Ordering::Relaxed);
     WIFI_DNS_TRIES.store(0, Ordering::Relaxed);   // P8: reset per connect, not per boot
 
     {
@@ -538,9 +631,45 @@ pub fn teardown_wifi_iface() {
     WIFI_IFACE_UP.store(false, Ordering::Release);
     *WIFI_DNS_QUERY.lock() = None;
     *WIFI_DNS_HANDLE.lock() = None;
+    *WIFI_DHCP_HANDLE.lock() = None;
     *WIFI_SOCKETS.lock() = None;
     *WIFI_IFACE.lock() = None;
     crate::serial_println!("[WIFI] P8: IP interface torn down.");
+}
+
+/// ★★ Make smoltcp's DNS `unwrap()` unreachable, for either stack.
+///
+/// `socket/dns.rs:588` dispatches with `cx.get_source_address(dst).unwrap()` — carrying its own
+/// "TODO remove unwrap" — and that returns `None` whenever the interface holds no address in the
+/// destination's family. It is a **kernel panic reached from ordinary idle-task polling**, and it
+/// has now fired twice by two different routes: a lookup issued before DHCP granted a lease, and a
+/// lease torn down while a query was still in flight.
+///
+/// Guarding the syscall was not enough, because the syscall is not the only thing that starts a
+/// query — `init_wifi_iface` and the retry inside `poll_wifi` both do too, and a future caller
+/// would inherit the same trap.
+///
+/// So gate the socket rather than the callers. With an empty server list smoltcp's own dispatch
+/// takes the branch above the unwrap — `if pq.server_idx >= servers.len() { set Failure; continue }`
+/// — and fails every pending query cleanly through a path it already supports. No address means no
+/// DNS, which is simply true; the servers are restored when a lease configures one.
+fn gate_dns_on_source_address(
+    iface: &Interface,
+    sockets: &mut SocketSet<'static>,
+    dns_handle: SocketHandle,
+    tag: &str,
+) {
+    let has_source = iface.ip_addrs().iter().any(|cidr| match cidr.address() {
+        smoltcp::wire::IpAddress::Ipv4(v4) => !v4.is_unspecified(),
+        _ => false,
+    });
+    if has_source {
+        return;
+    }
+    let sock = sockets.get_mut::<DnsSocket>(dns_handle);
+    // `update_servers(&[])` also drops any query still waiting on the old list.
+    sock.update_servers(&[]);
+    let _ = tag;
 }
 
 /// Drive the WiFi interface. Mirrors poll_network() but touches only the WIFI_* statics, so it can
@@ -581,7 +710,67 @@ pub fn poll_wifi() {
         let tsc_mhz = crate::time::TSC_MHZ.load(Ordering::Relaxed).max(1);
         let timestamp = Instant::from_millis((tsc / (tsc_mhz * 1000)) as i64);
 
+        gate_dns_on_source_address(iface, sockets, *dns_handle, "WIFI");
+
         let _ = iface.poll(timestamp, driver, sockets);
+
+        // ── Lease maintenance ───────────────────────────────────────────────────────────────────
+        //
+        // Read the DHCP socket's events and apply them, exactly as the wired path does. This is
+        // what renews the lease: smoltcp owns T1/T2 internally and re-requests on its own schedule,
+        // so the address, gateway and DNS server stay current for as long as the link is up.
+        //
+        // ⚠️ `Deconfigured` really does drop the address and the default route. That is correct —
+        // an expired lease is not ours to keep using — and it is a behaviour change: previously the
+        // lease never expired because nothing tracked it, so the link would keep trying to use a
+        // dead address forever.
+        if let Some(dhcp_handle) = *WIFI_DHCP_HANDLE.lock() {
+            let event = sockets
+                .get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle)
+                .poll();
+            match event {
+                Some(smoltcp::socket::dhcpv4::Event::Configured(cfg)) => {
+                    crate::serial_println!("[WIFI] DHCP: lease configured/renewed {}", cfg.address);
+                    WIFI_DHCP_CONFIGURED.store(true, Ordering::Relaxed);
+                    iface.update_ip_addrs(|addrs| {
+                        addrs.clear();
+                        let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(cfg.address));
+                    });
+                    // Replace rather than add: `add_default_ipv4_route` on a full table would
+                    // otherwise fail silently and leave the old gateway in place.
+                    iface.routes_mut().remove_default_ipv4_route();
+                    if let Some(r) = cfg.router {
+                        let _ = iface.routes_mut().add_default_ipv4_route(r);
+                    }
+                    if !cfg.dns_servers.is_empty() {
+                        let list: alloc::vec::Vec<smoltcp::wire::IpAddress> = cfg
+                            .dns_servers
+                            .iter()
+                            .map(|s| smoltcp::wire::IpAddress::Ipv4(*s))
+                            .collect();
+                        sockets
+                            .get_mut::<DnsSocket>(*dns_handle)
+                            .update_servers(&list[..]);
+                    }
+                }
+                Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
+                    // Only meaningful after a real lease. Before that it is the socket's opening
+                    // announcement, and obeying it would destroy the driver's bootstrap lease —
+                    // see WIFI_DHCP_CONFIGURED.
+                    if WIFI_DHCP_CONFIGURED.load(Ordering::Relaxed) {
+                        crate::serial_println!("[WIFI] DHCP: lease LOST — dropping address and route.");
+                        WIFI_DHCP_CONFIGURED.store(false, Ordering::Relaxed);
+                        iface.update_ip_addrs(|addrs| addrs.clear());
+                        iface.routes_mut().remove_default_ipv4_route();
+                    } else {
+                        crate::serial_println!(
+                            "[WIFI] DHCP: client starting (keeping the driver's bootstrap lease)."
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
 
         // Report the DNS answer. A failure here is almost always "nothing came back", so retry a
         // few times before giving up — and print the Device counters, which say whether the link
@@ -699,10 +888,14 @@ fn poll_network_locked() {
         let tsc_mhz = crate::time::TSC_MHZ.load(Ordering::Relaxed);
         let time_ms = tsc / (tsc_mhz * 1000); 
         
-        let timestamp = Instant::from_millis(time_ms as i64); 
-        
+        let timestamp = Instant::from_millis(time_ms as i64);
+
+        // Same trap as the WiFi path: this stack's DHCP `Deconfigured` arm clears the address, and a
+        // DNS query in flight across that moment would reach smoltcp's unguarded unwrap.
+        gate_dns_on_source_address(iface, sockets, *dns_handle, "NET");
+
         let _ = iface.poll(timestamp, driver, sockets);
-        
+
         //  THE FIX: Extract DHCP config FIRST, drop the lock, THEN apply it!
         let mut dhcp_config = None;
         let mut dhcp_deconfig = false;
