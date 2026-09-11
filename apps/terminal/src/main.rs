@@ -96,9 +96,18 @@ fn term_bg() -> u32 {
 /// JetBrains Mono's slot in `nyx_gui::font`'s registry.
 const MONO: usize = nyx_meridian::font::SLOT_MONO;
 
-/// How much of a page goes into the scrollback. The history is one `String` that the draw path
-/// walks every frame, so an unbounded paste of a 500 KB page makes the terminal itself unusable.
-const MAX_PAGE_CHARS: usize = 8000;
+/// How much of a page goes into the scrollback.
+///
+/// This was 8000 — about two screens — because the scrollback was one `String` that the draw path
+/// re-walked and re-allocated every frame, so a big page really did make the terminal unusable. Now
+/// that the scrollback is lines and the wrap is cached, the per-frame cost is proportional to the
+/// ~15 lines actually on screen and not to the history, so a whole page is affordable and the
+/// truncation that used to be a necessity is just an amputation.
+///
+/// It is still bounded, because `MAX_BODY` in `libs/net` allows an 8 MB response and a machine with
+/// no OOM killer should not try to lay all of that out. 400 000 characters is past the end of
+/// essentially every real document.
+const MAX_PAGE_CHARS: usize = 400_000;
 
 /// Truncate on a CHARACTER boundary. `&s[..n]` panics mid-UTF-8, and page text is full of
 /// multi-byte punctuation (curly quotes, em dashes) — so a byte cut is not a rare edge case here.
@@ -113,6 +122,41 @@ fn clip(s: &str, max: usize) -> String {
 const SYS_SET_REALTIME_OFFSET: u64 = 550;
 /// Syscall 551: leave a one-byte breadcrumb in CMOS that survives a freeze and the power cycle.
 const SYS_DEBUG_MARK: u64 = 551;
+/// Unix time at which this image was built, the floor for any clock `time sync` will accept.
+///
+/// Derived from `NYX_BUILD_STAMP` at compile time when it parses, with a conservative fallback of
+/// 2025-01-01 — the same date `date` already uses to decide a clock is implausibly old.
+const BUILD_UNIX: i64 = match option_env!("NYX_BUILD_UNIX") {
+    Some(s) => match konst_parse_i64(s) {
+        Some(v) => v,
+        None => 1_735_689_600,
+    },
+    None => 1_735_689_600,
+};
+
+/// How far past the build stamp a reported time may be before it is refused. Twenty years: long
+/// enough that an old image still syncs, short enough to catch a clock pushed far forward.
+const MAX_CLOCK_AHEAD_SECS: i64 = 20 * 365 * 24 * 3600;
+
+/// `str::parse` is not const, and this needs to run in a `const` initialiser.
+const fn konst_parse_i64(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let mut acc: i64 = 0;
+    while i < b.len() {
+        let d = b[i];
+        if d < b'0' || d > b'9' {
+            return None;
+        }
+        acc = acc * 10 + (d - b'0') as i64;
+        i += 1;
+    }
+    Some(acc)
+}
+
 /// Syscall 552: write the battery-backed RTC, so a clock fix survives a reboot.
 const SYS_SET_RTC: u64 = 552;
 /// Syscall 553/554: read/persist the DISPLAY timezone, in minutes east of UTC.
@@ -241,18 +285,293 @@ fn clip_line(s: &str, max: usize) -> String {
     }
 }
 
+/// Split one logical line into display lines of at most `cols` characters, breaking at spaces.
+///
+/// JetBrains Mono is fixed-pitch, so this is arithmetic on character counts rather than a per-glyph
+/// advance lookup — `advance_px_face` takes a mutex per call, and this runs over the whole history.
+///
+/// Chunks by `chars()`, never by byte index: page text is full of curly quotes and em dashes, so a
+/// byte cut is a routine panic here rather than an edge case (the same reason `clip` exists).
+///
+/// Two behaviours worth naming, both of which only matter now that the terminal renders prose:
+///
+/// * The break goes at the last space that fits, not at column `cols`. Chopping mid-word is fine for
+///   a hex dump and unreadable for a paragraph. A word longer than the whole line — a URL, which is
+///   most of what `links` prints — still hard-breaks, because the alternative is a line that runs
+///   off the edge.
+/// * Continuations are indented to hang under the text they continue, so a wrapped bullet stays
+///   visibly one bullet instead of starting a new column of text at the margin.
+fn wrap_logical_line(logical: &str, cols: usize, out: &mut Vec<String>) {
+    if logical.is_empty() {
+        out.push(String::new());
+        return;
+    }
+
+    let chars: Vec<char> = logical.chars().collect();
+    if chars.len() <= cols {
+        out.push(logical.to_string());
+        return;
+    }
+
+    // Never let the hanging indent eat so much of the line that there is no room left to wrap into.
+    let indent = hanging_indent(&chars).min(cols / 2);
+    let mut start = 0usize;
+    let mut prefix = 0usize;
+
+    while start < chars.len() {
+        let budget = cols.saturating_sub(prefix).max(1);
+        if chars.len() - start <= budget {
+            out.push(indent_of(prefix) + &chars[start..].iter().collect::<String>());
+            return;
+        }
+
+        // The break point: the last space within budget. `budget` itself is a legal break, since
+        // breaking *at* a space consumes it rather than pushing a character past the edge.
+        let window_end = start + budget;
+        let brk = (start + 1..=window_end).rev().find(|&i| chars[i - 1] == ' ');
+
+        let (cut, resume) = match brk {
+            // A word longer than the line has no break point; take the hard cut rather than
+            // letting the line run off the edge.
+            None => (window_end, window_end),
+            Some(i) => (i - 1, i),
+        };
+        out.push(indent_of(prefix) + &chars[start..cut].iter().collect::<String>());
+
+        // Leading spaces on the continuation are the ones the break consumed; they are not content.
+        start = resume;
+        while start < chars.len() && chars[start] == ' ' {
+            start += 1;
+        }
+        prefix = indent;
+    }
+}
+
+fn indent_of(n: usize) -> String {
+    " ".repeat(n)
+}
+
+/// How far a wrapped continuation should be indented to hang under its first line.
+///
+/// The leading whitespace, plus the width of a list bullet or quote marker if one is there — those
+/// are the markers `nyx_htmltext` emits, and a continuation that starts under the bullet rather than
+/// under the text reads as a second item.
+fn hanging_indent(chars: &[char]) -> usize {
+    let lead = chars.iter().take_while(|c| **c == ' ').count();
+    let rest = &chars[lead..];
+    let marker = if rest.starts_with(&['•', ' ']) || rest.starts_with(&['>', ' ']) {
+        2
+    } else {
+        // "1. ", "12. " — an ordered-list marker of any width.
+        let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 && rest.get(digits) == Some(&'.') && rest.get(digits + 1) == Some(&' ') {
+            digits + 2
+        } else {
+            0
+        }
+    };
+    lead + marker
+}
+
+/// The scrollback, stored as lines rather than as one `String`.
+///
+/// It used to be a single `String` that the draw path re-split, re-walked and re-allocated into a
+/// fresh `Vec<String>` on every frame — and that was described in a comment as safe because "the
+/// history is capped at `MAX_PAGE_CHARS`". It was not: `MAX_PAGE_CHARS` caps *one page*, and nothing
+/// capped the total. Ten pages left an 80 000-character history, `acpi log` adds 16 KB in a single
+/// command, and the per-frame cost grew with all of it forever.
+///
+/// Two things follow from storing lines. The wrap can be cached against [`Scrollback::revision`],
+/// because a frame that changed nothing can now prove it changed nothing. And the history can be
+/// bounded, because there is something countable to bound.
+///
+/// The last element is always the line currently being written to; `push_str` starts a new one at
+/// each `\n`. That keeps the append-only API (`push_str`, `push`, `clear`) the ~200 existing call
+/// sites already use, so none of them had to change.
+struct Scrollback {
+    lines: Vec<String>,
+    /// Bumped on every mutation. The draw path compares it to decide whether its wrap is still good.
+    revision: u64,
+}
+
+/// How many logical lines of scrollback survive. Generous — trimming shifts everything above the
+/// view, and a jump while you are reading is worse than the memory it saves — but finite, which is
+/// the part that matters.
+const MAX_SCROLLBACK_LINES: usize = 12000;
+
+impl Scrollback {
+    fn new(initial: &str) -> Scrollback {
+        let mut s = Scrollback { lines: vec![String::new()], revision: 0 };
+        s.push_str(initial);
+        s
+    }
+
+    fn push_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        for (i, part) in s.split('\n').enumerate() {
+            if i > 0 {
+                self.lines.push(String::new());
+            }
+            if !part.is_empty() {
+                // `lines` is never empty: `new` seeds it and `clear` re-seeds it.
+                self.lines.last_mut().unwrap().push_str(part);
+            }
+        }
+        self.trim();
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn push(&mut self, c: char) {
+        if c == '\n' {
+            self.lines.push(String::new());
+            self.trim();
+        } else {
+            self.lines.last_mut().unwrap().push(c);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.lines.push(String::new());
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// True when the open line has nothing on it — i.e. output is at the start of a fresh line.
+    fn at_line_start(&self) -> bool {
+        self.lines.last().map(|l| l.is_empty()).unwrap_or(true)
+    }
+
+    fn trim(&mut self) {
+        if self.lines.len() > MAX_SCROLLBACK_LINES {
+            // One `drain` rather than repeated `remove(0)`, which is quadratic in the overflow.
+            let excess = self.lines.len() - MAX_SCROLLBACK_LINES;
+            self.lines.drain(..excess);
+        }
+    }
+}
+
+/// A page, kept whole.
+///
+/// The whole point of holding it rather than only printing it: `find` needs something to search,
+/// `reader` needs something to re-render without going back to the network, and `open <n>` needs the
+/// links and the base to still be around after the user has scrolled past them.
+struct LoadedPage {
+    /// Where the body actually came from, AFTER redirects. Relative links resolve against this
+    /// rather than against what was typed — an href on a page reached through a 301 is relative to
+    /// where the page came FROM, not to where we asked.
+    url: String,
+    title: String,
+    text: String,
+    links: Vec<nyx_htmltext::Link>,
+    /// `<base href>` if the document declared one. Overrides `url` for link resolution, which is
+    /// what the HTML standard says and what the sites that use it depend on.
+    base: Option<String>,
+    /// The raw body, kept so `reader` can re-render without a second request.
+    source: String,
+    /// False for a body that was not markup — JSON, plain text — which is shown verbatim.
+    is_html: bool,
+}
+
+/// Session state for browsing: where we have been, and where we are in it.
+#[derive(Default)]
+struct Browser {
+    /// Visited URLs, oldest first. `back` and `forward` move `pos` within it.
+    history: Vec<String>,
+    /// Index into `history` of the page being shown. Meaningless when `history` is empty.
+    pos: usize,
+    page: Option<LoadedPage>,
+    /// Whether to drop navigation chrome when rendering. Persists across pages, because a reader who
+    /// wants the article on one page wants it on the next.
+    reader: bool,
+    /// The last `find` term and how far through the page it has got, so `next` has a meaning.
+    find_term: String,
+    find_from: usize,
+}
+
+impl Browser {
+    /// The URL relative links on the current page resolve against.
+    fn base_url(&self) -> Option<&str> {
+        let page = self.page.as_ref()?;
+        Some(page.base.as_deref().unwrap_or(page.url.as_str()))
+    }
+
+    /// Record a visit. Navigating after going back truncates the forward entries, exactly as a
+    /// browser does — the forward history is a branch you left, not a queue.
+    fn visit(&mut self, url: &str) {
+        if !self.history.is_empty() && self.history.get(self.pos).map(String::as_str) == Some(url) {
+            return; // a reload of the same page is not a new history entry
+        }
+        if !self.history.is_empty() {
+            self.history.truncate(self.pos + 1);
+        }
+        self.history.push(url.to_string());
+        self.pos = self.history.len() - 1;
+    }
+}
+
+/// What a completed load should do to the history.
+#[derive(Clone, Copy, PartialEq)]
+enum Nav {
+    /// A new destination: push it and drop any forward entries.
+    Push,
+    /// `back`, `forward` or `reload` — `pos` is already where it should be.
+    Keep,
+}
+
+/// A fetch in flight.
+///
+/// `nyx_net::Fetch` has existed since the browser was written and had exactly one caller in the
+/// whole repository: an example. The terminal called the blocking `nyx_net::get` instead, from
+/// inside `on_key`, which is inside the window loop's IPC drain — so for the entire duration of a
+/// page load the window did not repaint, did not blink its cursor, and did not process
+/// `MSG_WINDOW_CLOSE`. It looked alive and could not be closed.
+struct Loading {
+    fetch: Box<nyx_net::Fetch>,
+    /// What the user asked for, for the messages — `fetch.url()` moves as redirects are followed.
+    requested: String,
+    nav: Nav,
+    started: std::time::Instant,
+    /// The link's counters when this load began, so the report can be a DELTA.
+    ///
+    /// Cumulative counters cannot answer "how did THIS transfer go" — the interesting figures are
+    /// frames per KB and bytes per second across one fetch, and both are differences.
+    link_at_start: WifiRing,
+}
+
 struct TerminalApp {
     input_buffer: String,
-    output_history: String,
+    output_history: Scrollback,
     blink_timer: usize,
     cursor_visible: bool,
 
-    /// The URL the last `get` actually landed on, AFTER redirects. `open <n>` resolves against this
-    /// rather than against what was typed: a relative href on a page reached through a 301 is
-    /// relative to where the page came FROM, not to where we asked.
-    current_url: Option<String>,
-    /// Links from the last page, in document order, so `open <n>` has something to mean.
-    links: Vec<nyx_htmltext::Link>,
+    /// Everything about the page being read.
+    browser: Browser,
+    /// The fetch in flight, pumped from `update` once a frame. `None` means nothing is loading.
+    loading: Option<Loading>,
+    /// A line drawn under the scrollback and above the prompt while something is happening.
+    ///
+    /// Deliberately NOT part of the scrollback. A progress line that lives in the history has to be
+    /// the last line to be rewritable, which means nothing else may print while a page loads — so
+    /// either the terminal locks up its own command line for the duration, or the progress report
+    /// scrolls past sixty times a second. Keeping it outside the history costs one branch in the
+    /// wrap and removes the whole problem.
+    status_line: Option<String>,
+
+    /// Commands entered, oldest first, walked with the up and down arrows.
+    ///
+    /// The arrows were previously pushed into the input buffer as literal U+E012/U+E013 glyphs, so
+    /// pressing Up printed a box and retyping the last URL meant retyping the last URL. There is no
+    /// Ctrl on this machine (`HandleControl::Ignore` in the kernel's keyboard), so the arrows are
+    /// the only affordance available for this.
+    cmd_history: Vec<String>,
+    /// Where in `cmd_history` the arrows are. `== len` means "at the live line, not in history".
+    cmd_pos: usize,
+    /// The half-typed line the user was on before they started walking history, so that arrowing all
+    /// the way back down returns it instead of leaving them on an empty prompt.
+    cmd_stash: String,
 
     // ── Scrollback ──────────────────────────────────────────────────────────────────────────
     /// First visible display line. Counted in *wrapped* lines, not logical ones, so it maps
@@ -268,55 +587,103 @@ struct TerminalApp {
     /// here. One frame stale at worst, which is what `apps/notepad` does for the same reason.
     wrapped_len: usize,
     view_rows: usize,
+
+    // ── Wrap cache ──────────────────────────────────────────────────────────────────────────────
+    /// The scrollback split into display lines. Held across frames, because the wrap only changes
+    /// when one of the three things below changes — and while you hold Page Down, none of them do.
+    wrapped: Vec<String>,
+    wrap_cols: usize,
+    wrap_rev: u64,
+    /// The live lines below the scrollback — the loading status, then the prompt — wrapped fresh
+    /// every frame. Kept apart from `wrapped` so that animating them costs two lines of work
+    /// rather than re-wrapping the whole history.
+    tail: Vec<String>,
 }
 
 impl TerminalApp {
     fn new() -> Self {
         Self {
             input_buffer: String::new(),
-            output_history: String::from("NyxOS v0.1 Shell\nType 'help' for commands.\n"),
+            output_history: Scrollback::new("NyxOS v0.1 Shell\nType 'help' for commands.\n"),
             blink_timer: 0,
             cursor_visible: true,
-            current_url: None,
-            links: Vec::new(),
+            browser: Browser::default(),
+            loading: None,
+            status_line: None,
+            cmd_history: Vec::new(),
+            cmd_pos: 0,
+            cmd_stash: String::new(),
             scroll: 0,
             stick_bottom: true,
             wrapped_len: 0,
             view_rows: 1,
+            wrapped: Vec::new(),
+            // `usize::MAX` cols and a revision the scrollback can never be at, so the first frame
+            // always builds rather than trusting an empty cache.
+            wrap_cols: usize::MAX,
+            wrap_rev: u64::MAX,
+            tail: Vec::new(),
         }
     }
 
-    /// Split the scrollback into display lines at `cols` characters.
+    /// Bring [`Self::wrapped`] — the scrollback's wrap — up to date, if it has gone stale.
     ///
-    /// JetBrains Mono is fixed-pitch, so wrapping is arithmetic on character counts rather than a
-    /// per-glyph advance lookup. That matters: the history is capped at `MAX_PAGE_CHARS` and this
-    /// runs every frame, and `advance_px_face` takes a mutex per call.
+    /// It depends on exactly two things: the column count and the scrollback's revision. When
+    /// neither has moved, the previous wrap is still correct and rebuilding it is pure waste. That
+    /// waste used to be the terminal's dominant cost after a page load: a fresh `Vec` of
+    /// freshly-allocated `String`s, one per display line, over the whole history, to then draw the
+    /// ~15 of them that fit on screen.
     ///
-    /// Chunks by `chars()`, never by byte index — page text is full of curly quotes and em dashes,
-    /// so a byte cut is a routine panic here rather than an edge case (same reason `clip` exists).
-    fn wrap_into(&self, cols: usize, out: &mut Vec<String>) {
-        out.clear();
+    /// ★ The input line and the status line are deliberately NOT part of this, and are wrapped
+    /// separately by [`Self::rebuild_tail`]. They are the two things on screen that change most
+    /// often — the input on every keystroke, the status on every frame of a load, because it counts
+    /// milliseconds — and folding them in here would mean re-wrapping twelve thousand lines of
+    /// history sixty times a second to animate one of them. Splitting the cache at the boundary
+    /// between "rarely changes and is enormous" and "changes constantly and is two lines" is the
+    /// whole trick.
+    fn rewrap(&mut self, cols: usize) {
         let cols = cols.max(1);
-        let prompt_line = format!("N> {}", self.input_buffer);
+        if self.wrap_cols == cols && self.wrap_rev == self.output_history.revision {
+            return;
+        }
 
-        for logical in self.output_history.split('\n').chain(core::iter::once(prompt_line.as_str())) {
-            if logical.is_empty() {
-                out.push(String::new());
-                continue;
+        // Taken out and put back so the wrapper can borrow the scrollback while filling it, and so
+        // the `Vec`'s allocation (and each line's) survives from frame to frame.
+        let mut out = core::mem::take(&mut self.wrapped);
+        out.clear();
+        for logical in self.output_history.lines.iter() {
+            wrap_logical_line(logical, cols, &mut out);
+        }
+
+        self.wrapped = out;
+        self.wrap_cols = cols;
+        self.wrap_rev = self.output_history.revision;
+    }
+
+    /// Wrap the two live lines that sit under the scrollback: the loading status, then the prompt.
+    ///
+    /// Rebuilt unconditionally every frame, which is free — it is at most a few display lines.
+    fn rebuild_tail(&mut self, cols: usize) {
+        let cols = cols.max(1);
+        let mut tail = core::mem::take(&mut self.tail);
+        tail.clear();
+        if let Some(status) = self.status_line.as_deref() {
+            // Split on newlines first: `wrap_logical_line` takes ONE logical line and would
+            // otherwise render an embedded '\n' as a glyph. The status is multi-line whenever it is
+            // carrying the loader's diagnostic.
+            for line in status.split('\n') {
+                wrap_logical_line(line, cols, &mut tail);
             }
-            let mut cur = String::new();
-            let mut n = 0usize;
-            for ch in logical.chars() {
-                cur.push(ch);
-                n += 1;
-                if n == cols {
-                    out.push(core::mem::take(&mut cur));
-                    n = 0;
-                }
-            }
-            if n > 0 {
-                out.push(cur);
-            }
+        }
+        wrap_logical_line(&format!("N> {}", self.input_buffer), cols, &mut tail);
+        self.tail = tail;
+    }
+
+    /// The display line at `idx` across the scrollback and the live tail, as one sequence.
+    fn display_line(&self, idx: usize) -> &str {
+        match self.wrapped.get(idx) {
+            Some(l) => l.as_str(),
+            None => self.tail.get(idx - self.wrapped.len()).map(String::as_str).unwrap_or(""),
         }
     }
 
@@ -354,13 +721,52 @@ impl TerminalApp {
                     WIFI_RADIO_OFF => "radio OFF",
                     _ => "unknown",
                 };
+                // The RX parser's counters go on the same line as the lease because they answer the
+                // question the lease cannot: whether frames are arriving and being discarded inside
+                // the driver. `seen` climbing while `passed` does not is a driver bug wearing the
+                // costume of a dead server.
+                // `group` is broadcast/multicast we can never decrypt (GTK, KeyID 1) and never
+                // asked for. `ours` is individually-addressed traffic going missing — the only
+                // figure that can explain a broken TCP transfer, and the one a combined count hid.
+                let (seen, passed, group, nosnap) = sys_wifi_rx_counters();
+                let ours = nosnap.saturating_sub(group);
                 format!(
-                    "wifi: {} ssid={:?} ip={}.{}.{}.{} gw={}.{}.{}.{} dns={}.{}.{}.{}\n",
+                    "wifi: {} ssid={:?} ip={}.{}.{}.{} gw={}.{}.{}.{} dns={}.{}.{}.{}\n\
+                     rx: seen={} passed={} dropped={} (group={} OURS={})\n",
                     state, st.name(),
                     st.ip[0], st.ip[1], st.ip[2], st.ip[3],
                     st.router[0], st.router[1], st.router[2], st.router[3],
                     st.dns[0], st.dns[1], st.dns[2], st.dns[3],
-                )
+                    seen, passed, seen.saturating_sub(passed), group, ours,
+                ) + &{
+                    // The hardware side. `handed` is what the ring gave the parser; `seen` is what
+                    // the parser recognised. And read_ptr vs closed is the comparison the whole RX
+                    // path turns on — they are tested for inequality while living in different
+                    // moduli, so read_ptr climbing past 4095 means every poll claims a frame forever.
+                    let r = sys_wifi_rx_ring();
+                    format!(
+                        "ring: read_ptr={} closed={} handed={} badsig={} runaway={}{}\n\
+                         traffic: tx={} frames/{} KB   rx={} KB   tx_dropped={}\n\
+                         parse: desc={} scan={} undecrypted={} (descsz={} hdr claimed={} true={})\n\
+                         {}",
+                        r.read_ptr, r.closed, r.handed, r.badsig, r.runaway,
+                        if r.read_ptr > 0x0FFF { "   << read_ptr PAST THE RING" } else { "" },
+                        r.tx_frames, r.tx_bytes / 1024, r.rx_bytes / 1024, r.tx_nospace,
+                        r.desc_hit, r.scan_hit, r.undecrypted,
+                        r.desc_size, r.claimed_hdr, r.true_hdr,
+                        // ★ The lease clock. Nothing renews it yet (audit M1), so the only defence
+                        // against a lease quietly expiring is saying so before it does — a link
+                        // that stops routing for no visible reason is the least debuggable failure
+                        // this machine can produce.
+                        match r.lease_secs {
+                            0 => String::new(),
+                            n if n < 120 => {
+                                format!("lease: {n} s left  ** EXPIRING — `wifi join` to renew **\n")
+                            }
+                            n => format!("lease: {} min left\n", n / 60),
+                        },
+                    )
+                }
             }
         }
     }
@@ -431,6 +837,46 @@ impl TerminalApp {
             return;
         }
 
+        // `wifi rx` — the frames the driver threw away.
+        //
+        // Every dropped frame on this link is a NOSNAP, and the counters cannot say why the LLC/SNAP
+        // scan missed. These are the bytes it scanned. `fc1 & 0x40` set means the frame is marked
+        // Protected — if the firmware did not decrypt it in place, there is no SNAP to find at any
+        // offset. `fc1 & 0x80` is the Order bit: a QoS frame with HT Control carries 4 extra header
+        // bytes that `hlen` does not account for.
+        if arg == "rx" {
+            let mut buf = [0u8; 160];
+            let n = sys_wifi_nosnap_dump(&mut buf) as usize;
+            if n == 0 {
+                self.output_history
+                    .push_str("No dropped frames captured (nothing has failed the SNAP scan yet).\n");
+                return;
+            }
+            self.output_history.push_str("Frames dropped by the RX parser (no LLC/SNAP found):\n");
+            for i in 0..n.min(4) {
+                let r = &buf[i * 40..i * 40 + 40];
+                let mpdu = r[4] as u16 | ((r[5] as u16) << 8);
+                self.output_history.push_str(&format!(
+                    "  [{}] fc0={:02x} fc1={:02x} hlen={} ccmp={} len={}{}{}\n",
+                    i + 1, r[0], r[1], r[2], r[3], mpdu,
+                    if r[1] & 0x40 != 0 { " PROTECTED" } else { "" },
+                    if r[1] & 0x80 != 0 { " ORDER(+4 HT ctl)" } else { "" },
+                ));
+                let mut hex = String::from("      ");
+                for (k, b) in r[6..40].iter().enumerate() {
+                    hex.push_str(&format!("{:02x} ", b));
+                    if k == 15 {
+                        hex.push_str("\n      ");
+                    }
+                }
+                self.output_history.push_str(&hex);
+                self.output_history.push('\n');
+            }
+            self.output_history
+                .push_str("  (looking for aa aa 03 00 00 00 within 20 bytes of the header end)\n");
+            return;
+        }
+
         if arg == "on" || arg == "off" {
             let want = arg == "on";
             let got = sys_wifi_set_radio(want) != WIFI_RADIO_OFF;
@@ -491,6 +937,15 @@ impl TerminalApp {
                 _ => "the join did not complete\n",
             });
             if rc == WIFI_CONNECTED {
+                // The new network has its own resolver, and on a captive portal or a split-horizon
+                // corporate DNS it has its own answers for the same names. Carrying the previous
+                // link's addresses across is how a machine ends up unable to reach anything on a
+                // network that works.
+                nyx_net::dns::flush();
+                // Same reasoning for the kept connection: a socket opened on the previous network
+                // is not going to work on this one, and reusing it would cost a failed request and
+                // a retry before we noticed.
+                nyx_net::http::close_idle();
                 // Saved only on success, so the boot agent can never inherit a typo — the same rule
                 // the agent itself follows.
                 if wifi_save_network(ssid, psk) {
@@ -827,6 +1282,46 @@ impl TerminalApp {
         };
         mark(3);
 
+        // ★ Sanity-bound the answer before it is allowed anywhere near the clock.
+        //
+        // This value arrives over PLAIN HTTP and is unauthenticated by construction — it has to be,
+        // because you cannot fetch the time over https when a wrong clock is what breaks https.
+        // But `SystemTime::now()` is the ONLY input to certificate expiry checking, so anyone able
+        // to answer that request could otherwise set this machine's clock at will. Setting it
+        // BACKWARDS is the dangerous direction: it makes expired — and, since there is no CRL or
+        // OCSP here, revoked — certificates look valid again. And the write is persistent (the RTC
+        // is set below), so an attack would survive the power cycle.
+        //
+        // A floor fixes the whole rollback class for one comparison: this build did not exist
+        // before it was compiled, so any "now" earlier than the build stamp is a lie. The ceiling
+        // catches the other direction, where a far-future clock would reject every live
+        // certificate as not-yet-valid and take the machine off https entirely.
+        //
+        // This is not authentication and does not pretend to be. NTS or Roughtime is the real
+        // answer; this bounds the damage in the meantime.
+        if server_unix < BUILD_UNIX {
+            self.output_history.push_str(&format!(
+                "  REFUSED: {} is before this build was compiled ({}).
+                   A clock set backwards makes expired certificates look valid, so this is not
+                   accepted from an unauthenticated source.
+",
+                fmt_unix(server_unix),
+                fmt_unix(BUILD_UNIX)
+            ));
+            mark(0);
+            return;
+        }
+        if server_unix > BUILD_UNIX + MAX_CLOCK_AHEAD_SECS {
+            self.output_history.push_str(&format!(
+                "  REFUSED: {} is more than {} years after this build.
+",
+                fmt_unix(server_unix),
+                MAX_CLOCK_AHEAD_SECS / (365 * 24 * 3600)
+            ));
+            mark(0);
+            return;
+        }
+
         // The offset is computed against the UNCORRECTED clock, so running `time sync` twice does
         // not apply the correction on top of itself.
         let raw = raw_unix_now();
@@ -844,8 +1339,34 @@ impl TerminalApp {
         // you have to reapply after every boot is not a fix.
         if syscall(SYS_SET_RTC, server_unix as u64, 0, 0, 0, 0, 0) == 0 {
             mark(5);
-            self.output_history
-                .push_str("  hardware clock updated — this survives a reboot.\n");
+            // ★ Read the HARDWARE back and report what it holds, rather than asserting success.
+            //
+            // A 0 from the syscall means "the write was issued", not "the clock kept it" — and the
+            // line that used to print here claimed the second while only knowing the first. On this
+            // machine the RTC comes back at 2024 after every power cycle, so that reassurance was
+            // the only thing standing between the user and the truth. Anything that says "this
+            // survives a reboot" had better have checked.
+            let back = sys_get_rtc();
+            self.output_history.push_str(&format!(
+                "  RTC reads back {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n",
+                back.year, back.month, back.day, back.hour, back.min, back.sec
+            ));
+            // The seconds will have moved on; a clock that refused the write comes back years away.
+            let expected_year = fmt_unix(server_unix)
+                .get(..4)
+                .and_then(|y| y.parse::<u16>().ok())
+                .unwrap_or(0);
+            if expected_year != 0 && back.year != expected_year {
+                self.output_history.push_str(
+                    "  ** the RTC did NOT keep it — the write was accepted and the hardware still\n\
+                     \x20    disagrees, so it will be wrong again after a power cycle. Most likely a\n\
+                     \x20    dead CMOS battery or firmware reinitialising the clock; set the date in\n\
+                     \x20    the firmware setup screen to make it stick.\n",
+                );
+            } else {
+                self.output_history
+                    .push_str("  hardware clock updated — verified by reading it back.\n");
+            }
         } else {
             // `as u64` keeps the two's-complement bit pattern; the kernel reads it back as i64, so
             // a clock that is AHEAD (negative offset) corrects just as well as one behind.
@@ -876,10 +1397,48 @@ impl TerminalApp {
     fn do_dns(&mut self, arg: &str) {
         let host = arg.trim();
         if host.is_empty() {
-            self.output_history.push_str("usage: dns <host>\n");
+            self.output_history.push_str("usage: dns <host> | dns cache | dns flush\n");
             return;
         }
+
+        // The cache is worth being able to see and clear. An invisible cache is a thing you will
+        // eventually blame for something it did not do — and a stale one after a network change is
+        // exactly the case where you need to be able to rule it out in one command.
+        if host == "cache" {
+            let entries = nyx_net::dns::cached_hosts();
+            if entries.is_empty() {
+                self.output_history.push_str("DNS cache is empty.\n");
+            } else {
+                self.output_history.push_str("DNS cache:\n");
+                for e in entries {
+                    self.output_history.push_str(&format!("  {e}\n"));
+                }
+            }
+            return;
+        }
+        if host == "flush" {
+            nyx_net::dns::flush();
+            self.output_history.push_str("DNS cache cleared.\n");
+            return;
+        }
+
         self.output_history.push_str(&self.link_summary());
+        // Show EVERY address the resolver gives, not just the one we would dial. A name with one
+        // usable address has no fallback, and that difference is invisible from a single line.
+        let all = nyx_net::dns::lookup_all(host, 80).unwrap_or_default();
+        if all.len() > 1 {
+            self.output_history
+                .push_str(&format!("  ({} addresses cached for this name)
+", all.len()));
+        }
+        if nyx_net::dns::lookup(host, 80).is_some() {
+            // This command deliberately bypasses the cache — it exists to measure the resolver, and
+            // a cache hit measures nothing. Saying so matters because the timing below will not be
+            // what `get` pays for the same name.
+            self.output_history.push_str(
+                "  (this name is cached: `get` would skip the lookup below entirely)\n",
+            );
+        }
 
         let started = std::time::Instant::now();
         // Port 80 is arbitrary — `to_socket_addrs` needs one and DNS does not care.
@@ -924,104 +1483,490 @@ impl TerminalApp {
         // Bare host -> https, matching what every mainstream browser now does. Guessing http costs
         // a whole extra request and DNS lookup on any site that redirects, which is most of them.
         let url = if arg.contains("://") { arg.to_string() } else { format!("https://{arg}") };
-        self.load(&url);
+        self.start_load(&url, Nav::Push);
     }
 
-    /// Fetch `url`, render it, and remember its links for `open`.
-    fn load(&mut self, url: &str) {
-        self.output_history.push_str(&format!("GET {url}\n"));
-        let resp = match nyx_net::get(url) {
-            Ok(r) => r,
-            Err(e) => {
-                self.output_history.push_str(&format!("  failed: {e}\n"));
-                return;
+    /// Begin a page load. Returns immediately; `update` drives it to completion.
+    fn start_load(&mut self, url: &str, nav: Nav) {
+        if self.loading.is_some() {
+            self.output_history
+                .push_str("Already loading. `stop` to cancel it first.\n");
+            return;
+        }
+        match nyx_net::Fetch::new(url) {
+            Ok(f) => {
+                // The link state, up front, exactly as `fetch` and `dns` already do it. A failure
+                // to reach anything is far more often "there is no usable link" than a fault in the
+                // page fetch, and `get` was the one command that hid the answer.
+                let link = self.link_summary();
+                self.output_history.push_str(&link);
+                // Name the commonest cause outright. Until the kernel's resolver learned to refuse
+                // a query with no source address, browsing in this window did not fail — it
+                // PANICKED THE MACHINE, inside smoltcp's DNS dispatch. It is now a clean failure,
+                // but it is still a failure, and "ip=0.0.0.0" in the line above is easy to skim
+                // past when you are looking at a URL.
+                if let Some(st) = sys_wifi_status() {
+                    if st.ip == [0, 0, 0, 0] {
+                        self.output_history.push_str(
+                            "  ** no DHCP lease yet — DNS cannot work until this machine has an\n\
+                             \x20    address. Wait a few seconds after boot, or `wifi` to check.\n",
+                        );
+                    }
+                }
+                self.output_history.push_str(&format!("GET {url}\n"));
+                self.status_line = Some("  starting…".to_string());
+                self.loading = Some(Loading {
+                    fetch: Box::new(f),
+                    requested: url.to_string(),
+                    nav,
+                    started: std::time::Instant::now(),
+                    link_at_start: sys_wifi_rx_ring(),
+                });
             }
-        };
+            Err(e) => self.output_history.push_str(&format!("  bad URL: {e}\n")),
+        }
+    }
 
+    /// One frame's worth of loading. Returns true if anything changed on screen.
+    ///
+    /// This is the whole reason the window stays alive during a fetch: `Fetch::poll` blocks for at
+    /// most a socket timeout and reports a timeout as "nothing yet", so the cost of staying
+    /// responsive is bounded by a constant rather than by how slow the server is.
+    fn pump_load(&mut self) -> bool {
+        let Some(load) = self.loading.as_mut() else { return false };
+
+        let progress = load.fetch.poll();
+        let elapsed = load.started.elapsed().as_millis();
+
+        match progress {
+            nyx_net::Progress::Connecting(phase) => {
+                let host = load.fetch.url().host.clone();
+                // After a few seconds a fetch that is merely slow and a fetch that is stuck look
+                // identical, and there is no serial console on this machine to tell them apart —
+                // so the counters go on screen. Only once it has gone on long enough to be worth
+                // suspecting, so a normal load stays quiet.
+                let detail = if elapsed > 4000 {
+                    format!("\n  {}", load.fetch.diagnostic())
+                } else {
+                    String::new()
+                };
+                self.status_line =
+                    Some(format!("  {} {host}… ({elapsed} ms){detail}", phase.label()));
+                true
+            }
+            nyx_net::Progress::Receiving { got, total } => {
+                // An indeterminate bar is not a failure to measure: a chunked response genuinely
+                // has no length, and claiming a percentage would be inventing one.
+                self.status_line = Some(match total {
+                    Some(t) if t > 0 => format!(
+                        "  receiving {} of {} KB ({}%) — {elapsed} ms",
+                        got / 1024,
+                        t / 1024,
+                        got * 100 / t
+                    ),
+                    _ => format!("  receiving {} KB — {elapsed} ms", got / 1024),
+                });
+                true
+            }
+            nyx_net::Progress::Done(resp) => {
+                let (nav, requested) = (load.nav, load.requested.clone());
+                let before = load.link_at_start;
+                // The socket summary on the SUCCESS path too. `rd=N/MB to=T` is what separates
+                // "the link is slow" from "we only asked N times": a transfer that spends its life
+                // in timeouts is starved, one that reads back-to-back is bandwidth-bound, and the
+                // two look identical from a KB/s figure alone.
+                let diag = load.fetch.diagnostic();
+                self.loading = None;
+                self.status_line = None;
+                self.finish_load(*resp, nav, &requested, elapsed, before, &diag);
+                true
+            }
+            nyx_net::Progress::Failed(e) => {
+                let requested = load.requested.clone();
+                // Captured before the fetch is dropped: a failure whose only description is
+                // "the server took too long" says nothing about which of the four stages it died
+                // in, and that is the entire question.
+                let diag = load.fetch.diagnostic();
+                self.loading = None;
+                self.status_line = None;
+                self.output_history.push_str(&format!(
+                    "  failed after {elapsed} ms: {e}\n  ({requested})\n  {diag}\n"
+                ));
+                true
+            }
+        }
+    }
+
+    /// A response arrived: render it, remember it, and put it on screen.
+    fn finish_load(
+        &mut self,
+        resp: nyx_net::Response,
+        nav: Nav,
+        requested: &str,
+        ms: u128,
+        before: WifiRing,
+        diag: &str,
+    ) {
         let final_url = resp.url.to_string();
-        self.output_history.push_str(&format!(
-            "  {} | {} bytes | {}\n  from {}\n",
-            resp.status,
-            resp.body.len(),
-            resp.content_type().unwrap_or("(no content-type)"),
-            final_url
-        ));
-
         let is_html = resp
             .content_type()
             .map(|c| c.to_ascii_lowercase().contains("html"))
             .unwrap_or(true);
-        let body = resp.text();
 
-        if is_html {
-            let page = nyx_htmltext::render(&body);
-            if !page.title.is_empty() {
-                self.output_history.push_str(&format!("\n== {} ==\n", page.title));
-            }
-            self.output_history.push('\n');
-            self.output_history.push_str(&clip(&page.text, MAX_PAGE_CHARS));
-            let n = page.links.len();
-            self.links = page.links;
-            self.output_history.push_str(&format!(
-                "\n[{n} link{}] — `links` to list, `open <n>` to follow\n",
-                if n == 1 { "" } else { "s" }
-            ));
-        } else {
-            // Not markup: show it as-is rather than running a tag stripper over JSON or plain text.
-            self.links.clear();
-            self.output_history.push('\n');
-            self.output_history.push_str(&clip(&body, MAX_PAGE_CHARS));
-            self.output_history.push('\n');
+        // Charset: the header first, then a `<meta>` inside the document, then UTF-8. The meta only
+        // gets a say when the header was silent — a server that declares a charset outranks the
+        // document, and a document that disagrees with its server is not ours to arbitrate.
+        let charset = resp
+            .charset()
+            .or_else(|| if is_html { nyx_htmltext::sniff_charset(&resp.body) } else { None });
+        let body = resp.text_as(charset.as_deref());
+
+        self.output_history.push_str(&format!(
+            "  {} | {} bytes | {} | {} ms\n",
+            resp.status,
+            resp.body.len(),
+            resp.content_type().unwrap_or("(no content-type)"),
+            ms
+        ));
+        // What this transfer cost the link. Deltas, not totals — the question is how THIS fetch
+        // went, and frames-per-KB is what separates "the link is slow" from "the link is
+        // retransmitting". `tx_dropped` is outbound traffic the driver refused and smoltcp threw
+        // away; anything but zero is lost ACKs, which is exactly how a download crawls.
+        let now = sys_wifi_rx_ring();
+        let rx_kb = now.rx_bytes.saturating_sub(before.rx_bytes) as u128 / 1024;
+        let tx_frames = now.tx_frames.saturating_sub(before.tx_frames);
+        let dropped = now.tx_nospace.saturating_sub(before.tx_nospace);
+        let kbps = if ms > 0 { rx_kb * 1000 / ms } else { 0 };
+        self.output_history.push_str(&format!(
+            "  link: {} KB in {} ms = {} KB/s   tx {} frames   tx_dropped {}
+  {diag}
+",
+            rx_kb, ms, kbps, tx_frames, dropped
+        ));
+
+        // Only worth a line when it differs: with redirects followed silently, the final URL is the
+        // only way to tell that `http://x` quietly became `https://www.x/`.
+        if final_url != requested {
+            self.output_history.push_str(&format!("  from {final_url}\n"));
         }
 
-        // Set LAST, and to the post-redirect URL — `open` resolves relative hrefs against it.
-        self.current_url = Some(final_url);
+        let page = LoadedPage {
+            url: final_url.clone(),
+            title: String::new(),
+            text: String::new(),
+            links: Vec::new(),
+            base: None,
+            source: body,
+            is_html,
+        };
+        self.browser.page = Some(page);
+        self.render_current();
+
+        if nav == Nav::Push {
+            self.browser.visit(&final_url);
+        } else if let Some(slot) = self.browser.history.get_mut(self.browser.pos) {
+            // back/forward/reload land on the post-redirect URL, which may differ from the one the
+            // history recorded. Correcting it in place keeps `back` from bouncing through the
+            // redirect again on the way out.
+            *slot = final_url;
+        }
+        // A new page invalidates the previous search.
+        self.browser.find_from = 0;
+    }
+
+    /// Render the current page's stored source into text, and print it.
+    ///
+    /// Separate from the load so `reader` can re-render without another request. That matters more
+    /// than it sounds: refetching to change a rendering option would put a TLS handshake behind a
+    /// display toggle.
+    fn render_current(&mut self) {
+        let Some(page) = self.browser.page.as_mut() else {
+            self.output_history.push_str("No page loaded. `get <url>` first.\n");
+            return;
+        };
+
+        if page.is_html {
+            let opts = nyx_htmltext::Options { reader: self.browser.reader };
+            let rendered = nyx_htmltext::render_with(&page.source, &opts);
+            page.title = rendered.title;
+            page.text = rendered.text;
+            page.links = rendered.links;
+            page.base = rendered.base;
+        } else {
+            // Not markup: show it as-is rather than running a tag stripper over JSON or plain text.
+            page.title.clear();
+            page.text.clone_from(&page.source);
+            page.links.clear();
+            page.base = None;
+        }
+
+        let title = page.title.clone();
+        let text = page.text.clone();
+        let n_links = page.links.len();
+        let reader = self.browser.reader;
+
+        if !title.is_empty() {
+            self.output_history.push_str(&format!("\n== {title} ==\n"));
+        }
+        self.output_history.push('\n');
+        self.output_history.push_str(&clip(&text, MAX_PAGE_CHARS));
+        self.output_history.push_str(&format!(
+            "\n[{} line{}, {n_links} link{}{}] — `links`, `open <n>`, `find <text>`\n",
+            text.lines().count(),
+            if text.lines().count() == 1 { "" } else { "s" },
+            if n_links == 1 { "" } else { "s" },
+            if reader { ", reader on" } else { "" },
+        ));
     }
 
     /// `links` — list what the last page linked to.
     fn do_links(&mut self) {
-        if self.links.is_empty() {
-            self.output_history.push_str("No links (load a page with `get <url>` first).\n");
+        let Some(page) = self.browser.page.as_ref() else {
+            self.output_history.push_str("No page loaded. `get <url>` first.\n");
+            return;
+        };
+        if page.links.is_empty() {
+            self.output_history.push_str("This page has no links.\n");
             return;
         }
         let mut s = String::new();
-        for l in &self.links {
+        for l in &page.links {
             let label = if l.text.is_empty() { "(no text)" } else { l.text.as_str() };
             s.push_str(&format!("  [{}] {}\n      {}\n", l.index, clip_line(label, 60), l.href));
         }
         self.output_history.push_str(&s);
     }
 
-    /// `open <n>` — follow one of those links.
+    /// `open <n>` — follow one of those links — or `open <url>`, which is `get` by another name.
     fn do_open(&mut self, arg: &str) {
-        let Ok(n) = arg.trim().parse::<usize>() else {
-            self.output_history.push_str("usage: open <n>   (see `links`)\n");
+        let arg = arg.trim();
+        if arg.is_empty() {
+            self.output_history.push_str("usage: open <n>   (see `links`)   |   open <url>\n");
+            return;
+        }
+
+        // A bare number is a link index; anything else is a URL. Checked in that order because the
+        // index is the common case and a hostname is never all digits.
+        let Ok(n) = arg.parse::<usize>() else {
+            let url = if arg.contains("://") { arg.to_string() } else { format!("https://{arg}") };
+            self.start_load(&url, Nav::Push);
             return;
         };
-        let Some(link) = self.links.iter().find(|l| l.index == n).cloned() else {
+
+        let Some(page) = self.browser.page.as_ref() else {
+            self.output_history.push_str("No page loaded. `get <url>` first.\n");
+            return;
+        };
+        let Some(link) = page.links.iter().find(|l| l.index == n).cloned() else {
             self.output_history.push_str(&format!("No link [{n}]. Try `links`.\n"));
             return;
         };
 
         // Resolve through `Url::join`, which handles absolute, scheme-relative (`//host/x`) and
-        // path-relative forms. Doing it by string concatenation is how `/a/b` + `../c` goes wrong.
-        let target = match &self.current_url {
-            Some(base) => match nyx_net::url::Url::parse(base) {
-                Ok(b) => match b.join(&link.href) {
-                    Ok(u) => u.to_string(),
-                    Err(e) => {
-                        self.output_history.push_str(&format!("Bad link {:?}: {e}\n", link.href));
-                        return;
-                    }
-                },
+        // path-relative forms, and now also `.`/`..` — string concatenation is how `/a/b` + `../c`
+        // becomes `/a/b/../c`, a path the server has never heard of.
+        let target = match self.browser.base_url() {
+            Some(base) => match nyx_net::url::Url::parse(base).and_then(|b| b.join(&link.href)) {
+                Ok(u) => u.to_string(),
                 Err(e) => {
-                    self.output_history.push_str(&format!("Bad base URL: {e}\n"));
+                    self.output_history.push_str(&format!("Bad link {:?}: {e}\n", link.href));
                     return;
                 }
             },
             None => link.href.clone(),
         };
-        self.load(&target);
+        self.start_load(&target, Nav::Push);
+    }
+
+    /// `back` / `forward` — move through this session's history without refetching from `open`.
+    fn do_back(&mut self, delta: isize) {
+        let b = &self.browser;
+        if b.history.is_empty() {
+            self.output_history.push_str("Nowhere to go — no pages visited yet.\n");
+            return;
+        }
+        let target = b.pos as isize + delta;
+        if target < 0 {
+            self.output_history.push_str("Already at the oldest page.\n");
+            return;
+        }
+        if target as usize >= b.history.len() {
+            self.output_history.push_str("Already at the newest page.\n");
+            return;
+        }
+        self.browser.pos = target as usize;
+        let url = self.browser.history[self.browser.pos].clone();
+        self.start_load(&url, Nav::Keep);
+    }
+
+    /// `reload` — fetch the current page again.
+    fn do_reload(&mut self) {
+        let Some(url) = self.browser.history.get(self.browser.pos).cloned() else {
+            self.output_history.push_str("Nothing to reload. `get <url>` first.\n");
+            return;
+        };
+        self.start_load(&url, Nav::Keep);
+    }
+
+    /// `history` — where this session has been, with the current page marked.
+    fn do_history(&mut self) {
+        if self.browser.history.is_empty() {
+            self.output_history.push_str("No pages visited yet.\n");
+            return;
+        }
+        let mut s = String::new();
+        for (i, url) in self.browser.history.iter().enumerate() {
+            s.push_str(&format!(
+                "{} {:>3}  {}\n",
+                if i == self.browser.pos { "*" } else { " " },
+                i + 1,
+                url
+            ));
+        }
+        s.push_str("  `back` / `forward` to move, `open <n>` is links not history\n");
+        self.output_history.push_str(&s);
+    }
+
+    /// `reader` — toggle dropping nav/aside/footer, and re-render what is already loaded.
+    fn do_reader(&mut self) {
+        self.browser.reader = !self.browser.reader;
+        self.output_history.push_str(if self.browser.reader {
+            "Reader mode ON — navigation, sidebars and footers are dropped.\n"
+        } else {
+            "Reader mode OFF — the whole document is shown.\n"
+        });
+        if self.browser.page.is_some() {
+            self.render_current();
+        }
+    }
+
+    /// `find <text>` / `next` — search the page that is loaded, not the scrollback.
+    ///
+    /// Searching the page rather than the terminal's output is the distinction that makes this
+    /// useful: the scrollback also holds the output of every other command, and a hit in last
+    /// week's `acpi log` is not what "find" means while reading a page.
+    fn do_find(&mut self, arg: &str) {
+        let term = arg.trim();
+        if !term.is_empty() {
+            self.browser.find_term = term.to_lowercase();
+            self.browser.find_from = 0;
+        }
+        if self.browser.find_term.is_empty() {
+            self.output_history.push_str("usage: find <text>   then `next` for the one after\n");
+            return;
+        }
+
+        let Some(page) = self.browser.page.as_ref() else {
+            self.output_history.push_str("No page loaded. `get <url>` first.\n");
+            return;
+        };
+
+        let needle = self.browser.find_term.clone();
+        let from = self.browser.find_from;
+        let hit = page
+            .text
+            .lines()
+            .enumerate()
+            .skip(from)
+            .find(|(_, line)| line.to_lowercase().contains(&needle));
+
+        match hit {
+            Some((idx, line)) => {
+                self.browser.find_from = idx + 1;
+                let total = page.text.lines().filter(|l| l.to_lowercase().contains(&needle)).count();
+                let remaining = page
+                    .text
+                    .lines()
+                    .skip(idx + 1)
+                    .filter(|l| l.to_lowercase().contains(&needle))
+                    .count();
+                let text = format!(
+                    "  line {}: {}\n  ({} of {} — `next` for the following one)\n",
+                    idx + 1,
+                    line.trim(),
+                    total - remaining,
+                    total
+                );
+                self.output_history.push_str(&text);
+            }
+            None if from > 0 => {
+                // Wrapping is what a reader expects; saying so is what stops it looking like a bug.
+                self.browser.find_from = 0;
+                self.output_history
+                    .push_str(&format!("  no more matches for {needle:?} — wrapped to the top\n"));
+            }
+            None => {
+                self.output_history.push_str(&format!("  {needle:?} is not on this page\n"));
+            }
+        }
+    }
+
+    /// Move up or down through the command history, replacing the input line.
+    ///
+    /// `cmd_pos == cmd_history.len()` is the live line. Stepping up off it stashes whatever was
+    /// half-typed, so arrowing all the way back down returns it rather than leaving a blank prompt —
+    /// the behaviour of every shell, and its absence is noticed immediately.
+    fn walk_history(&mut self, up: bool) {
+        if self.cmd_history.is_empty() {
+            return;
+        }
+        let live = self.cmd_history.len();
+
+        if up {
+            if self.cmd_pos == 0 {
+                return; // already at the oldest
+            }
+            if self.cmd_pos == live {
+                self.cmd_stash.clear();
+                self.cmd_stash.push_str(&self.input_buffer);
+            }
+            self.cmd_pos -= 1;
+        } else {
+            if self.cmd_pos >= live {
+                return; // already on the live line
+            }
+            self.cmd_pos += 1;
+        }
+
+        self.input_buffer.clear();
+        if self.cmd_pos == live {
+            let stash = core::mem::take(&mut self.cmd_stash);
+            self.input_buffer.push_str(&stash);
+        } else {
+            let entry = self.cmd_history[self.cmd_pos].clone();
+            self.input_buffer.push_str(&entry);
+        }
+    }
+
+    /// Record a command in the history. Consecutive duplicates are collapsed, because pressing Up
+    /// four times to get past four `reload`s is not history, it is an obstacle.
+    fn remember_command(&mut self, cmd: &str) {
+        if cmd.is_empty() {
+            return;
+        }
+        if self.cmd_history.last().map(String::as_str) != Some(cmd) {
+            self.cmd_history.push(cmd.to_string());
+            // Bounded for the same reason the scrollback is: a session should not grow without end.
+            if self.cmd_history.len() > 200 {
+                self.cmd_history.remove(0);
+            }
+        }
+        self.cmd_pos = self.cmd_history.len();
+        self.cmd_stash.clear();
+    }
+
+    /// `stop` — abandon a load in flight.
+    fn do_stop(&mut self) {
+        match self.loading.take() {
+            // Dropping the `Fetch` closes its socket. There is nothing else to unwind: the stepped
+            // fetch owns its whole state, which is the reason it can be abandoned at any point.
+            Some(l) => {
+                self.status_line = None;
+                self.output_history
+                    .push_str(&format!("Stopped loading {}\n", l.requested));
+            }
+            None => self.output_history.push_str("Nothing is loading.\n"),
+        }
     }
 
     // D4: `toolchains` — enumerate the registry's installed language backends. This is the single
@@ -1142,13 +2087,19 @@ impl NyxApp for TerminalApp {
     }
 
     fn update(&mut self) -> bool {
+        // The page loader's frame hook. `update` is called every ~16 ms whether or not anything
+        // happened, which is exactly the cadence a stepped fetch wants — and it is the difference
+        // between a window that shows its progress and one that is simply frozen until the page
+        // arrives.
+        let mut redraw = self.pump_load();
+
         self.blink_timer += 1;
         if self.blink_timer > 30 {
             self.blink_timer = 0;
             self.cursor_visible = !self.cursor_visible;
-            return true; // Force redraw to show/hide cursor
+            redraw = true; // Force redraw to show/hide cursor
         }
-        false
+        redraw
     }
 
     fn draw(&mut self, canvas: &mut Canvas) {
@@ -1164,12 +2115,12 @@ impl NyxApp for TerminalApp {
         let cols = (inner_w / cw).max(1);
         let rows = (inner_h / TERM_LINE_H).max(1);
 
-        let mut lines: Vec<String> = Vec::new();
-        self.wrap_into(cols, &mut lines);
+        self.rewrap(cols);
+        self.rebuild_tail(cols);
 
         // Publish the measurements `content_height`/`scroll_offset` need, then re-clamp: the window
         // may have been resized since the last frame, which changes both the wrap and the viewport.
-        self.wrapped_len = lines.len();
+        self.wrapped_len = self.wrapped.len() + self.tail.len();
         self.view_rows = rows;
         let max = self.max_scroll();
         if self.stick_bottom {
@@ -1178,10 +2129,11 @@ impl NyxApp for TerminalApp {
             self.scroll = max;
         }
 
-        let last_idx = lines.len().saturating_sub(1);
+        let total = self.wrapped_len;
+        let last_idx = total.saturating_sub(1);
 
-        for (row, idx) in (self.scroll..lines.len()).take(rows).enumerate() {
-            let text = &lines[idx];
+        for (row, idx) in (self.scroll..total).take(rows).enumerate() {
+            let text = self.display_line(idx);
             let y = PAD_Y + row * TERM_LINE_H;
             let mut x = PAD_X;
 
@@ -1190,7 +2142,7 @@ impl NyxApp for TerminalApp {
             // wrapped continuation of a long command is not re-coloured halfway through.
             let (sigil, rest) = match text.strip_prefix("N> ") {
                 Some(r) => ("N> ", r),
-                None => ("", text.as_str()),
+                None => ("", text),
             };
 
             for ch in sigil.chars() {
@@ -1236,6 +2188,15 @@ impl NyxApp for TerminalApp {
             }
         }
 
+        // Command history. The arrows previously fell through to the input buffer and were typed
+        // into the command as literal U+E012/U+E013 glyphs, so Up printed a box. There is no Ctrl on
+        // this machine — the kernel builds `pc_keyboard` with `HandleControl::Ignore` — so the
+        // arrows are the only key left that can carry this.
+        if key == keys::UP || key == keys::DOWN {
+            self.walk_history(key == keys::UP);
+            return true;
+        }
+
         if key == '\n' || key == '\r' {
             // Typing always returns you to the live end of the output — a command whose result you
             // could not see because the view was parked in history would be baffling.
@@ -1243,6 +2204,7 @@ impl NyxApp for TerminalApp {
             // Own the command string so the dispatch below can take `&mut self` (do_compile /
             // list_toolchains) without colliding with a borrow of self.input_buffer.
             let cmd = self.input_buffer.trim().to_string();
+            self.remember_command(&cmd);
             let cmd = cmd.as_str();
             self.output_history.push_str("N> ");
             self.output_history.push_str(cmd);
@@ -1254,20 +2216,29 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  compile [file]    - compile a source file (defaults to the bundled sample.ql)\n");
                 self.output_history.push_str("Browsing (text mode — this is the browser now):\n");
                 self.output_history.push_str("  get <url>         - fetch a page and render it as text (bare host => https)\n");
-                self.output_history.push_str("  links             - list the last page's links\n");
-                self.output_history.push_str("  open <n>          - follow link <n>\n");
+                self.output_history.push_str("  links             - list this page's links\n");
+                self.output_history.push_str("  open <n> | <url>  - follow link <n>, or go straight to a URL\n");
+                self.output_history.push_str("  back | b          - the previous page      forward | f - undo a back\n");
+                self.output_history.push_str("  reload | r        - fetch this page again  history     - everywhere this session went\n");
+                self.output_history.push_str("  find <text>       - search THIS PAGE (not the scrollback)   next | n - the following hit\n");
+                self.output_history.push_str("  reader            - drop nav/sidebar/footer chrome, re-render with no refetch\n");
+                self.output_history.push_str("  page              - re-print the loaded page   stop - abandon a load in flight\n");
+                self.output_history.push_str("  Up / Down arrows  - command history (there is no Ctrl-R on this machine)\n");
                 self.output_history.push_str("  dns <host>        - resolve a name, with timing (says WHY a lookup failed)\n");
+                self.output_history.push_str("  dns cache | flush - what is cached / drop it (do this after joining a new network)\n");
                 self.output_history.push_str("  date              - the clock. A wrong clock makes EVERY https:// fail\n");
                 self.output_history.push_str("  time sync [url]   - set the clock from a plain-http server's Date header\n");
                 self.output_history.push_str("  tz [+5:30]        - DISPLAY timezone (clock itself stays UTC). India: tz +5:30\n");
                 self.output_history.push_str("  date offset <s>   - apply a clock offset directly, no network (bisects time sync)\n");
-                self.output_history.push_str("  fetch <url>       - raw GET: status, size, first 1 KB unrendered\n");
+                self.output_history.push_str("  fetch <url>       - raw GET: status, size, first 1 KB unrendered. BLOCKS (`get` does not)\n");
                 self.output_history.push_str("  exec <path>       - fork+execve any binary (a bad one kills this window, not the desktop)\n");
                 self.output_history.push_str("Hardware probes:\n");
                 self.output_history.push_str("  panel             - what ACPI says about the backlight: _BCL levels and _BQC current (READ ONLY)\n");
                 self.output_history.push_str("  panel set <5-100> - drive the panel via _BCM. On this laptop that ends in a firmware SMI\n");
                 self.output_history.push_str("  acpi log          - everything ACPICA printed since boot. Read this FIRST when anything ACPI is missing\n");
-                self.output_history.push_str("  battery           - ACPI control-method battery: charge, rate, health (READ ONLY)\n");
+                self.output_history.push_str("  battery | bat     - ACPI control-method battery: charge, rate, health (READ ONLY)\n");
+                self.output_history.push_str("  acpi ls [path]    - walk the ACPI namespace   acpi probe <n> [depth] - one evaluation\n");
+                self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
                 self.output_history.push_str("Scrollback:\n");
                 self.output_history.push_str("  PageUp / PageDown - page through history   Home / End - jump to top / live end\n");
                 self.output_history.push_str("  (or drag the scrollbar; new output follows only when you are at the bottom)\n");
@@ -1315,6 +2286,26 @@ impl NyxApp for TerminalApp {
                 self.do_links();
             } else if let Some(arg) = cmd.strip_prefix("open ") {
                 self.do_open(arg);
+            // ── Browsing ────────────────────────────────────────────────────────────────────────
+            } else if cmd == "back" || cmd == "b" {
+                self.do_back(-1);
+            } else if cmd == "forward" || cmd == "f" {
+                self.do_back(1);
+            } else if cmd == "reload" || cmd == "r" {
+                self.do_reload();
+            } else if cmd == "history" {
+                self.do_history();
+            } else if cmd == "reader" {
+                self.do_reader();
+            } else if cmd == "stop" {
+                self.do_stop();
+            } else if cmd == "page" {
+                // Re-print what is already loaded, for when the page has scrolled out of reach.
+                self.render_current();
+            } else if let Some(arg) = cmd.strip_prefix("find ") {
+                self.do_find(arg);
+            } else if cmd == "next" || cmd == "n" {
+                self.do_find("");
             } else if let Some(arg) = cmd.strip_prefix("exec ") {
                 // Launch an ARBITRARY binary. The start menu lives in the compositor, and the
                 // compositor IS the desktop — so a launch that kills its caller costs a power
@@ -1468,7 +2459,7 @@ impl NyxApp for TerminalApp {
                         self.output_history.push_str("ACPICA log:\n");
                         self.output_history
                             .push_str(core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>\n"));
-                        if !self.output_history.ends_with('\n') { self.output_history.push('\n'); }
+                        if !self.output_history.at_line_start() { self.output_history.push('\n'); }
                     }
                 } else if let Some(n) = arg.strip_prefix("probe ") {
                     // One ACPI evaluation, on the governor's next tick. See sys_acpi_probe.
@@ -1833,6 +2824,13 @@ impl NyxApp for TerminalApp {
             self.input_buffer.clear();
         } else if key == '\x08' {
             self.input_buffer.pop();
+        } else if ('\u{E000}'..='\u{E0FF}').contains(&key) {
+            // A key the kernel encodes as a private-use codepoint that this app does not handle —
+            // Left, Right, Delete, an unbound F-key. Swallow it. Falling through to the buffer is
+            // what used to happen, and it typed a literal box glyph into the middle of the command:
+            // silently ignoring a key you have not bound is bad, but printing a box for it is worse,
+            // because it looks like a rendering failure rather than an unhandled key.
+            return false;
         } else {
             self.input_buffer.push(key);
         }
