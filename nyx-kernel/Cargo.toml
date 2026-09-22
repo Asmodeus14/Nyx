@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+# `sched_stats` is on by default because the scheduler currently has no measurement at all, and a
+# performance claim about it is unfalsifiable without one. It is a feature rather than a permanent
+# fixture so the cost can be removed: turning it off drops the per-tick `rdtsc` and every counter
+# write from the timer, yield and syscall paths (see src/schedstats.rs).
+default = ["sched_stats"]
 net_trace = [] #  Milestone 2.3: Enables packet sniffing logs when needed
+sched_stats = [] # Per-CPU scheduler counters, latency histograms and the tick-gap probe.
 
 [dependencies]
 # Bootloader

@@ -247,6 +247,11 @@ pub extern "C" fn nyx_task_manager_daemon() {
     kernel_sleep_ms(1000);
 
     loop {
+        // Serviced here because this task runs with interrupts ENABLED, once a second. The request
+        // itself is set from the keyboard ISR (F12), which must not do the printing — see
+        // `schedstats::DUMP_REQUEST` for why that would falsify the measurement.
+        crate::schedstats::service_dump_request();
+
         let temp = get_intel_silicon_temp();
 
         // Park the GPU once it has been idle a while. This lives here because it needs a periodic

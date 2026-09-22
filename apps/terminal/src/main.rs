@@ -935,6 +935,339 @@ impl TerminalApp {
         }
     }
 
+    /// `sched` — what the scheduler is actually doing, and how long a tick actually is.
+    ///
+    /// ★ The headline is the first line. `timer_context_switch` adds 1 to `UPTIME_MS` per APIC
+    /// timer interrupt, which asserts that a tick is exactly one millisecond — while `init_timer`
+    /// programs a hardcoded count that nothing ever measured against a real clock. Every `sleep`,
+    /// every socket timeout, and this desktop's frame pacing are denominated in that unit. If the
+    /// measured period is not ~1000 us, they all mean something other than what they say.
+    ///
+    /// Second headline: `UPTIME_MS` is incremented by EVERY core, into one shared atomic. So the
+    /// clock's rate is (cores / tick period) — it depends on how many cores came up, and it changed
+    /// as they did. The "clock runs" line states that error directly rather than leaving it to be
+    /// inferred.
+    ///
+    /// This is the first process-visibility tool on the system; there is no `ps`, `top` or `uptime`.
+    fn cmd_sched(&mut self, arg: &str) {
+        let g = match sys_sched_globals() {
+            Some(g) => g,
+            None => {
+                self.output_history
+                    .push_str("sched: kernel rejected the request (syscall 575 missing?)\n");
+                return;
+            }
+        };
+
+        if g.stats_enabled == 0 {
+            self.output_history.push_str(
+                "sched: this kernel was built WITHOUT the `sched_stats` feature.\n\
+                 \x20 Every per-core counter below will read zero — that is the build, not the \
+                 machine.\n",
+            );
+        }
+
+        let mhz = g.tsc_mhz.max(1);
+        // cycles -> microseconds. TSC_MHZ is cycles per microsecond by definition.
+        let us = |cycles: u64| cycles / mhz;
+
+        let mut out = String::new();
+        out.push_str("Clock\n");
+        if g.tick_period_us == 0 {
+            out.push_str(
+                "  tick period       NOT MEASURED — calibration did not run.\n\
+                 \x20                   Everything below that depends on it is unknown, not \
+                 assumed.\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "  tick period       {} us   <- the kernel assumes 1000\n",
+                g.tick_period_us
+            ));
+        }
+        out.push_str(&format!(
+            "  APIC timer        {} ticks/ms (div 16), initial count {:#x}\n",
+            g.apic_ticks_per_ms, g.timer_initial_count
+        ));
+        out.push_str(&format!(
+            "  TSC               {} MHz\n  uptime            {} ms (as the kernel counts it)   cores {}\n",
+            g.tsc_mhz, g.uptime_ms, g.active_cores
+        ));
+
+        // Sum ticks across cores so the clock-rate claim is about the machine, not one core.
+        let ncores = g.active_cores.max(1) as usize;
+        let mut cores: Vec<SchedStats> = Vec::new();
+        for i in 0..ncores {
+            match sys_sched_stats(i as u64) {
+                Some(s) => cores.push(s),
+                None => break,
+            }
+        }
+        let total_ticks: u64 = cores.iter().map(|c| c.ticks).sum();
+
+        if g.tick_period_us > 0 && total_ticks > 0 {
+            // Real time elapsed = ticks on ONE core x period. Using the total across cores would
+            // count the same wall-clock interval once per core.
+            let per_core_ticks = cores.iter().map(|c| c.ticks).max().unwrap_or(0);
+            let real_ms = per_core_ticks.saturating_mul(g.tick_period_us) / 1000;
+            if real_ms > 0 {
+                // x100 to keep two decimals in integer arithmetic — no float formatting here.
+                let ratio_x100 = g.uptime_ms.saturating_mul(100) / real_ms;
+                out.push_str(&format!(
+                    "  clock runs        {}.{:02}x real time  ({} ms elapsed, kernel says {})\n",
+                    ratio_x100 / 100,
+                    ratio_x100 % 100,
+                    real_ms,
+                    g.uptime_ms
+                ));
+                out.push_str(
+                    "  \x20                 (UPTIME_MS is bumped by EVERY core into one atomic)\n",
+                );
+            }
+        }
+
+        if cores.is_empty() {
+            self.output_history.push_str(&out);
+            self.output_history
+                .push_str("\nsched: no per-core statistics available.\n");
+            return;
+        }
+
+        out.push_str("\nPer core\n");
+        out.push_str(
+            "  cpu   ticks   sched()  switch   waste   volu  invol    idle   wake   rq  live/dead  sched%\n",
+        );
+        for (i, c) in cores.iter().enumerate() {
+            // ★ The number this whole exercise is about: calls to schedule() that did NOT change
+            // the running task. Each one is a full interrupt entry plus 512 bytes of FXSAVE and 512
+            // of FXRSTOR spent to decide to keep doing what it was already doing.
+            let waste = c.schedule_calls.saturating_sub(c.switches);
+            // Share of this core's time spent inside schedule(), as a percentage of the real time
+            // its own ticks account for.
+            let real_cycles = c.ticks.saturating_mul(g.tick_period_us).saturating_mul(mhz);
+            let pct = if real_cycles > 0 {
+                c.sched_cycles.saturating_mul(1000) / real_cycles
+            } else {
+                0
+            };
+            out.push_str(&format!(
+                "  {:>3} {:>7} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>6} {:>4} {:>4}/{:<4} {}.{}%\n",
+                i,
+                c.ticks,
+                c.schedule_calls,
+                c.switches,
+                waste,
+                c.voluntary,
+                c.involuntary,
+                c.idle_entries,
+                c.wakeups,
+                c.rq_len,
+                c.tasks_live,
+                c.tasks_dead,
+                pct / 10,
+                pct % 10
+            ));
+        }
+
+        out.push_str("\nWorst observed\n");
+        for (i, c) in cores.iter().enumerate() {
+            if c.max_gap_tsc == 0 && c.max_wake_tsc == 0 {
+                continue;
+            }
+            let gap_us = us(c.max_gap_tsc);
+            // Anything beyond one tick period is time this core could not take an interrupt: the
+            // APIC timer is periodic, so it should have fired and did not.
+            let over = if g.tick_period_us > 0 && gap_us > g.tick_period_us {
+                gap_us - g.tick_period_us
+            } else {
+                0
+            };
+            let who = if c.max_gap_syscall == u64::MAX {
+                String::from("not in a syscall")
+            } else {
+                format!("syscall {}", c.max_gap_syscall)
+            };
+            out.push_str(&format!(
+                "  cpu{}  wake->run {} us   longest tick gap {} us",
+                i,
+                us(c.max_wake_tsc),
+                gap_us
+            ));
+            if over > 0 {
+                out.push_str(&format!("  => ~{} us interrupts-off, last syscall {}", over, who));
+            }
+            out.push('\n');
+            // ★ The authoritative attribution. The tick-gap line above can only name whichever
+            // syscall most recently ran, because a syscall that masks interrupts does not see the
+            // suppressed timer tick until after `sysretq` has already restored IF and cleared the
+            // "currently in" marker. This one is timed INSIDE the call, so it cannot be fooled —
+            // and when the two agree, the gap and the syscall are the same event.
+            if c.max_sys_cycles > 0 {
+                out.push_str(&format!(
+                    "          longest syscall {} us  (syscall {})\n",
+                    us(c.max_sys_cycles),
+                    c.max_sys_id as i64
+                ));
+            }
+        }
+
+        // ★ The recent-stall history. Printed unconditionally rather than behind `hist`, because
+        // this is the one thing here that names a cause: a stall that repeats shows the same
+        // syscall over and over, while a one-off (boot, `execve`) appears once with an early
+        // `at` timestamp and is pushed out. The rate line matters more than any single row.
+        {
+            let total: u64 = cores.iter().map(|c| c.gap_ring_count).sum();
+            if total == 0 {
+                out.push_str("\n  No stalls over 3 ticks recorded.\n");
+            } else {
+                out.push_str("\nStall rate (interrupts-off windows over 3 ticks)\n ");
+                for (i, c) in cores.iter().enumerate() {
+                    let rate_x100 = c.gap_ring_count.saturating_mul(100_000) / g.uptime_ms.max(1);
+                    out.push_str(&format!(
+                        " cpu{}:{} ({}.{:02}/s)",
+                        i,
+                        c.gap_ring_count,
+                        rate_x100 / 100,
+                        rate_x100 % 100
+                    ));
+                }
+                out.push('\n');
+
+                // Detail for the WORST core only. Printing every core's ring is ~136 lines on an
+                // 8-core machine, which pushes the one core that matters off the top of a terminal
+                // that has to be read on the device. The busiest core is the one with the stalls.
+                let (worst, wc) = cores
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, c)| c.gap_ring_count)
+                    .map(|(i, c)| (i, c))
+                    .unwrap();
+                out.push_str(&format!("\n  cpu{} — most recent, newest first\n", worst));
+                // 6, not 16: the ring is context for the tally below, and a long list pushes the
+                // summary that actually gets read off the top of the window.
+                let n = (wc.gap_ring_count as usize).min(SCHED_GAP_RING_LEN).min(6);
+                for k in 0..n {
+                    let idx = (wc.gap_ring_head as usize + SCHED_GAP_RING_LEN - 1 - k)
+                        % SCHED_GAP_RING_LEN;
+                    let s = &wc.gap_ring[idx];
+                    if s.cycles == 0 {
+                        continue;
+                    }
+                    let who = if s.syscall == u64::MAX {
+                        String::from("no syscall")
+                    } else {
+                        format!("syscall {}", s.syscall)
+                    };
+                    out.push_str(&format!(
+                        "      {:>7} us  at {:>7} ms  {} ({})\n",
+                        us(s.cycles),
+                        s.at_ms,
+                        who,
+                        if s.flags & 1 != 0 { "inside" } else { "just after" }
+                    ));
+                }
+
+                // ★ The cumulative answer to "what stalls most", on one line per core. The ring
+                // below only shows the last 16 samples, which is both incomplete and tedious to
+                // read off a laptop screen — this is the number to act on.
+                for (i, c) in cores.iter().enumerate() {
+                    if c.gap_ring_count == 0 {
+                        continue;
+                    }
+                    let mut t: Vec<&GapTally> =
+                        c.gap_tally.iter().filter(|t| t.count > 0).collect();
+                    t.sort_by(|a, b| b.total_cycles.cmp(&a.total_cycles));
+                    out.push_str(&format!("  cpu{} by syscall:", i));
+                    for e in t.iter().take(4) {
+                        let who = if e.syscall == u64::MAX {
+                            String::from("none")
+                        } else {
+                            format!("{}", e.syscall)
+                        };
+                        // Mean matters as much as count: a rare 40 ms stall and a frequent 6 ms one
+                        // are different problems with different fixes.
+                        out.push_str(&format!(
+                            "  {} x{} (avg {}us)",
+                            who,
+                            e.count,
+                            us(e.total_cycles / e.count.max(1))
+                        ));
+                    }
+                    out.push('\n');
+                }
+
+            }
+        }
+
+        if arg == "hist" {
+            out.push_str("\nHistograms (power-of-two buckets, microseconds)\n");
+            for (i, c) in cores.iter().enumerate() {
+                out.push_str(&format!("  cpu{}\n", i));
+                Self::push_hist(&mut out, "    tick gap ", &c.gap_hist, mhz);
+                Self::push_hist(&mut out, "    wake->run", &c.wake_hist, mhz);
+                Self::push_hist(&mut out, "    syscall  ", &c.sys_hist, mhz);
+            }
+        } else {
+            out.push_str("\n  `sched hist` for the full latency distributions.\n");
+        }
+
+        // ★ LAST, deliberately. This report is long and the terminal shows its tail, so a stamp at
+        // the top is scrolled off exactly when it is needed. Two boots of this output get compared
+        // routinely, and a stale flash makes a fixed kernel and an unfixed one produce
+        // indistinguishable numbers — that has now cost this project a debugging cycle twice, most
+        // recently a GPU fence fix that read as "no effect" because the old image was running.
+        // If this value has not changed since the last build, everything above came from the old
+        // kernel.
+        {
+            let mut stamp = [0u8; 48];
+            let n = sys_sched_build_stamp(&mut stamp);
+            if n > 0 {
+                out.push_str(&format!(
+                    "  kernel build stamp: {}\n",
+                    core::str::from_utf8(&stamp[..n]).unwrap_or("?")
+                ));
+            }
+        }
+
+        self.output_history.push_str(&out);
+    }
+
+    /// Render one power-of-two histogram as `lo-hi us: count` lines, skipping empty buckets.
+    ///
+    /// Empty buckets are skipped rather than printed as zeros because the interesting distributions
+    /// here are extremely sparse — a handful of populated buckets spread across a 32-bucket range —
+    /// and 32 lines of mostly zeros per histogram per core does not fit in a terminal window.
+    fn push_hist(out: &mut String, label: &str, hist: &[u32; SCHED_HIST_BUCKETS], mhz: u64) {
+        let total: u64 = hist.iter().map(|&n| n as u64).sum();
+        if total == 0 {
+            out.push_str(&format!("{}  (no samples)\n", label));
+            return;
+        }
+        out.push_str(&format!("{}  n={}\n", label, total));
+        for (i, &n) in hist.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let lo_cycles = 1u64 << i;
+            let hi_cycles = lo_cycles.saturating_mul(2) - 1;
+            // Sub-microsecond buckets all collapse to "0" in integer us, so show cycles there
+            // instead of three identical-looking rows.
+            if hi_cycles < mhz {
+                out.push_str(&format!(
+                    "      {:>10}-{:<10} cyc : {}\n",
+                    lo_cycles, hi_cycles, n
+                ));
+            } else {
+                out.push_str(&format!(
+                    "      {:>10}-{:<10} us  : {}\n",
+                    lo_cycles / mhz,
+                    hi_cycles / mhz,
+                    n
+                ));
+            }
+        }
+    }
+
     /// `wifi …` — the whole radio, from a prompt.
     ///
     /// ★ Meridian step 20 retires `apps/wifi`, the standalone picker, and with it the only graphical
@@ -3339,6 +3672,8 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  battery | bat     - ACPI control-method battery: charge, rate, health (READ ONLY)\n");
                 self.output_history.push_str("  acpi ls [path]    - walk the ACPI namespace   acpi probe <n> [depth] - one evaluation\n");
                 self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
+                self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
+                self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
                 self.output_history.push_str("Scrollback:\n");
                 self.output_history.push_str("  PageUp / PageDown - page through history   Home / End - jump to top / live end\n");
                 self.output_history.push_str("  (or drag the scrollbar; new output follows only when you are at the bottom)\n");
@@ -3861,6 +4196,9 @@ impl NyxApp for TerminalApp {
                          \x20 again after a while — the bytes that MOVE are charge/current/voltage.\n",
                     );
                 }
+            } else if cmd == "sched" || cmd.starts_with("sched ") {
+                let arg = cmd.strip_prefix("sched").unwrap_or("").trim();
+                self.cmd_sched(arg);
             } else if cmd == "battery" || cmd == "bat" {
                 // ACPI control-method battery. Depends on the namespace actually having loaded, so
                 // if this says "no battery" the first thing to check is `acpi log`, not the battery.

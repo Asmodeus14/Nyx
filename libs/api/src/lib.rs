@@ -1823,6 +1823,175 @@ pub fn sys_get_metrics() -> Option<SysMetrics> {
     if rc == 0 { Some(m) } else { None }
 }
 
+/// Scheduler instrumentation — see [`SchedGlobals`], [`SchedStats`] and [`sys_sched_stats`].
+pub const SYS_SCHED_STATS: u64 = 575;
+
+/// Number of power-of-two buckets in each [`SchedStats`] histogram. Mirrors
+/// `nyx_kernel::schedstats::HIST_BUCKETS`.
+pub const SCHED_HIST_BUCKETS: usize = 32;
+
+/// Retained long interrupts-off windows per core. Mirrors `schedstats::GAP_RING_LEN`.
+pub const SCHED_GAP_RING_LEN: usize = 16;
+
+/// Distinct syscalls in the cumulative stall tally. Mirrors `schedstats::GAP_TALLY_LEN`.
+pub const SCHED_GAP_TALLY_LEN: usize = 8;
+
+/// Cumulative stalls attributed to one syscall. Mirrors `schedstats::GapTally`.
+///
+/// ★ The ring shows the most RECENT stalls; this survives past 16 samples and collapses to one line
+/// per offender, so "what stalls most" is answerable at a glance instead of by transcribing a list.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GapTally {
+    /// Syscall number; `u64::MAX` means "not in a syscall", or an unused slot when `count == 0`.
+    pub syscall: u64,
+    pub count: u64,
+    /// Summed TSC cycles, so a mean can be shown — a rare 40 ms stall and a frequent 6 ms one need
+    /// telling apart.
+    pub total_cycles: u64,
+}
+
+/// One observed interrupts-off window. Mirrors `schedstats::GapSample`.
+///
+/// ★ A single worst-case sample was not actionable: the histogram showed dozens of 13-27 ms stalls
+/// per run, but the one retained sample was always the boot-time `execve`, which says nothing about
+/// steady state. A short history lets a *recurring* cause name itself.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GapSample {
+    pub cycles: u64,
+    pub syscall: u64,
+    /// Uptime in ms when seen — distinguishes boot-time stalls from steady-state ones.
+    pub at_ms: u64,
+    /// Bit 0: still inside `syscall` when observed. Clear is the normal case for a syscall-caused
+    /// stall, since `sysretq` restores IF before the suppressed tick is delivered.
+    pub flags: u64,
+}
+
+/// Machine-wide scheduler facts. `repr(C)`; mirrors `schedstats::SchedGlobals` in the kernel and
+/// the two must move together, same contract as [`SysMetrics`].
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct SchedGlobals {
+    /// Measured duration of one scheduler tick, in microseconds. **`0` = calibration did not run.**
+    ///
+    /// The kernel has always *assumed* 1000 here — `timer_context_switch` adds 1 to `UPTIME_MS` per
+    /// tick — while programming a hardcoded APIC count that nothing ever measured. If this reads
+    /// anything other than ~1000, every `sleep`, every socket timeout and the compositor's frame
+    /// pacing are denominated in a unit of that length instead of a millisecond.
+    pub tick_period_us: u64,
+    pub apic_ticks_per_ms: u64,
+    /// Calibrated TSC rate, for turning the cycle counts in [`SchedStats`] into time.
+    pub tsc_mhz: u64,
+    pub uptime_ms: u64,
+    pub active_cores: u64,
+    pub context_switches: u64,
+    pub timer_initial_count: u64,
+    /// `1` when the kernel was built with the `sched_stats` feature. When `0`, every per-core block
+    /// reads zero because the instrumentation was compiled out — which is otherwise
+    /// indistinguishable from a machine that never scheduled anything.
+    pub stats_enabled: u64,
+}
+
+/// One core's scheduler statistics. `repr(C)`, mirroring `schedstats::SchedStats`.
+///
+/// ⚠️ The kernel snapshots this from a *live* per-CPU block with no synchronisation (deliberately —
+/// a lock here would sit in the timer ISR). Individual fields are always real values, but they are
+/// not guaranteed mutually consistent: a histogram need not sum to its counter.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct SchedStats {
+    pub schedule_calls: u64,
+    /// Times the running task actually changed. The gap between this and `schedule_calls` is pure
+    /// overhead — an interrupt entry plus 1 KiB of FPU save/restore spent to change nothing.
+    pub switches: u64,
+    pub voluntary: u64,
+    pub involuntary: u64,
+    pub idle_entries: u64,
+    pub wakeups: u64,
+    pub migrations: u64,
+    pub ticks: u64,
+    pub rq_len: u64,
+    pub tasks_live: u64,
+    /// Zombie/Empty tombstones, which are never reclaimed — so this only climbs, and every per-tick
+    /// O(n) scan walks them.
+    pub tasks_dead: u64,
+    pub sched_cycles: u64,
+    pub last_tick_tsc: u64,
+    /// Longest observed interval between consecutive timer interrupts, in TSC cycles. Because the
+    /// APIC timer is periodic, anything beyond one tick period is time this core could not take an
+    /// interrupt.
+    pub max_gap_tsc: u64,
+    /// The syscall executing when `max_gap_tsc` was seen; `u64::MAX` if the core was not in one.
+    pub max_gap_syscall: u64,
+    pub cur_syscall: u64,
+    pub gap_hist: [u32; SCHED_HIST_BUCKETS],
+    pub wake_hist: [u32; SCHED_HIST_BUCKETS],
+    pub max_wake_tsc: u64,
+    pub sys_hist: [u32; SCHED_HIST_BUCKETS],
+    pub sys_entry_tsc: u64,
+    /// Longest single syscall on this core, in TSC cycles, and which one.
+    ///
+    /// ★ Measured INSIDE the syscall, and therefore the only trustworthy attribution for a long
+    /// interrupts-off window. `max_gap_syscall` cannot see it: `SYSCALL` masks interrupts and
+    /// `sysretq` restores IF, so the suppressed timer interrupt only lands once the syscall has
+    /// already returned.
+    pub max_sys_cycles: u64,
+    pub max_sys_id: u64,
+    pub last_syscall: u64,
+    /// Cycle threshold above which a gap is recorded; derived at runtime from the tick period and
+    /// TSC rate. 0 = calibration had not landed yet, so nothing was recorded.
+    pub gap_threshold: u64,
+    pub gap_ring: [GapSample; SCHED_GAP_RING_LEN],
+    pub gap_ring_head: u64,
+    /// Total long gaps ever seen; may far exceed the ring length. Against uptime this is the stall
+    /// RATE, which matters more than any single sample.
+    pub gap_ring_count: u64,
+    pub gap_tally: [GapTally; SCHED_GAP_TALLY_LEN],
+}
+
+impl Default for SchedStats {
+    fn default() -> Self {
+        // Not derivable: `[u32; 32]` has no `Default` impl.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+// Size assertions, same guard as `WindowHeader` and `QpuInfo`: the kernel memcpy's these bytes, so a
+// field added on one side of the ring boundary and not the other must break the build rather than
+// silently reinterpret every field after it.
+const _: () = assert!(core::mem::size_of::<SchedGlobals>() == 64);
+const _: () = assert!(core::mem::size_of::<SchedStats>() == 1280);
+const _: () = assert!(core::mem::align_of::<SchedStats>() == 64);
+
+/// Read the machine-wide scheduler facts. `None` if the kernel rejected the buffer.
+pub fn sys_sched_globals() -> Option<SchedGlobals> {
+    let mut g = SchedGlobals::default();
+    let n = core::mem::size_of::<SchedGlobals>() as u64;
+    let rc = syscall(SYS_SCHED_STATS, 0, 0, (&mut g as *mut SchedGlobals) as u64, n, 0, 0);
+    if rc == n { Some(g) } else { None }
+}
+
+/// Copy the kernel's build stamp into `out`; returns bytes written, 0 on failure.
+///
+/// ★ Exists so a report can say which image produced it. A stale flash makes a fixed kernel and an
+/// unfixed one emit identical-looking diagnostics, and comparing two such reports across boots
+/// leads straight to chasing a bug that is already fixed — which has now cost this project a cycle
+/// twice. `acpi log` carries the same stamp for the same reason.
+pub fn sys_sched_build_stamp(out: &mut [u8]) -> usize {
+    let rc = syscall(
+        SYS_SCHED_STATS, 2, 0, out.as_mut_ptr() as u64, out.len() as u64, 0, 0);
+    if rc == u64::MAX { 0 } else { rc as usize }
+}
+
+/// Read one core's scheduler statistics. `None` if that core does not exist.
+pub fn sys_sched_stats(core: u64) -> Option<SchedStats> {
+    let mut s = SchedStats::default();
+    let n = core::mem::size_of::<SchedStats>() as u64;
+    let rc = syscall(SYS_SCHED_STATS, 1, core, (&mut s as *mut SchedStats) as u64, n, 0, 0);
+    if rc == n { Some(s) } else { None }
+}
+
 pub fn sys_sleep_ms(ms: u64) {
     syscall(525, ms, 0, 0, 0, 0, 0);
 }
@@ -1860,6 +2029,21 @@ pub fn sys_ipc_send(target_pid: u64, msg_type: u64, data1: u64, data2: u64) -> b
 
 pub fn sys_ipc_recv(msg_ptr: *mut IpcMessage, block: bool) -> bool {
     syscall(533, msg_ptr as u64, if block { 1 } else { 0 }, 0, 0, 0, 0) == 1
+}
+
+/// Wait for a message, but no longer than `timeout_ms`. `true` if one was delivered.
+///
+/// ★ This is the primitive a GUI frame loop actually wants, and until now it did not exist. Apps
+/// drove themselves with `sleep(16)` plus a non-blocking [`sys_ipc_recv`], which means a keystroke
+/// forwarded by the window server waits up to a whole frame before the app even looks — and the app
+/// wakes 62 times a second regardless of whether anything happened.
+///
+/// Blocking with a deadline collapses both: the kernel wakes the task the instant `ipc_send`
+/// delivers, and otherwise at the timeout, so the message path is immediate and the idle path stops
+/// spinning. Pass the frame budget as the timeout and the loop still paces itself exactly as before
+/// when nothing arrives.
+pub fn sys_ipc_recv_timeout(msg_ptr: *mut IpcMessage, timeout_ms: u64) -> bool {
+    syscall(533, msg_ptr as u64, 2, timeout_ms, 0, 0, 0) == 1
 }
 
 pub fn sys_socket(domain: u64, typ: u64, protocol: u64) -> i64 {
