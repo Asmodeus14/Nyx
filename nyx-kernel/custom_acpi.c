@@ -65,6 +65,7 @@ typedef struct {
     UINT32 slave_addr;
     UINT32 speed_hz;
     UINT32 gpio_pin;
+    UINT32 irq_gsi;       /* plain APIC interrupt, when _CRS returns one instead of a GpioInt */
     UINT32 hid_desc_reg;
     UINT32 ctrl_adr;      /* controller _ADR: (device << 16) | function */
     char   path[72];
@@ -103,6 +104,21 @@ static ACPI_STATUS NyxHidResourceCb(ACPI_RESOURCE *Resource, void *Context) {
         if (gpio->ConnectionType == ACPI_RESOURCE_GPIO_TYPE_INT
             && gpio->PinTableLength > 0 && gpio->PinTable) {
             info->gpio_pin = gpio->PinTable[0];
+        }
+    } else if (Resource->Type == ACPI_RESOURCE_TYPE_EXTENDED_IRQ) {
+        /* ★ This device's _CRS is a Method that returns EITHER a GpioInt OR a plain Interrupt,
+         * chosen by OSYS and SDM0. On this machine it returns the plain Interrupt — so the
+         * touchpad's "report ready" line is an ordinary APIC GSI that the IOAPIC can route, NOT a
+         * GPIO pad. Capturing it is what tells us a GPIO controller driver is unnecessary; without
+         * this field the answer looks like "no interrupt at all". */
+        ACPI_RESOURCE_EXTENDED_IRQ *irq = &Resource->Data.ExtendedIrq;
+        if (irq->InterruptCount > 0) {
+            info->irq_gsi = irq->Interrupts[0];
+        }
+    } else if (Resource->Type == ACPI_RESOURCE_TYPE_IRQ) {
+        ACPI_RESOURCE_IRQ *irq = &Resource->Data.Irq;
+        if (irq->InterruptCount > 0) {
+            info->irq_gsi = irq->Interrupts[0];
         }
     }
     return AE_OK;

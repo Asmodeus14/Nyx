@@ -894,8 +894,11 @@ pub struct I2cHidInfo {
     pub sta: u32,
     pub slave_addr: u32,
     pub speed_hz: u32,
-    /// GPIO pin carrying "report ready". Unused while the transport polls; needed for Phase 5.
+    /// GPIO pin carrying "report ready". 0 when `_CRS` returned a plain Interrupt instead.
     pub gpio_pin: u32,
+    /// Plain APIC interrupt (GSI) when `_CRS` returned an Interrupt rather than a GpioInt.
+    /// ★ Non-zero means the IOAPIC routes this directly and NO GPIO driver is needed.
+    pub irq_gsi: u32,
     /// Register at which the HID descriptor is read, from `_DSM(HIDG, 1, 1)`.
     pub hid_desc_reg: u32,
     /// Controller `_ADR`: `(device << 16) | function`. `0x00150001` is PCI 00:15.1.
@@ -913,7 +916,7 @@ impl Default for I2cHidInfo {
 
 // Same ABI guard as SysMetrics/SchedStats: the kernel memcpy's these bytes, so a field added on one
 // side and not the other must break the build rather than reinterpret every field after it.
-const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 172);
+const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 176);
 
 impl I2cHidInfo {
     /// PCI device and function decoded from `ctrl_adr`.

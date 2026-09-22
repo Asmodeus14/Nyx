@@ -1303,10 +1303,22 @@ impl TerminalApp {
             let (dev, func) = info.pci_dev_func();
             self.output_history.push_str(&format!(
                 "\n{}\n  controller   {}\n               = PCI 00:{:02x}.{}  (_ADR {:#010x})\n  \
-                 address      {:#04x} @ {} Hz\n  HID desc reg {:#06x}\n  GPIO pin     {}\n  \
+                 address      {:#04x} @ {} Hz\n  HID desc reg {:#06x}\n  interrupt    {}\n  \
                  _STA         {:#x}\n",
                 path, ctrl, dev, func, info.ctrl_adr,
-                info.slave_addr, info.speed_hz, info.hid_desc_reg, info.gpio_pin, info.sta,
+                info.slave_addr, info.speed_hz, info.hid_desc_reg,
+                // ★ Which of these is populated decides whether a GPIO driver is needed at all.
+                // This device's `_CRS` is a Method returning EITHER a GpioInt OR a plain Interrupt,
+                // selected by `OSYS`/`SDM0`. An APIC GSI the IOAPIC can already route means the
+                // whole GPIO phase is unnecessary — and a blank field could not tell us that.
+                if info.irq_gsi != 0 {
+                    format!("APIC GSI {} — no GPIO driver needed", info.irq_gsi)
+                } else if info.gpio_pin != 0 {
+                    format!("GPIO pin {} — needs a GPIO driver", info.gpio_pin)
+                } else {
+                    String::from("none reported")
+                },
+                info.sta,
             ));
         }
 

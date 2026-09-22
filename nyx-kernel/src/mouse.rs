@@ -58,14 +58,6 @@ impl MouseDriver {
             self.wait_for_write(); self.command_port.write(0x60);
             self.wait_for_write(); self.data_port.write(status);
             
-            // 🚨 THE FIX: 0xF6 (Set Defaults) instead of 0xFF (Reset). 
-            // This prevents the hardware from flooding the buffer with 3 bytes and breaking the packet cycle!
-            self.write_mouse(0xF6);
-            self.wait_for_read(); let _ = self.data_port.read();
-            
-            self.write_mouse(0xF4);
-            self.wait_for_read(); let _ = self.data_port.read();
-
             // ★ Set the KEYBOARD's typematic rate. Nothing ever did, so it sat at the 8042's
             // power-on default — which is the SLOWEST the hardware offers: a 500 ms delay before
             // repeat, then ~10.9 characters per second. Holding a key (arrowing through a file,
@@ -78,10 +70,28 @@ impl MouseDriver {
             // ⚠️ Keyboard commands go to the DATA port directly. 0xD4 prefixes a command for the
             // AUX (mouse) device — using `write_mouse` here would send this to the trackpad, which
             // has no such command and would leave the keyboard untouched.
+            //
+            // ⚠️⚠️ THIS MUST COME BEFORE THE MOUSE IS STARTED, AND IT DID NOT — THAT DISABLED THE
+            // TOUCHPAD. `0xF4` is "enable data reporting": the moment it is acked the mouse begins
+            // streaming 3-byte packets into the SAME output buffer this handshake reads from. And
+            // `wait_for_read` only tests status bit 0 (output buffer full), not bit 5 (AUX data) —
+            // so it cannot tell a keyboard ACK from a mouse byte. Run after `0xF4`, these four
+            // blind reads swallow mouse bytes, desynchronise the packet state machine, and leave
+            // the pointer dead.
+            //
+            // Ordered before `0xF6`/`0xF4`, nothing else is in flight and both sequences are clean.
             self.wait_for_write(); self.data_port.write(0xF3);
             self.wait_for_read(); let _ = self.data_port.read();   // ACK
             self.wait_for_write(); self.data_port.write(0x00);
             self.wait_for_read(); let _ = self.data_port.read();   // ACK
+
+            // 🚨 THE FIX: 0xF6 (Set Defaults) instead of 0xFF (Reset).
+            // This prevents the hardware from flooding the buffer with 3 bytes and breaking the packet cycle!
+            self.write_mouse(0xF6);
+            self.wait_for_read(); let _ = self.data_port.read();
+
+            self.write_mouse(0xF4);
+            self.wait_for_read(); let _ = self.data_port.read();
         }
     }
 

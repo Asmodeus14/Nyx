@@ -180,6 +180,9 @@ pub struct I2cHidInfo {
     pub slave_addr: u32,
     pub speed_hz: u32,
     pub gpio_pin: u32,
+    /// Plain APIC interrupt, when `_CRS` returns an Interrupt instead of a GpioInt. Non-zero here
+    /// means the IOAPIC can route it directly and no GPIO driver is required.
+    pub irq_gsi: u32,
     pub hid_desc_reg: u32,
     /// Controller `_ADR`: `(device << 16) | function`. `0x00150001` is PCI 00:15.1.
     pub ctrl_adr: u32,
@@ -194,6 +197,7 @@ impl I2cHidInfo {
         slave_addr: 0,
         speed_hz: 0,
         gpio_pin: 0,
+        irq_gsi: 0,
         hid_desc_reg: 0,
         ctrl_adr: 0,
         path: [0; 72],
