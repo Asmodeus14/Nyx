@@ -14,11 +14,17 @@
 //! # Ok::<(), nyx_net::Error>(())
 //! ```
 
+mod body;
+pub mod dns;
 pub mod fetch;
 pub mod http;
 mod rng;
 pub mod url;
 
 pub use fetch::{Fetch, Progress};
-pub use http::{get, get_once, Error, Response};
+// `Request` / `request_once` are the POST path, added for the quantum subsystem's cloud providers.
+// ⚠️ `request_once` never retries — see its docs; replaying a POST could submit a job twice.
+pub use http::{
+    get, get_once, request_once, request_once_within, Error, Request, Response,
+};
 pub use url::{Scheme, Url};

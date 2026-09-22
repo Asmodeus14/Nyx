@@ -15,6 +15,16 @@ build_*.log
 # as an embedded git repository. This has now happened twice.
 ~/
 
+# ★ Quantum provider credentials (IonQ / IBM API keys + the IBM instance CRN).
+#
+# Build.sh bakes this into the boot image so the keys reach the machine with nothing to type — Nyx
+# has no clipboard and cannot express a paste chord, and an IBM CRN is ~120 characters.
+#
+# It must NEVER be committed: `git log -p` keeps a deleted line forever, and a leaked key on a
+# metered quantum backend is someone else's bill. `quantum-credentials.example.txt` is the tracked
+# template — copy it, do not rename it.
+quantum-credentials.txt
+
 # musl build outputs (reproducible via ./Build-musl.sh in ~90s)
 vendor/musl/obj/
 vendor/musl/lib/

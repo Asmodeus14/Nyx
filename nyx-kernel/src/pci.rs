@@ -227,6 +227,13 @@ fn enumerate_pci_legacy() {
     let devices = driver.scan();
 
     for dev in devices {
+        // Same offer as the MCFG path in `scan_bus_range`. Both, deliberately: this branch runs on
+        // a machine with no MCFG table, and a subsystem that only registers devices on one of the
+        // two enumeration paths works by luck.
+        crate::quantum::probe_pci(
+            dev.bus, dev.device, dev.func, dev.vendor_id, dev.device_id, dev.class_id, dev.subclass_id,
+        );
+
         match dev.class_id {
             0x02 => {
                 crate::serial_println!("[PCI] *** FOUND NETWORK CARD: Vendor {:#06x}, Device {:#06x} ***", dev.vendor_id, dev.device_id);
@@ -302,6 +309,9 @@ fn enumerate_pci_legacy() {
 
                         let mut config = Config::new();
                         config.hardware_addr = Some(hw_addr);
+                        // smoltcp derives TCP initial sequence numbers and DNS query IDs from this.
+                        // At its default of 0 both are identical on every boot — see random::seed_u64.
+                        config.random_seed = crate::random::seed_u64();
                         
                         let iface = Interface::new(config, &mut eth_driver);
 
@@ -392,6 +402,13 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
                         let device_id = unsafe { core::ptr::read_volatile((device_virt + 2) as *const u16) };
                         let class_code = unsafe { core::ptr::read_volatile((device_virt + 11) as *const u8) };
                         let subclass = unsafe { core::ptr::read_volatile((device_virt + 10) as *const u8) };
+
+                        // Offer every device to the quantum registry before the bind chain below.
+                        // It only records identity we have already read — it maps no BAR, enables
+                        // no bus mastering, and writes no register. There is no IOMMU in this
+                        // kernel, so letting an unidentified card master the bus would give it all
+                        // of physical memory. See `quantum::probe_pci`.
+                        crate::quantum::probe_pci(bus, device, func, vendor_id, device_id, class_code, subclass);
 
                         match class_code {
                             0x02 => {
@@ -489,7 +506,11 @@ fn scan_bus_range(base_addr: u64, start_bus: u8, end_bus: u8) {
 
                                     let mut config = Config::new();
                                     config.hardware_addr = Some(hw_addr);
-                                    
+                                    // smoltcp derives TCP initial sequence numbers and DNS query
+                                    // IDs from this. At its default of 0 both are identical on
+                                    // every boot — see random::seed_u64.
+                                    config.random_seed = crate::random::seed_u64();
+
                                     let iface = Interface::new(config, &mut eth_driver);
 
                                     *crate::drivers::net::NET_DRIVER.lock() = Some(eth_driver);

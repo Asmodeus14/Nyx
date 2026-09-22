@@ -20,10 +20,11 @@
 - [Kernel ABI Reference](#kernel-abi-reference)
   - [System Call Interface](#system-call-interface)
   - [POSIX-Compatible Syscalls](#posix-compatible-syscalls)
-  - [Nyx Native Syscalls (500–540)](#nyx-native-syscalls-500540)
+  - [Nyx Native Syscalls (501–574)](#nyx-native-syscalls-501574)
   - [Interrupt Vector Table](#interrupt-vector-table)
   - [Calling Convention](#calling-convention)
 - [QCLang — Quantum Programming Language](#qclang--quantum-programming-language)
+- [Quantum Subsystem — the QPU as a Compute Resource](#quantum-subsystem--the-qpu-as-a-compute-resource)
 - [Project Structure](#project-structure)
 - [Current Status](#current-status)
 - [Quick Start](#quick-start)
@@ -254,9 +255,15 @@ These syscalls follow Linux x86_64 numbering and semantics, allowing standard EL
 
 ---
 
-### Nyx Native Syscalls (500–540)
+### Nyx Native Syscalls (501–574)
 
 These syscalls are unique to Nyx OS and provide access to the kernel's quantum, graphics, AI, and system telemetry subsystems. They begin at number 500 to avoid conflicts with the Linux syscall table.
+
+⚠️ **The tables below are a selection, not the full list.** 501–574 are allocated with no gaps; the
+authoritative source is the `match` in `nyx-kernel/src/interrupts.rs`, and `tools/check_dup_syscall_arms.sh`
+verifies it. **Next free number: 575.** Run that script before adding an arm — `interrupts.rs` carries
+`#![allow(warnings)]`, so `unreachable_patterns` is suppressed and a duplicate arm silently shadows
+rather than failing to compile. That has cost this project real debugging time twice.
 
 #### Graphics & Display
 
@@ -327,6 +334,19 @@ These syscalls are unique to Nyx OS and provide access to the kernel's quantum, 
 | Number | Name | Arguments | Returns | Description |
 |--------|------|-----------|---------|-------------|
 | `534` | `sys_dns_resolve` | `hostname*, hostname_len` | Packed IPv4 `u64` | Initiate a DNS A-record query for the given hostname. Returns the resolved IPv4 address packed into a `u64`, or 0 on failure or pending. |
+| `572` | `sys_dns_resolve_all` | `hostname*, hostname_len, out*` | Count | Up to 4 IPv4 addresses, so a client whose first address is unreachable has a fallback. Retries with a **fresh query** (3 × 4 s) rather than waiting longer on one — DNS is UDP, and nothing recovers a dropped datagram except sending another. |
+
+#### Quantum
+
+Discovery and introspection only. The kernel holds no gates, no circuits, no simulator and no
+networking — see [Quantum Subsystem](#quantum-subsystem--the-qpu-as-a-compute-resource). Both arms
+are read-only, take no lock and allocate nothing, because every syscall body runs with interrupts
+disabled.
+
+| Number | Name | Arguments | Returns | Description |
+|--------|------|-----------|---------|-------------|
+| `573` | `sys_quantum_enumerate` | `buf*, max_entries` | Count, or `-EFAULT` | Quantum devices the PCI probe found, as `QpuInfo` records. **Normally — and correctly — zero.** |
+| `574` | `sys_quantum_info` | `id, out*` | `0` / `-ENODEV` / `-EFAULT` | One device by id. |
 
 ---
 
@@ -458,6 +478,106 @@ Full language specification is documented in `SYNTAX.md`.
 
 ---
 
+## Quantum Subsystem — the QPU as a Compute Resource
+
+Nyx models three compute substrates. QCLang above is the *language*; this is the **operating system's**
+model of quantum computation — a QPU as a discoverable resource alongside the CPU and GPU.
+
+```
+CPU   general-purpose classical    scheduler, PerCpu, SysMetrics
+GPU   parallel classical           drivers/gpu/intel, syscalls 501–538
+QPU   quantum                      libs/quantum, syscalls 573–574
+```
+
+**Status: a Bell state has been measured on real IBM quantum hardware from this OS.**
+
+### The rule the whole design is built around
+
+> Never report `HARDWARE` when Nyx is not driving physically attached quantum hardware.
+
+This is enforced by the type system, not by convention:
+
+| state | meaning |
+|---|---|
+| `NOT PRESENT` | nothing, anywhere |
+| `SIMULATOR` | classical software on this CPU |
+| `REMOTE/hw` | a real QPU, reached over the network |
+| `REMOTE/sim` | a *cloud simulator* — remote, and still classical |
+| `HARDWARE` | a real QPU attached to this machine |
+
+- `QpuStatus::Hardware` is produced in exactly one place in the tree — the kernel's PCI probe, on a
+  match against a device table that is **deliberately empty**. Nothing in userspace can construct it.
+- `SimBackend::info()` hardcodes `Simulator`; there is no setter.
+- A QPU that is attached but has no driver **refuses** rather than falling back to the simulator.
+  `QpuSession::backend_for` has no `Hardware` arm, so the fallback path does not exist.
+
+⚠️ **`REMOTE` alone would be a lie.** Providers serve classical simulators through the *same API,
+lifecycle and JSON* as their real processors — IonQ's `simulator` and `qpu.aria-1` differ by one
+string. Hence `remote_is_simulator`, and `REMOTE/sim` rendered distinctly everywhere.
+
+⚠️ **Counts and probabilities are different facts.** The local simulator samples shots and reports
+counts. IonQ returns a probability histogram and never says how many shots produced each bucket —
+turning `0.5` into "512 of 1024" would invent a measurement nobody made. `Readout` is an enum with
+**no conversion** between its arms.
+
+### Architecture
+
+```
+ terminal   sysmon   qcstudio
+     └─────────┴─────────┘
+               │
+     libs/quantum-rt  (std)      QpuSession · backends · qclang adapter · providers
+               │
+   ┌───────────┼────────────┬──────────────┐
+   ▼           ▼            ▼              ▼
+SimBackend  IonqProvider  IbmProvider   (future hardware)
+               │
+        libs/json ─ libs/net (TLS 1.3)
+               │
+     libs/quantum  (no_std, ZERO deps)    QpuInfo · Circuit · trait QpuBackend · state-vector sim
+               │
+     nyx-kernel/src/quantum.rs            registry · PCI probe · syscalls 573/574
+```
+
+The kernel holds **no gates, no circuits, no simulator and no networking** — a device table, a probe,
+and two read-only syscalls. There is no local hardware to arbitrate for, the kernel has no async
+model, and a cloud provider is an HTTPS client with no business in ring 0.
+
+### Commands
+
+```
+quantum                          is a QPU present, and what is actually computing
+quantum devices                  every device, with what each one really is
+quantum run bell                 H(q0), CX(q0,q1), measure — expect only 00 and 11
+quantum simulate [file.ql]       compile real QCLang and run it
+quantum remote jobs              pick a past cloud job and collect its result
+quantum remote run <target>      a REAL cloud QPU. hardware targets are metered
+quantum stop                     cancel a running job
+```
+
+Credentials are **baked into the boot image at build time** from a gitignored
+`quantum-credentials.txt` — Nyx has no clipboard and cannot express a paste chord, and an IBM
+instance CRN is ~120 characters. See `quantum-credentials.example.txt`.
+
+### Providers
+
+| provider | status |
+|---|---|
+| Local state-vector simulator | 20 qubits, exact, no noise model — cross-checked against `qclang_compiler::statevector` on every `cargo test` |
+| **IonQ** | abstract gates, one auth header |
+| **IBM Quantum** | ISA circuits (OpenQASM 2.0, basis `cz/rz/sx/x`), heavy-hex placement without a SWAP router — Bell pairs and GHZ chains |
+| AWS Braket | blocked: SigV4 needs HMAC-SHA256; `libs/crypto` has only SHA-1 |
+
+⚠️ **No consumer gate-model QPU exists that Nyx can drive over PCIe.** A cryogenic QPU is a fridge
+plus a rack of control electronics; the one genuinely PCI-attached piece of quantum hardware is a
+QRNG, which is an entropy source and not a processor. The cloud is the only path to a non-simulated
+result, and `docs/quantum/limitations.md` is the honest account of why.
+
+Full documentation in **`docs/quantum/`** — architecture, device model, circuit IR, simulator,
+syscalls, security, remote providers, and what future hardware would require.
+
+---
+
 ## Project Structure
 
 ```
@@ -564,7 +684,11 @@ Nyx/
 │
 ├── libs/                       # Shared userspace libraries
 │   ├── gui/                    # GUI widget toolkit (canvas, draw, effects, UI layout)
-│   └── api/                    # Nyx OS system call bindings
+│   ├── api/                    # Nyx OS system call bindings
+│   ├── net/                    # HTTP/1.1 + TLS 1.3 client (rustls), GET and POST
+│   ├── json/                   # Minimal JSON reader/writer — no_std, zero deps, depth-capped
+│   ├── quantum/                # QPU device model, circuit IR, backend trait, state-vector sim
+│   └── quantum-rt/             # Quantum runtime: sessions, qclang adapter, IonQ + IBM providers
 │
 ├── nyx-recv/                   # Debug utilities
 │   ├── udp.py                  # UDP packet capture
@@ -596,6 +720,8 @@ Nyx/
 | QCLang Compiler | ✅ Functional | v0.6.0 — full pipeline through OpenQASM output |
 | QIR Optimizer | ✅ Functional | Dead qubit elimination, gate cancellation |
 | Quantum Simulator | ✅ Functional | Software state vector simulator |
+| **QPU Subsystem** | ✅ Functional | QPU as a third compute substrate: device model, kernel registry, syscalls 573/574, `no_std` circuit IR + simulator |
+| **Cloud QPU (IonQ / IBM)** | ✅ **Hardware-verified** | **A Bell state measured on a real IBM QPU from Nyx.** IBM path: IAM auth, ISA circuits (OpenQASM 2.0), Primitives V2, job re-attach |
 | Kernel Boot (QEMU) | ✅ Functional | Full boot sequence to Ring 3 userspace |
 | Memory Management | ✅ Functional | 4-level paging, per-process isolation, SHM |
 | VFS / ext4 | ✅ Functional | Read/write ext4 via NVMe on real hardware |

@@ -1315,6 +1315,95 @@ pub fn sys_wifi_status() -> Option<WifiStatus> {
     if rc == 0 { Some(st) } else { None }
 }
 
+/// The WiFi RX parser's counters: `(seen, passed, amsdu, nosnap)`.
+///
+/// `seen` is data frames the driver looked at; `passed` is the ones that became Ethernet frames.
+/// A gap between them is a frame that arrived and was thrown away inside the driver — which from
+/// every layer above is indistinguishable from a frame that was never sent at all.
+///
+/// `amsdu` counts aggregates, and it is the one to watch during a stalled bulk transfer: the RX path
+/// keeps only the FIRST subframe of an aggregate and drops the rest, and aggregation is precisely
+/// what an access point turns on for bulk traffic like a certificate chain.
+///
+/// Each field saturates at 65535 — these are for spotting a gap, not for accounting.
+pub fn sys_wifi_rx_counters() -> (u32, u32, u32, u32) {
+    let p = syscall(569, 0, 0, 0, 0, 0, 0);
+    (
+        (p & 0xFFFF) as u32,
+        ((p >> 16) & 0xFFFF) as u32,
+        ((p >> 32) & 0xFFFF) as u32,
+        ((p >> 48) & 0xFFFF) as u32,
+    )
+}
+
+/// The frames the WiFi RX parser discarded for want of an LLC/SNAP signature, verbatim.
+///
+/// Four 40-byte records: `fc0, fc1, hlen, ccmp, mpdu_len` (u16 LE), then 34 raw frame bytes.
+/// Returns how many records are valid. No counter can say *why* the scan missed — only the bytes.
+pub fn sys_wifi_nosnap_dump(out: &mut [u8; 160]) -> u32 {
+    syscall(570, out.as_mut_ptr() as u64, 0, 0, 0, 0, 0) as u32
+}
+
+/// The WiFi RX ring's hardware state: `(read_ptr, closed, handed, badsig, runaway)`.
+///
+/// `closed` is the firmware's producer index, a 12-bit field (0..4095). `read_ptr` is the driver's
+/// consumer index, a u32. `poll_next_rx` decides a frame is waiting by testing the two for
+/// INEQUALITY — so once `read_ptr` climbs past 4095 they can never agree again, every poll claims a
+/// frame, and the parser walks stale ring slots without end.
+///
+/// **`read_ptr > 4095` while `closed` is small is the bug, visible directly.** `badsig` counts slots
+/// handed over that held no RX_MPDU (the stale ones), and `runaway` counts times the parser's loop
+/// had to be cut off to keep the machine alive.
+pub fn sys_wifi_rx_ring() -> WifiRing {
+    let mut out = [0u32; 16];
+    if syscall(571, out.as_mut_ptr() as u64, 0, 0, 0, 0, 0) == 0 {
+        return WifiRing::default();
+    }
+    WifiRing {
+        read_ptr: out[0], closed: out[1], handed: out[2], badsig: out[3], runaway: out[4],
+        tx_frames: out[5], tx_bytes: out[6], tx_nospace: out[7], rx_bytes: out[8],
+        desc_hit: out[9], scan_hit: out[10], undecrypted: out[11],
+        desc_size: out[12], claimed_hdr: out[13], true_hdr: out[14], lease_secs: out[15],
+    }
+}
+
+/// The WiFi RX ring and traffic counters.
+///
+/// `read_ptr` vs `closed` is the pair that matters for correctness: the firmware's producer index
+/// wraps at the ring size and the driver's consumer index must share that modulus, or every poll
+/// reports a frame that is not there (see the RX ring memory). `runaway` counts times the parser's
+/// loop had to be cut off; it should be 0.
+///
+/// The rest is throughput. `tx_frames`/`rx_bytes` against wall time give bytes-per-second, and
+/// `tx_nospace` is outbound traffic DROPPED because the AP queue was not ready — smoltcp reads a
+/// refused `transmit()` as backpressure and discards the packet rather than retrying it.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct WifiRing {
+    pub read_ptr: u32,
+    pub closed: u32,
+    pub handed: u32,
+    pub badsig: u32,
+    pub runaway: u32,
+    pub tx_frames: u32,
+    pub tx_bytes: u32,
+    pub tx_nospace: u32,
+    pub rx_bytes: u32,
+    /// Payload located from the RX descriptor's own header-length field — the correct path.
+    pub desc_hit: u32,
+    /// Payload located only by scanning for the LLC/SNAP signature. Non-zero means the descriptor's
+    /// header length was wrong for that frame, which is the thing worth knowing.
+    pub scan_hit: u32,
+    /// Frames the firmware did not decrypt, skipped without searching them.
+    pub undecrypted: u32,
+    /// Calibrated `iwl_rx_mpdu_desc` size, and the claimed vs actual 802.11 header length of the
+    /// last frame the scan had to rescue. `claimed != true` names the descriptor-offset error.
+    pub desc_size: u32,
+    pub claimed_hdr: u32,
+    pub true_hdr: u32,
+    /// Seconds left on the DHCP lease, or 0 when the server gave no duration.
+    pub lease_secs: u32,
+}
+
 // ── The radio-operation request, Meridian step 20 ────────────────────────────
 //
 // ★ Why this exists at all.
@@ -1469,6 +1558,210 @@ pub fn wifi_op_decode(arg: &str) -> Option<(WifiOp, &str, &str)> {
     match rest.as_bytes().iter().position(|&c| c == b'\n') {
         Some(i) => Some((op, &rest[..i], &rest[i + 1..])),
         None => Some((op, rest, "")),
+    }
+}
+
+// ─────────────────────────── Quantum / QPU ───────────────────────────
+//
+// Nyx's third compute substrate, alongside the CPU and the GPU. These two calls are the ENTIRE
+// kernel-facing surface of it: discovery and introspection, nothing else. Circuits, the simulator,
+// backend selection and every cloud provider are userspace — `libs/quantum` and `libs/quantum-rt`.
+// `docs/quantum/architecture.md` explains why the kernel's share is this small.
+
+/// Enumerate physically-attached quantum devices. See [`sys_quantum_enumerate`].
+pub const SYS_QUANTUM_ENUMERATE: u64 = 573;
+/// Look one up by id. See [`sys_quantum_info`].
+pub const SYS_QUANTUM_INFO: u64 = 574;
+
+/// Where a quantum device's answers come from. Mirror of `nyx_quantum::QpuStatus`.
+///
+/// ⚠️ [`QPU_STATUS_HARDWARE`] is produced in exactly one place in the whole tree — the kernel's PCI
+/// probe, on a match against a verified device ID. Nothing in userspace can construct it, and on
+/// this machine it is unreachable by design: no consumer gate-model QPU exists that Nyx could drive
+/// over PCIe. See `docs/quantum/limitations.md`.
+pub const QPU_STATUS_NOT_PRESENT: u32 = 0;
+/// Classical software running on this CPU.
+pub const QPU_STATUS_SIMULATOR: u32 = 1;
+/// Reachable over the network. ⚠️ Check `remote_is_simulator` before calling it a quantum device —
+/// providers serve cloud simulators through the same API as real processors.
+pub const QPU_STATUS_REMOTE: u32 = 2;
+/// A quantum processor physically attached to this machine.
+pub const QPU_STATUS_HARDWARE: u32 = 3;
+
+/// A gate-model quantum processor.
+pub const QPU_KIND_QPU: u32 = 0;
+/// Control electronics for a QPU that lives elsewhere. Cannot execute a circuit.
+pub const QPU_KIND_CONTROL: u32 = 1;
+/// A quantum entropy source. Real physics, no computation.
+pub const QPU_KIND_RNG: u32 = 2;
+/// Something on the PCI bus Nyx cannot identify. A diagnostic, never a claim.
+pub const QPU_KIND_UNIDENTIFIED: u32 = 3;
+
+/// One quantum compute resource.
+///
+/// `#[repr(C)]`, **append-only**, and hand-mirrored in three places — here,
+/// `libs/quantum/src/device.rs`, and `nyx-kernel/src/quantum.rs`. Field order IS the ABI; there is
+/// no bindgen across the ring boundary in this tree, exactly as with [`SysMetrics`] and
+/// [`WindowQuad`]. All three carry a size assertion so a field addition breaks the build instead of
+/// silently reinterpreting every later field.
+///
+/// Fields documented as "`0` = not reported" mean exactly that. A simulator has no T1; a provider
+/// may publish no calibration date. Substituting a plausible default would be the failure
+/// `apps/sysmon` refuses when it declines to draw a GPU utilisation percentage it cannot measure.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QpuInfo {
+    pub id: u32,
+    /// One of the `QPU_KIND_*` constants.
+    pub kind: u32,
+    /// One of the `QPU_STATUS_*` constants.
+    pub status: u32,
+    /// Non-zero when `status == QPU_STATUS_REMOTE` **and the remote backend is itself a simulator**.
+    pub remote_is_simulator: u32,
+
+    /// Usable qubits. `0` when nothing is present — never a placeholder.
+    pub qubits: u32,
+    pub topology: u32,
+    pub exec_model: u32,
+    pub _reserved0: u32,
+
+    /// Bitmask of supported gates.
+    pub gate_set: u64,
+
+    /// `0` = not reported.
+    pub max_shots: u32,
+    /// `0` = not reported.
+    pub max_depth: u32,
+    /// `u32::MAX` = no queue applies. Distinct from `0`, which would claim an empty queue exists.
+    pub queue_depth: u32,
+    /// `0` = not reported.
+    pub queue_capacity: u32,
+
+    /// `0` = not reported.
+    pub coherence_t1_ns: u64,
+    /// `0` = not reported.
+    pub coherence_t2_ns: u64,
+    /// `0` = not reported.
+    pub calibrated_unix: u64,
+
+    /// `bus << 16 | dev << 8 | func`, or `0` for a non-PCI backend.
+    pub pci_bdf: u32,
+    pub pci_vendor_id: u32,
+    pub pci_device_id: u32,
+    pub _reserved1: u32,
+
+    /// NUL-padded ASCII.
+    pub vendor: [u8; 32],
+    /// NUL-padded ASCII.
+    pub arch: [u8; 32],
+    /// NUL-padded ASCII.
+    pub name: [u8; 64],
+}
+
+/// The exact wire size of [`QpuInfo`]. Asserted in all three mirrors.
+pub const QPU_INFO_SIZE: usize = 224;
+const _: () = assert!(core::mem::size_of::<QpuInfo>() == QPU_INFO_SIZE);
+const _: () = assert!(core::mem::align_of::<QpuInfo>() == 8);
+
+impl Default for QpuInfo {
+    fn default() -> QpuInfo {
+        // Zeroed, except the one field whose "unknown" is not zero.
+        let mut q: QpuInfo = unsafe { core::mem::zeroed() };
+        q.queue_depth = u32::MAX;
+        q
+    }
+}
+
+impl QpuInfo {
+    fn cstr(buf: &[u8]) -> &str {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        core::str::from_utf8(&buf[..end]).unwrap_or("")
+    }
+
+    pub fn vendor_str(&self) -> &str {
+        Self::cstr(&self.vendor)
+    }
+    pub fn arch_str(&self) -> &str {
+        Self::cstr(&self.arch)
+    }
+    pub fn name_str(&self) -> &str {
+        Self::cstr(&self.name)
+    }
+
+    /// Whether results from this device are produced by quantum mechanics.
+    ///
+    /// ⚠️ Use this rather than matching on [`QpuInfo::status`]: a remote *simulator* has status
+    /// `QPU_STATUS_REMOTE` and is not a quantum device, and that is the case a direct match forgets.
+    pub fn is_quantum(&self) -> bool {
+        match self.status {
+            QPU_STATUS_HARDWARE => true,
+            QPU_STATUS_REMOTE => self.remote_is_simulator == 0,
+            _ => false,
+        }
+    }
+
+    /// `NOT PRESENT` / `SIMULATOR` / `REMOTE/hw` / `REMOTE/sim` / `HARDWARE`.
+    pub fn status_label(&self) -> &'static str {
+        match self.status {
+            QPU_STATUS_SIMULATOR => "SIMULATOR",
+            QPU_STATUS_REMOTE => {
+                if self.remote_is_simulator != 0 {
+                    "REMOTE/sim"
+                } else {
+                    "REMOTE/hw"
+                }
+            }
+            QPU_STATUS_HARDWARE => "HARDWARE",
+            _ => "NOT PRESENT",
+        }
+    }
+}
+
+/// Enumerate the quantum devices the kernel found on the PCI bus.
+///
+/// Returns how many entries were written into `out`. **Normally — and correctly — zero**: see
+/// `docs/quantum/limitations.md`. A non-empty result on this laptop means the probe found an
+/// unidentified accelerator, which it reports as `QPU_KIND_UNIDENTIFIED` with status
+/// `QPU_STATUS_NOT_PRESENT` rather than guessing.
+///
+/// ⚠️ Remote devices are **not** here. The kernel knows nothing about cloud providers; those are
+/// discovered over HTTPS by `libs/quantum-rt` and merged into the device list in userspace.
+pub fn sys_quantum_enumerate(out: &mut [QpuInfo]) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    let rc = syscall(
+        SYS_QUANTUM_ENUMERATE,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    ) as i64;
+    if rc < 0 {
+        0
+    } else {
+        (rc as usize).min(out.len())
+    }
+}
+
+/// One quantum device by id. `None` if there is no such device.
+pub fn sys_quantum_info(id: u32) -> Option<QpuInfo> {
+    let mut q = QpuInfo::default();
+    let rc = syscall(
+        SYS_QUANTUM_INFO,
+        id as u64,
+        (&mut q as *mut QpuInfo) as u64,
+        0,
+        0,
+        0,
+        0,
+    ) as i64;
+    if rc == 0 {
+        Some(q)
+    } else {
+        None
     }
 }
 

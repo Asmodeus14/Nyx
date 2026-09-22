@@ -27,3 +27,8 @@ webpki-roots = "1.0"
 # The whole crypto stack funnels its entropy through getrandom 0.2 (via rand_core 0.6), and there is
 # no target_os="nyx" backend, so we register one. See src/rng.rs.
 getrandom = { version = "0.2", features = ["custom"] }
+# `Accept-Encoding: gzip`. HTML is the most compressible thing on the wire — 3-5x is typical — and on
+# this machine the wire is the slow part, so this is the single biggest cut in how long a page takes
+# to arrive. Not a new dependency in any meaningful sense: `libs/image` already inflates PNG IDAT
+# with this exact crate and feature set, so it is known to build for target_os="nyx".
+miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }

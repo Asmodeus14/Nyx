@@ -19,17 +19,37 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 pub static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
-// Atomic counter prevents Ephemeral Port exhaustion!
+// Ephemeral source ports, handed out round-robin over the IANA dynamic range (RFC 6335).
+//
+// ⚠️ A bare `fetch_add` on a u16 wraps at 65535 to **0**, and then walks up through the reserved
+// and well-known ports — so after ~16k sockets a connection would try to source from port 0, then
+// from 22, 80, 443. `next_local_port` folds the counter back into 49152..=65535 instead.
 static NEXT_LOCAL_PORT: AtomicU16 = AtomicU16::new(49152);
+const EPHEMERAL_LO: u16 = 49152;
+
+/// Wired NIC interrupts taken since boot. Incremented from the ISR, which is why it is an atomic
+/// and not a log line — see `rtl8168_interrupt_handler`.
+pub static IRQ_NET_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The next ephemeral source port, always inside the dynamic range.
+fn next_local_port() -> u16 {
+    let raw = NEXT_LOCAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // 16384 ports in 49152..=65535. Modulo the span rather than testing for wrap, so the sequence
+    // stays uniform across the boundary instead of stuttering at it.
+    EPHEMERAL_LO + (raw.wrapping_sub(EPHEMERAL_LO) % (u16::MAX - EPHEMERAL_LO + 1))
+}
 
 const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
 const EINTR: i64 = -4;
 const EBADF: i64 = -9;
+const EIO: i64 = -5;
 const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
 const EACCES: i64 = -13;
 const EFAULT: i64 = -14;
+/// No such device. Used by the quantum introspection syscalls (574) for an unknown device id.
+const ENODEV: i64 = -19;
 const EEXIST: i64 = -17;
 const ENOTDIR: i64 = -20;
 const EISDIR: i64 = -21;
@@ -2304,7 +2324,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         },
 
         41 => frame.rax = sys_socket(arg1, arg2, arg3) as u64,
-        42 => frame.rax = sys_connect(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64,
+        42 => frame.rax = sys_connect(arg1 as usize, arg2 as *const u8, arg3 as usize, arg4) as u64,
         44 => frame.rax = sys_write_internal(arg1 as usize, arg2 as *const u8, arg3 as usize) as u64, 
         45 => frame.rax = sys_read_internal(arg1 as usize, arg2 as *mut u8, arg3 as usize) as u64,
 
@@ -2913,17 +2933,40 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = percpu.scheduler.tasks[curr_idx].pid;
         },
 
-        318 => { // SYS_GETRANDOM (Required for Rust HashMaps)
+        318 => { // SYS_GETRANDOM(buf, len, flags) -> len, or -EIO under NYX_GRND_CRYPTO
+            //
+            // ★ `flags` exists so key material can FAIL CLOSED.
+            //
+            // `random::fill` returns false when it had to fall back to the TSC-seeded xorshift —
+            // and this syscall used to discard that boolean and report success regardless. rustls
+            // draws ECDHE private keys, the client random and GCM nonces from right here, and its
+            // caller (`libs/net/src/rng.rs`) only checks the byte count, so weak entropy reached
+            // TLS with nothing anywhere in the chain able to notice. `random::is_cryptographic()`
+            // was written to guard exactly this and had no callers.
+            //
+            // Plain callers keep the old behaviour deliberately: std seeds every `HashMap` through
+            // getrandom during startup and cannot cope with a failure, so making the default path
+            // fail would make a DRNG-less machine unbootable. Callers choosing key material pass
+            // NYX_GRND_CRYPTO and get an error instead of guessable bytes.
+            const NYX_GRND_CRYPTO: u64 = 0x8000;
             let buf_ptr = arg1 as *mut u8;
             let len = arg2 as usize;
+            let want_crypto = arg3 & NYX_GRND_CRYPTO != 0;
             if is_valid_user_ptr(buf_ptr, len) {
                 // Hardware RDSEED/RDRAND (see random.rs), falling back to the old TSC-seeded
                 // xorshift only on a CPU with no DRNG at all. This used to be the xorshift
                 // unconditionally, which was written for HashMap seeding and is guessable — and
                 // rustls draws ECDHE keys and GCM nonces from right here.
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
-                crate::random::fill(buf);
-                frame.rax = len as u64;
+                let strong = crate::random::fill(buf);
+                if want_crypto && !strong {
+                    // Wipe before reporting failure: the caller is not going to read the buffer,
+                    // but leaving guessable bytes in a key-shaped allocation is not a habit to keep.
+                    buf.fill(0);
+                    frame.rax = EIO as u64;
+                } else {
+                    frame.rax = len as u64;
+                }
             } else {
                 frame.rax = EFAULT as u64;
             }
@@ -4353,6 +4396,187 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
         }
 
+        // 569: sys_wifi_rx_counters() -> packed RX parser counters, or 0 with no adapter.
+        //
+        // seen and passed in the low 32 bits (16 each, saturating), amsdu and nosnap in the high 32.
+        // Packed into the return value rather than written through a pointer so it needs no struct
+        // and no ABI shared with userspace — it is a diagnostic, and the cheapest one that works is
+        // the right one.
+        //
+        // ★ What it answers: a TLS handshake that receives ZERO bytes cannot, from above the driver,
+        // be told apart from a peer that never replied. If `seen` climbs while `passed` does not,
+        // the frames arrived and this driver discarded them. `amsdu` matters because the RX path
+        // extracts only the FIRST subframe of an aggregate and silently drops the rest — and
+        // aggregation is exactly what an AP turns on for a bulk transfer like a certificate chain.
+        569 => {
+            let (seen, passed, amsdu, nosnap) = crate::drivers::net::wifi_rx_counters();
+            let pack16 = |v: u32| core::cmp::min(v, 0xFFFF) as u64;
+            frame.rax = pack16(seen)
+                | (pack16(passed) << 16)
+                | (pack16(amsdu) << 32)
+                | (pack16(nosnap) << 48);
+        }
+
+        // 570: sys_wifi_nosnap_dump(out_ptr) -> record count. Writes 160 bytes: four 40-byte records
+        // of {fc0, fc1, hlen, ccmp, mpdu_len:u16, then 34 raw frame bytes}.
+        //
+        // The frames the RX parser threw away, verbatim. `nosnap` accounts for every dropped frame
+        // on this link, and no counter can say WHY the LLC/SNAP scan missed — only the bytes can.
+        570 => {
+            let out = arg1 as *mut u8;
+            if is_valid_user_ptr(out as *const u8, 160) {
+                let mut buf = [0u8; 160];
+                let n = crate::drivers::net::wifi_nosnap_dump(&mut buf);
+                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), out, 160) };
+                frame.rax = n as u64;
+            } else {
+                frame.rax = 0;
+            }
+        }
+
+        // 571: sys_wifi_rx_ring(out_ptr) -> 1 ok. Writes TWELVE u32: read_ptr, closed, handed,
+        // badsig, runaway, tx_frames, tx_bytes, tx_nospace, rx_bytes, desc_hit, scan_hit,
+        // undecrypted.
+        //
+        // ★ read_ptr vs closed is the pair that matters. `closed` is the firmware's 12-bit producer
+        // index (0..4095); `read_ptr` is ours, a u32 that wraps at 2^32. `poll_next_rx` decides a
+        // frame is waiting by testing them for INEQUALITY, so the moment read_ptr passes 4095 the
+        // test is true forever: every poll reports a frame, the parser walks stale slots, and the
+        // loop that consumes them never terminates. read_ptr > 4095 with a small closed IS the bug,
+        // and `badsig`/`runaway` are its fingerprints.
+        571 => {
+            let out = arg1 as *mut u32;
+            if is_valid_user_ptr(out as *const u8, 64) {
+                let (rp, closed, handed, badsig, runaway) =
+                    crate::drivers::net::wifi_rx_ring_state();
+                let (txf, txb, txn, rxb) = crate::drivers::net::wifi_traffic();
+                let (dhit, shit, undec) = crate::drivers::net::wifi_parse_stats();
+                let (dsz, chdr, thdr, lease) = crate::drivers::net::wifi_offsets();
+                unsafe {
+                    out.add(0).write_volatile(rp);
+                    out.add(1).write_volatile(closed);
+                    out.add(2).write_volatile(handed);
+                    out.add(3).write_volatile(badsig);
+                    out.add(4).write_volatile(runaway);
+                    out.add(5).write_volatile(txf);
+                    out.add(6).write_volatile(txb);
+                    out.add(7).write_volatile(txn);
+                    out.add(8).write_volatile(rxb);
+                    out.add(9).write_volatile(dhit);
+                    out.add(10).write_volatile(shit);
+                    out.add(11).write_volatile(undec);
+                    out.add(12).write_volatile(dsz);
+                    out.add(13).write_volatile(chdr);
+                    out.add(14).write_volatile(thdr);
+                    out.add(15).write_volatile(lease);
+                }
+                frame.rax = 1;
+            } else {
+                frame.rax = 0;
+            }
+        }
+
+        // 572: sys_dns_resolve_all(host_ptr, host_len, out_ptr) -> count of IPv4 addresses written.
+        //
+        // Resolves, then writes up to DNS_MAX_ADDRS addresses as u32 (network byte order packed the
+        // same way 534 packs its single answer). Returns 0 on failure, exactly like 534.
+        //
+        // ★ Why this exists: 534 returns ONE address because its ABI is a single packed u64, and a
+        // client with one address has no fallback. Every large site publishes several A records and
+        // some are routinely unreachable from a given network, so "the first one" is a coin flip
+        // that a real client never has to make.
+        572 => {
+            let out = arg3 as *mut u32;
+            if !is_valid_user_ptr(out as *const u8, DNS_MAX_ADDRS * 4) {
+                frame.rax = 0;
+                return;
+            }
+            // Resolve through the same path as 534 so there is one resolver, not two. It fills
+            // DNS_LAST as a side effect.
+            let first = sys_dns_resolve(arg1 as usize, arg2 as usize);
+            if first == 0 {
+                frame.rax = 0;
+                return;
+            }
+            let (found, n) = *DNS_LAST.lock();
+            for i in 0..n.min(DNS_MAX_ADDRS) {
+                unsafe { out.add(i).write_volatile(found[i]) };
+            }
+            frame.rax = n.min(DNS_MAX_ADDRS) as u64;
+        }
+
+        // ── Quantum subsystem ───────────────────────────────────────────────────────────────────
+        //
+        // Two syscalls, both read-only, both lock-free, both allocation-free. That is the whole
+        // kernel-facing surface of Nyx's QPU support, and `nyx-kernel/src/quantum.rs` explains at
+        // length why it is not larger: there is no local quantum hardware to arbitrate for, the
+        // kernel has no async model to submit a job through, and remote providers are HTTPS clients
+        // that have no business in ring 0.
+        //
+        // They copy from a static table published once during `pci::enumerate_pci()` and immutable
+        // afterwards — the same "publish, don't expose" discipline as 567, and for the same reason:
+        // these run at IF=0, so taking any lock a kernel task might hold at IF=1 is a deadlock that
+        // would also kill the thermal governor.
+
+        // 573: sys_quantum_enumerate(buf_ptr, max_entries) -> entries written, or -EFAULT.
+        //
+        // ⚠️ `buf_ptr` is an ARRAY of QpuInfo and can span many pages, so it needs per-page
+        // validation — `is_valid_user_ptr` is only a range check against the userspace ceiling and
+        // says nothing about whether the pages are mapped. A kernel-mode read of an unmapped user
+        // address panics the machine rather than the process.
+        573 => {
+            let out = arg1 as *mut u8;
+            let max = arg2 as usize;
+            if max == 0 {
+                frame.rax = 0;
+                return;
+            }
+            // Cap before multiplying so a huge `max` cannot overflow the byte count.
+            let n = crate::quantum::count().min(max);
+            if n == 0 {
+                frame.rax = 0;
+                return;
+            }
+            let bytes = n * crate::quantum::QPU_INFO_SIZE;
+            if !is_valid_user_ptr(out, bytes) || !user_range_mapped(arg1, bytes) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
+            let src = crate::quantum::devices();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    out,
+                    bytes,
+                );
+            }
+            frame.rax = n as u64;
+        }
+
+        // 574: sys_quantum_info(id, out_ptr) -> 0, or -ENODEV / -EFAULT.
+        574 => {
+            let id = arg1 as u32;
+            let out = arg2 as *mut u8;
+            let bytes = crate::quantum::QPU_INFO_SIZE;
+            if !is_valid_user_ptr(out, bytes) || !user_range_mapped(arg2, bytes) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
+            match crate::quantum::device(id) {
+                Some(d) => {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &d as *const crate::quantum::QpuInfo as *const u8,
+                            out,
+                            bytes,
+                        );
+                    }
+                    frame.rax = 0;
+                }
+                None => frame.rax = ENODEV as u64,
+            }
+        }
+
         // 547: sys_wifi_disconnect() -> 0. Leaves the network and frees the radio to scan/retune.
         547 => {
             if crate::drivers::net::wifi_try_begin() {
@@ -4959,6 +5183,34 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
 /// address panics the MACHINE rather than killing the caller. The individual `iov_base` pointers
 /// need no check here — they are passed to sys_read_internal / sys_write_internal, which validate
 /// exactly as they would for a plain read(2)/write(2).
+/// Is every page of `[start, start + len)` present in the CALLER's address space?
+///
+/// ⚠️ `is_valid_user_ptr` is only a **range** check — it asks whether an address is below the
+/// userspace ceiling, not whether anything is mapped there. A kernel-mode read of a valid-looking
+/// but unmapped user address takes a page fault in ring 0, which panics the whole machine rather
+/// than killing the process. So any arm that dereferences a user buffer larger than a few bytes
+/// needs this as well.
+///
+/// This is the loop `iov_array_ok` and `user_cstr_raw` already run inline; it is factored out here
+/// because the quantum enumeration syscall copies an array that can span many pages.
+fn user_range_mapped(start: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = match start.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    let mut a = start & !0xFFF;
+    while a < end {
+        if !unsafe { crate::memory::user_addr_mapped(a) } {
+            return false;
+        }
+        a += 4096;
+    }
+    true
+}
+
 fn iov_array_ok(iov_ptr: *const u64, iovcnt: usize) -> bool {
     const IOV_MAX: usize = 1024;
     if iovcnt == 0 || iovcnt > IOV_MAX { return false; }
@@ -5057,6 +5309,21 @@ fn sys_read_internal(fd: usize, buf_ptr: *mut u8, len: usize) -> isize {
                                 if now.saturating_sub(start_ms) > timeout_ms {
                                     return ETIMEDOUT as isize;
                                 }
+                            }
+
+                            // ★ The second legal exit. `poll` has checked this since it was
+                            // written; these loops never did, so a process parked in a socket read
+                            // could not be interrupted by anything — `kill` it and nothing happened
+                            // until the fd happened to wake up. Checked here, before blocking, and
+                            // only when nothing has been transferred yet: both loops return on the
+                            // FIRST successful transfer, so at this point the count is zero and
+                            // EINTR loses no data, which is what POSIX requires.
+                            //
+                            // `signal_would_interrupt` honours disposition — an IGNORED signal must
+                            // not interrupt, or every program that spawns children would see
+                            // spurious EINTR from SIGCHLD.
+                            if unsafe { signal_would_interrupt() } {
+                                return EINTR as isize;
                             }
 
                             // Yield thread safely while waiting for new hardware frames
@@ -5177,6 +5444,12 @@ fn sys_write_internal(fd: usize, buf_ptr: *const u8, len: usize) -> isize {
                                 }
                             }
 
+                            // See the read loop: nothing has been sent at this point, so EINTR is
+                            // free of partial-write ambiguity.
+                            if unsafe { signal_would_interrupt() } {
+                                return EINTR as isize;
+                            }
+
                             unsafe {
                                 x86_64::instructions::interrupts::enable();
                                 core::arch::asm!("int 0x41");
@@ -5245,7 +5518,7 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
     // 🔥 MILESTONE 3.1: Linux checks if SOCK_NONBLOCK (2048 / 0x800) is set in the type parameter
     let is_non_blocking = (_typ & 2048) != 0;
     let clean_type = _typ & !2048; // Strip the flag out to get the raw type (1 = TCP, 2 = UDP)
-    let local_port = NEXT_LOCAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let local_port = next_local_port();
 
     let handle = crate::drivers::net::with_sockets(stack, gen, |sockets| {
         if clean_type == 1 {
@@ -5276,7 +5549,14 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
             if curr_idx >= percpu.scheduler.tasks.len() { break 'place None; }
 
             let task = &mut percpu.scheduler.tasks[curr_idx];
-            for i in 3..32 {
+            // ★ The WHOLE table, not the first 32 slots.
+            //
+            // `fd_table` is `FD_MAX` (256) entries and every other allocator — open, dup2,
+            // socketpair — walks all of it. This one stopped at 32, so a process could hold at most
+            // 29 sockets and, worse, a process whose low fds were already taken by FILES got
+            // `EMFILE` for a socket while 224 slots sat empty. A browser opens a connection per
+            // request (there is no keep-alive yet), so this is a ceiling it can actually reach.
+            for i in 3..crate::process::FD_MAX {
                 if task.fd_table[i].is_none() {
                     let ks = KernelSocket {
                         kind: kind.clone(), local_port, remote: None,
@@ -5299,7 +5579,9 @@ pub extern "C" fn sys_socket(_domain: u64, _typ: u64, _protocol: u64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -> i64 {
+/// `connect(fd, addr, len, timeout_ms)`. `timeout_ms == 0` keeps the historic 10 s default, so
+/// callers that predate the argument are unaffected.
+pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize, timeout_ms: u64) -> i64 {
     if addr_len < 16 || !is_valid_user_ptr(addr_ptr, addr_len) { return EFAULT; }
     if KERNEL_CR3.load(Ordering::Relaxed) == 0 { return EBADF; }
     
@@ -5345,6 +5627,7 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
             }
 
             // Blocking Loop: Put thread to sleep until TCP handshakes finish or fail
+            let connect_deadline_ms = if timeout_ms == 0 { 10_000 } else { timeout_ms };
             let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
             loop {
                 crate::drivers::net::poll_stack(stack);
@@ -5358,10 +5641,25 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
                     None => return ECONNREFUSED, // link went away mid-handshake
                 }
 
-                // Timeout check (safely timeout after 10 seconds)
+                // Give up on the handshake. The caller's deadline when it supplied one, else 10 s.
+                //
+                // ★ This used to be hardcoded at 10 s, and that is too long to be the only choice
+                // once a client walks a name's several addresses looking for one that answers:
+                // four unreachable addresses cost forty seconds, during which the browser shows
+                // nothing. A caller that intends to try the next candidate wants to find out
+                // quickly; a caller with one address still wants to wait.
                 let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
-                if current_ms.saturating_sub(start_ms) > 10000 {
+                if current_ms.saturating_sub(start_ms) > connect_deadline_ms {
                     return ETIMEDOUT;
+                }
+
+                // ⚠️ EINTR from connect leaves the handshake RUNNING — POSIX says so, and smoltcp
+                // agrees: the socket stays in SynSent and completes or fails on its own. The caller
+                // must not retry `connect` on this fd; it should poll for writability instead.
+                // Reported anyway, because a connect that cannot be interrupted is a process that
+                // cannot be killed for the kernel's full 10 s deadline.
+                if unsafe { signal_would_interrupt() } {
+                    return EINTR;
                 }
 
                 // Yield the CPU core to other threads while waiting for the network card interrupt
@@ -5378,14 +5676,33 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize) -
 }
 
 pub extern "x86-interrupt" fn rtl8168_interrupt_handler(_stack_frame: x86_64::structures::idt::InterruptStackFrame) {
-   
-    crate::serial_println!("[ISR] Hardware Interrupt Fired! NIC Woke up the CPU!");
+    // ⚠️ NOTHING that can block or take a lock belongs here.
+    //
+    // This used to `serial_println!` on every packet interrupt. Serial is a ~11 KB/s UART and the
+    // print runs with interrupts masked, so under any real inbound traffic the machine would spend
+    // all of its time inside this handler writing a line nobody can read — this laptop has no
+    // serial cable at all. The counter below is the same information, readable from userspace, at
+    // the cost of one atomic increment.
+    IRQ_NET_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     
     crate::drivers::net::NETWORK_PENDING.store(true, core::sync::atomic::Ordering::Release);
     crate::apic::end_of_interrupt();
 }
 
 // Domain Name Resolution (DNS)
+
+/// How many addresses one lookup may hand back. Four is well past the point of diminishing
+/// returns — if four separate addresses all refuse a connection, the fault is not the address.
+pub const DNS_MAX_ADDRS: usize = 4;
+
+/// Every IPv4 answer from the most recent successful lookup, for syscall 572 to collect.
+///
+/// A side channel rather than an out-parameter on 534 because 534's ABI (one packed u64) is what
+/// the std PAL's `lookup_host` is built on, and widening it would mean rebuilding std. The two are
+/// always written together, one line apart, so they cannot describe different lookups.
+static DNS_LAST: spin::Mutex<([u32; DNS_MAX_ADDRS], usize)> =
+    spin::Mutex::new(([0; DNS_MAX_ADDRS], 0));
+
 #[no_mangle]
 pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u64 {
     if hostname_len == 0 { return 0; }
@@ -5412,7 +5729,52 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
         }
     };
 
-    // 1. Fire the DNS Query
+    // ★ Refuse to query on an interface that has no IPv4 address of its own.
+    //
+    // This is a guard against a KERNEL PANIC, not a politeness check. smoltcp's DNS socket
+    // dispatches with `cx.get_source_address(dst).unwrap()` (socket/dns.rs:588, carrying its own
+    // "TODO remove unwrap"), and that returns None when the interface holds no address in the
+    // destination's family. So a lookup issued before DHCP has granted a lease does not fail — it
+    // takes the whole machine down, from an ordinary userspace `get`.
+    //
+    // The window is not narrow or theoretical: on a cold boot `apps/wifiagent` rejoins the
+    // remembered network and DHCP takes seconds, so typing a URL as soon as the desktop appears
+    // lands squarely inside it.
+    //
+    // Returning 0 puts it back on the path every other resolver failure already takes — the PAL
+    // reports "failed to lookup address information" and the caller sees a failed fetch.
+    let has_source_address = crate::drivers::net::with_stack(stack, gen, |_, iface| {
+        iface.ip_addrs().iter().any(|cidr| match cidr.address() {
+            smoltcp::wire::IpAddress::Ipv4(v4) => !v4.is_unspecified(),
+            _ => false,
+        })
+    });
+    if has_source_address != Some(true) {
+        crate::serial_println!(
+            "[DNS] {:?} has no IPv4 address yet (no DHCP lease) — refusing to query",
+            stack
+        );
+        return 0;
+    }
+
+    // ★★ Retry with a FRESH QUERY, rather than waiting longer on one (2026-09-20).
+    //
+    // The symptom that motivated this, reported from hardware: `dns iam.cloud.ibm.com` had to be
+    // typed **twice**, consistently — the first attempt failed and the second returned in 1.6 s.
+    // That is not random loss, it is a lost packet: DNS is UDP, and nothing recovers a dropped
+    // datagram except sending another one. Waiting longer on the first query cannot help, which is
+    // why raising the single timeout from 5 s to 12 s did not fix it.
+    //
+    // ⚠️ smoltcp does retransmit internally, but on a link dropping this many frames (the same
+    // session showed `badsig=9`, `undecrypted=19`) its backoff can consume the whole budget on one
+    // unlucky query. Three independent queries of four seconds beat one of twelve.
+    //
+    // Cancelling between attempts matters: an abandoned query is not just a leaked slot, smoltcp
+    // keeps retransmitting it forever and every `poll_stack` walks the list. See the timeout path.
+    const DNS_ATTEMPTS: u32 = 3;
+    const DNS_ATTEMPT_MS: u64 = 4_000;
+
+    for attempt in 0..DNS_ATTEMPTS {
     let query_handle = match crate::drivers::net::with_stack(stack, gen, |sockets, iface| {
         let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
         dns_socket.start_query(iface.context(), hostname_str, smoltcp::wire::DnsQueryType::A)
@@ -5429,7 +5791,8 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
     };
 
     let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
-    
+    let _ = attempt;
+
     // 2. Safely Block until the DNS Server Replies
     loop {
         crate::drivers::net::poll_stack(stack);
@@ -5438,19 +5801,35 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
             let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
             match dns_socket.get_query_result(query_handle) {
                 Ok(addrs) => {
+                    // ★ Keep EVERY IPv4 answer, not just the first.
+                    //
+                    // smoltcp hands back the whole A-record set, and this used to return `addrs[0]`
+                    // and discard the rest. Any large site publishes several addresses and at any
+                    // moment some may be unreachable from a given network — so a client holding one
+                    // address has NO FALLBACK and fails outright where every real client simply
+                    // tries the next. That is the cause of "it worked an hour ago": DNS rotates the
+                    // order, and one address at a time is roulette.
+                    let mut found = [0u32; DNS_MAX_ADDRS];
+                    let mut n = 0usize;
                     for addr in addrs.iter() {
                         if let smoltcp::wire::IpAddress::Ipv4(ipv4) = addr {
-                            let o = ipv4.0;
-                            // Pack the 4 bytes into a single u64 to return across the Syscall boundary
-                            return Some((o[0] as u64) | ((o[1] as u64) << 8)
-                                | ((o[2] as u64) << 16) | ((o[3] as u64) << 24));
+                            if n < DNS_MAX_ADDRS {
+                                let o = ipv4.0;
+                                found[n] = (o[0] as u32) | ((o[1] as u32) << 8)
+                                    | ((o[2] as u32) << 16) | ((o[3] as u32) << 24);
+                                n += 1;
+                            }
                         }
                     }
-                    Some(0) // answered, but no IPv4 in it
+                    *DNS_LAST.lock() = (found, n);
+                    Some(if n > 0 { found[0] as u64 } else { 0 })
                 }
                 Err(smoltcp::socket::dns::GetQueryResultError::Pending) => None,
                 Err(_) => {
                     crate::serial_println!("[DNS] Query Failed/NXDOMAIN.");
+                    // `Some(0)` means "this attempt is over". The caller decides whether to try
+                    // again — smoltcp reports a lost query and a genuine NXDOMAIN identically, so
+                    // treating failure as final would abandon a name that simply lost a packet.
                     Some(0)
                 }
             }
@@ -5460,22 +5839,43 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
                 if packed != 0 {
                     crate::serial_println!("[DNS] Resolved {} -> {}.{}.{}.{}", hostname_str,
                         packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff, (packed >> 24) & 0xff);
+                    return packed;
                 }
-                return packed;
+                // Failed. `get_query_result` already freed the slot, so break straight to the next
+                // attempt without cancelling.
+                break;
             }
             Some(None) => {}   // still waiting
             None => return 0,  // stack went away
         }
 
         let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
-        if current_ms.saturating_sub(start_ms) > 5000 {
-            crate::serial_println!("[DNS] Timeout.");
-            // Cancel before giving up. `get_query_result` frees the slot on success or failure, but
-            // a query still Pending is freed ONLY here — and the socket is built with a growable
-            // `vec![]`, so an abandoned query is not merely a leaked slot: smoltcp keeps
-            // retransmitting it forever, and every `poll_stack` (which every blocking socket
-            // syscall calls in a tight loop) walks the whole list. Enough timeouts and the machine
-            // spends all its time re-sending dead lookups.
+        // ⚠️ This whole loop runs with interrupts ENABLED (the arm re-enables them), so a long wait
+        // does not starve the thermal governor — but it DOES block the calling app for the full
+        // duration, which is why `Fetch` announces the resolve stage before entering it.
+        if current_ms.saturating_sub(start_ms) > DNS_ATTEMPT_MS {
+            crate::serial_println!("[DNS] attempt {} timed out", attempt + 1);
+            // Cancel before starting the next one. `get_query_result` frees the slot on success or
+            // failure, but a query still Pending is freed ONLY here — and the socket is built with a
+            // growable `vec![]`, so an abandoned query is not merely a leaked slot: smoltcp keeps
+            // retransmitting it forever, and every `poll_stack` (which every blocking socket syscall
+            // calls in a tight loop) walks the whole list. Enough timeouts and the machine spends
+            // all its time re-sending dead lookups.
+            crate::drivers::net::with_sockets(stack, gen, |sockets| {
+                sockets
+                    .get_mut::<smoltcp::socket::dns::Socket>(dns_handle)
+                    .cancel_query(query_handle);
+            });
+            break;
+        }
+
+        // This syscall returns a packed address with 0 for failure, so there is no errno channel
+        // to put EINTR in. Cancel and report failure: the caller sees "could not resolve", which is
+        // true, and the alternative is a process that cannot be killed for five seconds.
+        //
+        // Cancelling matters — see the timeout path below. A query left Pending is not merely a
+        // leaked slot: smoltcp retransmits it forever and every poll walks the list.
+        if unsafe { signal_would_interrupt() } {
             crate::drivers::net::with_sockets(stack, gen, |sockets| {
                 sockets
                     .get_mut::<smoltcp::socket::dns::Socket>(dns_handle)
@@ -5491,4 +5891,8 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
             x86_64::instructions::interrupts::disable();
         }
     }
+    } // end of one attempt
+
+    crate::serial_println!("[DNS] {} unresolved after {} attempts", hostname_str, DNS_ATTEMPTS);
+    0
 }

@@ -223,8 +223,13 @@ impl Device for Rtl8168Driver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500; 
-        caps.max_burst_size = Some(1);
+        caps.max_transmission_unit = 1500;
+        // ★ This is smoltcp's advertised TCP RECEIVE WINDOW, not a transmit hint: it clamps the
+        // window to `max_burst_size * mss`. At 1 that is 1460 bytes — one segment in flight, one
+        // round trip per segment. Measured on the WiFi path before the same fix, that was ~5 KB/s
+        // on a 30 Mbps link. The wired driver keeps 16 descriptors of 2 KiB, so 16 is the honest
+        // ceiling here (the WiFi path posts 128 buffers and uses 32).
+        caps.max_burst_size = Some(16);
         caps.checksum = ChecksumCapabilities::default();
         caps
     }

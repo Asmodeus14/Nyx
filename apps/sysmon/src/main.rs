@@ -123,7 +123,24 @@ enum Detail {
     None,
     Processes,
     Log,
+    /// The quantum substrate.
+    ///
+    /// ⚠️ Deliberately a disclosure row and **not** a fifth `.mc` card, and not a replacement for
+    /// Storage either. The module docs above explain why Storage holds the slot the design labels
+    /// "Graphics": because it is a real measurement. Evicting a real measurement to make room for a
+    /// device that is not present would invert the exact rule this window is built on.
+    ///
+    /// A quantum processor has no percentage to show. What it has is a presence state, and "there
+    /// isn't one" is a complete and useful answer that belongs in the design's own idiom for detail
+    /// that exists but has to be asked for.
+    Quantum,
 }
+
+/// How many quantum devices the kernel's PCI probe can report.
+///
+/// Matches `nyx-kernel/src/quantum.rs`'s registry size. Eight is already generous for a class of
+/// device that does not exist in consumer form.
+const MAX_QPUS: usize = 8;
 
 struct Monitor {
     width: i32,
@@ -288,7 +305,7 @@ impl Monitor {
     /// One walk that draw, hit-test and `content_height` all call, for the reason `panes` exists at
     /// all: an accordion whose click target and whose plate are computed separately drifts the
     /// moment one of them is edited.
-    fn sections(&self) -> (layout::Rect, layout::Rect, i32) {
+    fn sections(&self) -> (layout::Rect, layout::Rect, layout::Rect, i32) {
         let dh = self.disclosure_h();
         let mut y = self.grid_h();
 
@@ -298,19 +315,108 @@ impl Monitor {
             y += self.proc_count() as i32 * sc(ROW_H);
         }
 
+        let qpu_row = layout::Rect::new(0, y, self.width, dh);
+        y += dh;
+        if self.detail == Detail::Quantum {
+            y += self.quantum_lines().len() as i32 * sc(ROW_H);
+        }
+
         let log_row = layout::Rect::new(0, y, self.width, dh);
         y += dh;
         if self.detail == Detail::Log {
             y += self.log_lines.len() as i32 * sc(LOG_H);
         }
 
-        (proc_row, log_row, y)
+        (proc_row, qpu_row, log_row, y)
+    }
+
+    /// The one-word state shown on the collapsed Quantum row.
+    ///
+    /// Reads the kernel's registry only (syscall 573), because this window reports **this machine's
+    /// hardware**. The userspace state-vector simulator is a software capability, not a device on
+    /// this bus, so it does not turn this row into `SIMULATOR` — it is mentioned in the expanded
+    /// detail instead, where there is room to say what it actually is.
+    fn quantum_state(&self) -> &'static str {
+        let mut buf = [QpuInfo::default(); MAX_QPUS];
+        let n = sys_quantum_enumerate(&mut buf);
+        for d in &buf[..n] {
+            if d.status == QPU_STATUS_HARDWARE {
+                return "hardware";
+            }
+        }
+        // ★ The honest answer, and the one this laptop will always give. See
+        // `docs/quantum/limitations.md`: no consumer gate-model QPU exists that Nyx can drive over
+        // PCIe, so `hardware` above is unreachable here by design. If this row ever reads
+        // "hardware" on this machine, that is a bug and not a success.
+        "not present"
+    }
+
+    /// The expanded Quantum detail, one line per row.
+    ///
+    /// Built as strings rather than drawn directly so `sections()` can size the section from the
+    /// same data the draw uses — the sysmon rule that a hit-test must not be able to disagree with a
+    /// paint.
+    fn quantum_lines(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+
+        let mut buf = [QpuInfo::default(); MAX_QPUS];
+        let n = sys_quantum_enumerate(&mut buf);
+
+        let real = buf[..n].iter().filter(|d| d.status == QPU_STATUS_HARDWARE).count();
+        if real == 0 {
+            out.push(String::from("No quantum processor is attached to this machine."));
+        }
+
+        for d in &buf[..n] {
+            if d.status == QPU_STATUS_HARDWARE {
+                out.push(alloc::format!(
+                    "{}  {}  {} qubits",
+                    d.status_label(),
+                    d.name_str(),
+                    d.qubits
+                ));
+            } else {
+                // Something on the bus the probe could not identify. Reported rather than hidden:
+                // this laptop has no serial console, so a probe finding that only reached
+                // `serial_println!` would be discovered and then thrown away.
+                out.push(alloc::format!(
+                    "PCI {:02x}:{:02x}.{}  {:04x}:{:04x}  unidentified accelerator, not claimed as quantum",
+                    (d.pci_bdf >> 16) & 0xFF,
+                    (d.pci_bdf >> 8) & 0xFF,
+                    d.pci_bdf & 0xFF,
+                    d.pci_vendor_id,
+                    d.pci_device_id,
+                ));
+            }
+        }
+
+        out.push(String::from(
+            "A classical state-vector simulator is available to applications.",
+        ));
+        out.push(String::from(
+            "It is software running on this CPU, not a quantum processor.",
+        ));
+        out.push(String::from("Run `quantum` in Terminal for the full picture."));
+        out
+    }
+
+    fn draw_quantum(&self, canvas: &mut Canvas, t: &Theme, top: i32, sy: i32) {
+        let mut y = top;
+        for line in self.quantum_lines() {
+            let ry = y - sy;
+            y += sc(ROW_H);
+            if ry + sc(ROW_H) < 0 || ry >= self.height {
+                continue;
+            }
+            let ty = text::centre_y(ry, sc(ROW_H), B3);
+            text::draw(canvas, sc(PROC_PAD_X), ty, B3, t.fg_3, &line);
+        }
     }
 
     /// Everything this window has to show, in pixels. See `panes::reported_content_height` for why
     /// this must be measured from the top of the surface and not from the top of a list.
     fn content_h(&self) -> i32 {
-        self.sections().2
+        self.sections().3
     }
 
     /// Read and split the kernel log, but only when it has actually changed. `sys_get_boot_logs`
@@ -641,11 +747,13 @@ impl NyxApp for Monitor {
     }
 
     fn on_mouse(&mut self, mx: usize, my: usize, _clicked: bool) -> bool {
-        let (proc_row, log_row, _) = self.sections();
+        let (proc_row, qpu_row, log_row, _) = self.sections();
         let (x, y) = (mx as i32, my as i32 + self.scroll);
 
         let want = if proc_row.contains(x, y) {
             Some(Detail::Processes)
+        } else if qpu_row.contains(x, y) {
+            Some(Detail::Quantum)
         } else if log_row.contains(x, y) {
             Some(Detail::Log)
         } else {
@@ -677,12 +785,20 @@ impl NyxApp for Monitor {
             self.draw_card(canvas, &t, i, *m, sy);
         }
 
-        let (proc_row, log_row, _) = self.sections();
+        let (proc_row, qpu_row, log_row, _) = self.sections();
         let procs = self.proc_count();
         self.draw_disclosure(canvas, &t, proc_row, sy, "Processes",
             &alloc::format!("{} running", procs), self.detail == Detail::Processes);
         if self.detail == Detail::Processes {
             self.draw_processes(canvas, &t, proc_row.bottom(), sy);
+        }
+
+        // Nyx's third compute substrate. The collapsed state is one word, and on this machine that
+        // word is "not present" — which is the true answer, not a placeholder awaiting a driver.
+        self.draw_disclosure(canvas, &t, qpu_row, sy, "Quantum",
+            self.quantum_state(), self.detail == Detail::Quantum);
+        if self.detail == Detail::Quantum {
+            self.draw_quantum(canvas, &t, qpu_row.bottom(), sy);
         }
 
         // The count is only known once the log has been read, and it is only read when asked for —

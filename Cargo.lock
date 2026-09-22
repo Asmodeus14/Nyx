@@ -1841,6 +1841,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-json"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-kernel"
 version = "0.1.0"
 dependencies = [
@@ -1883,9 +1887,25 @@ name = "nyx-net"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
+ "miniz_oxide",
  "rustls",
  "rustls-rustcrypto",
  "webpki-roots",
+]
+
+[[package]]
+name = "nyx-quantum"
+version = "0.1.0"
+
+[[package]]
+name = "nyx-quantum-rt"
+version = "0.1.0"
+dependencies = [
+ "nyx-api",
+ "nyx-json",
+ "nyx-net",
+ "nyx-quantum",
+ "qclang_compiler",
 ]
 
 [[package]]
@@ -1896,6 +1916,7 @@ dependencies = [
  "nyx-api",
  "nyx-gui",
  "nyx-meridian",
+ "nyx-quantum",
 ]
 
 [[package]]

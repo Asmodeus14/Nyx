@@ -1,5 +1,28 @@
-
-
 [target.'cfg(target_os = "none")']
 runner = "cargo run -q -p runner --"
 rustflags = ["-C", "relocation-model=static"]
+
+# ★★ smoltcp's DNS limits, which default to 1 and silently broke two things (found 2026-09-20).
+#
+# smoltcp sizes its DNS buffers at BUILD time from these env vars (see its `build.rs`), and the
+# defaults are `DNS_MAX_RESULT_COUNT = 1` and `DNS_MAX_SERVER_COUNT = 1`. Both are wrong for us:
+#
+# 1. **The multi-address DNS fallback was dead.** Syscall 572 (`sys_dns_resolve_all`) exists
+#    specifically so a name resolving to several A records has a fallback when one address is
+#    unreachable — that was the fix for the "HTTPS looks broken" session. But smoltcp's
+#    `addresses` vector had capacity **1**, so `get_query_result` could only ever hand back one
+#    address no matter how many the server sent. The kernel's `DNS_MAX_ADDRS` loop, the `[u32; 4]`
+#    ABI and the connect-retry logic were all correct and all fed by a resolver that had thrown the
+#    alternatives away. Nothing failed loudly; the fallback just never had anything to fall back to.
+#
+# 2. **`update_servers` panics above capacity.** smoltcp documents "Panics if
+#    `servers.len() > MAX_SERVER_COUNT`", and both DHCP paths in `drivers/net/mod.rs` passed the
+#    lease's whole server list straight in. Most home routers hand out **two** DNS servers, so that
+#    is a whole-machine panic on a very ordinary network. The call sites now clamp as well — this
+#    value alone is not a safe fix, because a lease with four servers would still panic.
+#
+# ⚠️ These are build-time buffer sizes, not runtime settings. Changing them requires a rebuild of
+# smoltcp, which `cargo` handles via the `rerun-if-env-changed` lines in its build script.
+[env]
+SMOLTCP_DNS_MAX_RESULT_COUNT = "4"
+SMOLTCP_DNS_MAX_SERVER_COUNT = "3"

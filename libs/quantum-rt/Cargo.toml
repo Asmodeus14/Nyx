@@ -1,0 +1,34 @@
+[package]
+name = "nyx-quantum-rt"
+version = "0.1.0"
+edition = "2021"
+description = "Nyx quantum runtime: device discovery, backend selection, job lifecycle, providers"
+
+[lints.rust]
+# `kernel_devices()` is gated on target_os="nyx", which rustc does not know about when this crate is
+# built for the host (which it is, for `cargo test`). Declare the value rather than silencing the
+# lint, so a genuine typo in a cfg still gets caught. Same line as `libs/net`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("nyx"))'] }
+
+[dependencies]
+# The device model, circuit IR, backend trait and simulator. no_std, zero deps.
+nyx-quantum = { path = "../quantum" }
+
+# The portable qclang core (logos + thiserror only; no host CLI/sim deps), for the `.ql` -> circuit
+# adapter. Same `default-features = false` line `libs/toolchains` uses, for the same reason.
+#
+# ⚠️ This crate ADAPTS qclang; it does not modify it. `tools/compiler` is a working compiler with an
+# on-device consumer (`apps/qcstudio`) and a terminal command (`compile`) already depending on it.
+qclang_compiler = { path = "../../tools/compiler", default-features = false }
+
+# The cloud-provider path. `nyx-net` gained `Request`/`request_once` (POST + headers + body) for this;
+# `nyx-json` exists because provider responses are untrusted input and a 350-line parser with a
+# stated depth cap is a smaller thing to audit than a derive framework.
+nyx-net = { path = "../net" }
+nyx-json = { path = "../json" }
+
+# The syscall wrappers, only where the syscalls exist. On the host there is no kernel to ask, so
+# `kernel_devices()` returns nothing — which is also exactly what it returns on this laptop, since
+# there is no quantum hardware to find. Host tests therefore exercise the real code path.
+[target.'cfg(target_os = "nyx")'.dependencies]
+nyx-api = { path = "../api" }

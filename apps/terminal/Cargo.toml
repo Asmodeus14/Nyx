@@ -27,6 +27,10 @@ nyx-meridian = { path = "../../libs/meridian" }
 # Meridian step 19 — `passwd` derives the lock's stored key. The same crate the shell verifies
 # against and the same one `iwlwifi` uses for WPA2, so there is exactly one PBKDF2 in the tree.
 nyx-crypto = { path = "../../libs/crypto" }
+# The quantum subsystem — backs the `quantum` command. Pulls `nyx-quantum` (the device model,
+# circuit IR and state-vector simulator) and the qclang adapter, so `quantum simulate <file.ql>`
+# runs the same compiler `compile` already uses and evaluates the result in-process.
+nyx-quantum-rt = { path = "../../libs/quantum-rt" }
 
 [[bin]]
 name = "nyx-terminal"

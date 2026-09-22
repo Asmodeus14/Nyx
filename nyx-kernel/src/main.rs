@@ -31,6 +31,10 @@ pub mod boot_screen;
 pub mod random;
 pub mod scheduler;
 pub mod pci;
+// The QPU as a discoverable compute resource. Discovery and introspection only — no gates, no
+// circuits, no simulator, no networking. See `docs/quantum/architecture.md` for why the kernel's
+// share of this subsystem is deliberately two syscalls and a table.
+pub mod quantum;
 pub mod drivers;
 pub mod fs;
 pub mod vfs;
@@ -266,6 +270,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         acpi::boot_checkpoint("post-smp");
         crate::boot_screen::milestone(crate::boot_screen::Milestone::Acpi);
         pci::enumerate_pci();
+        // Reports what `enumerate_pci` recorded, so it must run after it. Mirrored in the degraded
+        // branch below — a device that only registers on one boot path works by luck.
+        quantum::init();
         acpi::boot_checkpoint("post-pci");
         crate::boot_screen::milestone(crate::boot_screen::Milestone::Pci);
     } else {
@@ -275,6 +282,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         time::init();
         crate::time::calibrate_tsc();
         pci::enumerate_pci();
+        quantum::init();
         crate::boot_screen::milestone(crate::boot_screen::Milestone::Pci);
     }
 

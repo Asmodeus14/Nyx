@@ -1,0 +1,14 @@
+[package]
+name = "nyx-json"
+version = "0.1.0"
+edition = "2021"
+description = "A small, auditable JSON reader/writer for Nyx. Not a serde replacement."
+
+# No dependencies, deliberately.
+#
+# `serde_json` would have been one line and is excellent. It is not taken because this crate exists
+# to parse responses from a network service — untrusted input — and the property that matters most
+# here is that the whole parser can be read in one sitting and its recursion bound can be pointed at.
+# ~350 lines with an explicit depth cap is a smaller thing to audit than serde's derive machinery,
+# and Nyx's engineering rule is "small, modular, understandable, auditable".
+[dependencies]

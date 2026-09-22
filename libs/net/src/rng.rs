@@ -16,6 +16,16 @@
 #[cfg(target_os = "nyx")]
 mod imp {
     const SYS_GETRANDOM: usize = 318;
+    /// Ask the kernel to FAIL rather than hand back non-cryptographic bytes.
+    ///
+    /// ★ Without this the kernel reported success even when it had fallen back to a TSC-seeded
+    /// xorshift, and the only check here was the byte count — so guessable bytes would have become
+    /// ECDHE private keys, the client random and GCM nonces, silently. The kernel's
+    /// `random::is_cryptographic()` was written to prevent precisely that and had no callers.
+    ///
+    /// Plain `getrandom` keeps its old always-succeed behaviour, because std seeds every `HashMap`
+    /// through it during startup and cannot cope with an error.
+    const NYX_GRND_CRYPTO: usize = 0x8000;
 
     fn nyx_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
         if buf.is_empty() {
@@ -28,13 +38,16 @@ mod imp {
                 inlateout("rax") SYS_GETRANDOM => ret,
                 in("rdi") buf.as_mut_ptr() as usize,
                 in("rsi") buf.len(),
-                in("rdx") 0usize,
+                in("rdx") NYX_GRND_CRYPTO,
                 out("rcx") _, out("r11") _,
                 options(nostack),
             );
         }
-        // The kernel fills the whole buffer or reports EFAULT; a short count would mean key material
-        // with predictable bytes in it, so treat anything but an exact fill as failure.
+        // The kernel fills the whole buffer, or reports EFAULT for a bad pointer, or EIO when it
+        // could not produce cryptographic bytes and we asked it to fail rather than substitute weak
+        // ones. A short count would mean key material with predictable bytes in it, so treat
+        // anything but an exact fill as failure — rustls will abandon the handshake, which is the
+        // correct outcome.
         if ret < 0 || ret as usize != buf.len() {
             return Err(getrandom::Error::UNSUPPORTED);
         }
