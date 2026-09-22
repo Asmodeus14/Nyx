@@ -58,32 +58,25 @@ impl MouseDriver {
             self.wait_for_write(); self.command_port.write(0x60);
             self.wait_for_write(); self.data_port.write(status);
             
-            // ★ Set the KEYBOARD's typematic rate. Nothing ever did, so it sat at the 8042's
-            // power-on default — which is the SLOWEST the hardware offers: a 500 ms delay before
-            // repeat, then ~10.9 characters per second. Holding a key (arrowing through a file,
-            // holding backspace) therefore felt sluggish no matter how fast the scheduler got.
+            // ⚠️⚠️ THE KEYBOARD TYPEMATIC HANDSHAKE USED TO LIVE HERE, AND IT KILLED THE TOUCHPAD.
             //
-            // 0xF3 = Set Typematic Rate/Delay, argument 0x00 = 250 ms delay, 30.0 cps. That is the
-            // fastest the PS/2 protocol can express: bits 6-5 are the delay (00 = 250 ms) and bits
-            // 4-0 the rate (00000 = 30 cps).
+            // Setting the repeat rate (0xF3, 0x00 -> 250 ms delay / 30 cps) is a genuine
+            // improvement — the 8042 powers up at its SLOWEST setting, 500 ms then ~10.9 cps — but
+            // two attempts at it both left the pointer dead on real hardware, and it is not worth a
+            // dead pointer on a laptop.
             //
-            // ⚠️ Keyboard commands go to the DATA port directly. 0xD4 prefixes a command for the
-            // AUX (mouse) device — using `write_mouse` here would send this to the trackpad, which
-            // has no such command and would leave the keyboard untouched.
+            // First attempt put it AFTER `0xF4` ("enable data reporting"), so the mouse was already
+            // streaming 3-byte packets into the same output buffer the handshake reads from.
+            // `wait_for_read` only tests status bit 0 (output buffer full), never bit 5 (AUX data),
+            // so it cannot tell a keyboard ACK from a mouse byte and the blind reads desynchronised
+            // the packet state machine. Moving it BEFORE `0xF6`/`0xF4` did NOT fix it, so that
+            // explanation was incomplete at best.
             //
-            // ⚠️⚠️ THIS MUST COME BEFORE THE MOUSE IS STARTED, AND IT DID NOT — THAT DISABLED THE
-            // TOUCHPAD. `0xF4` is "enable data reporting": the moment it is acked the mouse begins
-            // streaming 3-byte packets into the SAME output buffer this handshake reads from. And
-            // `wait_for_read` only tests status bit 0 (output buffer full), not bit 5 (AUX data) —
-            // so it cannot tell a keyboard ACK from a mouse byte. Run after `0xF4`, these four
-            // blind reads swallow mouse bytes, desynchronise the packet state machine, and leave
-            // the pointer dead.
-            //
-            // Ordered before `0xF6`/`0xF4`, nothing else is in flight and both sequences are clean.
-            self.wait_for_write(); self.data_port.write(0xF3);
-            self.wait_for_read(); let _ = self.data_port.read();   // ACK
-            self.wait_for_write(); self.data_port.write(0x00);
-            self.wait_for_read(); let _ = self.data_port.read();   // ACK
+            // ⚠️ QEMU reproduces NEITHER failure — its 8042 tolerates the interleaving and clicks
+            // keep working — so this cannot be developed here. Reintroducing it needs, at minimum:
+            // drain the output buffer first, then VERIFY each response is 0xFA instead of reading
+            // blindly, and treat a missing ACK as "skip the whole thing" rather than continuing.
+            // Until that can be tested against the real controller, the pointer wins.
 
             // 🚨 THE FIX: 0xF6 (Set Defaults) instead of 0xFF (Reset).
             // This prevents the hardware from flooding the buffer with 3 bytes and breaking the packet cycle!
