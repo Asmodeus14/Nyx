@@ -30,6 +30,7 @@ pub mod brand_gen;
 pub mod boot_screen;
 pub mod random;
 pub mod scheduler;
+pub mod schedstats;
 pub mod pci;
 // The QPU as a discoverable compute resource. Discovery and introspection only — no gates, no
 // circuits, no simulator, no networking. See `docs/quantum/architecture.md` for why the kernel's
@@ -256,6 +257,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::memory::identity_map_low_memory();
         time::init();
         crate::time::calibrate_tsc();
+        // Measure the APIC timer against the PIT. Report-only — `init_timer` still programs the
+        // count it always did. BSP only, and it has to sit between `apic::init` (which maps the
+        // LAPIC) and `init_timer` (which arms it).
+        crate::apic::calibrate_timer();
         ioapic::init();
         
         let bsp_apic_id = apic_ids[0] as u8;
@@ -293,9 +298,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::acpi::boot_checkpoint("post-nvme");
     
     unsafe {
-        if let Some(ref mut driver) = crate::fs::GLOBAL_NVME { 
-            driver.create_io_queues(); 
+        if let Some(ref mut driver) = crate::fs::GLOBAL_NVME {
+            driver.create_io_queues();
         }
+        // Must follow `create_io_queues` — the check issues real I/O reads. Proves on this specific
+        // device that an 8-block command returns the same bytes as eight 1-block commands, which is
+        // what gates the 4 KiB read chunking that removes ~7 of every 8 NVMe round trips from the
+        // ELF loader. See `fs::nvme_enable_fast_reads`.
+        crate::fs::nvme_enable_fast_reads();
         crate::entity::awaken_entity(&mut crate::fs::GLOBAL_NVME);
     }
     crate::acpi::boot_checkpoint("post-entity");

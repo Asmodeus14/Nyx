@@ -146,6 +146,16 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
     // still maps it (use-after-free of RAM it may reuse), so we hold it here until the ACK arrives.
     let mut pending_retire: Vec<(u64, u64)> = Vec::new();
 
+    /// How long a frame loop is willing to sit idle before waking to repaint. Unchanged from the
+    /// `sleep(16)` this loop used to end with — it is a frame budget, not a poll interval, and now
+    /// only applies when genuinely nothing happened.
+    const FRAME_BUDGET_MS: u64 = 16;
+
+    // A message consumed by the blocking wait at the bottom of the previous iteration. It is
+    // handed to the drain below rather than decoded there, so message decoding stays in exactly
+    // one place; two copies of that match would drift.
+    let mut carried: Option<IpcMessage> = None;
+
     loop {
         let mut event_redraw = false;
 
@@ -161,7 +171,13 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
         //   Some(Some(pos)) = the pointer is here      Some(None) = it left      None = no news
         let mut pending_hover: Option<Option<(usize, usize)>> = None;
         let mut pending_theme: Option<bool> = None;
-        while sys_ipc_recv(&mut msg, false) {
+        // Seeded with whatever the blocking wait already pulled off the queue, so that message
+        // takes the same path as every other one. `take()` because it must be consumed once.
+        let mut have = match carried.take() {
+            Some(m) => { msg = m; true }
+            None => sys_ipc_recv(&mut msg, false),
+        };
+        while have {
             match msg.msg_type {
                 MSG_WINDOW_CLOSE => sys_exit(0),
                 MSG_WINDOW_RESIZED => {
@@ -203,6 +219,7 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
                 },
                 _ => {}
             }
+            have = sys_ipc_recv(&mut msg, false);
         }
 
         // The theme first: it changes what everything else will be drawn in, and an app that lays
@@ -298,7 +315,25 @@ pub fn run<T: NyxApp>(mut app: T) -> ! {
             
             needs_redraw = false;
         }
-        
-        sys_sleep_ms(16);
+
+        // ★ Block for the frame budget instead of sleeping through it.
+        //
+        // This was `sys_sleep_ms(16)` paired with the non-blocking drain above, and it cost up to a
+        // full frame of latency on every event: the window server forwards a keystroke with
+        // `ipc_send` the instant the IRQ lands, and the app then ignored it until its next tick. It
+        // also woke the task 62 times a second on a completely idle desktop.
+        //
+        // `sys_ipc_recv_timeout` is woken directly by `ipc_send`, so an event reaches the app
+        // immediately while the timeout preserves the old pacing exactly when nothing arrives. Any
+        // message it pulls off is CARRIED into the next iteration's drain rather than decoded here,
+        // so the match above stays the only place that interprets a message.
+        //
+        // ⚠️ This also replaces something that used to work by accident: the input ISRs woke every
+        // sleeping task on every mouse byte, dragging apps out of `sleep(16)` early. That herd is
+        // gone, so this call is now the only thing making an app feel responsive.
+        let mut wake_msg = IpcMessage { sender_pid: 0, msg_type: 0, data1: 0, data2: 0 };
+        if sys_ipc_recv_timeout(&mut wake_msg, FRAME_BUDGET_MS) {
+            carried = Some(wake_msg);
+        }
     }
 }
