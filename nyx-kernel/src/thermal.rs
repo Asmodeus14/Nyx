@@ -90,30 +90,12 @@ pub fn scan_smbus(smbus_base: u16) {
     }
 }
 
+/// Kept as a thin alias so this file's many call sites read unchanged. The implementation moved to
+/// `scheduler::kernel_sleep_ms` when the USB HID poller needed the same primitive — two copies of a
+/// blocking sleep would drift, and one of them already lacked the `WaitReason` tag that stops the
+/// input ISRs waking it.
 fn kernel_sleep_ms(ms: u64) {
-    let wake_ms = crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) + ms; 
-    
-    unsafe {
-        x86_64::instructions::interrupts::enable();
-        loop {
-            let percpu = crate::percpu::current();
-            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
-            {
-                let task = &mut percpu.scheduler.tasks[curr_idx];
-                task.state = crate::scheduler::TaskState::Blocked;
-                task.wake_tsc = wake_ms; 
-            }
-            
-            // Yield the CPU
-            core::arch::asm!("int 0x41"); 
-            
-            // Did the time actually pass? If yes, break!
-            if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) >= wake_ms { break; } 
-            
-            // If we woke up illegally (scheduler fallback), HALT to save battery!
-            x86_64::instructions::hlt(); 
-        }
-    }
+    crate::scheduler::kernel_sleep_ms(ms);
 }
 
 

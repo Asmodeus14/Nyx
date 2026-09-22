@@ -423,6 +423,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     percpu.scheduler.tasks.push(idle_task);    
     percpu.scheduler.tasks.push(init_process); 
     percpu.scheduler.tasks.push(thermal_task); 
+
+    // USB HID poller. Nothing called `poll_all_mice`, so the xHCI driver enumerated devices,
+    // configured their interrupt endpoints and then never collected a single report — a USB
+    // keyboard or mouse did nothing at all.
+    //
+    // ⚠️ Built with `new_idle_ap`'s RESERVED PID range (0xFFFF_0000+), not `Process::new()`. The
+    // boot daemons occupy the well-known low numbers and apps hardcode COMPOSITOR_PID=4 for their
+    // window IPC (libs/gui/app.rs); taking an ordinary PID here would shift the compositor off 4
+    // and break every app's ability to open a window. That regression has happened before — it is
+    // why the reserved range exists.
+    //
+    // `is_idle` is cleared: the constructor is shared with the AP idle tasks, but this one is real
+    // work and must not be treated as a last-resort fallback by the scheduler.
+    {
+        let mut usb_task = crate::process::Process::new_idle_ap()
+            .expect("Failed to create USB HID task");
+        usb_task.is_idle = false;
+        usb_task.name = *b"usb-hid         ";
+        unsafe {
+            let iretq_ptr = usb_task.kernel_stack_top - 40;
+            let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+            iret_slice[0] = crate::usb::nyx_usb_hid_task as u64;
+            iret_slice[1] = 0x08; iret_slice[2] = 0x202;
+            iret_slice[3] = usb_task.kernel_stack_top; iret_slice[4] = 0x10;
+            let regs_ptr = iretq_ptr - 120;
+            core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
+            let fxsave_ptr = (regs_ptr - 512) & !0xF;
+            crate::process::init_fpu_state(fxsave_ptr as u64);
+            let final_rsp = fxsave_ptr - 16;
+            let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+            bottom[0] = regs_ptr; bottom[1] = 0;
+            usb_task.saved_rsp = final_rsp;
+        }
+        percpu.scheduler.tasks.push(usb_task);
+    }
+
     
     percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32] = 1;
 

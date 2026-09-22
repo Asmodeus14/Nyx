@@ -124,6 +124,41 @@ static HB_TICK: AtomicU64 = AtomicU64::new(0);
 /// look for, and it is invisible to a per-core snapshot.
 static HB_CORE_LAST_MS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
 
+/// Block the calling KERNEL task for `ms`, then return.
+///
+/// Shared by the thermal governor and the USB HID poller, which previously each would have carried
+/// their own copy. Marks the wait as [`WaitReason::Timer`], so the input ISRs — which wake only
+/// `Input` waiters — correctly leave it alone.
+///
+/// ⚠️ Kernel tasks only. It enables interrupts and yields, so the caller must hold no lock and must
+/// not be inside a syscall that promised atomicity.
+pub fn kernel_sleep_ms(ms: u64) {
+    let wake_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed) + ms;
+
+    unsafe {
+        x86_64::instructions::interrupts::enable();
+        loop {
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx < percpu.scheduler.tasks.len() {
+                let task = &mut percpu.scheduler.tasks[curr_idx];
+                task.state = TaskState::Blocked;
+                task.wake_tsc = wake_ms;
+                task.wait_reason = WaitReason::Timer;
+            }
+
+            core::arch::asm!("int 0x41");
+
+            if crate::time::UPTIME_MS.load(Ordering::Relaxed) >= wake_ms {
+                break;
+            }
+            // Woken early by something other than the deadline; park rather than spin.
+            x86_64::instructions::hlt();
+        }
+        x86_64::instructions::interrupts::disable();
+    }
+}
+
 /// Place a newly created task on the least-loaded core and return which one took it.
 ///
 /// ★★★ This is the change that makes the machine multi-core at all. `fork` and `clone` pushed onto
