@@ -65,6 +65,20 @@ fn screen_dims() -> Option<(u32, u32, u32)> {
 /// CPU compositing. A LINEAR-pitch violation (window width not 16-aligned) fails the whole call so the
 /// compositor CPU-composites that frame — correct, just not accelerated.
 pub fn composite(quads: &[WindowQuad]) -> bool {
+    // ★ Refuse immediately once the render engine has proven itself wedged.
+    //
+    // Measured on hardware: the RCS fence never signalled, so every composite ran its wait to the
+    // end and returned EngineHang — 23.5 ms of interrupts-off time, roughly 4 times a second,
+    // before falling back to software compositing regardless. The fallback is what was actually
+    // drawing the desktop; the GPU attempt contributed nothing but latency. Returning `false` takes
+    // the same path, minus the stall.
+    //
+    // Self-clearing: any successful fence resets the counter (see `super::RENDER_HANGS`), so an
+    // engine that recovers — after a reset, or once forcewake/MOCS are re-established following
+    // RC6 — is picked up again without a reboot.
+    if super::engine_is_wedged() {
+        return false;
+    }
     if quads.is_empty() {
         return true; // nothing to composite; wallpaper alone is correct
     }
@@ -139,11 +153,26 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
     let ok = unsafe {
         eng.draw_scene(scene, &mvps, 0x1400_0000, 0, sw, sh, pitch, 0, 0, false, true, false, false)
     };
+    // ★★ Strike-counting lives HERE, at composite granularity, not inside `wait_fence_value`.
+    //
+    // It was per-fence, and that could never latch: `draw_scene` performs TWO fence waits per
+    // composite, and when one succeeded while the other timed out, the success reset the counter —
+    // so it flapped 0 -> 1 -> 0 -> 1 forever. The hardware evidence was a stall of 39,664 us, i.e.
+    // almost exactly 2 x the 20,000 us timeout, still arriving 10 times a second long after the
+    // latch should have fired.
+    //
+    // "Did the composite work" is the question the fallback actually turns on, so that is what gets
+    // counted.
+    use core::sync::atomic::Ordering;
     if ok.is_err() {
+        super::RENDER_HANGS.fetch_add(1, Ordering::Relaxed);
         // On a GPU hang the scene may be wedged; drop it so the next call rebuilds, and fall back.
         ctx.scene = None;
         ctx.sig.clear();
         return false;
     }
+    // Only a WHOLE successful composite clears the strikes, so an engine that half-works cannot
+    // hold the path open indefinitely.
+    super::RENDER_HANGS.store(0, Ordering::Relaxed);
     true
 }

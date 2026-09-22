@@ -66,6 +66,84 @@ pub const GRDOM_FULL: u32 = 1 << 0;
 // Global fault register (already probed by the BLT self-test at 0x4094).
 pub const RENDER_FAULT_REG: u32 = 0x4094;
 
+/// How long to wait for the render fence before declaring the engine hung, in microseconds.
+///
+/// This is a deadline for declaring the engine dead, NOT a performance knob — the same distinction
+/// that matters for `BLT_FENCE_TIMEOUT_US`, where setting it too tight abandoned real work and
+/// corrupted the screen. Steady-state cost is governed by [`RENDER_HANG_LIMIT`], not by this: once
+/// the path latches off, no further waits happen at all, so the timeout is only paid for the first
+/// few frames.
+///
+/// Chosen generously enough that a *working* render engine (on some other machine, or on this one
+/// once the underlying fence bug is fixed) is never given up on mid-composite.
+/// ⚠️ Budget is paid TWICE per composite — `draw_scene` performs two fence waits — so the worst
+/// case before the latch engages is `2 x this x RENDER_HANG_LIMIT`. At 20_000 that was 320 ms of
+/// stalling before the path switched off; measured on hardware as repeated 39,664 us windows.
+pub const FENCE_TIMEOUT_US: u64 = 5_000;
+
+/// Consecutive fence timeouts before the RCS composite path is latched off.
+///
+/// ★ Measured on hardware: the engine hung on *every* composite, ~4 times a second, 23.5 ms each —
+/// about 94 ms per second of core 0 spent with interrupts masked waiting for a fence that was never
+/// going to signal. Shortening the timeout bounds the damage; refusing to retry removes it. The
+/// compositor already handles a `false` return by compositing in software, so the fallback path is
+/// the one that was running anyway — it just no longer pays for a failed GPU attempt first.
+pub const RENDER_HANG_LIMIT: u32 = 8;
+
+/// Consecutive FAILED COMPOSITES. Incremented and cleared by `compositor::composite` — not by
+/// individual fence waits, which flap (two per composite).
+pub static RENDER_HANGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Fence timeouts seen, used only to rate-limit the diagnostic log line.
+pub static FENCE_TIMEOUT_LOGS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// A wall-clock budget for a spin loop.
+///
+/// ★★★ Every wait in this driver was bounded by an ITERATION COUNT, and that is how three separate
+/// fixes each missed the loop that was actually stalling. An iteration count means a different
+/// duration on every machine and in every loop body — 20,000,000 iterations of
+/// `clflush + mfence + read` measured ~23.5 ms here, while 1,000,000 of a bare register poll is
+/// well under a millisecond. So the numbers said nothing about time, could not be compared to each
+/// other, and could not be reasoned about from the source.
+///
+/// Expressed in microseconds, a budget means the same thing everywhere and shows up directly in the
+/// stall report. ⚠️ These are deadlines for declaring hardware DEAD, never throughput knobs: set one
+/// below the time real work takes and it abandons that work mid-flight, which corrupts output
+/// rather than saving time (see `BLT_FENCE_TIMEOUT_US`).
+#[derive(Clone, Copy)]
+pub struct SpinDeadline {
+    end: u64,
+}
+
+impl SpinDeadline {
+    #[inline(always)]
+    pub fn new(us: u64) -> Self {
+        let mhz = crate::time::TSC_MHZ.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        Self { end: crate::time::rdtsc().wrapping_add(mhz.saturating_mul(us)) }
+    }
+
+    #[inline(always)]
+    pub fn expired(&self) -> bool {
+        crate::time::rdtsc() >= self.end
+    }
+}
+
+/// Budget for a fence wait in the 3D pipeline. Same reasoning as [`FENCE_TIMEOUT_US`].
+pub const PIPELINE_FENCE_TIMEOUT_US: u64 = 20_000;
+/// Budget for waiting on ring space, or for a register ack. These complete in microseconds when the
+/// hardware is alive, so the only question is how long to wait before calling it dead.
+pub const RING_TIMEOUT_US: u64 = 5_000;
+
+/// True once the render engine has failed enough consecutive fences to stop trying.
+///
+/// Deliberately not permanent-by-construction: a successful wait clears the counter, so an engine
+/// that recovers (after a reset, or after forcewake/MOCS are re-established following RC6 — see the
+/// notes in this module) comes back on its own.
+pub fn engine_is_wedged() -> bool {
+    RENDER_HANGS.load(core::sync::atomic::Ordering::Relaxed) >= RENDER_HANG_LIMIT
+}
+
 // ---------------------------------------------------------------------------
 // GVA (GGTT) layout owned by the 3D engine. Chosen to avoid the BLT driver's
 // existing allocations (ring 0x1000_0000, backbuffer 0x1400_0000, fence
@@ -235,11 +313,10 @@ impl RenderEngine {
     pub unsafe fn forcewake_render(&self) {
         // Masked write: enable bit 0 (mask bit 16 set).
         self.write_reg(FORCEWAKE_RENDER, 0x0001_0001);
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(RING_TIMEOUT_US);
         while (self.read_reg(FORCEWAKE_ACK_RENDER) & 1) == 0 {
             core::hint::spin_loop();
-            t += 1;
-            if t > 1_000_000 {
+            if deadline.expired() {
                 crate::serial_println!("[RCS] WARN: render forcewake ack timeout (ack={:#x})",
                     self.read_reg(FORCEWAKE_ACK_RENDER));
                 break;
@@ -311,25 +388,23 @@ impl RenderEngine {
         // 1. Request reset (masked reg: set REQUEST_RESET bit 0).
         self.write_reg(RCS_RESET_CTL, (1 << 16) | (1 << 0));
         // 2. Wait until the engine reports READY_FOR_RESET (bit 1).
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(RING_TIMEOUT_US);
         while (self.read_reg(RCS_RESET_CTL) & (1 << 1)) == 0 {
             core::hint::spin_loop();
-            t += 1;
-            if t > 2_000_000 {
+            if deadline.expired() {
                 crate::serial_println!("[RCS] WARN: engine not ready-for-reset, forcing anyway");
                 break;
             }
         }
         // 3. Pulse the render reset domain via GEN6_GDRST.
         self.write_reg(GDRST, GRDOM_RENDER);
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(RING_TIMEOUT_US);
         loop {
             if (self.read_reg(GDRST) & GRDOM_RENDER) == 0 {
                 break;
             }
             core::hint::spin_loop();
-            t += 1;
-            if t > 5_000_000 {
+            if deadline.expired() {
                 crate::serial_println!("[RCS] ERROR: GDRST render reset timeout");
                 self.write_reg(RCS_RESET_CTL, 1 << 16); // release request
                 return Err(RenderError::ResetFailed);
@@ -435,7 +510,7 @@ impl RenderEngine {
         ];
         self.rcs_submit(&cmd)?;
 
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(PIPELINE_FENCE_TIMEOUT_US);
         loop {
             self.flush_line(self.fence_virt as usize);
             let v = self.fence_virt.read_volatile();
@@ -443,8 +518,7 @@ impl RenderEngine {
                 break;
             }
             core::hint::spin_loop();
-            t += 1;
-            if t > 20_000_000 {
+            if deadline.expired() {
                 let head = self.read_reg(RENDER_RING_HEAD);
                 let tail = self.read_reg(RENDER_RING_TAIL);
                 let fault = self.read_reg(RENDER_FAULT_REG);
@@ -516,24 +590,53 @@ impl RenderEngine {
         self.wait_fence_value(DONE)
     }
 
-    /// Spin until the fence page reads `expected` (or a hang timeout trips).
+    /// Spin until the fence page reads `expected`, or a **time** budget expires.
+    ///
+    /// ★★★ This was a 20,000,000-iteration count, and on real hardware it ran to completion on
+    /// **every single composite**: measured stalls of 23,541-23,544 us — a 3 us spread across nine
+    /// samples, which is the signature of a counter-bounded loop running out, not of waiting on a
+    /// device. The body is `clflush` + `mfence` + read + `pause`, so 20M iterations is ~24 ms here.
+    ///
+    /// Meaning: the render fence never signals on this machine, `EngineHang` is returned every
+    /// frame, the compositor silently falls back to software — and it burns 23.5 ms with interrupts
+    /// masked first, ~4 times a second. That was the largest single source of interactive latency
+    /// on the system, and it was invisible because the message below goes to a serial port this
+    /// laptop does not have.
+    ///
+    /// Two changes. The budget is now **time**, because an iteration count means a different
+    /// duration on every machine and happened to mean 24 ms on this one. And it is short: if the
+    /// engine is going to hang, learning that in 2 ms rather than 24 ms is most of the win.
+    /// Repeated failures then latch the path off entirely — see [`engine_is_wedged`].
     unsafe fn wait_fence_value(&self, expected: u32) -> Result<(), RenderError> {
-        let mut t = 0u32;
+        let mhz = crate::time::TSC_MHZ.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        let deadline = crate::time::rdtsc().wrapping_add(mhz * FENCE_TIMEOUT_US);
         loop {
             self.flush_line(self.fence_virt as usize);
             if self.fence_virt.read_volatile() == expected {
+                // ⚠️ Deliberately does NOT clear `RENDER_HANGS`. It used to, and that made the
+                // latch unreachable: a composite performs two fence waits, so one succeeding while
+                // the other timed out reset the count every frame. Strikes are counted per
+                // COMPOSITE in `compositor::composite` instead.
                 return Ok(());
             }
             core::hint::spin_loop();
-            t += 1;
-            if t > 20_000_000 {
+            if crate::time::rdtsc() >= deadline {
                 let head = self.read_reg(RENDER_RING_HEAD);
                 let tail = self.read_reg(RENDER_RING_TAIL);
                 let fault = self.read_reg(RENDER_FAULT_REG);
-                crate::serial_println!(
-                    "[RCS] fence wait timeout: got {:#010x} want {:#010x} HEAD={:#x} TAIL={:#x} FAULT={:#010x}",
-                    self.fence_virt.read_volatile(), expected, head, tail, fault
-                );
+                // A SEPARATE counter, only for rate-limiting this log. `RENDER_HANGS` is the latch
+                // and is owned by `compositor::composite`; incrementing it here would double-count
+                // (two waits per composite) and re-introduce the flapping described above.
+                let n = FENCE_TIMEOUT_LOGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                // Rate-limited. When the engine is wedged this fires every frame, and
+                // `serial_println!` is itself a long interrupts-off operation (a byte-at-a-time
+                // UART spin) — logging unconditionally would make the stall it reports worse.
+                if n <= 3 || n % 512 == 0 {
+                    crate::serial_println!(
+                        "[RCS] fence timeout #{}: got {:#010x} want {:#010x} HEAD={:#x} TAIL={:#x} FAULT={:#010x}",
+                        n, self.fence_virt.read_volatile(), expected, head, tail, fault
+                    );
+                }
                 return Err(RenderError::EngineHang);
             }
         }

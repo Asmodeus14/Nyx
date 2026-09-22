@@ -99,6 +99,15 @@ fn build_run(glyphs: &[GlyphQuad]) -> (Vec<Vertex>, Vec<u32>) {
 /// over what's already there. Returns true on success; false tells the caller to fall back to CPU text.
 /// Empty list is a no-op success. The atlas pitch must be 64-byte aligned (LINEAR surface requirement).
 pub fn draw_text(atlas_gva: u32, atlas_w: u32, atlas_h: u32, atlas_pitch: u32, glyphs: &[GlyphQuad]) -> bool {
+    // ★ Same gate as `compositor::composite`, and for the same reason: this is the SAME render
+    // engine. Latching only the composite path just moved the stall — measured on hardware,
+    // syscall 536 fell to exactly 8 (the strike limit, working perfectly) while syscall 537
+    // appeared with 34 hits at 21 ms each, because glyph drawing kept waking the same dead fence.
+    //
+    // A wedged engine is wedged for every consumer, so the check belongs on every entry point.
+    if super::engine_is_wedged() {
+        return false;
+    }
     if glyphs.is_empty() {
         return true;
     }
@@ -150,9 +159,15 @@ pub fn draw_text(atlas_gva: u32, atlas_w: u32, atlas_h: u32, atlas_pitch: u32, g
         eng.draw_scene(scene, &mvps, 0x1400_0000, 0, sw, sh, pitch, 0, 0, false, true, false, false)
     };
     if ok.is_err() {
+        // Counted into the SHARED strike total: one wedged engine, one counter. Were this path to
+        // keep its own, each consumer would separately have to rediscover that the engine is dead.
+        super::RENDER_HANGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         ctx.scene = None;
         ctx.atlas_gva = 0;
         return false;
     }
+    // Only a whole successful draw clears the strikes — see the note in `compositor::composite`
+    // about counting at the granularity of the decision, not of the individual fence wait.
+    super::RENDER_HANGS.store(0, core::sync::atomic::Ordering::Relaxed);
     true
 }

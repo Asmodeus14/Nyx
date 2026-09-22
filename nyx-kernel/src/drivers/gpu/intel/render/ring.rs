@@ -21,7 +21,8 @@ impl RenderEngine {
         let ring = ring_virt as *mut u32;
 
         // 1. Wait for enough free space (HEAD chases TAIL as the GPU consumes).
-        let mut timeout = 0u32;
+        // Time-bounded rather than iteration-bounded: see `SpinDeadline`.
+        let deadline = super::SpinDeadline::new(super::RING_TIMEOUT_US);
         loop {
             let head_idx = self.read_reg(RENDER_RING_HEAD) / 4;
             let tail_idx = self.read_reg(RENDER_RING_TAIL) / 4;
@@ -33,7 +34,7 @@ impl RenderEngine {
             if free >= dwords.len() as u32 {
                 break;
             }
-            if timeout > 1_000_000 {
+            if deadline.expired() {
                 let fault = self.read_reg(RENDER_FAULT_REG);
                 crate::serial_println!(
                     "[RCS] FATAL: ring full / hang (HEAD={:#x} TAIL={:#x} FAULT={:#010x})",
@@ -42,7 +43,6 @@ impl RenderEngine {
                 return Err(RenderError::RingFull);
             }
             core::hint::spin_loop();
-            timeout += 1;
         }
 
         // 2. Write the dwords into the ring, flushing each cache line to RAM so the

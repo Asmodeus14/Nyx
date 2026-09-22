@@ -16,6 +16,25 @@ pub mod cursor;
 pub static INTEL_GPU: Mutex<Option<IntelGpuDriver>> = Mutex::new(None);
 pub static BACKBUFFER_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 
+/// How long to wait for a BLT fence before giving up, in microseconds.
+///
+/// ⚠️ **Generous on purpose, and must stay that way.** Unlike the RCS fence — which on this hardware
+/// never signals at all — the BLT engine *works*: it is what actually draws the desktop, and a
+/// full-screen 1280x800 fill moves 4 MB, which takes on the order of milliseconds. Measured BLT
+/// waits were 6-13 ms.
+///
+/// ★ This was briefly set to 2_000, and that abandoned real blits mid-flight: the caller carried on
+/// as though the fill had completed, producing a half-drawn, shifted screen at boot that corrected
+/// itself on the next frame. Timing out a wait for work that WILL complete does not remove a stall,
+/// it corrupts output. The number here exists only to stop a genuinely hung engine wedging the
+/// machine forever — it is a deadline, not a performance knob.
+///
+/// The real fix for the 6-13 ms of masked time is to allow interrupts *during* the wait, which
+/// needs `INTEL_GPU` to not be held across it — see the preemption-boundary note in `thermal.rs`.
+pub const BLT_FENCE_TIMEOUT_US: u64 = 100_000;
+/// Count of BLT fence timeouts, used only to rate-limit the log line.
+pub static BLT_HANGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 // --- PRM Verified Registers ---
 pub const BLT_RING_TAIL: u32 = 0x22030;
 pub const BLT_RING_HEAD: u32 = 0x22034;
@@ -323,7 +342,11 @@ impl IntelGpuDriver {
         self.ensure_blt_ready();
         if let Some(ring_ptr) = self.ring_virt_addr {
             let ring = ring_ptr as *mut u32;
-            let mut timeout = 0;
+            // Time-bounded, not iteration-bounded. See `render::SpinDeadline`: an iteration count
+            // means a different duration in every loop body, which is how repeated attempts to fix
+            // GPU stalls each missed the loop that was actually responsible.
+            let ring_deadline =
+                render::SpinDeadline::new(render::RING_TIMEOUT_US);
             
             loop {
                 let head_idx = self.read_reg(BLT_RING_HEAD) / 4;
@@ -337,12 +360,11 @@ impl IntelGpuDriver {
                 
                 if free_space >= dwords.len() as u32 { break; }
                 
-                if timeout > 1_000_000 {
+                if ring_deadline.expired() {
                     crate::serial_println!("[INTEL GPU] FATAL: Ring buffer full / GPU Hang detected!");
                     return Err(GpuHangError::RingBufferFull);
                 }
                 core::hint::spin_loop();
-                timeout += 1;
             }
 
             let mut tail_idx = self.read_reg(BLT_RING_TAIL) / 4;
@@ -386,15 +408,30 @@ impl IntelGpuDriver {
         val
     }
 
+    /// Wait for the BLT fence to reach `val`, bounded in **time**.
+    ///
+    /// ★ Was a 50,000,000-iteration count. Measured on hardware via syscall 503 (`sys_gpu_sync`):
+    /// stalls of 6.5 ms and 13 ms with interrupts masked, several times a second. As with the render
+    /// fence, an iteration count means a different duration on every machine, while a microsecond
+    /// budget says what it means. A BLT that is going to complete does so in well under a
+    /// millisecond, so this only ever shortens the failure case.
     pub unsafe fn wait_fence(&self, val: u32) {
-        let mut timeout = 0;
+        let mhz = crate::time::TSC_MHZ.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        let deadline = crate::time::rdtsc().wrapping_add(mhz * BLT_FENCE_TIMEOUT_US);
         while (core::ptr::read_volatile(self.fence_virt) as i32).wrapping_sub(val as i32) < 0 {
-            if timeout > 50_000_000 {
-                crate::serial_println!("[INTEL GPU] FATAL: Fence wait timeout! GPU Hung? (Expected {}, Got {})", val, core::ptr::read_volatile(self.fence_virt));
+            if crate::time::rdtsc() >= deadline {
+                // Rate-limited: when the engine is wedged this fires on every frame, and
+                // `serial_println!` is itself a long interrupts-off operation (byte-at-a-time UART
+                // spin) — logging unconditionally would make the stall it reports worse.
+                let n = BLT_HANGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 3 || n % 512 == 0 {
+                    crate::serial_println!(
+                        "[INTEL GPU] BLT fence timeout #{} (expected {}, got {})",
+                        n, val, core::ptr::read_volatile(self.fence_virt));
+                }
                 break;
             }
             core::hint::spin_loop();
-            timeout += 1;
         }
     }
 

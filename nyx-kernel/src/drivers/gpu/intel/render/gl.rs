@@ -120,7 +120,14 @@ const SS: u32 = 2;
 ///
 /// The RENDER_ENGINE must already be brought up (init_render_engine ran at boot); we only borrow its
 /// kernels/mmio, we don't re-bring-up here.
+/// Consecutive failed GL frames. Separate from the compositor's `RENDER_HANGS` on purpose — see
+/// the note in `gl_render`. Cleared by `gl_init`, so launching a 3D app always gets a fresh start.
+pub static GL_HANGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 pub fn gl_init(width: u32, height: u32, dst_cpu: u64) -> Result<(), RenderError> {
+    // A new GL session re-programs engine state (forcewake, MOCS), so whatever made previous frames
+    // fail may no longer apply. Start it with a clean slate rather than inheriting old strikes.
+    GL_HANGS.store(0, core::sync::atomic::Ordering::Relaxed);
     let mut ctx = GL_CONTEXT.lock();
     if ctx.initialized {
         // Re-init with the same geometry pending is fine (client just re-declaring dims); but if a
@@ -243,6 +250,21 @@ pub fn gl_render_flat(flat: &[f32], count: usize) -> Result<(), RenderError> {
 /// every mesh into the supersampled Y-tiled RT (SSAA), pass 2 box-downsamples to the backbuffer and
 /// presents. Reuses draw_scene + draw_resolve unchanged.
 pub fn gl_render(mvps: &[Mat4]) -> Result<(), RenderError> {
+    // ⚠️ Gated on the GL path's OWN strike count, deliberately NOT on `engine_is_wedged()`.
+    //
+    // ★ Sharing the compositor's latch here was a regression: the desktop fails its first 8
+    // composites within a second of boot, the shared latch engaged, and glcube could then never
+    // start — `gl_render` returned EngineHang before touching the hardware. "The 3D engine doesn't
+    // run" was entirely self-inflicted.
+    //
+    // The two cases are not equivalent. `gl_init` re-programs forcewake and MOCS, which is exactly
+    // the state this project has previously seen the engine lose after RC6 (see
+    // project_gl-runtime-forcewake) — so an explicitly-launched GL session can legitimately succeed
+    // on hardware where the compositor's cached state does not. It has to be allowed to try, and
+    // `gl_init` clears these strikes so every session starts clean.
+    if GL_HANGS.load(core::sync::atomic::Ordering::Relaxed) >= super::RENDER_HANG_LIMIT {
+        return Err(RenderError::EngineHang);
+    }
     let mut ctx = GL_CONTEXT.lock();
     if !ctx.initialized {
         return Err(RenderError::NotInitialized);
@@ -327,17 +349,25 @@ pub fn gl_render(mvps: &[Mat4]) -> Result<(), RenderError> {
         // Pass 1: render all meshes into the supersampled Y-tiled scene RT (no present). blend=false:
         // glcube's cube is opaque, so keep the GL mesh pass byte-identical to its HW-proven stream.
         // (Per-mesh GL blending is a later addition when the GPU compositor path needs translucency.)
-        eng.draw_scene(
+        if let Err(e) = eng.draw_scene(
             scene, &mvps_owned, rt_tiled_gva, rt_tiled_cpu, ss_w, ss_h, pitch, tiled_pitch,
             rt_buf_bytes, false, false, true, verbose,
-        )?;
+        ) {
+            GL_HANGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
     }
     let cl1 = unsafe { eng.read_reg(0x2340) };
     let ps1 = unsafe { eng.read_reg(0x2348) };
     unsafe {
         // Pass 2: bilinear box-downsample the supersampled RT to the private window backbuffer.
         // present=false: we do NOT blit the scanout — the compositor composites our window instead.
-        eng.draw_resolve(scene, bb_cpu, width, height, pitch, false, verbose)?;
+        if let Err(e) = eng.draw_resolve(scene, bb_cpu, width, height, pitch, false, verbose) {
+            GL_HANGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
+        // Both passes landed — this session is healthy, so forget any earlier strikes.
+        GL_HANGS.store(0, core::sync::atomic::Ordering::Relaxed);
     }
     let cl2 = unsafe { eng.read_reg(0x2340) };
     let ps2 = unsafe { eng.read_reg(0x2348) };
