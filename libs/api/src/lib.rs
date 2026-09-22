@@ -1083,6 +1083,19 @@ pub fn sys_get_mouse() -> (usize, usize, bool, bool) {
     (x, y, left, right)
 }
 
+/// Wait up to `timeout_ms` for a keystroke. `None` if none arrived.
+///
+/// ★ Blocks in the kernel on `WaitReason::Input`, so the keyboard IRQ wakes the caller directly
+/// rather than the caller discovering the key on its next poll. Replaces polling [`sys_read_key`]
+/// on a timer, which put the poll interval straight into keystroke latency.
+///
+/// ⚠️ ALWAYS pass a real timeout. The window server calls this, and it must never block
+/// indefinitely — a missed wake there stops the whole desktop.
+pub fn sys_read_key_wait(timeout_ms: u64) -> Option<char> {
+    let k = syscall(576, timeout_ms, 0, 0, 0, 0, 0);
+    if k == 0 { None } else { core::char::from_u32(k as u32) }
+}
+
 pub fn sys_read_key() -> Option<char> {
     let k = syscall(506, 0, 0, 0, 0, 0, 0);
     if k == 0 { None } else { core::char::from_u32(k as u32) }

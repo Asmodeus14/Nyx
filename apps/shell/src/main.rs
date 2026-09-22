@@ -2375,6 +2375,14 @@ struct Shell {
     /// The panel level to put back on wake, captured the moment before sleep dropped it. `None`
     /// means sleep never touched it: either this display has no PWM backlight, or we have not slept.
     bright_before_sleep: Option<u32>,
+    /// A keystroke already pulled off the queue by the blocking idle wait at the bottom of the
+    /// frame loop, waiting to be handled by `process_input` on the next pass.
+    ///
+    /// ★ The loop used to idle with `sleep(2)` and poll for keys separately, which put the poll
+    /// interval straight into keystroke latency. It now BLOCKS on the key instead — but the key it
+    /// receives has to reach `process_input` rather than be swallowed by the wait, and
+    /// `process_input` is the single place that knows what to do with one.
+    pending_key: Option<char>,
     /// The animation key of the last drawn idle frame — `(dx, dy, lid)`. The idle screen is redrawn
     /// only when this changes, which is a handful of frames a second rather than sixty.
     idle_key: (i32, i32, bool),
@@ -2474,6 +2482,7 @@ impl Shell {
             last_input: 0,
             phase: Phase::Active,
             bright_before_sleep: None,
+            pending_key: None,
             idle_key: (i32::MIN, i32::MIN, false),
             auth: Auth::load(),
             locked: false,
@@ -3538,7 +3547,8 @@ impl Shell {
         // responsiveness is the whole point.
         let was = self.phase;
 
-        if let Some(key) = sys_read_key() {
+        // Take whatever the blocking idle wait already collected, else look for a fresh one.
+        if let Some(key) = self.pending_key.take().or_else(sys_read_key) {
             self.last_input = now;
             // The lock OWNS the keyboard, exactly as the Command does. Nothing reaches the desktop
             // or the focused app while it is up — that is what makes it a gate rather than a
@@ -4741,7 +4751,20 @@ pub extern "C" fn _start() -> ! {
         }
 
         if !state.needs_redraw && now.wrapping_sub(last_frame) < ms_per_frame {
-            sys_sleep_ms(2);
+            // ★ Block for a keystroke instead of sleeping through the gap.
+            //
+            // This was `sys_sleep_ms(2)`, with keys polled separately at the top of the loop. While
+            // UPTIME_MS ran fast that sleep was really ~0.36 ms, so the shell happened to poll at
+            // ~2,700 Hz; fixing the clock made it an honest 2 ms and therefore made keystrokes up
+            // to 2 ms later. Blocking removes the interval from the latency entirely — the keyboard
+            // IRQ wakes this directly — and stops ~500 pointless syscalls a second.
+            //
+            // ⚠️ The timeout is what makes this safe in the WINDOW SERVER. It must never block
+            // indefinitely: a missed wake here would stop the desktop, not just one app. On
+            // timeout it behaves exactly as the old sleep did.
+            if let Some(k) = sys_read_key_wait(2) {
+                state.pending_key = Some(k);
+            }
             continue;
         }
         last_frame = now;

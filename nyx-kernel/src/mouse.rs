@@ -65,6 +65,23 @@ impl MouseDriver {
             
             self.write_mouse(0xF4);
             self.wait_for_read(); let _ = self.data_port.read();
+
+            // ★ Set the KEYBOARD's typematic rate. Nothing ever did, so it sat at the 8042's
+            // power-on default — which is the SLOWEST the hardware offers: a 500 ms delay before
+            // repeat, then ~10.9 characters per second. Holding a key (arrowing through a file,
+            // holding backspace) therefore felt sluggish no matter how fast the scheduler got.
+            //
+            // 0xF3 = Set Typematic Rate/Delay, argument 0x00 = 250 ms delay, 30.0 cps. That is the
+            // fastest the PS/2 protocol can express: bits 6-5 are the delay (00 = 250 ms) and bits
+            // 4-0 the rate (00000 = 30 cps).
+            //
+            // ⚠️ Keyboard commands go to the DATA port directly. 0xD4 prefixes a command for the
+            // AUX (mouse) device — using `write_mouse` here would send this to the trackpad, which
+            // has no such command and would leave the keyboard untouched.
+            self.wait_for_write(); self.data_port.write(0xF3);
+            self.wait_for_read(); let _ = self.data_port.read();   // ACK
+            self.wait_for_write(); self.data_port.write(0x00);
+            self.wait_for_read(); let _ = self.data_port.read();   // ACK
         }
     }
 

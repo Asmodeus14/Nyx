@@ -4356,6 +4356,56 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
 
         506 => { if let Some(c) = crate::shell::pop_key() { frame.rax = c as u64; } else { frame.rax = 0; } },
 
+        576 => {
+            // SYS_READ_KEY_WAIT(timeout_ms) -> char, or 0 if nothing arrived in time.
+            //
+            // ★★ This is what finally uses `WaitReason::Input`. The input ISRs have been waking
+            // only `Input` waiters since the thundering herd was removed — and until now NOTHING
+            // ever registered as one, so the mechanism was correct and unused.
+            //
+            // The window server polled `506` every 2 ms instead. That was ~2,700 Hz by accident
+            // while `UPTIME_MS` ran fast, and became an honest 500 Hz once the clock was fixed —
+            // so correcting the clock silently made keystrokes up to 2 ms later. Blocking removes
+            // the poll entirely: the keyboard IRQ wakes the waiter directly.
+            //
+            // ⚠️ ALWAYS with a timeout, never indefinitely. The shell IS the window server; a
+            // blocking call with no deadline there stops the desktop dead if the wake is ever
+            // missed. The timeout also preserves its frame cadence when no one is typing.
+            if let Some(c) = crate::shell::pop_key() {
+                frame.rax = c as u64;
+                return;
+            }
+            let deadline = crate::time::UPTIME_MS
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .saturating_add(arg1);
+            unsafe {
+                x86_64::instructions::interrupts::enable();
+                loop {
+                    if let Some(c) = crate::shell::pop_key() {
+                        frame.rax = c as u64;
+                        break;
+                    }
+                    if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed)
+                        >= deadline
+                    {
+                        frame.rax = 0;
+                        break;
+                    }
+                    let percpu = crate::percpu::current();
+                    let curr_idx =
+                        percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                    if curr_idx < percpu.scheduler.tasks.len() {
+                        let task = &mut percpu.scheduler.tasks[curr_idx];
+                        task.state = crate::scheduler::TaskState::Blocked;
+                        task.wake_tsc = deadline;
+                        task.wait_reason = crate::scheduler::WaitReason::Input;
+                    }
+                    core::arch::asm!("int 0x41");
+                }
+                x86_64::instructions::interrupts::disable();
+            }
+        },
+
         507 => { 
              unsafe {
                  if let Some(p) = &crate::SCREEN_PAINTER {
