@@ -163,9 +163,56 @@ pub fn init_intel_acpica() {
 // ==========================================
 // 3. CUSTOM ACPI METHODS
 // ==========================================
+/// One I2C-HID device as ACPI describes it.
+///
+/// ⚠️ `#[repr(C)]` and the field order IS the ABI — it mirrors `NyxI2cHidInfo` in `custom_acpi.c`
+/// byte for byte. The C side memcpy's into an array of these.
+///
+/// ★ Every field here has to be read from evaluated AML; none of it can be hardcoded. This DSDT
+/// declares the same touch-device slot on four I2C buses and patches its `_HID` and slave address
+/// at `_INI` from an NVS variable, so the identity depends on which panel the factory fitted, and
+/// `_CRS` is a Method whose result additionally depends on `OSYS`/`SDM0`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct I2cHidInfo {
+    pub valid: u32,
+    pub sta: u32,
+    pub slave_addr: u32,
+    pub speed_hz: u32,
+    pub gpio_pin: u32,
+    pub hid_desc_reg: u32,
+    /// Controller `_ADR`: `(device << 16) | function`. `0x00150001` is PCI 00:15.1.
+    pub ctrl_adr: u32,
+    pub path: [u8; 72],
+    pub ctrl_path: [u8; 72],
+}
+
+impl I2cHidInfo {
+    pub const EMPTY: I2cHidInfo = I2cHidInfo {
+        valid: 0,
+        sta: 0,
+        slave_addr: 0,
+        speed_hz: 0,
+        gpio_pin: 0,
+        hid_desc_reg: 0,
+        ctrl_adr: 0,
+        path: [0; 72],
+        ctrl_path: [0; 72],
+    };
+
+    /// PCI device and function decoded from `ctrl_adr`.
+    pub fn pci_dev_func(&self) -> (u8, u8) {
+        (((self.ctrl_adr >> 16) & 0xFF) as u8, (self.ctrl_adr & 0xFF) as u8)
+    }
+}
+
 extern "C" {
     fn acpi_wake_cnvi_wifi() -> i32;
-    fn acpi_find_i2c_hid() -> i32; 
+    fn acpi_find_i2c_hid() -> i32;
+    /// Fill `out` with up to `max` PRESENT I2C-HID devices; returns how many were written.
+    ///
+    /// ⚠️ Evaluates AML (`_STA`, `_CRS`, `_DSM`, `_ADR`). Governor context only — never a syscall.
+    fn acpi_get_i2c_hid(out: *mut I2cHidInfo, max: i32) -> i32;
     
     // --- NEW: THE ACPICA FAN CONTROLLER ---
     fn acpi_set_fan_state(turn_on: i32) -> i32;
@@ -417,6 +464,16 @@ pub struct AcpiCache {
     /// False until the governor's first pass has run — so "no panel" and "not asked yet" are
     /// distinguishable, which is the distinction this whole path keeps getting wrong.
     pub ready: bool,
+
+    /// I2C-HID devices found by `acpi probe 13`, and how many are populated.
+    ///
+    /// Four slots because this firmware declares the touch device on I2C0..I2C3; at most one of
+    /// them is real on any given board, but reporting which ones were rejected is worth more than
+    /// reporting only the survivor.
+    pub i2c_hid: [I2cHidInfo; 4],
+    pub i2c_hid_n: usize,
+    /// True once step 13 has actually run, so "no touchpad" and "never asked" stay distinguishable.
+    pub i2c_hid_probed: bool,
 }
 
 impl AcpiCache {
@@ -427,6 +484,9 @@ impl AcpiCache {
         panel_levels: [0; 64],
         panel_n: 0,
         panel_pct: u32::MAX,
+        i2c_hid: [I2cHidInfo::EMPTY; 4],
+        i2c_hid_n: 0,
+        i2c_hid_probed: false,
         bcl_status: 5,
         bqc_status: 5,
         battery: Battery {
@@ -447,7 +507,7 @@ impl AcpiCache {
     };
 }
 
-static CACHE: spin::Mutex<AcpiCache> = spin::Mutex::new(AcpiCache::EMPTY);
+pub static CACHE: spin::Mutex<AcpiCache> = spin::Mutex::new(AcpiCache::EMPTY);
 
 /// A brightness change asked for by userspace, in percent. `-1` means nothing pending.
 ///
@@ -828,6 +888,23 @@ pub fn refresh_cache() {
                 c.ready = true;
             }
             crate::postmortem::user_mark(107);
+        }
+        13 => {
+            // I2C-HID discovery. Evaluates _STA, _CRS (a Method here), _DSM and the controller's
+            // _ADR for every PNP0C50 device.
+            //
+            // ⚠️ Deliberately an opt-in probe step rather than something the boot path does. The
+            // comment on PROBE is blunt about why: "three boots died on the governor's automatic
+            // first pass and each guess at which call was responsible cost a power cycle." The
+            // breadcrumbs in `I2cHidCallback` (70/71/72) narrow a hang to _CRS, _DSM, or neither.
+            let mut buf = [I2cHidInfo::EMPTY; 4];
+            let n = unsafe { acpi_get_i2c_hid(buf.as_mut_ptr(), 4) };
+            let n = if n < 0 { 0 } else { (n as usize).min(4) };
+            if let Some(mut c) = CACHE.try_lock() {
+                c.i2c_hid = buf;
+                c.i2c_hid_n = n;
+                c.i2c_hid_probed = true;
+            }
         }
         6 => {
             let want = BRIGHT_REQUEST.swap(-1, core::sync::atomic::Ordering::Relaxed);

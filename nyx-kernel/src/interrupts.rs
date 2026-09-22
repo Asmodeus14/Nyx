@@ -4354,6 +4354,37 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = m_val;
         },
 
+        577 => {
+            // SYS_I2C_HID_INFO(index, out_ptr) -> 1 if that slot is populated, else 0.
+            //
+            // ⚠️ Copies from the published cache and evaluates NOTHING. `acpi probe 13` — which
+            // runs on the thermal governor at IF=1 — is what fills it. Evaluating AML here would be
+            // the preemption-boundary deadlock that wedged this machine on `panel` and `battery`:
+            // SYSCALL runs with IF=0, and AcpiEvaluateObject takes the interpreter mutex,
+            // allocates, and on this laptop can end in a firmware SMI.
+            let idx = arg1 as usize;
+            let out = arg2 as *mut u8;
+            let n = core::mem::size_of::<crate::acpi::I2cHidInfo>();
+            if idx >= 4 || !is_valid_user_ptr(out, n)
+                || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                frame.rax = 0;
+                return;
+            }
+            // `try_lock`, never `lock` — both sides of this cache do, because the governor holds it
+            // at IF=1 while this runs at IF=0.
+            let got = match crate::acpi::CACHE.try_lock() {
+                Some(c) if c.i2c_hid_probed && idx < c.i2c_hid_n => {
+                    let e = c.i2c_hid[idx];
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(&e as *const _ as *const u8, out, n);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            frame.rax = if got { 1 } else { 0 };
+        },
+
         506 => { if let Some(c) = crate::shell::pop_key() { frame.rax = c as u64; } else { frame.rax = 0; } },
 
         576 => {

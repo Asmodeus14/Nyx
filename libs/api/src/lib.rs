@@ -880,6 +880,58 @@ pub fn sys_acpi_probe(step: u8, arg: u32) {
     syscall(SYS_ACPI_PROBE, step as u64, arg as u64, 0, 0, 0, 0);
 }
 
+/// One I2C-HID device as ACPI describes it. `repr(C)`; mirrors `acpi::I2cHidInfo` in the kernel,
+/// and the two must move together.
+///
+/// ★ None of this can be hardcoded. The DSDT declares the same touch-device slot on four I2C buses
+/// and patches its `_HID` and slave address at `_INI` from an NVS variable, so which one is real —
+/// and what address it answers on — depends on the panel the factory fitted.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct I2cHidInfo {
+    pub valid: u32,
+    /// `_STA`. Bit 0 clear means the firmware declares the slot but no device is fitted.
+    pub sta: u32,
+    pub slave_addr: u32,
+    pub speed_hz: u32,
+    /// GPIO pin carrying "report ready". Unused while the transport polls; needed for Phase 5.
+    pub gpio_pin: u32,
+    /// Register at which the HID descriptor is read, from `_DSM(HIDG, 1, 1)`.
+    pub hid_desc_reg: u32,
+    /// Controller `_ADR`: `(device << 16) | function`. `0x00150001` is PCI 00:15.1.
+    pub ctrl_adr: u32,
+    pub path: [u8; 72],
+    pub ctrl_path: [u8; 72],
+}
+
+impl Default for I2cHidInfo {
+    fn default() -> Self {
+        // Not derivable: `[u8; 72]` has no Default impl.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+// Same ABI guard as SysMetrics/SchedStats: the kernel memcpy's these bytes, so a field added on one
+// side and not the other must break the build rather than reinterpret every field after it.
+const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 172);
+
+impl I2cHidInfo {
+    /// PCI device and function decoded from `ctrl_adr`.
+    pub fn pci_dev_func(&self) -> (u8, u8) {
+        (((self.ctrl_adr >> 16) & 0xFF) as u8, (self.ctrl_adr & 0xFF) as u8)
+    }
+}
+
+/// Read slot `index` of the kernel's I2C-HID table. `None` if unpopulated.
+///
+/// ⚠️ Returns whatever `acpi probe 13` last published — it evaluates nothing itself. Request the
+/// probe, give the governor a tick to run it, then read.
+pub fn sys_i2c_hid_info(index: u32) -> Option<I2cHidInfo> {
+    let mut info = I2cHidInfo::default();
+    let rc = syscall(577, index as u64, (&mut info as *mut I2cHidInfo) as u64, 0, 0, 0, 0);
+    if rc == 1 { Some(info) } else { None }
+}
+
 pub const SYS_BATTERY: u64 = 561;
 
 /// The ACPI control-method battery (`PNP0C0A`), from `_BIF` and `_BST`.

@@ -1268,6 +1268,69 @@ impl TerminalApp {
         }
     }
 
+    /// `touchpad` — what ACPI says about the I2C-HID touchpad.
+    ///
+    /// ★ Everything printed here has to come from evaluated AML. This laptop's DSDT declares the
+    /// same touch-device slot on FOUR I2C buses and patches its `_HID` and slave address at `_INI`
+    /// from an NVS variable — the one slot becomes WCOM4831@0x0A, ALPS0000@0x2C, ELAN2097@0x10,
+    /// NTRG0001@0x07, SYNA2393 or DLL077A depending on the panel fitted — and `_CRS` is a Method
+    /// whose result additionally depends on `OSYS`/`SDM0`. There is nothing here to hardcode.
+    ///
+    /// ⚠️ The kernel evaluates none of it on its own. `acpi probe 13` asks the thermal governor,
+    /// which runs at IF=1, to do it on its next tick; AML in a syscall is the preemption-boundary
+    /// deadlock that wedged this machine on `panel` and `battery`. So this requests, waits a beat,
+    /// then reads the published cache.
+    fn cmd_touchpad(&mut self) {
+        sys_acpi_probe(13, 0);
+        self.output_history
+            .push_str("Asked the governor to evaluate ACPI for I2C-HID devices (probe 13)...\n");
+        // The governor ticks at 1 Hz, so one tick plus margin.
+        sys_sleep_ms(1600);
+
+        let mut found = 0;
+        for i in 0..4u32 {
+            let info = match sys_i2c_hid_info(i) {
+                Some(d) => d,
+                None => continue,
+            };
+            found += 1;
+            let path = core::str::from_utf8(&info.path)
+                .unwrap_or("?")
+                .trim_end_matches('\0');
+            let ctrl = core::str::from_utf8(&info.ctrl_path)
+                .unwrap_or("?")
+                .trim_end_matches('\0');
+            let (dev, func) = info.pci_dev_func();
+            self.output_history.push_str(&format!(
+                "\n{}\n  controller   {}\n               = PCI 00:{:02x}.{}  (_ADR {:#010x})\n  \
+                 address      {:#04x} @ {} Hz\n  HID desc reg {:#06x}\n  GPIO pin     {}\n  \
+                 _STA         {:#x}\n",
+                path, ctrl, dev, func, info.ctrl_adr,
+                info.slave_addr, info.speed_hz, info.hid_desc_reg, info.gpio_pin, info.sta,
+            ));
+        }
+
+        if found == 0 {
+            self.output_history.push_str(
+                "No I2C-HID device reported.\n\
+                 \x20 Either the governor has not ticked yet (run `touchpad` again), or every \
+                 PNP0C50 slot\n\
+                 \x20 this firmware declares has _STA bit 0 clear — which is the EXPECTED result \
+                 for three\n\
+                 \x20 of the four, since they are templates for other board builds.\n\
+                 \x20 If it never reports, check `acpi log` FIRST: this depends on the namespace \
+                 having loaded.\n",
+            );
+        } else {
+            self.output_history.push_str(&format!(
+                "\n{} device(s). A plausible address and descriptor register here means the ACPI \
+                 half is\n  done — reading the descriptor itself is the I2C controller driver's \
+                 job, which is next.\n",
+                found
+            ));
+        }
+    }
+
     /// `wifi …` — the whole radio, from a prompt.
     ///
     /// ★ Meridian step 20 retires `apps/wifi`, the standalone picker, and with it the only graphical
@@ -3672,6 +3735,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  battery | bat     - ACPI control-method battery: charge, rate, health (READ ONLY)\n");
                 self.output_history.push_str("  acpi ls [path]    - walk the ACPI namespace   acpi probe <n> [depth] - one evaluation\n");
                 self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
+                self.output_history.push_str("  touchpad          - what ACPI says about the I2C-HID touchpad: bus, address, HID register\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
                 self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
                 self.output_history.push_str("Scrollback:\n");
@@ -3926,7 +3990,8 @@ impl NyxApp for TerminalApp {
                         // `_REG` (which is fatal on this machine — mark 57) and 11 sets `ECRD`
                         // directly, which is what `_REG` exists to do. Extend this range when a step
                         // is added; 7 was silently rejected for a while and its dump never ran.
-                        Ok(s) if (1..=12).contains(&s) => {
+                        // 13 is I2C-HID discovery (_STA/_CRS/_DSM/_ADR per PNP0C50 device).
+                        Ok(s) if (1..=13).contains(&s) => {
                             sys_acpi_probe(s, depth);
                             if s == 1 {
                                 self.output_history.push_str(&format!(
@@ -4196,6 +4261,8 @@ impl NyxApp for TerminalApp {
                          \x20 again after a while — the bytes that MOVE are charge/current/voltage.\n",
                     );
                 }
+            } else if cmd == "touchpad" || cmd.starts_with("touchpad ") {
+                self.cmd_touchpad();
             } else if cmd == "sched" || cmd.starts_with("sched ") {
                 let arg = cmd.strip_prefix("sched").unwrap_or("").trim();
                 self.cmd_sched(arg);
