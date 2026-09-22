@@ -257,13 +257,50 @@ mkdir -p build_initrd/fonts
 cp libs/meridian/fonts/*.ttf build_initrd/fonts/
 cp libs/meridian/fonts/LICENSE-*.txt build_initrd/fonts/
 
+# ── Quantum provider credentials, baked in at build time ────────────────────────────────────────
+#
+# ★ WHY this exists rather than a Settings text field: Nyx has **no clipboard and cannot express a
+# paste chord** — `HandleControl::Ignore` means Ctrl+V is not an input event at all. An IonQ key is
+# ~40 characters, an IBM key ~44, and an **IBM instance CRN is ~120**. Typing that by hand, with no
+# paste and no way to correct a mistake you cannot see, is not a workflow anyone uses twice.
+#
+# So you write the credentials ONCE here on the host, in a file git never sees, and they arrive on
+# the machine with the image.
+#
+#   cp quantum-credentials.example.txt quantum-credentials.txt   # then edit it
+#
+# ⚠️ `quantum-credentials.txt` is in .gitignore. Do NOT move these into source: `git log -p` would
+# keep the key after you deleted the line, and the repo is the thing most likely to be shared.
+#
+# ⚠️ This lands at `/mnt/nvme/etc/quantum-credentials.BAKED`, not at the plain path. The plain file
+# is written on-device by `quantum remote login` and is NOT in this archive, so it survives a boot —
+# `installer::extract_tar_to_ext4` merges rather than wiping. `Credentials::load()` reads the baked
+# file then overlays the runtime one, so an on-device edit wins and reflashing cannot silently
+# revert it.
+mkdir -p build_initrd/etc
+if [ -f quantum-credentials.txt ]; then
+    cp quantum-credentials.txt build_initrd/etc/quantum-credentials.baked
+    # Report WHICH credentials were baked, never their values. A build that silently ships no key
+    # produces a runtime error that looks like a network fault.
+    CREDS_FOUND=$(grep -oE '^[[:space:]]*[a-zA-Z.]+[[:space:]]*=' quantum-credentials.txt \
+                  | tr -d ' =' | tr '\n' ' ')
+    echo "[creds] baked into the image: ${CREDS_FOUND:-(none — file is empty or all comments)}"
+else
+    # An empty file rather than no file, so the path always exists and Settings can distinguish
+    # "nothing configured" from "something went wrong reading it".
+    : > build_initrd/etc/quantum-credentials.baked
+    echo "[creds] no quantum-credentials.txt — cloud QPU access will be unconfigured"
+    echo "[creds]   cp quantum-credentials.example.txt quantum-credentials.txt  (gitignored)"
+fi
+
 # 4. Package it into a lightweight tape archive.
 #
-# ⚠️ `fonts` is a second top-level member alongside `apps`. `installer::extract_tar_to_ext4` walks
-# whatever the archive contains and mkdir/writes each path under /mnt/nvme, so it needed no change —
-# but an archive that lists only `apps` silently ships a system with no typefaces.
+# ⚠️ `fonts` and `etc` are further top-level members alongside `apps`.
+# `installer::extract_tar_to_ext4` walks whatever the archive contains and mkdir/writes each path
+# under /mnt/nvme, so it needed no change — but an archive that lists only `apps` silently ships a
+# system with no typefaces and no credentials.
 cd build_initrd
-tar -cf ../initrd.tar apps fonts
+tar -cf ../initrd.tar apps fonts etc
 cd ..
 cp initrd.tar nyx-kernel/src/initrd.tar
 touch nyx-kernel/src/main.rs

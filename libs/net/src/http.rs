@@ -122,6 +122,21 @@ pub enum Error {
     TooManyRedirects,
 }
 
+impl Error {
+    /// Whether this failure provably happened **before any request bytes reached the network**.
+    ///
+    /// ★ This is an idempotency question, not a diagnostic one. A caller may safely re-send a
+    /// **POST** after one of these, because the server cannot have seen the first attempt — the name
+    /// never resolved, or no connection was ever established.
+    ///
+    /// ⚠️ Everything else must be assumed to have been sent. `Io`, `Tls` and `Protocol` failures can
+    /// all occur *after* the request was written and before the response arrived, and re-sending
+    /// then would submit the same job twice — on metered quantum hardware, two charges.
+    pub fn is_before_send(&self) -> bool {
+        matches!(self, Error::Dns { .. } | Error::Connect { .. } | Error::Url(_))
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -646,25 +661,125 @@ pub(crate) fn response_is_reusable(headers: &[(String, String)], framed: bool) -
         })
 }
 
+/// What to send: a method, any extra headers, and an optional body.
+///
+/// Added for the quantum subsystem's cloud providers, which need `POST` with a JSON body and an
+/// `Authorization` header — neither of which this transport could express when it existed only to
+/// fetch pages. `Request::get()` reproduces the previous behaviour exactly, byte for byte, so no
+/// existing caller changed.
+#[derive(Clone, Debug)]
+pub struct Request {
+    /// `"GET"`, `"POST"`, … Uppercase; HTTP methods are case-sensitive.
+    pub method: &'static str,
+    /// Extra headers, sent after the standard block and before `Connection`.
+    ///
+    /// ⚠️ Values reach the wire verbatim. A caller putting a newline in one would be injecting
+    /// headers, so [`Request::header`] refuses those rather than trusting callers.
+    pub headers: Vec<(String, String)>,
+    /// The request body. Empty for a GET.
+    pub body: Vec<u8>,
+    /// `Content-Type`, sent only when there is a body.
+    pub content_type: Option<String>,
+}
+
+impl Request {
+    /// A plain GET — exactly what this crate sent before [`Request`] existed.
+    pub fn get() -> Request {
+        Request { method: "GET", headers: Vec::new(), body: Vec::new(), content_type: None }
+    }
+
+    /// A POST with a body and a content type.
+    pub fn post(body: Vec<u8>, content_type: &str) -> Request {
+        Request {
+            method: "POST",
+            headers: Vec::new(),
+            body,
+            content_type: Some(content_type.to_string()),
+        }
+    }
+
+    /// Add a header.
+    ///
+    /// ⚠️ Silently drops a name or value containing CR or LF. That is **header injection**: a
+    /// provider token or URL fragment carrying `\r\n` could otherwise append arbitrary headers, or
+    /// terminate the header block and forge a second request on the same connection. Dropping is
+    /// right rather than escaping, because there is no legal escape for a newline in a header value
+    /// and nothing that needs one.
+    pub fn header(mut self, name: &str, value: &str) -> Request {
+        let bad = |s: &str| s.contains('\r') || s.contains('\n') || s.is_empty();
+        if bad(name) || value.contains('\r') || value.contains('\n') {
+            return self;
+        }
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Whether replaying this request on a fresh connection is safe.
+    ///
+    /// ★ Load-bearing. `Fetch` retries once when a request fails on a connection taken from the idle
+    /// keep-alive slot, because a server closing an idle socket is the expected race in every
+    /// keep-alive implementation. That retry is **only** safe because a GET is idempotent. Replaying
+    /// a POST could submit the same quantum job — and the same charge — twice.
+    pub fn is_idempotent(&self) -> bool {
+        matches!(self.method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
+    }
+}
+
 /// The request bytes for a GET. Shared so the blocking and stepped paths cannot drift apart.
+///
+/// Preserved as-is so every existing caller and the byte-level test below are untouched; it is now a
+/// thin wrapper over [`request_bytes`].
 pub(crate) fn request_line(url: &Url, keep_alive: bool) -> Vec<u8> {
+    request_bytes(url, keep_alive, &Request::get())
+}
+
+/// The full request bytes for any method.
+pub(crate) fn request_bytes(url: &Url, keep_alive: bool, req: &Request) -> Vec<u8> {
     // Host must carry the port when it is non-default, or name-based virtual hosts answer wrong.
     let host_header = if url.port == url.scheme.default_port() {
         url.host.clone()
     } else {
         format!("{}:{}", url.host, url.port)
     };
-    format!(
-        "GET {} HTTP/1.1\r\n\
+
+    let mut s = format!(
+        "{method} {path} HTTP/1.1\r\n\
          Host: {host_header}\r\n\
          User-Agent: Nyx/0.1\r\n\
          Accept: */*\r\n\
-         Accept-Encoding: gzip\r\n\
-         Connection: {conn}\r\n\r\n",
-        url.path,
-        conn = if keep_alive { "keep-alive" } else { "close" }
-    )
-    .into_bytes()
+         Accept-Encoding: gzip\r\n",
+        method = req.method,
+        path = url.path,
+    );
+
+    for (k, v) in &req.headers {
+        s.push_str(k);
+        s.push_str(": ");
+        s.push_str(v);
+        s.push_str("\r\n");
+    }
+
+    // ⚠️ Content-Length is mandatory for a body. Without it the server has no framing for the
+    // request and waits for bytes that never come — the connection just hangs, which looks exactly
+    // like a slow provider.
+    if !req.body.is_empty() {
+        if let Some(ct) = &req.content_type {
+            s.push_str("Content-Type: ");
+            s.push_str(ct);
+            s.push_str("\r\n");
+        }
+        s.push_str(&format!("Content-Length: {}\r\n", req.body.len()));
+    }
+
+    s.push_str(if keep_alive {
+        "Connection: keep-alive\r\n\r\n"
+    } else {
+        "Connection: close\r\n\r\n"
+    });
+
+    let mut out = s.into_bytes();
+    out.extend_from_slice(&req.body);
+    out
 }
 
 /// Undo `Content-Encoding` on a completed body. Shared by the blocking and stepped paths so the two
@@ -749,18 +864,88 @@ pub fn head_only(url: &str) -> Result<Response, Error> {
 
 /// One request, no redirect handling, with its own whole-request budget.
 pub fn get_once(url: &Url) -> Result<Response, Error> {
-    get_with_deadline(url, Deadline::new(TOTAL_DEADLINE))
+    request_with_deadline(url, &Request::get(), Deadline::new(TOTAL_DEADLINE))
+}
+
+/// Send an arbitrary [`Request`] once. No redirect handling, no keep-alive, no retry.
+///
+/// The entry point for the quantum subsystem's cloud providers.
+///
+/// ★ **No retry, deliberately.** `Fetch`'s stepped path replays a request once when a reused
+/// keep-alive connection turns out to have been closed, which is safe for a GET and is not safe for
+/// a POST — a replayed job submission is a second job, and on metered quantum hardware a second
+/// charge. This path opens a fresh connection every time, so the race that retry exists for cannot
+/// arise.
+///
+/// Redirects are not followed: a provider API that 30x's a POST is doing something a client should
+/// not paper over, since the method and body may not survive the hop.
+pub fn request_once(url: &Url, req: &Request) -> Result<Response, Error> {
+    request_with_deadline(url, req, Deadline::new(TOTAL_DEADLINE))
+}
+
+/// [`request_once`] with a caller-chosen whole-request budget.
+///
+/// ★ The 60-second default is right for fetching a page, where giving up early wastes a slow but
+/// working download. It is wrong for **polling**: a caller that asks every few seconds wants to know
+/// quickly that this attempt failed so it can make another, and a 60-second stall inside one poll is
+/// indistinguishable from the job simply taking a while.
+pub fn request_once_within(
+    url: &Url,
+    req: &Request,
+    budget: Duration,
+) -> Result<Response, Error> {
+    request_with_deadline(url, req, Deadline::new(budget))
 }
 
 fn get_with_deadline(url: &Url, deadline: Deadline) -> Result<Response, Error> {
+    request_with_deadline(url, &Request::get(), deadline)
+}
+
+fn request_with_deadline(
+    url: &Url,
+    req: &Request,
+    deadline: Deadline,
+) -> Result<Response, Error> {
     let start = Instant::now();
-    trace!(&start, "GET {url}");
-    let addr = crate::fetch::resolve_host(url)?;
-    let mut transport = Transport::connect(url, addr, &start)?;
+    trace!(&start, "{} {url}", req.method);
+
+    // ★ Try EVERY address the name resolved to, not just the first.
+    //
+    // `resolve_host` returns `candidates[0]`, and a large service publishes several A records of
+    // which some are routinely unreachable from a given network. One address is roulette: it is the
+    // same failure that made HTTPS look broken for a whole session, and it reappeared here as
+    // "connection timed out (os error 110)" on the second request to a host whose first request had
+    // just succeeded.
+    //
+    // ⚠️ Only the CONNECT is retried across addresses. Once a connection is established and the
+    // request has been written, a failure is not retried — see the idempotency note on
+    // `request_once`. Re-sending a POST to a different address could submit the same job twice.
+    let addrs = crate::fetch::resolve_candidates(url)?;
+    let mut transport = None;
+    let mut last_err = None;
+    for addr in &addrs {
+        deadline.check()?;
+        match Transport::connect(url, *addr, &start) {
+            Ok(t) => {
+                transport = Some(t);
+                break;
+            }
+            Err(e) => {
+                trace!(&start, "connect to {addr} failed: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    let mut transport = match transport {
+        Some(t) => t,
+        None => {
+            return Err(last_err.unwrap_or_else(|| Error::Dns { host: url.host.clone() }))
+        }
+    };
 
     // For HTTPS this is where the handshake actually happens — rustls defers it to the first I/O —
     // so a stall here is a TLS problem, not a request-sending problem.
-    transport.write_all(&request_line(url, false))?;
+    transport.write_all(&request_bytes(url, false, req))?;
     transport.flush()?;
     trace!(&start, "request sent (handshake done for https)");
 
@@ -1352,6 +1537,101 @@ mod tests {
             assert!(r.ends_with("\r\n\r\n"), "{r}");
             assert!(r.contains("Host: example.com\r\n"), "{r}");
         }
+    }
+
+    // ── Methods and bodies ──────────────────────────────────────────────────────────────────────
+
+    /// ★★ The regression guard for adding POST support.
+    ///
+    /// `request_line` is now a wrapper over `request_bytes`, and `libs/net` is the transport under
+    /// the terminal's `get`/`links`/`open` — the browser. If a GET's bytes changed by one character,
+    /// every page load is affected, and the failure would show up on hardware as a subtly different
+    /// server response rather than as a compile error. So the exact wire form is pinned.
+    #[test]
+    fn a_get_is_byte_identical_to_what_it_was_before_post_existed() {
+        let u = Url::parse("http://example.com/x").unwrap();
+        let expected = "GET /x HTTP/1.1\r\n\
+                        Host: example.com\r\n\
+                        User-Agent: Nyx/0.1\r\n\
+                        Accept: */*\r\n\
+                        Accept-Encoding: gzip\r\n\
+                        Connection: close\r\n\r\n";
+        assert_eq!(String::from_utf8(request_line(&u, false)).unwrap(), expected);
+        assert_eq!(
+            String::from_utf8(request_bytes(&u, false, &Request::get())).unwrap(),
+            expected,
+            "Request::get() must reproduce the historical GET exactly"
+        );
+    }
+
+    #[test]
+    fn a_post_carries_its_method_content_type_length_and_body() {
+        let u = Url::parse("https://api.example.com/v0.3/jobs").unwrap();
+        let body = br#"{"a":1}"#.to_vec();
+        let req = Request::post(body.clone(), "application/json")
+            .header("Authorization", "apiKey SECRET");
+        let wire = String::from_utf8(request_bytes(&u, false, &req)).unwrap();
+
+        assert!(wire.starts_with("POST /v0.3/jobs HTTP/1.1\r\n"), "{wire}");
+        assert!(wire.contains("Authorization: apiKey SECRET\r\n"), "{wire}");
+        assert!(wire.contains("Content-Type: application/json\r\n"), "{wire}");
+        // ⚠️ Without Content-Length the server waits for bytes that never come, and the connection
+        // hangs in a way indistinguishable from a slow provider.
+        assert!(wire.contains("Content-Length: 7\r\n"), "{wire}");
+        assert!(wire.ends_with("\r\n\r\n{\"a\":1}"), "the body must follow the blank line: {wire}");
+    }
+
+    #[test]
+    fn a_get_never_gains_content_headers() {
+        let u = Url::parse("http://example.com/").unwrap();
+        let wire = String::from_utf8(request_bytes(&u, false, &Request::get())).unwrap();
+        assert!(!wire.contains("Content-Length"), "{wire}");
+        assert!(!wire.contains("Content-Type"), "{wire}");
+    }
+
+    /// ★ Header injection. A provider token or URL fragment carrying CRLF could otherwise append
+    /// headers, or close the header block and forge a second request on the same connection.
+    #[test]
+    fn crlf_in_a_header_is_dropped_rather_than_written_to_the_wire() {
+        let u = Url::parse("http://example.com/").unwrap();
+        let req = Request::get()
+            .header("X-Evil", "a\r\nX-Injected: yes")
+            .header("Bad\r\nName", "v")
+            .header("X-Good", "fine");
+        let wire = String::from_utf8(request_bytes(&u, false, &req)).unwrap();
+        assert!(!wire.contains("X-Injected"), "header injection got through: {wire}");
+        assert!(!wire.contains("Bad"), "{wire}");
+        assert!(wire.contains("X-Good: fine\r\n"), "a legitimate header must survive: {wire}");
+    }
+
+    /// ★ Load-bearing for `Fetch`'s replay-once-on-a-reused-connection retry.
+    ///
+    /// That retry is safe for a GET because a GET is idempotent. Replaying a POST would submit the
+    /// same quantum job twice — and on metered hardware, bill for it twice.
+    #[test]
+    fn only_idempotent_methods_may_be_replayed() {
+        assert!(Request::get().is_idempotent());
+        assert!(!Request::post(b"x".to_vec(), "text/plain").is_idempotent());
+    }
+
+    #[test]
+    fn a_non_default_port_reaches_the_host_header_for_any_method() {
+        let u = Url::parse("http://example.com:8080/j").unwrap();
+        for req in [Request::get(), Request::post(b"{}".to_vec(), "application/json")] {
+            let wire = String::from_utf8(request_bytes(&u, false, &req)).unwrap();
+            assert!(wire.contains("Host: example.com:8080\r\n"), "{wire}");
+        }
+    }
+
+    #[test]
+    fn an_empty_body_post_still_frames_correctly() {
+        // Some provider endpoints (cancel, for instance) are a POST with no body. It must not gain a
+        // Content-Length of 0 via the body branch, and it must still end in a blank line.
+        let u = Url::parse("http://example.com/cancel").unwrap();
+        let req = Request::post(Vec::new(), "application/json");
+        let wire = String::from_utf8(request_bytes(&u, false, &req)).unwrap();
+        assert!(wire.starts_with("POST /cancel HTTP/1.1\r\n"), "{wire}");
+        assert!(wire.ends_with("\r\n\r\n"), "{wire}");
     }
 
     #[test]

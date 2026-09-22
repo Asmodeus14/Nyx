@@ -63,6 +63,12 @@ use nyx_meridian::panes::{self, NavKind, RowKind};
 use nyx_meridian::shapes;
 use nyx_meridian::text;
 use nyx_meridian::tokens::{Theme, B1, B2, B3, D2, LB};
+// Credential parsing and redaction. `no_std`, no filesystem — the same code `libs/quantum-rt` links
+// through `std::fs`, so this pane and the terminal cannot disagree about what is configured.
+use nyx_quantum::creds::{redact as creds_redact, warning as creds_warning, CredSet};
+
+/// Matches the kernel registry's size in `nyx-kernel/src/quantum.rs`.
+const MAX_QPUS: usize = 8;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -83,18 +89,22 @@ enum Cat {
     Display,
     Network,
     Power,
+    Quantum,
     Storage,
     About,
 }
 
 /// The nav pane, as a flat list so a heading and a destination cannot get out of order.
-const NAV: [(&str, Option<Cat>); 8] = [
+const NAV: [(&str, Option<Cat>); 9] = [
     ("System", None),
     ("Appearance", Some(Cat::Appearance)),
     ("Display", Some(Cat::Display)),
     ("Network", Some(Cat::Network)),
     ("Power", Some(Cat::Power)),
     ("Machine", None),
+    // Under Machine rather than System: this pane answers "what compute does this box have, and
+    // what is it allowed to reach", which is the same question Storage and About answer.
+    ("Quantum", Some(Cat::Quantum)),
     ("Storage", Some(Cat::Storage)),
     ("About", Some(Cat::About)),
 ];
@@ -106,6 +116,7 @@ impl Cat {
             Cat::Display => "Display",
             Cat::Network => "Network",
             Cat::Power => "Power",
+            Cat::Quantum => "Quantum",
             Cat::Storage => "Storage",
             Cat::About => "About",
         }
@@ -116,6 +127,7 @@ impl Cat {
             Cat::Display => "The panel, and what is driving it.",
             Cat::Network => "The wireless link and its addresses.",
             Cat::Power => "What the battery reports.",
+            Cat::Quantum => "The QPU, and the cloud credentials that reach one.",
             Cat::Storage => "The filesystem this system runs from.",
             Cat::About => "What this machine is.",
         }
@@ -133,6 +145,52 @@ enum Control {
     Track(i32),
     /// A read-only value with a colour swatch after it.
     Swatch(String, u32),
+    /// One or more push buttons.
+    ///
+    /// Drawn and hit-tested through the same `panes::segment` geometry [`Control::Segments`] uses —
+    /// reusing it rather than inventing a second button rect is what keeps the draw and the
+    /// hit-test from disagreeing, which is the rule this app already follows for the theme picker
+    /// and the brightness track.
+    ///
+    /// The difference from `Segments` is semantic and it matters: a segment shows which option is
+    /// *selected*, a button *does* something. None is ever drawn as selected.
+    Actions(&'static [&'static str]),
+}
+
+/// The Quantum pane's buttons. Indices are used by the click handler, so the order is load-bearing.
+const QUANTUM_ACTIONS: [&str; 2] = ["Reload", "Clear"];
+const QA_RELOAD: usize = 0;
+const QA_CLEAR: usize = 1;
+
+/// Credentials baked into the boot image by `Build.sh`. Rewritten from the image on every boot.
+const CRED_BAKED: &str = "/mnt/nvme/etc/quantum-credentials.baked";
+/// Credentials written on the device. NOT in the initrd tar, so it survives a reboot.
+const CRED_RUNTIME: &str = "/mnt/nvme/etc/quantum-credentials";
+
+/// Read a whole file, or `""` if it is missing.
+///
+/// A missing credential file is the normal state, not an error — every machine starts that way.
+fn read_file(path: &str) -> String {
+    let fd = sys_open(path);
+    if fd < 0 {
+        return String::new();
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = sys_read(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n as usize]);
+        // A credential file is a handful of lines. A cap stops a corrupted or wrong file from
+        // growing this app's heap without bound.
+        if out.len() > 16 * 1024 {
+            break;
+        }
+    }
+    sys_close(fd);
+    String::from_utf8(out).unwrap_or_default()
 }
 
 struct Row {
@@ -212,6 +270,28 @@ impl Settings {
 
     /// The rows of the current category. Built fresh each time rather than cached: they are a
     /// handful of strings, and a cache is one more thing that can disagree with the machine.
+    /// The merged credential set: the image copy, overlaid by anything entered on the device.
+    ///
+    /// Re-read on each call rather than cached, so the pane reflects a Clear immediately. It is two
+    /// small file reads and this pane is not on a hot path.
+    ///
+    /// Parsing lives in `nyx_quantum::creds` — the same code `libs/quantum-rt` uses through
+    /// `std::fs`. One implementation, so this screen and the terminal cannot disagree about whether
+    /// a key is configured.
+    fn creds(&self) -> CredSet {
+        CredSet::merge(&read_file(CRED_BAKED), &read_file(CRED_RUNTIME))
+    }
+
+    /// Forget the on-device credentials. The baked copy is untouched, so this reverts to the image.
+    fn clear_runtime_creds(&self) -> bool {
+        let fd = sys_open_flags(CRED_RUNTIME, O_CREAT | O_TRUNC);
+        if fd < 0 {
+            return false;
+        }
+        sys_close(fd);
+        true
+    }
+
     fn rows(&self) -> Vec<Row> {
         let mut v: Vec<Row> = Vec::new();
         match self.cat {
@@ -296,6 +376,115 @@ impl Settings {
                 };
                 v.push(Row { label: "nvme0", desc: "The ext4 volume mounted at /mnt/nvme", control: Control::Text(cap) });
                 v.push(Row { label: "Used", desc: "Everything the installer and apps have written", control: Control::Text(used) });
+            }
+            Cat::Quantum => {
+                // ── What hardware is actually here ──────────────────────────────────────────────
+                //
+                // Read from the kernel's registry (syscall 573), which holds physically attached
+                // devices only. On this machine that is empty, and "not present" is the true
+                // answer rather than a placeholder waiting for a driver — see
+                // docs/quantum/limitations.md.
+                let mut qbuf = [QpuInfo::default(); MAX_QPUS];
+                let n = sys_quantum_enumerate(&mut qbuf);
+                let hardware = qbuf[..n].iter().find(|d| d.status == QPU_STATUS_HARDWARE);
+                v.push(Row {
+                    label: "Processor",
+                    desc: "A quantum processor attached to this machine",
+                    control: Control::Text(match hardware {
+                        Some(d) => alloc::format!("{} ({} qubits)", d.name_str(), d.qubits),
+                        None => String::from("not present"),
+                    }),
+                });
+                v.push(Row {
+                    label: "Simulator",
+                    desc: "Classical state-vector simulation, available to any application",
+                    control: Control::Text(String::from("20 qubits")),
+                });
+
+                // ── The cloud credentials ───────────────────────────────────────────────────────
+                let creds = self.creds();
+                let src = creds.source();
+                let providers = creds.configured_providers();
+
+                v.push(Row {
+                    label: "Cloud providers",
+                    desc: "Reaching a real QPU needs one of these; nothing here is required",
+                    control: Control::Text(if providers.is_empty() {
+                        String::from("none configured")
+                    } else {
+                        let mut s = String::new();
+                        for (i, p) in providers.iter().enumerate() {
+                            if i > 0 {
+                                s.push_str(", ");
+                            }
+                            s.push_str(p);
+                        }
+                        s
+                    }),
+                });
+                v.push(Row {
+                    label: "IonQ key",
+                    desc: "Trapped-ion hardware and a free cloud simulator",
+                    control: Control::Text(match creds.get("ionq.token") {
+                        // ★ Redacted, always. This pane is one screenshot away from being shared.
+                        Some(t) => creds_redact(t),
+                        None => String::from("\u{2014}"),
+                    }),
+                });
+                v.push(Row {
+                    label: "IBM key",
+                    desc: "10 free minutes a month on real hardware, on the Open plan",
+                    control: Control::Text(match creds.get("ibm.token") {
+                        Some(t) => creds_redact(t),
+                        None => String::from("\u{2014}"),
+                    }),
+                });
+                v.push(Row {
+                    label: "IBM instance",
+                    // ⚠️ Named as a separate row because IBM needs BOTH. A key with no CRN fails in
+                    // a way that reads like a rejected key, and this row is where a user sees why.
+                    desc: "The CRN IBM requires alongside its key",
+                    control: Control::Text(match creds.get("ibm.crn") {
+                        Some(t) => creds_redact(t),
+                        None => String::from("\u{2014}"),
+                    }),
+                });
+                v.push(Row {
+                    label: "Source",
+                    desc: "Baked in by Build.sh, or entered here",
+                    control: Control::Text(String::from(src.label())),
+                });
+
+                // The clock, because a wrong one breaks TLS in a way that reads as a network fault.
+                let now = sys_get_rtc().unix();
+                v.push(Row {
+                    label: "Clock",
+                    desc: "A clock before 2020 makes every certificate fail as 'not yet valid'",
+                    control: Control::Text(if now >= 1_577_836_800 {
+                        String::from("OK")
+                    } else {
+                        String::from("wrong \u{2014} run `time sync`")
+                    }),
+                });
+
+                v.push(Row {
+                    label: "Credentials",
+                    desc: "Reload re-reads the image copy; Clear forgets the on-device one",
+                    control: Control::Actions(&QUANTUM_ACTIONS),
+                });
+                v.push(Row {
+                    label: "Storage",
+                    // ★ Stated on the screen that shows the keys, not buried in a document. Nyx
+                    // genuinely cannot protect this file, and a user who does not know that cannot
+                    // choose which token to paste in.
+                    desc: creds_warning(),
+                    control: Control::Text(String::from("unprotected")),
+                });
+                v.push(Row {
+                    label: "Entering a key",
+                    desc: "There is no paste on this machine; keys are baked in at build time",
+                    control: Control::Text(String::from("quantum-credentials.txt")),
+                });
             }
             Cat::About => {
                 let machine = self.info.machine_name();
@@ -418,6 +607,7 @@ impl Settings {
                 Cat::Display => "Panel",
                 Cat::Network => "Wireless",
                 Cat::Power => "Battery",
+                Cat::Quantum => "Compute",
                 Cat::Storage => "Volume",
                 Cat::About => "System",
             };
@@ -479,6 +669,24 @@ impl Settings {
                     let col = if selected { t.fg } else { t.fg_3 };
                     let ty = text::centre_y(s.y, s.h, B2);
                     text::draw(canvas, s.x + (s.w - widths[i]) / 2, ty, B2, col, label);
+                }
+            }
+            Control::Actions(labels) => {
+                // Same geometry as `Segments`, so a button cannot be clickable anywhere other than
+                // where it is drawn. Every one gets the wash — none is ever "selected", because a
+                // button is an action and not a state.
+                let widths: Vec<i32> = labels.iter().map(|s| text::width(B2, s)).collect();
+                for (i, label) in labels.iter().enumerate() {
+                    let Some(s) = panes::segment(r.rect, r.value_right, &widths, i) else { continue };
+                    if s.y < 0 || s.bottom() > self.height {
+                        continue;
+                    }
+                    shapes::fill_round_rect(
+                        canvas, s.x as usize, s.y as usize, s.w as usize, s.h as usize,
+                        panes::segment_radius(), t.wash_2,
+                    );
+                    let ty = text::centre_y(s.y, s.h, B2);
+                    text::draw(canvas, s.x + (s.w - widths[i]) / 2, ty, B2, t.fg, label);
                 }
             }
             Control::Track(pct) => {
@@ -694,6 +902,39 @@ impl NyxApp for Settings {
                         0,
                     );
                     return false;
+                }
+            }
+        }
+
+        // The Quantum pane's buttons.
+        //
+        // The row index is FOUND rather than hardcoded: the pane's rows are built conditionally and
+        // a literal index would silently start hit-testing a different row the first time one is
+        // added above it. Same reasoning as the shell's APPS/DOCK index bug.
+        if self.cat == Cat::Quantum {
+            let rows = self.rows();
+            let kinds = self.row_kinds(&rows);
+            if let Some(ri) = rows
+                .iter()
+                .position(|r| matches!(r.control, Control::Actions(_)))
+            {
+                if let Some(r) = self.row_rect(&kinds, ri) {
+                    let widths: Vec<i32> =
+                        QUANTUM_ACTIONS.iter().map(|s| text::width(B2, s)).collect();
+                    if let Some(i) = panes::segment_hit(r.rect, r.value_right, &widths, x, y) {
+                        match i {
+                            // Reload: the pane re-reads both files on every draw, so there is
+                            // nothing to invalidate — a repaint IS the reload. Kept as an explicit
+                            // button because "did it pick up my new image?" is a real question and
+                            // a control that answers it beats a user rebooting to find out.
+                            QA_RELOAD => return true,
+                            QA_CLEAR => {
+                                self.clear_runtime_creds();
+                                return true;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }

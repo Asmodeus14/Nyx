@@ -48,6 +48,8 @@ const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
 const EACCES: i64 = -13;
 const EFAULT: i64 = -14;
+/// No such device. Used by the quantum introspection syscalls (574) for an unknown device id.
+const ENODEV: i64 = -19;
 const EEXIST: i64 = -17;
 const ENOTDIR: i64 = -20;
 const EISDIR: i64 = -21;
@@ -4503,6 +4505,78 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = n.min(DNS_MAX_ADDRS) as u64;
         }
 
+        // ── Quantum subsystem ───────────────────────────────────────────────────────────────────
+        //
+        // Two syscalls, both read-only, both lock-free, both allocation-free. That is the whole
+        // kernel-facing surface of Nyx's QPU support, and `nyx-kernel/src/quantum.rs` explains at
+        // length why it is not larger: there is no local quantum hardware to arbitrate for, the
+        // kernel has no async model to submit a job through, and remote providers are HTTPS clients
+        // that have no business in ring 0.
+        //
+        // They copy from a static table published once during `pci::enumerate_pci()` and immutable
+        // afterwards — the same "publish, don't expose" discipline as 567, and for the same reason:
+        // these run at IF=0, so taking any lock a kernel task might hold at IF=1 is a deadlock that
+        // would also kill the thermal governor.
+
+        // 573: sys_quantum_enumerate(buf_ptr, max_entries) -> entries written, or -EFAULT.
+        //
+        // ⚠️ `buf_ptr` is an ARRAY of QpuInfo and can span many pages, so it needs per-page
+        // validation — `is_valid_user_ptr` is only a range check against the userspace ceiling and
+        // says nothing about whether the pages are mapped. A kernel-mode read of an unmapped user
+        // address panics the machine rather than the process.
+        573 => {
+            let out = arg1 as *mut u8;
+            let max = arg2 as usize;
+            if max == 0 {
+                frame.rax = 0;
+                return;
+            }
+            // Cap before multiplying so a huge `max` cannot overflow the byte count.
+            let n = crate::quantum::count().min(max);
+            if n == 0 {
+                frame.rax = 0;
+                return;
+            }
+            let bytes = n * crate::quantum::QPU_INFO_SIZE;
+            if !is_valid_user_ptr(out, bytes) || !user_range_mapped(arg1, bytes) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
+            let src = crate::quantum::devices();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    out,
+                    bytes,
+                );
+            }
+            frame.rax = n as u64;
+        }
+
+        // 574: sys_quantum_info(id, out_ptr) -> 0, or -ENODEV / -EFAULT.
+        574 => {
+            let id = arg1 as u32;
+            let out = arg2 as *mut u8;
+            let bytes = crate::quantum::QPU_INFO_SIZE;
+            if !is_valid_user_ptr(out, bytes) || !user_range_mapped(arg2, bytes) {
+                frame.rax = EFAULT as u64;
+                return;
+            }
+            match crate::quantum::device(id) {
+                Some(d) => {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &d as *const crate::quantum::QpuInfo as *const u8,
+                            out,
+                            bytes,
+                        );
+                    }
+                    frame.rax = 0;
+                }
+                None => frame.rax = ENODEV as u64,
+            }
+        }
+
         // 547: sys_wifi_disconnect() -> 0. Leaves the network and frees the radio to scan/retune.
         547 => {
             if crate::drivers::net::wifi_try_begin() {
@@ -5109,6 +5183,34 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
 /// address panics the MACHINE rather than killing the caller. The individual `iov_base` pointers
 /// need no check here — they are passed to sys_read_internal / sys_write_internal, which validate
 /// exactly as they would for a plain read(2)/write(2).
+/// Is every page of `[start, start + len)` present in the CALLER's address space?
+///
+/// ⚠️ `is_valid_user_ptr` is only a **range** check — it asks whether an address is below the
+/// userspace ceiling, not whether anything is mapped there. A kernel-mode read of a valid-looking
+/// but unmapped user address takes a page fault in ring 0, which panics the whole machine rather
+/// than killing the process. So any arm that dereferences a user buffer larger than a few bytes
+/// needs this as well.
+///
+/// This is the loop `iov_array_ok` and `user_cstr_raw` already run inline; it is factored out here
+/// because the quantum enumeration syscall copies an array that can span many pages.
+fn user_range_mapped(start: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = match start.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    let mut a = start & !0xFFF;
+    while a < end {
+        if !unsafe { crate::memory::user_addr_mapped(a) } {
+            return false;
+        }
+        a += 4096;
+    }
+    true
+}
+
 fn iov_array_ok(iov_ptr: *const u64, iovcnt: usize) -> bool {
     const IOV_MAX: usize = 1024;
     if iovcnt == 0 || iovcnt > IOV_MAX { return false; }
@@ -5655,7 +5757,24 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
         return 0;
     }
 
-    // 1. Fire the DNS Query
+    // ★★ Retry with a FRESH QUERY, rather than waiting longer on one (2026-09-20).
+    //
+    // The symptom that motivated this, reported from hardware: `dns iam.cloud.ibm.com` had to be
+    // typed **twice**, consistently — the first attempt failed and the second returned in 1.6 s.
+    // That is not random loss, it is a lost packet: DNS is UDP, and nothing recovers a dropped
+    // datagram except sending another one. Waiting longer on the first query cannot help, which is
+    // why raising the single timeout from 5 s to 12 s did not fix it.
+    //
+    // ⚠️ smoltcp does retransmit internally, but on a link dropping this many frames (the same
+    // session showed `badsig=9`, `undecrypted=19`) its backoff can consume the whole budget on one
+    // unlucky query. Three independent queries of four seconds beat one of twelve.
+    //
+    // Cancelling between attempts matters: an abandoned query is not just a leaked slot, smoltcp
+    // keeps retransmitting it forever and every `poll_stack` walks the list. See the timeout path.
+    const DNS_ATTEMPTS: u32 = 3;
+    const DNS_ATTEMPT_MS: u64 = 4_000;
+
+    for attempt in 0..DNS_ATTEMPTS {
     let query_handle = match crate::drivers::net::with_stack(stack, gen, |sockets, iface| {
         let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
         dns_socket.start_query(iface.context(), hostname_str, smoltcp::wire::DnsQueryType::A)
@@ -5672,7 +5791,8 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
     };
 
     let start_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
-    
+    let _ = attempt;
+
     // 2. Safely Block until the DNS Server Replies
     loop {
         crate::drivers::net::poll_stack(stack);
@@ -5707,6 +5827,9 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
                 Err(smoltcp::socket::dns::GetQueryResultError::Pending) => None,
                 Err(_) => {
                     crate::serial_println!("[DNS] Query Failed/NXDOMAIN.");
+                    // `Some(0)` means "this attempt is over". The caller decides whether to try
+                    // again — smoltcp reports a lost query and a genuine NXDOMAIN identically, so
+                    // treating failure as final would abandon a name that simply lost a packet.
                     Some(0)
                 }
             }
@@ -5716,28 +5839,34 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
                 if packed != 0 {
                     crate::serial_println!("[DNS] Resolved {} -> {}.{}.{}.{}", hostname_str,
                         packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff, (packed >> 24) & 0xff);
+                    return packed;
                 }
-                return packed;
+                // Failed. `get_query_result` already freed the slot, so break straight to the next
+                // attempt without cancelling.
+                break;
             }
             Some(None) => {}   // still waiting
             None => return 0,  // stack went away
         }
 
         let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
-        if current_ms.saturating_sub(start_ms) > 5000 {
-            crate::serial_println!("[DNS] Timeout.");
-            // Cancel before giving up. `get_query_result` frees the slot on success or failure, but
-            // a query still Pending is freed ONLY here — and the socket is built with a growable
-            // `vec![]`, so an abandoned query is not merely a leaked slot: smoltcp keeps
-            // retransmitting it forever, and every `poll_stack` (which every blocking socket
-            // syscall calls in a tight loop) walks the whole list. Enough timeouts and the machine
-            // spends all its time re-sending dead lookups.
+        // ⚠️ This whole loop runs with interrupts ENABLED (the arm re-enables them), so a long wait
+        // does not starve the thermal governor — but it DOES block the calling app for the full
+        // duration, which is why `Fetch` announces the resolve stage before entering it.
+        if current_ms.saturating_sub(start_ms) > DNS_ATTEMPT_MS {
+            crate::serial_println!("[DNS] attempt {} timed out", attempt + 1);
+            // Cancel before starting the next one. `get_query_result` frees the slot on success or
+            // failure, but a query still Pending is freed ONLY here — and the socket is built with a
+            // growable `vec![]`, so an abandoned query is not merely a leaked slot: smoltcp keeps
+            // retransmitting it forever, and every `poll_stack` (which every blocking socket syscall
+            // calls in a tight loop) walks the whole list. Enough timeouts and the machine spends
+            // all its time re-sending dead lookups.
             crate::drivers::net::with_sockets(stack, gen, |sockets| {
                 sockets
                     .get_mut::<smoltcp::socket::dns::Socket>(dns_handle)
                     .cancel_query(query_handle);
             });
-            return 0;
+            break;
         }
 
         // This syscall returns a packed address with 0 for failure, so there is no errno channel
@@ -5762,4 +5891,8 @@ pub extern "C" fn sys_dns_resolve(hostname_ptr: usize, hostname_len: usize) -> u
             x86_64::instructions::interrupts::disable();
         }
     }
+    } // end of one attempt
+
+    crate::serial_println!("[DNS] {} unresolved after {} attempts", hostname_str, DNS_ATTEMPTS);
+    0
 }

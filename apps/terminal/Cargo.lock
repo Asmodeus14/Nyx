@@ -555,6 +555,10 @@ name = "nyx-htmltext"
 version = "0.1.0"
 
 [[package]]
+name = "nyx-json"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-meridian"
 version = "0.1.0"
 dependencies = [
@@ -578,6 +582,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-quantum"
+version = "0.1.0"
+
+[[package]]
+name = "nyx-quantum-rt"
+version = "0.1.0"
+dependencies = [
+ "nyx-api",
+ "nyx-json",
+ "nyx-net",
+ "nyx-quantum",
+ "qclang_compiler",
+]
+
+[[package]]
 name = "nyx-terminal"
 version = "0.1.0"
 dependencies = [
@@ -587,6 +606,7 @@ dependencies = [
  "nyx-htmltext",
  "nyx-meridian",
  "nyx-net",
+ "nyx-quantum-rt",
  "nyx-toolchains",
 ]
 

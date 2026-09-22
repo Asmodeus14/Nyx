@@ -1841,6 +1841,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-json"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-kernel"
 version = "0.1.0"
 dependencies = [
@@ -1890,6 +1894,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-quantum"
+version = "0.1.0"
+
+[[package]]
+name = "nyx-quantum-rt"
+version = "0.1.0"
+dependencies = [
+ "nyx-api",
+ "nyx-json",
+ "nyx-net",
+ "nyx-quantum",
+ "qclang_compiler",
+]
+
+[[package]]
 name = "nyx-settings"
 version = "0.1.0"
 dependencies = [
@@ -1897,6 +1916,7 @@ dependencies = [
  "nyx-api",
  "nyx-gui",
  "nyx-meridian",
+ "nyx-quantum",
 ]
 
 [[package]]

@@ -1,0 +1,20 @@
+[package]
+name = "nyx-quantum"
+version = "0.1.0"
+edition = "2021"
+description = "Nyx QPU device model, circuit IR, backend trait and state-vector simulator"
+
+# No dependencies, deliberately, and this one is load-bearing rather than aspirational.
+#
+# `device.rs` crosses the syscall boundary and is mirrored by hand in `libs/api` and the kernel, so
+# it must be `no_std` and layout-stable. `sim.rs` is a port of `tools/compiler/src/statevector.rs`,
+# which was already written with its own complex-number struct and plain `f64` specifically so it
+# could compile on-device — pulling `num-complex` back in here would undo that on purpose.
+[dependencies]
+
+[features]
+# The simulator needs an entropy source to sample shots. On Nyx that is syscall 318 (getrandom) via
+# `libs/api`; on the host it is a deterministic seed passed in by the caller. Rather than link
+# either, `sim` takes the seed as an argument — so there is no feature flag here and no hidden
+# dependency on where randomness comes from. See `sim::sample_shots`.
+default = []

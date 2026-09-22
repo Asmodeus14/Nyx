@@ -1561,6 +1561,210 @@ pub fn wifi_op_decode(arg: &str) -> Option<(WifiOp, &str, &str)> {
     }
 }
 
+// ─────────────────────────── Quantum / QPU ───────────────────────────
+//
+// Nyx's third compute substrate, alongside the CPU and the GPU. These two calls are the ENTIRE
+// kernel-facing surface of it: discovery and introspection, nothing else. Circuits, the simulator,
+// backend selection and every cloud provider are userspace — `libs/quantum` and `libs/quantum-rt`.
+// `docs/quantum/architecture.md` explains why the kernel's share is this small.
+
+/// Enumerate physically-attached quantum devices. See [`sys_quantum_enumerate`].
+pub const SYS_QUANTUM_ENUMERATE: u64 = 573;
+/// Look one up by id. See [`sys_quantum_info`].
+pub const SYS_QUANTUM_INFO: u64 = 574;
+
+/// Where a quantum device's answers come from. Mirror of `nyx_quantum::QpuStatus`.
+///
+/// ⚠️ [`QPU_STATUS_HARDWARE`] is produced in exactly one place in the whole tree — the kernel's PCI
+/// probe, on a match against a verified device ID. Nothing in userspace can construct it, and on
+/// this machine it is unreachable by design: no consumer gate-model QPU exists that Nyx could drive
+/// over PCIe. See `docs/quantum/limitations.md`.
+pub const QPU_STATUS_NOT_PRESENT: u32 = 0;
+/// Classical software running on this CPU.
+pub const QPU_STATUS_SIMULATOR: u32 = 1;
+/// Reachable over the network. ⚠️ Check `remote_is_simulator` before calling it a quantum device —
+/// providers serve cloud simulators through the same API as real processors.
+pub const QPU_STATUS_REMOTE: u32 = 2;
+/// A quantum processor physically attached to this machine.
+pub const QPU_STATUS_HARDWARE: u32 = 3;
+
+/// A gate-model quantum processor.
+pub const QPU_KIND_QPU: u32 = 0;
+/// Control electronics for a QPU that lives elsewhere. Cannot execute a circuit.
+pub const QPU_KIND_CONTROL: u32 = 1;
+/// A quantum entropy source. Real physics, no computation.
+pub const QPU_KIND_RNG: u32 = 2;
+/// Something on the PCI bus Nyx cannot identify. A diagnostic, never a claim.
+pub const QPU_KIND_UNIDENTIFIED: u32 = 3;
+
+/// One quantum compute resource.
+///
+/// `#[repr(C)]`, **append-only**, and hand-mirrored in three places — here,
+/// `libs/quantum/src/device.rs`, and `nyx-kernel/src/quantum.rs`. Field order IS the ABI; there is
+/// no bindgen across the ring boundary in this tree, exactly as with [`SysMetrics`] and
+/// [`WindowQuad`]. All three carry a size assertion so a field addition breaks the build instead of
+/// silently reinterpreting every later field.
+///
+/// Fields documented as "`0` = not reported" mean exactly that. A simulator has no T1; a provider
+/// may publish no calibration date. Substituting a plausible default would be the failure
+/// `apps/sysmon` refuses when it declines to draw a GPU utilisation percentage it cannot measure.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QpuInfo {
+    pub id: u32,
+    /// One of the `QPU_KIND_*` constants.
+    pub kind: u32,
+    /// One of the `QPU_STATUS_*` constants.
+    pub status: u32,
+    /// Non-zero when `status == QPU_STATUS_REMOTE` **and the remote backend is itself a simulator**.
+    pub remote_is_simulator: u32,
+
+    /// Usable qubits. `0` when nothing is present — never a placeholder.
+    pub qubits: u32,
+    pub topology: u32,
+    pub exec_model: u32,
+    pub _reserved0: u32,
+
+    /// Bitmask of supported gates.
+    pub gate_set: u64,
+
+    /// `0` = not reported.
+    pub max_shots: u32,
+    /// `0` = not reported.
+    pub max_depth: u32,
+    /// `u32::MAX` = no queue applies. Distinct from `0`, which would claim an empty queue exists.
+    pub queue_depth: u32,
+    /// `0` = not reported.
+    pub queue_capacity: u32,
+
+    /// `0` = not reported.
+    pub coherence_t1_ns: u64,
+    /// `0` = not reported.
+    pub coherence_t2_ns: u64,
+    /// `0` = not reported.
+    pub calibrated_unix: u64,
+
+    /// `bus << 16 | dev << 8 | func`, or `0` for a non-PCI backend.
+    pub pci_bdf: u32,
+    pub pci_vendor_id: u32,
+    pub pci_device_id: u32,
+    pub _reserved1: u32,
+
+    /// NUL-padded ASCII.
+    pub vendor: [u8; 32],
+    /// NUL-padded ASCII.
+    pub arch: [u8; 32],
+    /// NUL-padded ASCII.
+    pub name: [u8; 64],
+}
+
+/// The exact wire size of [`QpuInfo`]. Asserted in all three mirrors.
+pub const QPU_INFO_SIZE: usize = 224;
+const _: () = assert!(core::mem::size_of::<QpuInfo>() == QPU_INFO_SIZE);
+const _: () = assert!(core::mem::align_of::<QpuInfo>() == 8);
+
+impl Default for QpuInfo {
+    fn default() -> QpuInfo {
+        // Zeroed, except the one field whose "unknown" is not zero.
+        let mut q: QpuInfo = unsafe { core::mem::zeroed() };
+        q.queue_depth = u32::MAX;
+        q
+    }
+}
+
+impl QpuInfo {
+    fn cstr(buf: &[u8]) -> &str {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        core::str::from_utf8(&buf[..end]).unwrap_or("")
+    }
+
+    pub fn vendor_str(&self) -> &str {
+        Self::cstr(&self.vendor)
+    }
+    pub fn arch_str(&self) -> &str {
+        Self::cstr(&self.arch)
+    }
+    pub fn name_str(&self) -> &str {
+        Self::cstr(&self.name)
+    }
+
+    /// Whether results from this device are produced by quantum mechanics.
+    ///
+    /// ⚠️ Use this rather than matching on [`QpuInfo::status`]: a remote *simulator* has status
+    /// `QPU_STATUS_REMOTE` and is not a quantum device, and that is the case a direct match forgets.
+    pub fn is_quantum(&self) -> bool {
+        match self.status {
+            QPU_STATUS_HARDWARE => true,
+            QPU_STATUS_REMOTE => self.remote_is_simulator == 0,
+            _ => false,
+        }
+    }
+
+    /// `NOT PRESENT` / `SIMULATOR` / `REMOTE/hw` / `REMOTE/sim` / `HARDWARE`.
+    pub fn status_label(&self) -> &'static str {
+        match self.status {
+            QPU_STATUS_SIMULATOR => "SIMULATOR",
+            QPU_STATUS_REMOTE => {
+                if self.remote_is_simulator != 0 {
+                    "REMOTE/sim"
+                } else {
+                    "REMOTE/hw"
+                }
+            }
+            QPU_STATUS_HARDWARE => "HARDWARE",
+            _ => "NOT PRESENT",
+        }
+    }
+}
+
+/// Enumerate the quantum devices the kernel found on the PCI bus.
+///
+/// Returns how many entries were written into `out`. **Normally — and correctly — zero**: see
+/// `docs/quantum/limitations.md`. A non-empty result on this laptop means the probe found an
+/// unidentified accelerator, which it reports as `QPU_KIND_UNIDENTIFIED` with status
+/// `QPU_STATUS_NOT_PRESENT` rather than guessing.
+///
+/// ⚠️ Remote devices are **not** here. The kernel knows nothing about cloud providers; those are
+/// discovered over HTTPS by `libs/quantum-rt` and merged into the device list in userspace.
+pub fn sys_quantum_enumerate(out: &mut [QpuInfo]) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    let rc = syscall(
+        SYS_QUANTUM_ENUMERATE,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        0,
+        0,
+        0,
+        0,
+    ) as i64;
+    if rc < 0 {
+        0
+    } else {
+        (rc as usize).min(out.len())
+    }
+}
+
+/// One quantum device by id. `None` if there is no such device.
+pub fn sys_quantum_info(id: u32) -> Option<QpuInfo> {
+    let mut q = QpuInfo::default();
+    let rc = syscall(
+        SYS_QUANTUM_INFO,
+        id as u64,
+        (&mut q as *mut QpuInfo) as u64,
+        0,
+        0,
+        0,
+        0,
+    ) as i64;
+    if rc == 0 {
+        Some(q)
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────── Power ───────────────────────────
 
 pub const SYS_POWER: u64 = 568;

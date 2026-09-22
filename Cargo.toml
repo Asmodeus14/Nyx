@@ -30,6 +30,26 @@ members = [
     "libs/crypto",
     "libs/image",
     "libs/toolchains",
+    # The QPU as a compute resource: device model, circuit IR, backend trait, state-vector
+    # simulator. A workspace member specifically so `cargo test -p nyx-quantum` runs on the host —
+    # this machine has no QEMU and every on-device test costs a power cycle, which is a terrible way
+    # to discover that a gate matrix has a sign error. The `no_std` device types are mirrored by
+    # hand in `libs/api` and `nyx-kernel/src/quantum.rs`, so the layout assertions here are load
+    # bearing for the syscall ABI.
+    # Just enough JSON to talk to a quantum provider. no_std, zero deps — not a serde replacement.
+    # A workspace member because it parses untrusted input off the network, so its depth cap and its
+    # escape handling are exactly the kind of thing that must be exercised by `cargo test` rather
+    # than discovered by a malformed response from a cloud API.
+    "libs/json",
+    "libs/quantum",
+    # The quantum runtime: device discovery, backend selection, the job lifecycle, the qclang
+    # adapter, and (later) cloud providers. A workspace member because it holds the ★ cross-check
+    # test that evaluates the same compiled program through BOTH `nyx_quantum::sim` and
+    # `qclang_compiler::statevector` and requires the distributions to match. `sim` is a port of that
+    # evaluator, and the original is the one that has been producing histograms on real hardware —
+    # so if they disagree, the port is wrong, and that must be findable by `cargo test` rather than
+    # by a power cycle and a photograph.
+    "libs/quantum-rt",
     # HTTP/TLS transport. A workspace member so `cargo test -p nyx-net` can exercise the URL and
     # HTTP parsing on the host — only the socket layer needs real hardware.
     "libs/net",

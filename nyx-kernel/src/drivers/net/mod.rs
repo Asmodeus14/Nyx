@@ -10,6 +10,14 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+/// How many DNS servers from a DHCP lease we may hand to smoltcp.
+///
+/// ⚠️ **MUST NOT exceed `SMOLTCP_DNS_MAX_SERVER_COUNT` in `.cargo/config.toml`.** smoltcp's
+/// `update_servers` is documented to *panic* above that capacity, and the list comes from a DHCP
+/// lease — i.e. from the network. Two servers is the common case on home routers, which made an
+/// unclamped pass-through a whole-machine panic on an entirely ordinary network.
+pub const DNS_SERVERS_MAX: usize = 3;
+
 pub static NET_DRIVER: Mutex<Option<crate::drivers::net::rtl8168::Rtl8168Driver>> = Mutex::new(None);
 // WiFi (Intel Wireless-AC 9462 CNVi) — a second smoltcp Device, on its own interface so a fault
 // here can never disturb the wired stack.
@@ -743,9 +751,15 @@ pub fn poll_wifi() {
                         let _ = iface.routes_mut().add_default_ipv4_route(r);
                     }
                     if !cfg.dns_servers.is_empty() {
+                        // ⚠️ CLAMPED. `update_servers` is documented to **panic** when handed more
+                        // than `DNS_MAX_SERVER_COUNT` entries, and a DHCP lease is remote input —
+                        // most home routers advertise two servers, plenty advertise more. Passing
+                        // the list through unclamped made an ordinary network a whole-machine
+                        // panic. See `.cargo/config.toml`.
                         let list: alloc::vec::Vec<smoltcp::wire::IpAddress> = cfg
                             .dns_servers
                             .iter()
+                            .take(DNS_SERVERS_MAX)
                             .map(|s| smoltcp::wire::IpAddress::Ipv4(*s))
                             .collect();
                         sockets
@@ -934,8 +948,11 @@ fn poll_network_locked() {
             }
 
             if !dns_servers.is_empty() {
+                // Clamped for the same reason as the wired path above: `update_servers` panics
+                // above `DNS_MAX_SERVER_COUNT`, and the count comes from the DHCP lease.
+                let n = dns_servers.len().min(DNS_SERVERS_MAX);
                 let dns_sock = sockets.get_mut::<DnsSocket>(*dns_handle);
-                dns_sock.update_servers(&dns_servers[..]);
+                dns_sock.update_servers(&dns_servers[..n]);
             }
         } else if dhcp_deconfig {
             crate::serial_println!("[DHCP] Lease Lost. Deconfiguring.");

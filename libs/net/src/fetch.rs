@@ -804,11 +804,17 @@ impl Fetch {
 /// Deliberately separate from `TcpStream::connect((host, port))`, which does both in one opaque
 /// blocking call. Keeping them apart costs nothing and buys the ability to say which one hung.
 pub(crate) fn resolve_host(url: &Url) -> Result<std::net::SocketAddr, Error> {
-    // The blocking path in `http.rs` takes one address; the stepped path walks the whole list.
+    // ⚠️ Takes only the first address and therefore has NO fallback. `get`/`head_only` still use it;
+    // the stepped path and (since 2026-09-20) the one-shot `request_once` path walk the whole list
+    // via `resolve_candidates` instead. Prefer that for anything new.
     resolve_candidates(url).map(|v| v[0])
 }
 
-fn resolve_candidates(url: &Url) -> Result<Vec<std::net::SocketAddr>, Error> {
+/// Every address the name resolved to, best-first.
+///
+/// `pub(crate)` because `http.rs`'s one-shot path now walks the whole list — it used to take
+/// `resolve_host`'s first entry and had nothing to fall back to when that address would not answer.
+pub(crate) fn resolve_candidates(url: &Url) -> Result<Vec<std::net::SocketAddr>, Error> {
     // The cache is checked first because the miss path is genuinely expensive: the kernel's resolver
     // busy-polls the network stack until an answer arrives or five seconds elapse, so a repeat
     // lookup does not merely cost a round trip, it costs a round trip of spinning. See `crate::dns`.

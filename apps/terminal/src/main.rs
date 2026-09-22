@@ -41,6 +41,11 @@ use nyx_gui::app::NyxApp;
 use nyx_gui::canvas::Canvas;
 // D4: the pluggable compiler registry — dispatches a source file to a language backend by extension.
 use nyx_toolchains::{Artifact, Registry};
+// The quantum subsystem, backing `quantum`. `QpuSession` hides which backend serves a circuit; the
+// only thing that tells you is `Outcome::provenance`, which every line printed below carries.
+use nyx_quantum_rt::{
+    qclang as qadapt, Circuit, JobState, QpuBackend, QpuSelect, QpuSession, QpuStatus, Shots, Stage,
+};
 
 // D4: bundled by Build.sh into the Terminal app dir, so `compile` with no argument has something to
 // chew on out of the box (a Bell-pair .ql — same sample qcstudio uses).
@@ -528,6 +533,152 @@ enum Nav {
 /// inside `on_key`, which is inside the window loop's IPC drain — so for the entire duration of a
 /// page load the window did not repaint, did not blink its cursor, and did not process
 /// `MSG_WINDOW_CLOSE`. It looked alive and could not be closed.
+// ── The picker ──────────────────────────────────────────────────────────────────────────────────
+
+/// One choice in a [`Picker`].
+struct PickerItem {
+    /// The line shown, already formatted by whoever built the list.
+    label: String,
+    /// A dimmer second line, or empty. For detail that helps you choose but is not the choice.
+    detail: String,
+    /// What the action needs back — a job id, a path, a target name. Opaque to the picker.
+    value: String,
+}
+
+/// What to do with the chosen value.
+///
+/// ★ **This is the extension point.** The picker knows nothing about jobs; adding a new use is a
+/// variant here plus an arm in [`TerminalApp::picker_commit`]. Everything else — the list, the
+/// rendering, the key handling, the selection maths — is reused unchanged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    /// Re-attach to a cloud quantum job.
+    WatchJob,
+}
+
+/// A reusable single-choice list picker for the terminal.
+///
+/// ## Why a component rather than an inline menu
+///
+/// Choosing from a list is not specific to quantum jobs — a network to join, a file to open, a
+/// backend to run on, a toolchain to compile with are all the same interaction. Written inline each
+/// time they drift: one grows paging, another forgets to clamp the selection at the ends, a third
+/// handles Escape and the rest do not. So the list, the keys, the clamping and the drawing live here
+/// once, and a caller supplies items plus a [`PickerKind`].
+///
+/// ## Input
+///
+/// ⚠️ Shaped by two properties of this machine: **there are no modifier chords** — `Ctrl+…` cannot
+/// be expressed at all, the driver drops it — and **there is no scroll wheel**. So navigation is
+/// arrows, Enter and Escape, with `j`/`k` for anyone who reaches for them, and paging is the
+/// PageUp/PageDown keys rather than a wheel.
+///
+/// ## Rendering
+///
+/// Into the terminal's `tail`, the live region under the scrollback that normally holds the status
+/// line and the prompt. Deliberately: a picker is transient state, and pushing it into the
+/// scrollback would leave a dead copy of the menu in the history after every use.
+struct Picker {
+    title: String,
+    items: Vec<PickerItem>,
+    /// Index into `items`. Always valid while `items` is non-empty.
+    sel: usize,
+    /// First visible row, for lists longer than [`Picker::VISIBLE`].
+    top: usize,
+    kind: PickerKind,
+}
+
+impl Picker {
+    /// Rows shown at once. The tail shares the window with the scrollback, so a picker that filled
+    /// the screen would hide the command that opened it.
+    const VISIBLE: usize = 8;
+
+    fn new(title: impl Into<String>, items: Vec<PickerItem>, kind: PickerKind) -> Picker {
+        Picker { title: title.into(), items, sel: 0, top: 0, kind }
+    }
+
+    /// Move the selection, clamping at both ends.
+    ///
+    /// Deliberately **not** wrapping: on a list you can fall off the end of, holding a key past the
+    /// last item silently returns you to the first — which is usually the one you already rejected.
+    fn move_by(&mut self, delta: isize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let last = self.items.len() - 1;
+        self.sel = (self.sel as isize + delta).clamp(0, last as isize) as usize;
+
+        // Keep the selection inside the visible window.
+        if self.sel < self.top {
+            self.top = self.sel;
+        } else if self.sel >= self.top + Self::VISIBLE {
+            self.top = self.sel + 1 - Self::VISIBLE;
+        }
+    }
+
+    fn selected(&self) -> Option<&PickerItem> {
+        self.items.get(self.sel)
+    }
+
+    /// Render into the tail, one logical line per entry.
+    fn render(&self, cols: usize, out: &mut Vec<String>) {
+        wrap_logical_line(&self.title, cols, out);
+        let end = (self.top + Self::VISIBLE).min(self.items.len());
+        for i in self.top..end {
+            let it = &self.items[i];
+            // `>` marks the selection. The tail has no colour available, so the marker carries it —
+            // and `>` is already this terminal's quote prefix, so `hanging_indent` lines
+            // continuations up under it for free.
+            let mark = if i == self.sel { ">" } else { " " };
+            wrap_logical_line(&format!("{mark} {}", it.label), cols, out);
+            if !it.detail.is_empty() {
+                wrap_logical_line(&format!("    {}", it.detail), cols, out);
+            }
+        }
+        if self.items.len() > Self::VISIBLE {
+            wrap_logical_line(&format!("  ({} of {})", self.sel + 1, self.items.len()), cols, out);
+        }
+        wrap_logical_line("  up/down or j/k to move, Enter to choose, Esc to cancel", cols, out);
+    }
+}
+
+/// A cloud quantum job in flight.
+///
+/// ★★ This exists because the first version made **exactly the mistake the `Loading` doc below
+/// warns about**, and it is worth recording rather than quietly fixing.
+///
+/// `quantum remote run` originally polled to completion inside `do_quantum_remote`, which runs
+/// inside `on_key`, which runs inside the window loop's IPC drain. Each poll is an HTTPS round trip
+/// bounded by `nyx_net`'s 60-second whole-request deadline, and the loop allowed 120 of them — so
+/// the window could freeze for over an hour. Worse, the per-stage messages were being pushed into
+/// `output_history` the whole time and **never drawn**, because a frozen window does not repaint.
+/// From the outside it looked like nothing was happening at all.
+///
+/// Reported from hardware as "no answer yet, it's been more than 5 mins" — which was not the job
+/// being slow. It was the terminal being dead.
+///
+/// So the job is pumped from `update()` like a page load. One poll per tick, at most one HTTPS
+/// round trip of blocking, and the window stays alive between them.
+struct RemoteJob {
+    provider: Box<dyn QpuBackend>,
+    handle: nyx_quantum_rt::JobHandle,
+    /// The provider's name for the device, for the messages.
+    target: String,
+    started: std::time::Instant,
+    /// When to poll next. A cloud job changes state on the order of seconds at best, so polling
+    /// every frame would be 60 pointless HTTPS requests a second.
+    next_at: std::time::Instant,
+    polls: usize,
+}
+
+/// How long to watch a cloud job before giving up and cancelling it.
+///
+/// ⚠️ Generous, because an Open-plan IBM job legitimately queues for minutes behind paying work.
+/// The window stays usable throughout, so a long wait costs nothing but patience.
+const REMOTE_JOB_BUDGET: core::time::Duration = core::time::Duration::from_secs(15 * 60);
+/// Gap between polls.
+const REMOTE_POLL_GAP: core::time::Duration = core::time::Duration::from_secs(3);
+
 struct Loading {
     fetch: Box<nyx_net::Fetch>,
     /// What the user asked for, for the messages — `fetch.url()` moves as redirects are followed.
@@ -551,6 +702,10 @@ struct TerminalApp {
     browser: Browser,
     /// The fetch in flight, pumped from `update` once a frame. `None` means nothing is loading.
     loading: Option<Loading>,
+    /// A cloud quantum job in flight. Same reason `Loading` exists — see [`RemoteJob`].
+    quantum_job: Option<RemoteJob>,
+    /// An open list picker. While this is `Some`, keys go to it instead of the prompt.
+    picker: Option<Picker>,
     /// A line drawn under the scrollback and above the prompt while something is happening.
     ///
     /// Deliberately NOT part of the scrollback. A progress line that lives in the history has to be
@@ -609,6 +764,8 @@ impl TerminalApp {
             cursor_visible: true,
             browser: Browser::default(),
             loading: None,
+            quantum_job: None,
+            picker: None,
             status_line: None,
             cmd_history: Vec::new(),
             cmd_pos: 0,
@@ -674,6 +831,13 @@ impl TerminalApp {
             for line in status.split('\n') {
                 wrap_logical_line(line, cols, &mut tail);
             }
+        }
+        // A picker replaces the prompt while it is open — it owns the keyboard, so showing a prompt
+        // that does not accept typing would be a lie about what the keys do.
+        if let Some(p) = self.picker.as_ref() {
+            p.render(cols, &mut tail);
+            self.tail = tail;
+            return;
         }
         wrap_logical_line(&format!("N> {}", self.input_buffer), cols, &mut tail);
         self.tail = tail;
@@ -960,6 +1124,891 @@ impl TerminalApp {
         self.output_history.push_str(
             "usage: wifi [status] | list | scan | join <ssid> [pass] | leave | on | off | forget\n",
         );
+    }
+
+    /// `quantum` — inspect and use Nyx's third compute substrate.
+    ///
+    /// ## The rule every line printed here obeys
+    ///
+    /// > Never report `HARDWARE` when Nyx is not driving physically attached quantum hardware.
+    ///
+    /// There is no consumer gate-model QPU this OS can drive over PCIe (`docs/quantum/limitations.md`
+    /// has the full account), so on this machine every device listed is the local simulator and the
+    /// output says so in words, not just in a status column. Three distinct statements are kept
+    /// distinct:
+    ///
+    /// * `NOT PRESENT` — nothing there.
+    /// * `SIMULATOR` — arithmetic on this CPU.
+    /// * `REMOTE/hw` vs `REMOTE/sim` — ⚠️ providers serve cloud simulators through the *same* API as
+    ///   real processors, so "remote" alone would let a classical simulation read as a quantum
+    ///   result.
+    /// * `HARDWARE` — a real QPU, attached here. Unreachable today, by design.
+    ///
+    /// This is the standard `apps/sysmon` already holds itself to when it refuses to draw a GPU
+    /// utilisation percentage no counter exists for.
+    ///
+    /// ## Why this does not block the way `wifi scan` does
+    ///
+    /// The simulator is fast enough to run inline. A cloud provider is not — a queued job can sit for
+    /// minutes — which is why `QpuSession` is `submit`/`poll` shaped rather than blocking, and why
+    /// the remote path when it lands will be pumped from `update()` like `pump_load`.
+    fn do_quantum(&mut self, arg: &str) {
+        let arg = arg.trim();
+
+        if arg.is_empty() || arg == "status" {
+            self.quantum_status();
+            return;
+        }
+        if arg == "devices" || arg == "ls" {
+            self.quantum_devices();
+            return;
+        }
+        if arg == "backends" {
+            let devices = QpuSession::devices();
+            self.output_history.push_str("Backends:\n");
+            self.output_history.push_str(
+                "  simulator   exact state-vector on this CPU, up to 20 qubits   ready\n",
+            );
+            // Stated rather than omitted: a reader should learn that remote support is designed and
+            // unconfigured, not be left to infer it from an absence.
+            self.output_history
+                .push_str("  remote      cloud provider over HTTPS                        no provider configured\n");
+            self.output_history
+                .push_str("  hardware    local QPU driver                                 none exists\n");
+            self.output_history.push_str(&format!("{} device(s) available\n", devices.len()));
+            return;
+        }
+        if let Some(rest) = arg.strip_prefix("info") {
+            let id: u32 = rest.trim().parse().unwrap_or(0);
+            self.quantum_info(id);
+            return;
+        }
+        if arg == "run" || arg == "run bell" {
+            self.quantum_run_bell();
+            return;
+        }
+        if let Some(path) = arg.strip_prefix("simulate ") {
+            self.quantum_simulate(path.trim());
+            return;
+        }
+        if arg == "simulate" {
+            // Same default the `compile` command uses, so the two commands agree about what "the
+            // sample" means.
+            self.quantum_simulate(DEFAULT_SAMPLE);
+            return;
+        }
+        if arg == "remote" || arg.starts_with("remote ") {
+            self.do_quantum_remote(arg["remote".len()..].trim());
+            return;
+        }
+        if arg == "stop" || arg == "cancel" {
+            match self.quantum_job.take() {
+                Some(mut job) => {
+                    // Tell the provider before forgetting it. A job we stop watching keeps running
+                    // on their hardware and, on metered hardware, keeps billing.
+                    job.provider.cancel(job.handle);
+                    self.status_line = None;
+                    self.output_history.push_str("  cancelled\n");
+                }
+                None => self.output_history.push_str("  no quantum job is running\n"),
+            }
+            return;
+        }
+
+        self.output_history.push_str(
+            "usage: quantum [status] | devices | backends | info <id> | run bell | simulate [file.ql]\n",
+        );
+        self.output_history
+            .push_str("       quantum remote [status] | set <key> <value> | clear | run <target>\n");
+        self.output_history
+            .push_str("       quantum remote jobs             - pick from recent jobs and collect a result\n");
+        self.output_history
+            .push_str("       quantum remote watch <job-id>   - re-attach to a job by id\n");
+        self.output_history.push_str("       quantum stop\n");
+    }
+
+    /// `quantum remote` — the cloud path, and the only route to a genuinely non-simulated result.
+    ///
+    /// There is no consumer gate-model QPU Nyx can drive over PCIe (`docs/quantum/limitations.md`),
+    /// so a real quantum measurement on this machine has to come over the network. Nyx has working
+    /// TLS 1.3, so it can.
+    ///
+    /// ⚠️ **These commands block.** Each `poll` is one HTTPS round trip, which is far coarser than
+    /// the 20 ms slices `pump_load` uses for page loads. Following the `wifi scan` precedent, the
+    /// command says so before it starts rather than appearing to hang.
+    fn do_quantum_remote(&mut self, arg: &str) {
+        use nyx_quantum_rt::provider::{redact, warning, Credentials, ProviderTarget};
+        use nyx_quantum_rt::{JobState, QpuBackend};
+
+        let arg = arg.trim();
+
+        if arg.is_empty() || arg == "status" {
+            let creds = Credentials::load();
+            let providers = creds.configured_providers();
+            if providers.is_empty() {
+                self.output_history.push_str("remote: no provider configured\n");
+                self.output_history.push_str(
+                    "  the usual way is to put keys in quantum-credentials.txt and rebuild —\n",
+                );
+                self.output_history
+                    .push_str("  there is no paste on this machine, and an IBM CRN is ~120 chars\n");
+                self.output_history
+                    .push_str("  otherwise: quantum remote set ionq.token <key>\n");
+            } else {
+                self.output_history.push_str("remote:\n");
+                for p in &providers {
+                    self.output_history.push_str(&format!("  {} — ready\n", p));
+                }
+            }
+            // ★ Every value redacted. A terminal scrollback is one screenshot away from being
+            // shared, and these are live billing credentials.
+            for key in ["ionq.token", "ibm.token", "ibm.crn"] {
+                self.output_history.push_str(&format!(
+                    "  {:<11} {}\n",
+                    key,
+                    match creds.get(key) {
+                        Some(v) => redact(v),
+                        None => String::from("—"),
+                    }
+                ));
+            }
+            self.output_history
+                .push_str(&format!("  source:      {}\n", creds.source().label()));
+            self.output_history.push_str(&format!("  {}\n", warning()));
+
+            let now = sys_get_rtc().unix();
+            if now < 1_577_836_800 {
+                self.output_history.push_str(
+                    "  ⚠ the system clock is wrong; every TLS certificate will be rejected as \
+                     'not yet valid'. run `time sync`\n",
+                );
+            }
+            return;
+        }
+
+        // `set <key> <value>` rather than `login <token>`: there are now three credentials across
+        // two providers, and IBM's CRN is not a login by any reading of the word.
+        if let Some(rest) = arg.strip_prefix("set ") {
+            let mut it = rest.trim().splitn(2, char::is_whitespace);
+            let (Some(key), Some(value)) = (it.next(), it.next()) else {
+                self.output_history
+                    .push_str("usage: quantum remote set <ionq.token|ibm.token|ibm.crn> <value>\n");
+                return;
+            };
+            match Credentials::set(key, value) {
+                Ok(()) => {
+                    self.output_history.push_str(&format!(
+                        "  {} stored on the device ({})\n",
+                        key.trim().to_ascii_lowercase(),
+                        redact(value.trim())
+                    ));
+                    self.output_history
+                        .push_str("  this overrides the copy baked into the image\n");
+                    // Said at the moment of storage, not buried in a document: Nyx genuinely
+                    // cannot protect this file.
+                    self.output_history.push_str(&format!("  {}\n", warning()));
+                }
+                Err(e) => self.output_history.push_str(&format!("  {}\n", e)),
+            }
+            return;
+        }
+
+        if arg == "clear" || arg == "logout" {
+            match Credentials::clear() {
+                Ok(()) => self.output_history.push_str(
+                    "  on-device credentials cleared; the copy baked into the image is untouched\n",
+                ),
+                Err(e) => self.output_history.push_str(&format!("  {}\n", e)),
+            }
+            return;
+        }
+
+        // `watch <job-id>` — re-attach to a job that was already submitted.
+        //
+        // ★ A job outlives the connection that created it. When a flaky link loses contact after
+        // submission, the job keeps running on the provider's hardware and keeps consuming the
+        // allowance — the result is already paid for. This is how to go and collect it.
+        if let Some(job_id) = arg.strip_prefix("watch ") {
+            let job_id = job_id.trim();
+            if job_id.is_empty() {
+                self.output_history
+                    .push_str("usage: quantum remote watch <job-id>   (from a 'may still be running' message)\n");
+                return;
+            }
+            self.quantum_watch(job_id);
+            return;
+        }
+
+        // `jobs` — list what this account has run, and let one be chosen.
+        //
+        // ★ Better than `watch <id>` for the case it exists to serve: a job id is a 20-character
+        // opaque string, and a machine with no clipboard is the worst possible place to retype one.
+        if arg == "jobs" || arg == "ls" {
+            let pt = ProviderTarget {
+                name: String::from("ibm_fez"),
+                qubits: 0,
+                is_simulator: false,
+                queue: None,
+            };
+            let mut provider = match nyx_quantum_rt::ibm::IbmProvider::open(pt, sys_get_rtc().unix())
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    self.output_history.push_str(&format!("  {}\n", e));
+                    return;
+                }
+            };
+            self.output_history.push_str("  asking IBM for recent jobs (this blocks briefly)\n");
+            let jobs = match provider.list_jobs(20) {
+                Ok(j) => j,
+                Err(e) => {
+                    self.output_history.push_str(&format!("  {}\n", e));
+                    return;
+                }
+            };
+            if jobs.is_empty() {
+                self.output_history.push_str("  no jobs on this account\n");
+                return;
+            }
+
+            let items: Vec<PickerItem> = jobs
+                .iter()
+                .map(|j| PickerItem {
+                    // A completed job is the one with a result worth fetching; mark it so the
+                    // choice does not need the status column to be read carefully.
+                    label: format!(
+                        "{} {:<10} {}",
+                        if j.is_complete() { "*" } else { " " },
+                        j.status,
+                        j.id
+                    ),
+                    detail: if j.created.is_empty() {
+                        String::from(&j.backend)
+                    } else {
+                        format!("{}  {}", j.backend, j.created)
+                    },
+                    value: j.id.clone(),
+                })
+                .collect();
+
+            self.picker = Some(Picker::new(
+                format!("Recent IBM jobs ({} shown, * = has a result):", items.len()),
+                items,
+                PickerKind::WatchJob,
+            ));
+            return;
+        }
+
+        if let Some(target) = arg.strip_prefix("run ") {
+            let target = target.trim();
+            // One at a time. Two in flight would both bill, and only one status line exists to
+            // report them.
+            if self.quantum_job.is_some() {
+                self.output_history
+                    .push_str("  a quantum job is already running. `quantum stop` to cancel it\n");
+                return;
+            }
+            if target.is_empty() {
+                self.output_history
+                    .push_str("usage: quantum remote run <target>   e.g. simulator, qpu.aria-1\n");
+                return;
+            }
+
+            // Route by target name. IBM's backends are all `ibm…`; everything else is IonQ. Each
+            // provider decides for itself whether the name is one of its simulators, using its own
+            // conservative rule — an unrecognised name always claims LESS.
+            let is_ibm = target.to_ascii_lowercase().starts_with("ibm");
+            let is_sim = if is_ibm {
+                nyx_quantum_rt::ibm::target_is_simulator(target)
+            } else {
+                nyx_quantum_rt::ionq::target_is_simulator(target)
+            };
+
+            // ⚠️ Stated before the work starts, and in the strongest terms for the metered case. A
+            // user should not discover after the fact that they spent money.
+            if is_sim {
+                self.output_history.push_str(&format!(
+                    "  target {:?} is a REMOTE CLASSICAL SIMULATOR (free, not a quantum result)\n",
+                    target
+                ));
+            } else if is_ibm {
+                self.output_history.push_str(&format!(
+                    "  target {:?} is REMOTE QUANTUM HARDWARE — bills against your IBM runtime \
+                     allowance (the Open plan gives 10 free minutes a month)\n",
+                    target
+                ));
+            } else {
+                self.output_history.push_str(&format!(
+                    "  target {:?} is REMOTE QUANTUM HARDWARE — this is metered and costs money\n",
+                    target
+                ));
+            }
+            self.output_history
+                .push_str("  submitting (this BLOCKS; a queued job can take minutes)\n");
+
+            let pt = ProviderTarget {
+                name: target.to_string(),
+                // Not claimed. The provider's own response is the authority on width, and inventing
+                // a qubit count for a target we have not queried would be a fabrication.
+                qubits: 0,
+                is_simulator: is_sim,
+                queue: None,
+            };
+
+            let now = sys_get_rtc().unix();
+            let mut provider: Box<dyn QpuBackend> = if is_ibm {
+                match nyx_quantum_rt::ibm::IbmProvider::open(pt, now) {
+                    Ok(p) => Box::new(p),
+                    Err(e) => {
+                        self.output_history.push_str(&format!("  {}\n", e));
+                        return;
+                    }
+                }
+            } else {
+                match nyx_quantum_rt::ionq::IonqProvider::open(pt, now) {
+                    Ok(p) => Box::new(p),
+                    Err(e) => {
+                        self.output_history.push_str(&format!("  {}\n", e));
+                        return;
+                    }
+                }
+            };
+
+            let circuit = Circuit::bell();
+            let handle = match provider.begin(&circuit, Shots(1024), 0) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.output_history.push_str(&format!("  {}\n", e));
+                    return;
+                }
+            };
+
+            // ★ Hand the job to `update()` and RETURN. Polling it to completion here would run
+            // inside `on_key`, inside the window's IPC drain — see `RemoteJob`'s doc for what that
+            // cost the first time.
+            let now = std::time::Instant::now();
+            self.quantum_job = Some(RemoteJob {
+                provider,
+                handle,
+                target: target.to_string(),
+                started: now,
+                next_at: now,
+                polls: 0,
+            });
+            self.status_line = Some(String::from("  submitting…"));
+            self.output_history.push_str(
+                "  watching the job; the window stays usable. `quantum stop` to give up\n",
+            );
+            return;
+            provider.cancel(handle);
+            self.output_history
+                .push_str("  gave up waiting; the job was cancelled\n");
+            return;
+        }
+
+        self.output_history.push_str(
+            "usage: quantum remote [status] | set <key> <value> | clear | run <target>\n",
+        );
+        self.output_history
+            .push_str("  keys:    ionq.token | ibm.token | ibm.crn  (IBM needs BOTH)\n");
+        self.output_history
+            .push_str("  targets: simulator, qpu.aria-1 (IonQ) | ibm_fez (IBM)\n");
+        self.output_history
+            .push_str("  keys are normally baked in from quantum-credentials.txt at build time\n");
+    }
+
+    fn quantum_status(&mut self) {
+        let devices = QpuSession::devices();
+
+        // The headline is the most real thing available, so a machine that later gains hardware or a
+        // provider reports that instead of the simulator.
+        let best = devices.iter().filter(|d| d.kind().is_executor()).max_by_key(|d| {
+            match (d.status(), d.remote_is_simulator()) {
+                (QpuStatus::Hardware, _) => 3u8,
+                (QpuStatus::Remote, false) => 2,
+                (QpuStatus::Simulator, _) => 1,
+                _ => 0,
+            }
+        });
+
+        match best {
+            None => {
+                self.output_history.push_str("Quantum subsystem: NOT PRESENT\n");
+                self.output_history.push_str("  no quantum device of any kind is available\n");
+            }
+            Some(d) => {
+                self.output_history
+                    .push_str(&format!("Quantum subsystem: {}\n", d.status_label()));
+
+                // The number of PCI devices the kernel could identify as quantum. Zero is the
+                // correct answer and is stated rather than left blank.
+                self.output_history
+                    .push_str("  no quantum hardware detected on this machine\n");
+                self.output_history.push_str(&format!(
+                    "  local backend: {} ({} qubits max)\n",
+                    d.name_str(),
+                    d.qubits
+                ));
+                if !d.is_quantum() {
+                    self.output_history
+                        .push_str("  results are computed classically; no quantum mechanics involved\n");
+                }
+                self.output_history
+                    .push_str("  remote: no provider configured\n");
+            }
+        }
+
+        // Anything the PCI probe saw and could not identify. This matters because the laptop has no
+        // serial console — a probe finding that only reached `serial_println!` would be thrown away.
+        let unknown: Vec<_> =
+            devices.iter().filter(|d| !d.kind().is_executor()).collect();
+        if !unknown.is_empty() {
+            self.output_history.push_str(&format!(
+                "  {} unidentified accelerator(s) on the PCI bus (see `quantum devices`)\n",
+                unknown.len()
+            ));
+        }
+    }
+
+    fn quantum_devices(&mut self) {
+        let devices = QpuSession::devices();
+        if devices.is_empty() {
+            self.output_history.push_str("no quantum devices\n");
+            return;
+        }
+
+        let mut any_real = false;
+        for d in &devices {
+            self.output_history.push_str(&format!(
+                "QPU{}  {:<11} {:<26} {:>3} qubits   {}\n",
+                d.id,
+                d.status_label(),
+                d.name_str(),
+                d.qubits,
+                d.topology().label(),
+            ));
+            // The caveat is the line that stops a simulator from reading as a processor, so it is
+            // printed under the entry rather than squeezed into the status column.
+            if let Some(c) = d.caveat() {
+                self.output_history.push_str(&format!("        {}\n", c));
+            }
+            if let Some(q) = d.queue() {
+                self.output_history.push_str(&format!("        queue: {}\n", q));
+            }
+            if d.is_quantum() {
+                any_real = true;
+            }
+        }
+
+        if !any_real {
+            self.output_history
+                .push_str("  no physical or remote quantum devices present\n");
+        }
+    }
+
+    fn quantum_info(&mut self, id: u32) {
+        let devices = QpuSession::devices();
+        let Some(d) = devices.iter().find(|d| d.id == id) else {
+            self.output_history.push_str(&format!("no device with id {}\n", id));
+            return;
+        };
+
+        self.output_history.push_str(&format!("QPU{}\n", d.id));
+        self.output_history.push_str(&format!("  status:     {}\n", d.status_label()));
+        self.output_history.push_str(&format!("  kind:       {}\n", d.kind().label()));
+        self.output_history.push_str(&format!("  vendor:     {}\n", d.vendor_str()));
+        self.output_history.push_str(&format!("  arch:       {}\n", d.arch_str()));
+        self.output_history.push_str(&format!("  name:       {}\n", d.name_str()));
+        self.output_history.push_str(&format!("  qubits:     {}\n", d.qubits));
+        self.output_history.push_str(&format!("  topology:   {}\n", d.topology().label()));
+        self.output_history.push_str(&format!("  execution:  {}\n", d.exec_model().label()));
+        self.output_history.push_str(&format!(
+            "  quantum:    {}\n",
+            if d.is_quantum() { "yes" } else { "no - classical simulation" }
+        ));
+
+        // ★ Every one of these prints a dash rather than a zero when the backend did not report it.
+        // `0 ns` of coherence and "no coherence figure" are different statements and only one is
+        // true — the same rule `SystemInfo::ec_sensors` and `FAN_RPM_UNKNOWN` follow.
+        self.output_history.push_str(&format!(
+            "  max shots:  {}\n",
+            if d.max_shots > 0 { d.max_shots.to_string() } else { "—".to_string() }
+        ));
+        self.output_history.push_str(&format!(
+            "  max depth:  {}\n",
+            if d.max_depth > 0 { d.max_depth.to_string() } else { "—".to_string() }
+        ));
+        self.output_history.push_str(&format!(
+            "  T1:         {}\n",
+            match d.coherence_t1() {
+                Some(v) => format!("{} ns", v),
+                None => "— (not reported)".to_string(),
+            }
+        ));
+        self.output_history.push_str(&format!(
+            "  T2:         {}\n",
+            match d.coherence_t2() {
+                Some(v) => format!("{} ns", v),
+                None => "— (not reported)".to_string(),
+            }
+        ));
+        self.output_history.push_str(&format!(
+            "  calibrated: {}\n",
+            match d.calibrated() {
+                Some(v) => format!("unix {}", v),
+                None => "— (not reported)".to_string(),
+            }
+        ));
+        if d.pci_vendor_id != 0 {
+            self.output_history.push_str(&format!(
+                "  pci:        {:02x}:{:02x}.{} {:04x}:{:04x}\n",
+                (d.pci_bdf >> 16) & 0xFF,
+                (d.pci_bdf >> 8) & 0xFF,
+                d.pci_bdf & 0xFF,
+                d.pci_vendor_id,
+                d.pci_device_id,
+            ));
+        }
+    }
+
+    /// `quantum run bell` — the first quantum program running on Nyx.
+    ///
+    /// `H(q0); CX(q0,q1); measure both`. A correct result is only `00` and `11`, at roughly equal
+    /// rates; `01` or `10` on a noiseless backend means something is wrong, which is exactly what
+    /// makes this circuit worth being the demonstration.
+    fn quantum_run_bell(&mut self) {
+        let circuit = Circuit::bell();
+        self.quantum_execute(circuit, "bell");
+    }
+
+    /// `quantum simulate <file.ql>` — compile real QCLang and run it.
+    ///
+    /// Routes through the same `qclang_compiler` the `compile` command uses, so a `.ql` file that
+    /// transpiles to OpenQASM here and executes there is one program, not two.
+    fn quantum_simulate(&mut self, path: &str) {
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.output_history.push_str(&format!("  cannot read {}: {}\n", path, e));
+                return;
+            }
+        };
+        let circuit = match qadapt::compile_to_circuit(&src) {
+            Ok(c) => c,
+            Err(e) => {
+                self.output_history.push_str(&format!("  {}\n", e));
+                return;
+            }
+        };
+        self.output_history.push_str(&format!("Source:  {}\n", path));
+        self.quantum_execute(circuit, path);
+    }
+
+    /// Re-attach to an already-submitted job and watch it to completion.
+    ///
+    /// ⚠️ `measured` and `shots` cannot be recovered from the provider, so this assumes what Nyx
+    /// submits: a 2-qubit Bell circuit at 1024 shots. Stated rather than guessed at silently — a
+    /// wrong `measured` would mislabel the basis states, producing a real histogram with wrong
+    /// column headings, which is worse than an error.
+    fn quantum_watch(&mut self, job_id: &str) {
+        use nyx_quantum_rt::provider::ProviderTarget;
+
+        if self.quantum_job.is_some() {
+            self.output_history
+                .push_str("  a quantum job is already being watched. `quantum stop` first\n");
+            return;
+        }
+
+        let pt = ProviderTarget {
+            name: String::from("ibm_fez"),
+            qubits: 0,
+            is_simulator: false,
+            queue: None,
+        };
+        let mut provider = match nyx_quantum_rt::ibm::IbmProvider::open(pt, sys_get_rtc().unix()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.output_history.push_str(&format!("  {}\n", e));
+                return;
+            }
+        };
+        let handle = provider.attach(job_id, vec![0, 1], 1024);
+        let now = std::time::Instant::now();
+        self.quantum_job = Some(RemoteJob {
+            provider: Box::new(provider),
+            handle,
+            target: format!("job {job_id}"),
+            started: now,
+            next_at: now,
+            polls: 0,
+        });
+        self.status_line = Some(String::from("  re-attaching…"));
+        self.output_history.push_str(&format!(
+            "  watching {job_id} (assuming a 2-qubit Bell circuit, 1024 shots)\n"
+        ));
+    }
+
+    /// Route one key to the open picker. Returns whether to redraw.
+    ///
+    /// ⚠️ Escape arrives as `\u{1b}`. `q` is accepted too, because a terminal without modifier
+    /// chords is one where a key that might not survive the driver should always have a plain
+    /// alternative.
+    fn picker_key(&mut self, key: char) -> bool {
+        let Some(p) = self.picker.as_mut() else { return false };
+
+        match key {
+            keys::UP | 'k' => {
+                p.move_by(-1);
+                true
+            }
+            keys::DOWN | 'j' => {
+                p.move_by(1);
+                true
+            }
+            keys::PAGE_UP => {
+                p.move_by(-(Picker::VISIBLE as isize));
+                true
+            }
+            keys::PAGE_DOWN => {
+                p.move_by(Picker::VISIBLE as isize);
+                true
+            }
+            keys::HOME => {
+                p.move_by(isize::MIN / 2);
+                true
+            }
+            keys::END => {
+                p.move_by(isize::MAX / 2);
+                true
+            }
+            '\n' | '\r' => {
+                let picked = p.selected().map(|it| (p.kind, it.value.clone(), it.label.clone()));
+                self.picker = None;
+                match picked {
+                    Some((kind, value, label)) => self.picker_commit(kind, &value, &label),
+                    // An empty list is closed rather than left showing nothing selectable.
+                    None => self.output_history.push_str("  nothing to choose\n"),
+                }
+                true
+            }
+            '\u{1b}' | 'q' => {
+                self.picker = None;
+                self.output_history.push_str("  cancelled\n");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Act on a picked value.
+    ///
+    /// ★ The only place that knows what a [`PickerKind`] means. Adding a use for the picker is a
+    /// variant plus an arm here.
+    fn picker_commit(&mut self, kind: PickerKind, value: &str, label: &str) {
+        match kind {
+            PickerKind::WatchJob => {
+                self.output_history.push_str(&format!("  {label}\n"));
+                self.quantum_watch(value);
+            }
+        }
+    }
+
+    /// Advance a cloud quantum job by at most one HTTPS round trip. Called from `update()`.
+    ///
+    /// Returns whether anything changed on screen, exactly like [`Self::pump_load`].
+    ///
+    /// ⚠️ One poll still blocks for the length of one request — `nyx_net` bounds that at 60 s in the
+    /// worst case, typically about a second. That is far coarser than `Fetch`'s 20 ms slices, and it
+    /// is the honest limit of this design: making it finer means reimplementing the stepped HTTP
+    /// state machine for POST. What it buys over the previous version is that the window repaints
+    /// between polls instead of freezing for the entire job.
+    fn pump_quantum(&mut self) -> bool {
+        let Some(job) = self.quantum_job.as_mut() else { return false };
+
+        let now = std::time::Instant::now();
+        if now < job.next_at {
+            return false;
+        }
+
+        // Give up eventually, but cancel first — an abandoned job keeps running on the provider's
+        // hardware and, on metered hardware, keeps billing.
+        if now.duration_since(job.started) > REMOTE_JOB_BUDGET {
+            job.provider.cancel(job.handle);
+            let mins = REMOTE_JOB_BUDGET.as_secs() / 60;
+            self.quantum_job = None;
+            self.status_line = None;
+            self.output_history.push_str(&format!(
+                "  gave up after {mins} minutes and cancelled the job\n"
+            ));
+            return true;
+        }
+
+        job.polls += 1;
+        let state = job.provider.poll(job.handle);
+        let elapsed = now.duration_since(job.started).as_secs();
+
+        match state {
+            JobState::Running(stage) => {
+                // The stage goes on the STATUS LINE, not into the scrollback: a job polled every
+                // three seconds for ten minutes would otherwise push two hundred identical "queued"
+                // lines through the history and bury the command that started it.
+                let q = match stage {
+                    Stage::Queued(Some(n)) => format!("queued (position {n})"),
+                    other => String::from(other.label()),
+                };
+                job.next_at = now + REMOTE_POLL_GAP;
+                // ★ Surface a retry loop. Without this, a backend absorbing transport failures
+                // keeps reporting "queued" — honest about the job, silent about the link — and a
+                // watch quietly retrying for two minutes is indistinguishable from a hang.
+                let note = job
+                    .provider
+                    .status_note(job.handle)
+                    .map(|n| format!(" [{n}]"))
+                    .unwrap_or_default();
+                self.status_line = Some(format!("  {q} — {elapsed}s{note}"));
+                true
+            }
+            JobState::Failed(e) => {
+                self.quantum_job = None;
+                self.status_line = None;
+                let text = format!("{e}");
+                self.output_history.push_str(&format!("  {}\n", text));
+
+                // ⚠️ rustls reports a stale clock as "certificate not valid yet", which reads as a
+                // problem with the SERVER's certificate. It is not — it is this machine's clock, and
+                // this laptop's RTC has been observed silently reverting after `time sync` claimed
+                // to have written and verified it. Say so, because the rustls wording sends you
+                // looking in the wrong place.
+                if text.contains("not valid yet") || text.contains("not valid before") {
+                    self.output_history.push_str(
+                        "  ^ this is THIS MACHINE'S CLOCK, not the server's certificate.\n",
+                    );
+                    let t = sys_get_rtc();
+                    self.output_history.push_str(&format!(
+                        "    the RTC now reads {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC \
+                         — run `time sync` and retry immediately\n",
+                        t.year, t.month, t.day, t.hour, t.min, t.sec
+                    ));
+                }
+                true
+            }
+            JobState::Done(o) => {
+                let target = job.target.clone();
+                self.quantum_job = None;
+                self.status_line = None;
+                self.output_history
+                    .push_str(&format!("  {} answered after {}s\n", target, elapsed));
+                self.print_outcome(&o);
+                true
+            }
+        }
+    }
+
+    /// Print a measurement result, keeping counts and probabilities distinct.
+    ///
+    /// ★ The two providers report fundamentally different things and the display must not blur
+    /// them. IBM returns per-shot samples, so those really are counts. IonQ returns a probability
+    /// histogram and never says how many shots produced each bucket — printing "512 of 1024" there
+    /// would invent a measurement nobody made.
+    fn print_outcome(&mut self, o: &nyx_quantum_rt::Outcome) {
+        let has_counts = o.has_counts();
+        for (l, p) in o.ranked() {
+            if p <= 0.0 {
+                continue;
+            }
+            let bars = ((p * 24.0).round() as usize).min(24);
+            let bar: String = core::iter::repeat('#').take(bars).collect();
+            if has_counts {
+                let n = o.counts_for(&l).unwrap_or(0);
+                self.output_history.push_str(&format!("  {:<8} {:>6}  {}\n", l, n, bar));
+            } else {
+                self.output_history.push_str(&format!("  {:<8} {:>6.3}  {}\n", l, p, bar));
+            }
+        }
+        if has_counts {
+            self.output_history
+                .push_str(&format!("  {} shots, measured\n", o.shots_requested));
+        } else {
+            self.output_history.push_str(&format!(
+                "  probabilities as reported by the provider over {} shots\n",
+                o.shots_requested
+            ));
+        }
+        self.output_history.push_str(&format!("  {}\n", o.provenance.disclosure()));
+    }
+
+    /// Run a circuit and print it, honestly.
+    fn quantum_execute(&mut self, circuit: Circuit, label: &str) {
+        let _ = label;
+
+        let mut session = match QpuSession::open(QpuSelect::Best) {
+            Ok(s) => s,
+            Err(e) => {
+                self.output_history.push_str(&format!("  {}\n", e));
+                return;
+            }
+        };
+
+        let info = *session.info();
+        self.output_history.push_str(&format!(
+            "Circuit: {} qubits, {} ops, depth {}\n",
+            circuit.qubits,
+            circuit.ops.len(),
+            circuit.depth()
+        ));
+        self.output_history.push_str(&format!(
+            "Backend: {} — {}\n",
+            info.status_label(),
+            info.name_str()
+        ));
+
+        // Seed the sampler from the clock. A fixed seed would make every run of `quantum run bell`
+        // print identical counts, which looks like a cached answer rather than a measurement.
+        let seed = (sys_get_time() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED_D01E;
+
+        let outcome = match session.run(&circuit, Shots(1024), seed) {
+            Ok(o) => o,
+            Err(e) => {
+                self.output_history.push_str(&format!("  {}\n", e));
+                return;
+            }
+        };
+
+        let ranked = outcome.ranked();
+        let has_counts = outcome.has_counts();
+        for (label, p) in &ranked {
+            if *p <= 0.0 {
+                continue;
+            }
+            // ★ Counts and probabilities are printed differently because they are different facts.
+            // The simulator really drew shots, so it prints integers. A provider reports a
+            // probability histogram and does NOT say how many shots produced each bucket — turning
+            // 0.5 into "512 of 1024" would invent a measurement nobody made.
+            let bars = ((*p * 24.0).round() as usize).min(24);
+            let bar: String = core::iter::repeat('#').take(bars).collect();
+            if has_counts {
+                let n = outcome.counts_for(label).unwrap_or(0);
+                self.output_history
+                    .push_str(&format!("  {:<8} {:>6}  {}\n", label, n, bar));
+            } else {
+                self.output_history
+                    .push_str(&format!("  {:<8} {:>6.3}  {}\n", label, p, bar));
+            }
+        }
+
+        if has_counts {
+            self.output_history
+                .push_str(&format!("  {} shots\n", outcome.shots_requested));
+        } else {
+            self.output_history.push_str(&format!(
+                "  probabilities as reported by the provider over {} shots\n",
+                outcome.shots_requested
+            ));
+        }
+        // The last line, always. This is what stops a simulated histogram being read as a
+        // measurement three days later in a screenshot.
+        self.output_history
+            .push_str(&format!("  {}\n", outcome.provenance.disclosure()));
     }
 
     /// `fetch <url>` — the end-to-end proof that userspace networking reaches the internet.
@@ -2133,6 +3182,9 @@ impl NyxApp for TerminalApp {
         // between a window that shows its progress and one that is simply frozen until the page
         // arrives.
         let mut redraw = self.pump_load();
+        // Same hook, same reason: a cloud quantum job can queue for minutes behind paying work, and
+        // watching it from `on_key` froze the window for the whole job. See `RemoteJob`.
+        redraw |= self.pump_quantum();
 
         self.blink_timer += 1;
         if self.blink_timer > 30 {
@@ -2208,6 +3260,12 @@ impl NyxApp for TerminalApp {
     fn on_key(&mut self, key: char) -> bool {
         self.cursor_visible = true;
         self.blink_timer = 0;
+
+        // ★ The picker owns the keyboard while it is open — BEFORE the scrollback keys, because it
+        // uses PageUp/PageDown itself and would otherwise never see them.
+        if self.picker.is_some() {
+            return self.picker_key(key);
+        }
 
         // Scrollback keys. Handled before anything else so they never reach the input buffer.
         //
@@ -2294,6 +3352,19 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  wifi list / scan  - the last sweep / a fresh one (scan BLOCKS ~7 s, refused while joined)\n");
                 self.output_history.push_str("  wifi join <ssid> [pass]  - join and remember. BLOCKS ~10 s. Passphrase goes in the clear\n");
                 self.output_history.push_str("  wifi leave | on | off | forget\n");
+                self.output_history.push_str("Quantum (the third compute substrate, alongside CPU and GPU):\n");
+                self.output_history.push_str("  quantum           - is a QPU present, and what is actually computing\n");
+                self.output_history.push_str("  quantum devices   - every quantum device, with what each one really is\n");
+                self.output_history.push_str("  quantum backends  - simulator / remote / hardware and their state\n");
+                self.output_history.push_str("  quantum info <id> - full device detail ('—' means not reported, not zero)\n");
+                self.output_history.push_str("  quantum run bell  - H(q0), CX(q0,q1), measure: expect only 00 and 11\n");
+                self.output_history.push_str("  quantum simulate [file.ql]  - compile real QCLang and run it\n");
+                self.output_history.push_str("  quantum stop      - cancel a cloud job that is still running\n");
+                self.output_history.push_str("  quantum remote jobs - pick a past job from a menu and collect its result\n");
+                self.output_history.push_str("  quantum remote [status] | set <key> <value> | clear | watch <id>\n");
+                self.output_history.push_str("  quantum remote run <target>  - a REAL cloud QPU. BLOCKS; hardware targets are metered\n");
+                self.output_history.push_str("    IonQ: simulator (free) | qpu.aria-1 (costs money)   IBM: ibm_fez (10 free min/month)\n");
+                self.output_history.push_str("  (this machine has no quantum hardware; output says so rather than implying otherwise)\n");
             } else if cmd == "clear" {
                 self.output_history.clear();
             } else if cmd == "toolchains" {
@@ -2310,6 +3381,8 @@ impl NyxApp for TerminalApp {
                 self.do_dns(arg);
             } else if cmd == "wifi" || cmd.starts_with("wifi ") {
                 self.do_wifi(cmd["wifi".len()..].trim());
+            } else if cmd == "quantum" || cmd.starts_with("quantum ") {
+                self.do_quantum(cmd["quantum".len()..].trim());
             } else if cmd == "passwd" || cmd.starts_with("passwd ") {
                 self.do_passwd(cmd["passwd".len()..].trim());
             } else if cmd == "date" {
