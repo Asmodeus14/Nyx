@@ -2700,9 +2700,16 @@ impl Shell {
         let kinds: Vec<CmdEntry> = all.iter().map(|h| h.kind).collect();
         let n = layout::command_visible(self.screen_h, &kinds);
         all.truncate(n);
+        // ★ Damage the panel as it was AND as it will be — not the whole screen. This runs on every
+        // keystroke typed into the Command, and `mark_full` here made each one a full-screen
+        // recomposite plus a CPU scrim blend over every pixel of the desktop, which is why typing
+        // into search lagged. The panel only changes height, so the union of the old and new
+        // extents covers everything that can differ; the scrim is re-blended inside that rect by
+        // the partial-frame path. Opening and closing still repaint everything (`set_command`).
+        self.mark_command();
         self.hits = all;
         self.cmd_sel = layout::command_first(&self.kinds());
-        self.mark_full();
+        self.mark_command();
     }
 
     /// The result list as bare entry kinds — what every `layout::command_*` function takes.
@@ -3222,6 +3229,10 @@ impl Shell {
         if self.cmd_open {
             let sel = self.cmd_sel;
             self.rebuild_command();
+            // This runs on the 1 Hz heartbeat, which must stay a FULL frame (see the loop). Now that
+            // `rebuild_command` damages only the panel, say so explicitly, or the non-empty rect
+            // would quietly turn the heartbeat into a partial one while the Command is open.
+            self.mark_full();
             // Keep the selection where the user left it — a link state change once a second must not
             // yank the highlight back to the top row under their finger. Only if that index is still
             // a selectable row, though; `rebuild_command`'s own first-row default covers the rest.
@@ -3715,12 +3726,13 @@ impl Shell {
                     }
                 }
                 keys::UP => {
+                    // The selection plate moves inside the panel; nothing outside it changes.
                     self.cmd_sel = layout::command_step(&self.kinds(), self.cmd_sel, -1);
-                    self.mark_full();
+                    self.mark_command();
                 }
                 keys::DOWN => {
                     self.cmd_sel = layout::command_step(&self.kinds(), self.cmd_sel, 1);
-                    self.mark_full();
+                    self.mark_command();
                 }
                 '\t' => {
                     // ⇥ refine: adopt the selected result's name as the query. Not completion for
