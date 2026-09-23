@@ -11,6 +11,18 @@ libc++ programs, and treats a quantum processor as a compute resource beside the
 📚 **Full documentation: [`docs/`](docs/README.md)** — start with the
 [architecture overview](docs/ARCHITECTURE.md).
 
+![Nyx in QEMU: opening the Command, running a Bell-state circuit in the terminal, the QCLang studio, and Files](docs/images/demo.gif)
+
+### ▶ Try it in your browser
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Asmodeus14/Nyx?devcontainer_path=.devcontainer%2Fdemo%2Fdevcontainer.json)
+
+Nothing to install or build: the Codespace downloads the prebuilt image from the
+[`demo` release](https://github.com/Asmodeus14/Nyx/releases/tag/demo), boots it in QEMU, and opens the
+desktop in a browser tab after a couple of minutes (needs a GitHub account; it uses your Codespaces
+quota). To run the same thing locally: [`tools/demo/run-demo.sh`](tools/demo/run-demo.sh). It is
+QEMU, so there is no GPU acceleration, Wi-Fi or touchpad — see [`tools/demo/README.md`](tools/demo/README.md).
+
 ---
 
 ## What Nyx is

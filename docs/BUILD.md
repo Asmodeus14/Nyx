@@ -91,6 +91,11 @@ NYX_QEMU_ARGS="-cpu max -smp 4 -m 2048 \
 
 The runner connects QEMU's serial port to stdio, so the kernel log is readable.
 
+**Shortcut:** `tools/demo/run-demo.sh` does all of the above — disk image, firmware, flags — and
+serves the display in a browser via noVNC at `http://localhost:6080/`. By default it downloads the
+prebuilt image from the `demo` GitHub release; `NYX_IMG=target/x86_64-unknown-none/release/nyx-kernel.efi.img`
+runs your own build. The same script backs the Codespaces demo (`.devcontainer/demo/`).
+
 What QEMU does **not** exercise: the Intel GPU (no render engine, so GPU composite/text fall back
 to the CPU), Intel Wi-Fi, the I2C-HID touchpad, and real timing — QEMU's APIC runs far faster than
 the laptop's, so anything timing-derived must be re-checked on hardware.

@@ -1,0 +1,17 @@
+{
+  // Try Nyx in the browser: boots the prebuilt release image in QEMU and shows the desktop through
+  // noVNC on port 6080. Nothing is compiled — tools/demo/run-demo.sh downloads the image. The
+  // development container is the one in ../devcontainer.json.
+  "name": "Nyx demo — QEMU in your browser",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "hostRequirements": { "cpus": 4, "memory": "8gb" },
+  "onCreateCommand": "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 ovmf gdisk e2fsprogs curl ca-certificates websockify novnc",
+  "postStartCommand": "nohup bash tools/demo/run-demo.sh > /tmp/nyx-demo.log 2>&1 &",
+  "forwardPorts": [6080],
+  "portsAttributes": {
+    "6080": { "label": "Nyx desktop", "onAutoForward": "openBrowser" }
+  },
+  "customizations": {
+    "codespaces": { "openFiles": ["tools/demo/README.md"] }
+  }
+}
