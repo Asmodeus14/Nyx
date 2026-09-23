@@ -131,28 +131,56 @@ pub fn update_relative(dx: i32, dy: i32, buttons: u8) {
 const PS2_FALLBACK_BYTES: u32 = 60;
 
 pub fn handle_interrupt(packet_byte: u8) {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    // ★ Packet framing by TIME. A PS/2 packet's three bytes arrive back to back (well under 1 ms
+    // apart); packets are several ms apart. So a byte after a gap longer than this is the START of
+    // a packet, whatever the state machine thought. The bit-3 test alone cannot re-find the
+    // boundary — a motion byte can have bit 3 set — and one misaligned packet is a pointer jump.
+    const PACKET_GAP_US: u64 = 5_000;
+    static LAST_BYTE_US: AtomicU64 = AtomicU64::new(0);
+    // Set while PS/2 bytes are being dropped for the I2C touchpad: the state machine stopped
+    // mid-packet, so when PS/2 resumes it must wait for a packet boundary before decoding again.
+    static RESYNC: AtomicBool = AtomicBool::new(false);
+    let mhz = crate::time::TSC_MHZ.load(Relaxed).max(1);
+    let now_us = crate::time::rdtsc() / mhz;
+    let gap = now_us.wrapping_sub(LAST_BYTE_US.swap(now_us, Relaxed));
+    let boundary = gap > PACKET_GAP_US;
+
     // ★ Phase 4 of the I2C-HID touchpad: while it drives the pointer, PS/2 AUX bytes are dropped
     // (the caller has already read port 0x60, so the 8042 is not left holding them). A touchpad
     // that still reports on both paths would otherwise move the cursor twice. The flag falls back
     // to false on its own if the I2C side goes quiet — see `i2c_hid::poll`.
     if crate::drivers::i2c_hid::POINTER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        RESYNC.store(true, Relaxed);
         // ★ Fallback. The boot-time enable takes the pointer on the strength of the interrupt
         // firing at RESET — nobody is touching the pad to prove more. If that was wrong, the tell
         // is PS/2 still delivering packets while I2C delivers nothing: every I2C report resets this
         // counter, so it only climbs while the I2C side is silent. ~20 PS/2 packets (60 bytes) of
         // that and the PS/2 path is evidently the one alive — give the pointer back to it.
-        use core::sync::atomic::Ordering::Relaxed;
         let n = crate::drivers::i2c_hid::PS2_WHILE_SILENT.fetch_add(1, Relaxed) + 1;
         if n < PS2_FALLBACK_BYTES {
             return;
         }
         crate::drivers::i2c_hid::POINTER_ACTIVE.store(false, Relaxed);
         crate::drivers::i2c_hid::FELL_BACK.store(true, Relaxed);
+        // This byte is mid-stream: fall through to the resync below, which drops it.
     }
     static mut DRIVER_STATE: Option<MouseDriver> = None;
     unsafe {
         if DRIVER_STATE.is_none() { DRIVER_STATE = Some(MouseDriver::new()); }
         let driver = DRIVER_STATE.as_mut().unwrap();
+
+        // Resuming after bytes were dropped: decode nothing until a packet boundary. This is what
+        // stops the pointer being thrown when PS/2 takes back over from I2C mid-packet.
+        if RESYNC.load(Relaxed) {
+            if !boundary {
+                return;
+            }
+            RESYNC.store(false, Relaxed);
+        }
+        if boundary {
+            driver.cycle = 0;
+        }
 
         match driver.cycle {
             0 => { if (packet_byte & 0x08) != 0 { driver.packet[0] = packet_byte; driver.cycle += 1; } }

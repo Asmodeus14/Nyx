@@ -3851,8 +3851,8 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  acpi ls [path]    - walk the ACPI namespace   acpi probe <n> [depth] - one evaluation\n");
                 self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
                 self.output_history.push_str("  touchpad          - what ACPI says about the I2C-HID touchpad, then read it over I2C\n");
-                self.output_history.push_str("  touchpad i2c      - just the I2C part (~4 s: move a finger and click during it)\n");
-                self.output_history.push_str("  touchpad on       - initialise it; if reports arrive, it becomes the pointer (~6 s)\n");
+                self.output_history.push_str("  touchpad i2c      - just the I2C part: re-initialise and retake the pointer\n");
+                self.output_history.push_str("  touchpad on       - same, after refreshing the ACPI data (multi-touch mode is kept)\n");
                 self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
                 self.output_history.push_str("  touchpad status   - which path drives the pointer (I2C enables itself at boot)\n");
                 self.output_history.push_str("  touchpad ptp      - multi-touch: 2-finger scroll + right-click, 3-finger swipes\n");
@@ -4488,7 +4488,7 @@ impl NyxApp for TerminalApp {
                 sys_sleep_ms(1600);
                 self.output_history.push_str(
                     "Firmware handover (_DSM) requested. The PS/2 pointer may now be gone until a \
-                     full power-off.\n  Next: `touchpad on` (move a finger for ~5 s after Enter).\n",
+                     full power-off.\n  Next: `touchpad on`.\n",
                 );
             } else if cmd == "touchpad" || cmd.starts_with("touchpad ") {
                 self.cmd_touchpad();

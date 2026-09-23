@@ -272,8 +272,16 @@ pub fn service() {
     if !boot && !REQUEST.swap(false, Ordering::AcqRel) {
         return;
     }
-    let enable = boot || ENABLE.swap(false, Ordering::AcqRel);
-    let mut r = run(enable, boot);
+    // ★ EVERY probe (re)takes the pointer, on the interrupt-at-RESET proof — the boot semantics.
+    //
+    // Two hardware lessons. A plain probe used to tear the live driver down and leave it down, so
+    // running the `touchpad` diagnostic silently handed the pointer back to PS/2 (and then
+    // `touchpad ptp` found nothing to switch). And `touchpad on` required mouse reports inside a
+    // 3 s window, so it refused whenever nobody happened to touch the pad during it. The
+    // interrupt firing on RESET has since proven itself on every run — it is the proof.
+    ENABLE.store(false, Ordering::Release);
+    let _ = boot;
+    let mut r = run(true, true);
     // Wait out a syscall mid-copy rather than re-queue: re-running would repeat the probe WITHOUT
     // `enable` and tear down a device that had just taken the pointer.
     loop {
@@ -351,7 +359,10 @@ const BOOT_AFTER_MS: u64 = 8_000;
 
 fn run(enable: bool, boot: bool) -> ProbeResult {
     let mut r = ProbeResult::EMPTY;
-    // Re-probing tears down a live device first: the probe re-programs the same controller.
+    // Re-probing tears down a live device first: the probe re-programs the same controller. The
+    // RESET that follows puts the device back in mouse mode, so remember precision mode and ask for
+    // it again once the pointer is retaken.
+    let was_ptp = PTP_ACTIVE.swap(false, Ordering::AcqRel);
     POINTER_ACTIVE.store(false, Ordering::Release);
     mask_irq();
     if let Some(mut l) = LIVE.try_lock() {
@@ -467,6 +478,9 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
             FELL_BACK.store(false, Ordering::Relaxed);
             POINTER_ACTIVE.store(true, Ordering::Release);
             r.active = 1;
+            if was_ptp {
+                MODE_REQUEST.store(2, Ordering::Release);
+            }
         }
     }
     r
