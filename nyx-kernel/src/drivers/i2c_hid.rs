@@ -361,21 +361,27 @@ pub fn service() {
 ///
 /// Returns true exactly once: on the tick the ACPI data is ready and the enable should run.
 fn boot_step() -> bool {
-    use core::sync::atomic::AtomicU8;
+    use core::sync::atomic::{AtomicU64, AtomicU8};
     const WAIT: u8 = 0;
     const REQUESTED: u8 = 1;
-    const DONE: u8 = 2;
+    /// The first (mouse-mode) enable has run; decide whether to hand over.
+    const AFTER_FIRST: u8 = 2;
+    const HANDOVER_WAIT: u8 = 3;
+    /// The post-handover re-init has run; switch to precision mode (or retry the re-init).
+    const AFTER_REINIT: u8 = 4;
+    const DONE: u8 = 5;
     static STATE: AtomicU8 = AtomicU8::new(WAIT);
-    use core::sync::atomic::AtomicU64;
     static STARTED_AT: AtomicU64 = AtomicU64::new(0);
     static LAST_ASK: AtomicU64 = AtomicU64::new(0);
+    static REINIT_TRIES: AtomicU8 = AtomicU8::new(0);
 
     let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+    let set = |s: u8| STATE.store(s, Ordering::Relaxed);
     match STATE.load(Ordering::Relaxed) {
         // The normal case: `acpi::scan_for_modern_inputs` already ran discovery during boot, so
         // enable on this task's very first pass — before the desktop is up.
         WAIT if crate::acpi::CACHE.try_lock().map_or(false, |c| c.i2c_hid_probed && c.i2c_hid_n > 0) => {
-            STATE.store(DONE, Ordering::Relaxed);
+            set(AFTER_FIRST);
             true
         }
         // Fallback: boot-time discovery found nothing usable (or never ran). Ask the governor once
@@ -384,28 +390,86 @@ fn boot_step() -> bool {
             crate::acpi::request_probe(13, 0);
             STARTED_AT.store(now, Ordering::Relaxed);
             LAST_ASK.store(now, Ordering::Relaxed);
-            STATE.store(REQUESTED, Ordering::Relaxed);
+            set(REQUESTED);
             false
         }
         REQUESTED => {
             let probed = crate::acpi::CACHE.try_lock().map_or(false, |c| c.i2c_hid_probed);
             if probed {
-                STATE.store(DONE, Ordering::Relaxed);
+                set(AFTER_FIRST);
                 return true;
             }
             // The governor has one probe slot; a request from the terminal in the same second can
             // overwrite ours. Ask again every 3 s, and give up after 15 — `touchpad on` still works.
             if now.saturating_sub(STARTED_AT.load(Ordering::Relaxed)) >= 15_000 {
-                STATE.store(DONE, Ordering::Relaxed);
+                set(DONE);
             } else if now.saturating_sub(LAST_ASK.load(Ordering::Relaxed)) >= 3_000 {
                 crate::acpi::request_probe(13, 0);
                 LAST_ASK.store(now, Ordering::Relaxed);
             }
             false
         }
+        // ★ Precision mode at boot. The handover (`acpi probe 14`, the touchpad's `_DSM`) switches
+        // the EC's PS/2 emulation OFF for the rest of the power cycle, so it is sent ONLY once I2C
+        // has proven itself by taking the pointer. If I2C never came up, PS/2 stays the pointer.
+        AFTER_FIRST => {
+            if !AUTO_PRECISION || !POINTER_ACTIVE.load(Ordering::Acquire) {
+                set(DONE);
+            } else {
+                crate::acpi::request_probe(14, 0);
+                STARTED_AT.store(now, Ordering::Relaxed);
+                LAST_ASK.store(now, Ordering::Relaxed);
+                set(HANDOVER_WAIT);
+            }
+            false
+        }
+        HANDOVER_WAIT => {
+            let done = crate::acpi::CACHE.try_lock().map_or(-1, |c| c.i2c_hid_handover);
+            if done > 0 {
+                HANDED_OVER.store(true, Ordering::Release);
+                // Re-initialise, as Windows and Linux do after the handover.
+                set(AFTER_REINIT);
+                return true;
+            }
+            if done == 0 || now.saturating_sub(STARTED_AT.load(Ordering::Relaxed)) >= 10_000 {
+                // No device took the handover: stay in (working) mouse mode.
+                set(DONE);
+            } else if now.saturating_sub(LAST_ASK.load(Ordering::Relaxed)) >= 3_000 {
+                crate::acpi::request_probe(14, 0);
+                LAST_ASK.store(now, Ordering::Relaxed);
+            }
+            false
+        }
+        AFTER_REINIT => {
+            if POINTER_ACTIVE.load(Ordering::Acquire) {
+                // No trial: nobody touches the pad during boot, so "no finger within 10 s" would
+                // always revert it. The path is proven by the reset interrupt the re-init needed.
+                MODE_REQUEST.store(MODE_REQ_PTP_NO_TRIAL, Ordering::Release);
+                set(DONE);
+                false
+            } else if REINIT_TRIES.fetch_add(1, Ordering::Relaxed) < 2 {
+                // PS/2 is gone now — keep trying rather than leave the machine without a pointer.
+                true
+            } else {
+                set(DONE);
+                false
+            }
+        }
         _ => false,
     }
 }
+
+/// Enable precision (multi-touch) mode automatically at boot: handover, re-init, precision mode.
+/// Proven on the test laptop 2026-09-23; set false to boot into the firmware's mouse mode.
+const AUTO_PRECISION: bool = true;
+
+/// Set once the firmware handover has been done this power cycle. From then on the EC's PS/2
+/// emulation is off, so stray PS/2 bytes are dropped without counting towards the "I2C went
+/// silent" fallback — after a handover there is no working PS/2 path to fall back TO.
+pub static HANDED_OVER: AtomicBool = AtomicBool::new(false);
+
+/// `MODE_REQUEST` value: precision mode with no trial (the boot path).
+const MODE_REQ_PTP_NO_TRIAL: u8 = 3;
 
 /// Uptime before the boot-time enable starts. See [`boot_step`].
 const BOOT_AFTER_MS: u64 = 8_000;
@@ -587,6 +651,7 @@ fn poll() {
                 dev.ptp_trial_until = now + PTP_TRIAL_MS;
             }
         }
+        MODE_REQ_PTP_NO_TRIAL => set_mode(dev, true),
         _ => {}
     }
     // The trial ran out with no finger ever decoded: precision mode is not working on this device

@@ -945,6 +945,11 @@ pub fn refresh_cache() {
             // `_DSM` itself.
             let mut reg = 0u32;
             let n = unsafe { acpi_i2c_hid_handover(&mut reg) };
+            if n > 0 {
+                // Every handover path (boot automation and `touchpad handover`) comes through here.
+                crate::drivers::i2c_hid::HANDED_OVER
+                    .store(true, core::sync::atomic::Ordering::Release);
+            }
             if let Some(mut c) = CACHE.try_lock() {
                 c.i2c_hid_handover = n;
                 c.i2c_hid_handover_reg = reg;

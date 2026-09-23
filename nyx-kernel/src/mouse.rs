@@ -152,6 +152,12 @@ pub fn handle_interrupt(packet_byte: u8) {
     // to false on its own if the I2C side goes quiet — see `i2c_hid::poll`.
     if crate::drivers::i2c_hid::POINTER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
         RESYNC.store(true, Relaxed);
+        // After the firmware handover the EC's PS/2 emulation is OFF: whatever still arrives here
+        // is noise, and there is no working PS/2 pointer to fall back to. Drop it uncounted — a
+        // "fallback" now would only switch a working precision touchpad into a dead mode.
+        if crate::drivers::i2c_hid::HANDED_OVER.load(Relaxed) {
+            return;
+        }
         // ★ Fallback. The boot-time enable takes the pointer on the strength of the interrupt
         // firing at RESET — nobody is touching the pad to prove more. If that was wrong, the tell
         // is PS/2 still delivering packets while I2C delivers nothing: every I2C report resets this
