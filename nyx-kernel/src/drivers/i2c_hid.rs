@@ -10,7 +10,7 @@
 //!
 //! ⚠️ This does NOT perform the PS/2 handover. The EC keeps the touchpad on PS/2 until the device's
 //! HIDG `_DSM` is evaluated (`custom_acpi.c`, `NyxHidDescriptorRegister`), and nothing here does
-//! that. So the result also answers a real question: does this ALPS part answer on I2C at all
+//! that. So the result also answers a real question: does the touchpad (ELAN 04f3:30cb, not the ALPS the address suggested) answer on I2C at all
 //! while it is still in PS/2 mode? An address NACK here is an answer, not necessarily a bug.
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +31,10 @@ pub mod stage {
     pub const CONTROLLER: u32 = 3;
     pub const DESCRIPTOR_READ: u32 = 4;
     pub const DESCRIPTOR_VALID: u32 = 5;
+    /// Report descriptor read and parsed (Phase 3a), but no input report arrived while watching.
+    pub const REPORT_DESCRIPTOR: u32 = 6;
+    /// Input reports arrived on the I2C input register.
+    pub const REPORTS_SEEN: u32 = 7;
 }
 
 /// Why it stopped. 0 = it did not stop — every stage passed.
@@ -126,6 +130,8 @@ pub fn service() {
 
 fn run() -> ProbeResult {
     let mut r = ProbeResult::EMPTY;
+    // A probe that stops early must not leave the previous run's findings looking current.
+    publish(&Sink { len: 0, text: [0; REPORT_CAP] });
 
     // The ACPI half is published by `acpi probe 13`; take a copy and drop the lock at once.
     let hid = match crate::acpi::CACHE.try_lock() {
@@ -196,7 +202,7 @@ fn run() -> ProbeResult {
             r.status = status::TIMEOUT;
             return r;
         }
-        Err(I2cError::TooLong) => {
+        Err(I2cError::TooLong) | Err(I2cError::Underrun) => {
             r.status = status::TOO_LONG;
             return r;
         }
@@ -212,5 +218,171 @@ fn run() -> ProbeResult {
         return r;
     }
     r.stage = stage::DESCRIPTOR_VALID;
+
+    // Phase 3a — read-only from here on.
+    if explore(&mut ctl, hid.slave_addr as u8, &buf) {
+        r.stage = stage::REPORTS_SEEN;
+    } else {
+        r.stage = stage::REPORT_DESCRIPTOR;
+    }
     r
+}
+
+/// Human-readable findings from [`explore`], copied out by syscall 578 op 2.
+pub static REPORT: spin::Mutex<Report> = spin::Mutex::new(Report { len: 0, text: [0; REPORT_CAP] });
+pub const REPORT_CAP: usize = 1536;
+
+pub struct Report {
+    pub len: usize,
+    pub text: [u8; REPORT_CAP],
+}
+
+/// A bounded `fmt::Write` sink — the report text simply stops at the cap rather than failing.
+struct Sink {
+    len: usize,
+    text: [u8; REPORT_CAP],
+}
+
+impl core::fmt::Write for Sink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < REPORT_CAP {
+                self.text[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How long to watch the input register, and how often.
+const SAMPLE_MS: u64 = 3000;
+const SAMPLE_EVERY_MS: u64 = 4;
+
+/// Phase 3a: read the report descriptor, parse it, then watch the input register while the user
+/// moves a finger. Returns true if any input report arrived.
+///
+/// ⚠️ READ-ONLY. No RESET, no SET_POWER, no Set Feature, no `_DSM`. The touchpad is currently the
+/// machine's pointer over PS/2, and any of those could switch it off that path before this driver
+/// can replace it. What this answers is whether reports already flow on I2C as things stand.
+fn explore(ctl: &mut crate::drivers::i2c::Controller, addr: u8, desc: &[u8]) -> bool {
+    use crate::drivers::hid_desc;
+    use core::fmt::Write;
+
+    let w = |i: usize| u16::from_le_bytes([desc[i], desc[i + 1]]);
+    let (rd_len, rd_reg, in_reg, max_in) = (w(4) as usize, w(6), w(8), w(10) as usize);
+    let mut out = Sink { len: 0, text: [0; REPORT_CAP] };
+
+    // 1. The report descriptor. Bounded: a real one is a few hundred bytes.
+    let rd_len = rd_len.min(2048);
+    let mut rdesc = alloc::vec![0u8; rd_len];
+    let mut read = Err(crate::drivers::i2c::I2cError::Timeout);
+    for _ in 0..3 {
+        read = ctl.write_read(addr, &rd_reg.to_le_bytes(), &mut rdesc);
+        if !matches!(read, Err(crate::drivers::i2c::I2cError::Underrun)) {
+            break;
+        }
+    }
+    if let Err(e) = read {
+        let _ = writeln!(out, "report descriptor: read FAILED ({:?})", e);
+        publish(&out);
+        return false;
+    }
+    let d = hid_desc::parse(&rdesc);
+    let _ = writeln!(out, "report descriptor: {} bytes, {} input fields, report IDs {}{}",
+        rd_len, d.fields.len(), if d.uses_report_ids { "yes" } else { "no" },
+        if d.trailing != 0 { " (TRUNCATED)" } else { "" });
+    for &(page, u, id) in &d.apps {
+        let name = match (page, u) {
+            (0x01, 0x02) => "mouse",
+            (0x01, 0x01) => "pointer",
+            (0x0D, 0x05) => "touch pad",
+            (0x0D, 0x04) => "touch screen",
+            (0x0D, 0x0E) => "device config",
+            (0x01, 0x06) => "keyboard",
+            _ => "other",
+        };
+        let _ = writeln!(out, "  app {:02x}:{:02x} {:<13} report id {}", page, u, name, id);
+    }
+    let mouse = hid_desc::mouse_layout(&d);
+    match &mouse {
+        Some(m) => {
+            let _ = writeln!(out, "  mouse layout: id {} x@{}+{} y@{}+{} btn1@{}",
+                m.report_id, m.x.bit_off, m.x.size, m.y.bit_off, m.y.size,
+                m.buttons[0].map_or(-1, |b| b.bit_off as i32));
+        }
+        None => {
+            let _ = writeln!(out, "  no relative mouse collection");
+        }
+    }
+
+    // 2. Watch the input register. Each read returns [len_lo, len_hi, report...]; len 0 means
+    //    nothing pending (the spec's reset sentinel is also len 0).
+    let max_in = max_in.clamp(2, 64);
+    let mut buf = [0u8; 64];
+    let (mut reads, mut errors, mut reports) = (0u32, 0u32, 0u32);
+    let mut per_id: [(u8, u32); 8] = [(0, 0); 8];
+    let mut shown = 0;
+    let (mut sum_dx, mut sum_dy, mut clicks) = (0i32, 0i32, 0u32);
+    let mut elapsed = 0u64;
+    while elapsed < SAMPLE_MS {
+        reads += 1;
+        match ctl.write_read(addr, &in_reg.to_le_bytes(), &mut buf[..max_in]) {
+            Err(_) => errors += 1,
+            Ok(()) => {
+                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if len > 2 && len <= max_in {
+                    reports += 1;
+                    let id = if d.uses_report_ids { buf[2] } else { 0 };
+                    // Slots fill in order, so a matching slot always precedes the first empty one.
+                    if let Some(slot) = per_id.iter_mut().find(|(i, n)| *i == id || *n == 0) {
+                        slot.0 = id;
+                        slot.1 += 1;
+                    }
+                    if shown < 4 {
+                        shown += 1;
+                        let _ = write!(out, "  sample:");
+                        for b in &buf[..len] {
+                            let _ = write!(out, " {:02x}", b);
+                        }
+                        let _ = writeln!(out);
+                    }
+                    if let Some(m) = &mouse {
+                        if id == m.report_id {
+                            let body = &buf[if d.uses_report_ids { 3 } else { 2 }..len];
+                            sum_dx += m.x.extract(body).unwrap_or(0);
+                            sum_dy += m.y.extract(body).unwrap_or(0);
+                            if m.buttons[0].and_then(|b| b.extract(body)).unwrap_or(0) != 0 {
+                                clicks += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        crate::scheduler::kernel_sleep_ms(SAMPLE_EVERY_MS);
+        elapsed += SAMPLE_EVERY_MS;
+    }
+    let _ = write!(out, "input register {:#06x}: {} reads, {} errors, {} reports", in_reg, reads, errors, reports);
+    for (id, n) in per_id.iter().filter(|(_, n)| *n != 0) {
+        let _ = write!(out, "  [id {}: {}]", id, n);
+    }
+    let _ = writeln!(out);
+    if mouse.is_some() && reports != 0 {
+        let _ = writeln!(out, "decoded as mouse: total dx {} dy {}, button-1 reports {}", sum_dx, sum_dy, clicks);
+    }
+    publish(&out);
+    reports != 0
+}
+
+fn publish(s: &Sink) {
+    // `try_lock` in a loop rather than `lock`: the syscall side holds it at IF=0, only for a copy.
+    loop {
+        if let Some(mut g) = REPORT.try_lock() {
+            g.len = s.len;
+            g.text = s.text;
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }

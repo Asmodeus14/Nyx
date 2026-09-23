@@ -1348,9 +1348,11 @@ impl TerminalApp {
         sys_i2c_hid_probe_request();
         self.output_history.push_str("\nI2C: bringing up the controller and reading the HID descriptor...\n");
 
-        // The kernel task that runs it wakes every 8 ms; bring-up itself can sleep ~11 ms.
+        // The kernel task that runs it wakes every 8 ms; bring-up sleeps ~11 ms, and Phase 3a then
+        // watches the input register for 3 s. This window cannot say "move your finger NOW" —
+        // the terminal only redraws once the command returns — so the instruction is in `help`.
         let mut result = None;
-        for _ in 0..50 {
+        for _ in 0..400 {
             sys_sleep_ms(20);
             if let Some((seq, r)) = sys_i2c_hid_probe_result() {
                 if seq != before {
@@ -1362,15 +1364,16 @@ impl TerminalApp {
         let r = match result {
             Some(r) => r,
             None => {
-                self.output_history.push_str("  no answer from the kernel task within 1 s.\n");
+                self.output_history.push_str("  no answer from the kernel task within 8 s.\n");
                 return;
             }
         };
 
         let stages = ["nothing", "ACPI data", "PCI function", "controller up",
-                      "descriptor read", "descriptor valid"];
+                      "descriptor read", "descriptor valid", "report descriptor parsed",
+                      "input reports seen"];
         self.output_history.push_str(&format!(
-            "  reached      {} (stage {}/5)\n  status       {}\n  PCI id       {:04x}:{:04x}  \
+            "  reached      {} (stage {}/7)\n  status       {}\n  PCI id       {:04x}:{:04x}  \
              PMCSR {:#x}  BAR0 {:#x}\n  LPSS resets  {:#x} before release\n  IC_COMP_TYPE {:#010x}  \
              PARAM_1 {:#010x}\n",
             stages.get(r.stage as usize).copied().unwrap_or("?"), r.stage,
@@ -1421,7 +1424,7 @@ impl TerminalApp {
             }
             self.output_history.push_str(&format!("  descriptor   {}\n", hex));
         }
-        if r.stage == 5 {
+        if r.stage >= 5 {
             let w = |i: usize| u16::from_le_bytes([r.desc[i], r.desc[i + 1]]);
             self.output_history.push_str(&format!(
                 "  ★ valid HID descriptor: vendor {:04x} product {:04x} version {:04x}\n    \
@@ -1429,6 +1432,13 @@ impl TerminalApp {
                  command reg {:#06x}, data reg {:#06x}\n",
                 w(20), w(22), w(24), w(4), w(6), w(8), w(10), w(16), w(18),
             ));
+        }
+        // Phase 3a findings: report descriptor summary and input-register samples.
+        let mut text = [0u8; 1536];
+        let n = sys_i2c_hid_probe_text(&mut text);
+        if n > 0 {
+            self.output_history.push('\n');
+            self.output_history.push_str(core::str::from_utf8(&text[..n]).unwrap_or("(garbled)\n"));
         }
     }
 
@@ -3837,7 +3847,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  acpi ls [path]    - walk the ACPI namespace   acpi probe <n> [depth] - one evaluation\n");
                 self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
                 self.output_history.push_str("  touchpad          - what ACPI says about the I2C-HID touchpad, then read it over I2C\n");
-                self.output_history.push_str("  touchpad i2c      - just the I2C part: controller bring-up + HID descriptor read\n");
+                self.output_history.push_str("  touchpad i2c      - just the I2C part (~4 s: move a finger and click during it)\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
                 self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
                 self.output_history.push_str("Scrollback:\n");

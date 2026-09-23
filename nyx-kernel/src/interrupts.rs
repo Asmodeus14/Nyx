@@ -4421,6 +4421,24 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         None => u64::MAX,
                     };
                 }
+                2 => {
+                    // op 2: copy the Phase 3 findings text (up to arg3 bytes). Returns its length.
+                    let out = arg2 as *mut u8;
+                    let cap = (arg3 as usize).min(crate::drivers::i2c_hid::REPORT_CAP);
+                    if cap == 0 || !is_valid_user_ptr(out, cap)
+                        || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                    frame.rax = match crate::drivers::i2c_hid::REPORT.try_lock() {
+                        Some(r) => {
+                            let n = r.len.min(cap);
+                            unsafe { core::ptr::copy_nonoverlapping(r.text.as_ptr(), out, n); }
+                            n as u64
+                        }
+                        None => 0,
+                    };
+                }
                 _ => frame.rax = EINVAL as u64,
             }
         },

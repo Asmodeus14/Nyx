@@ -80,6 +80,9 @@ pub enum I2cError {
     Timeout,
     /// More bytes than the FIFOs can hold in one go. Callers stay under [`Controller::fifo_depth`].
     TooLong,
+    /// A large transfer ended early: the TX FIFO ran dry between refills and the controller sent
+    /// a STOP. Retrying is safe.
+    Underrun,
 }
 
 /// Which bus timing the controller was programmed with, and where the numbers came from.
@@ -515,7 +518,7 @@ impl Controller {
             return Ok(());
         }
         if total > self.tx_depth || rbuf.len() > self.rx_depth {
-            return Err(I2cError::TooLong);
+            return self.write_read_paced(addr, wbuf, rbuf);
         }
 
         // The target can only change while the controller is disabled.
@@ -560,6 +563,81 @@ impl Controller {
                 got += 1;
             }
             if got == rbuf.len() && raw & INTR_STOP_DET != 0 && rd(self.base, IC_TXFLR) == 0 {
+                let _ = rd(self.base, IC_CLR_STOP_DET);
+                return Ok(());
+            }
+            if dl.expired() {
+                return Err(I2cError::Timeout);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// [`write_read`] for transfers larger than the FIFOs — the 381-byte report descriptor.
+    ///
+    /// Commands are fed as FIFO space allows, never more reads outstanding than the RX FIFO holds.
+    /// Interrupts are masked only while a refill is pushed (microseconds), not for the whole
+    /// transfer, which at 400 kHz is ~9 ms for a report descriptor — far too long at IF=0.
+    ///
+    /// ⚠️ A preemption between refills can let the TX FIFO run dry. LPSS controllers normally hold
+    /// SCL low until more commands arrive, but a controller built without that option ends the
+    /// message with a STOP instead. That shows up here as STOP_DET before the last command was
+    /// issued, and is reported as [`I2cError::Underrun`] rather than returned as a short read.
+    fn write_read_paced(&mut self, addr: u8, wbuf: &[u8], rbuf: &mut [u8]) -> Result<(), I2cError> {
+        let total = wbuf.len() + rbuf.len();
+        if self.tar != addr as u32 {
+            self.disable().map_err(|_| I2cError::Timeout)?;
+            wr(self.base, IC_TAR, addr as u32 & 0x7F);
+            self.tar = addr as u32;
+        }
+        if rd(self.base, IC_ENABLE_STATUS) & 1 == 0 {
+            self.enable()?;
+        }
+        let _ = rd(self.base, IC_CLR_INTR);
+
+        // ~23 us a byte at 400 kHz and ~90 us at 100 kHz; allow the slow case with margin.
+        let dl = SpinDeadline::new(XFER_TIMEOUT_US + total as u64 * 120);
+        let mut issued = 0usize;
+        let mut got = 0usize;
+        loop {
+            let raw = rd(self.base, IC_RAW_INTR_STAT);
+            if raw & INTR_TX_ABRT != 0 {
+                let src = rd(self.base, IC_TX_ABRT_SOURCE);
+                let _ = rd(self.base, IC_CLR_TX_ABRT);
+                let _ = rd(self.base, IC_CLR_STOP_DET);
+                return Err(I2cError::Abort(src));
+            }
+            if raw & INTR_STOP_DET != 0 && issued < total {
+                let _ = rd(self.base, IC_CLR_STOP_DET);
+                return Err(I2cError::Underrun);
+            }
+
+            // Refill.
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                while issued < total && (rd(self.base, IC_TXFLR) as usize) < self.tx_depth {
+                    if issued >= wbuf.len() {
+                        let reads_issued = issued - wbuf.len();
+                        if reads_issued - got >= self.rx_depth {
+                            break;
+                        }
+                    }
+                    let mut cmd = if issued < wbuf.len() { wbuf[issued] as u32 } else { CMD_READ };
+                    if issued == wbuf.len() && !wbuf.is_empty() && !rbuf.is_empty() {
+                        cmd |= CMD_RESTART;
+                    }
+                    if issued == total - 1 {
+                        cmd |= CMD_STOP;
+                    }
+                    wr(self.base, IC_DATA_CMD, cmd);
+                    issued += 1;
+                }
+            });
+
+            while got < rbuf.len() && rd(self.base, IC_RXFLR) > 0 {
+                rbuf[got] = rd(self.base, IC_DATA_CMD) as u8;
+                got += 1;
+            }
+            if issued == total && got == rbuf.len() && raw & INTR_STOP_DET != 0 {
                 let _ = rd(self.base, IC_CLR_STOP_DET);
                 return Ok(());
             }

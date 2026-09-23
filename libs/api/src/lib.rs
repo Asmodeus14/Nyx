@@ -1016,6 +1016,13 @@ pub fn sys_i2c_hid_probe_result() -> Option<(u32, I2cHidProbe)> {
     if rc > u32::MAX as u64 { None } else { Some((rc as u32, r)) }
 }
 
+/// The probe's Phase 3 findings as text — report descriptor summary and input-register samples.
+/// Returns how many bytes were written into `buf`.
+pub fn sys_i2c_hid_probe_text(buf: &mut [u8]) -> usize {
+    let rc = syscall(578, 2, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    if rc > buf.len() as u64 { 0 } else { rc as usize }
+}
+
 /// Human-readable meaning of [`I2cHidProbe::status`].
 pub fn i2c_hid_status_text(status: u32) -> &'static str {
     match status {
