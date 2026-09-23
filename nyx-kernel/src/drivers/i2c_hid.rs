@@ -197,6 +197,10 @@ impl FrameAsm {
     };
 }
 
+/// Precision-mode pointer scale at 100% speed: a full pad width = NUM/DEN screen widths (1.2).
+const PTP_POINTER_NUM: i64 = 6;
+const PTP_POINTER_DEN: i64 = 5;
+
 /// How long a tap's click is held down. The desktop samples the button state; a press and release
 /// inside one of its frames would never be seen.
 const TAP_CLICK_MS: u64 = 60;
@@ -774,21 +778,26 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) -> (u8, i32, i32) {
     dev.asm.expected = 0;
     let o = dev.engine.frame(now, &dev.asm.contacts[..dev.asm.n], dev.asm.button);
 
-    // Scale logical units to pixels: at 100% a full pad width is 1.5 screen widths. The same
-    // factor on both axes keeps motion isotropic. Remainders carry, as on the mouse path.
+    // Scale logical units to pixels. At 100%, a full pad width moves the pointer
+    // PTP_POINTER_NUM/PTP_POINTER_DEN screen widths. ★ Started at 1.5; on the hardware that was
+    // "slightly fast", so 1.2. The same factor on both axes keeps motion isotropic. Remainders
+    // carry, as on the mouse path.
     let sw = crate::mouse::screen_width().max(1) as i64;
     let pct = SPEED_PCT.load(Ordering::Relaxed) as i64;
-    let unit = 2 * (t.x_max.max(1) as i64) * 100;
-    dev.acc_px += o.dx as i64 * sw * 3 * pct;
-    dev.acc_py += o.dy as i64 * sw * 3 * pct;
+    let x_max = t.x_max.max(1) as i64;
+    let unit = PTP_POINTER_DEN * x_max * 100;
+    dev.acc_px += o.dx as i64 * sw * PTP_POINTER_NUM * pct;
+    dev.acc_py += o.dy as i64 * sw * PTP_POINTER_NUM * pct;
     let mx = dev.acc_px / unit;
     let my = dev.acc_py / unit;
     dev.acc_px -= mx * unit;
     dev.acc_py -= my * unit;
-    // Scroll is not scaled by the pointer speed: they are different preferences.
+    // Scroll has its own scale (1.5 pad-widths per screen width), not the pointer speed: they are
+    // different preferences, and scroll was not reported as too fast.
+    let sunit = 2 * x_max * 100;
     dev.acc_scroll += o.scroll_y as i64 * sw * 3 * 100;
-    let sy = dev.acc_scroll / unit;
-    dev.acc_scroll -= sy * unit;
+    let sy = dev.acc_scroll / sunit;
+    dev.acc_scroll -= sy * sunit;
     if sy != 0 {
         SCROLL_ACCUM.fetch_add(sy as i32, Ordering::Relaxed);
     }
