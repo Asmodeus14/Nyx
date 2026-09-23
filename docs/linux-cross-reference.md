@@ -14,8 +14,10 @@ i = (i + 1) & (rxq->queue_size - 1);
 from a keyed hash since the 1990s), for DHCP lease renewal (RFC 2131 §4.4.5 T1/T2), and for returning
 a single A record when `getaddrinfo` has always returned a list.
 
-This machine has **no QEMU and no serial console** — every experiment costs a power cycle. Reading a
-reference implementation costs nothing. For the driver and protocol layers, reading comes first now.
+The test laptop has **no serial console**, and the drivers this file is about (Wi-Fi, networking on
+real links) cannot be exercised in QEMU — so every experiment on them costs a power cycle. (QEMU
+does boot Nyx now, see [BUILD.md](BUILD.md), but not with this hardware.) Reading a reference
+implementation costs nothing. For the driver and protocol layers, reading comes first now.
 
 ## The licence boundary — read for facts, never transcribe
 

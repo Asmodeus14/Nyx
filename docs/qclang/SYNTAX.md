@@ -1,7 +1,12 @@
-
----
-
 # QCLang Language Specification (v0.6.0)
+
+> **QCLang** is the quantum language whose compiler lives in `tools/compiler` (`qclang_compiler`);
+> it also runs on Nyx inside `apps/qcstudio`. Checked in the 2026-09 documentation audit: a Bell
+> program in this spec's style (`qreg q[2] = |00>;`, `let r: cbit = measure(q[0]);`) compiles with the
+> host `qclang`, as does the affine `qubit c = CNOT(H(a), b);` style of
+> `apps/qcstudio/samples/sample.ql`.
+> **Verification required:** this spec calls itself v0.6.0 while the crate is `0.2.2`
+> (`tools/compiler/Cargo.toml`), and its individual sections were not re-checked against the parser.
 
 ## 1. Lexical Elements & Primitive Syntax
 

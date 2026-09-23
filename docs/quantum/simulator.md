@@ -22,8 +22,8 @@ port_agrees_with_qclang_on_a_three_qubit_ghz
 ```
 
 The original is the one that has been producing histograms on real hardware, so **if they disagree,
-the port is wrong**. This runs on every `cargo test`, on a machine with no QEMU, where the alternative
-way to find a sign error in a gate matrix is a power cycle and a photograph.
+the port is wrong**. This runs on every `cargo test`, on the host, where the alternative way to find a
+sign error in a gate matrix is a boot of the whole OS.
 
 The phase-gate case exists because S and T are invisible in the computational basis unless an
 interference path exposes them — the outer Hadamard pair is what makes a conjugation error visible.

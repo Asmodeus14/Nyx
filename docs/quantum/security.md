@@ -18,8 +18,9 @@ other process's window buffer (`sys_map_shm`/`sys_destroy_shm` take a bare id), 
 (568), set the hardware clock (552), join a Wi-Fi network and learn the PSK path (545), or panic the
 kernel on purpose (555).
 
-⚠️ `Readme.md:55` claims Nyx "implements capability-based permissions" and "explicit user pointer
-validation on every syscall boundary". Neither is accurate — there are no capabilities anywhere in the
+⚠️ The project README claimed (until the 2026-09 documentation rewrite, which removed it) that Nyx
+"implements capability-based permissions" and "explicit user pointer validation on every syscall
+boundary". Neither is accurate — there are no capabilities anywhere in the
 tree, and syscall arms 510, 511, 541, 542 and 558 perform no pointer validation at all. This document
 does not inherit that claim.
 

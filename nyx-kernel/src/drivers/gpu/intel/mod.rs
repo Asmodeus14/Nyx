@@ -119,7 +119,7 @@ impl IntelGpuDriver {
         match device_id {
             // Gen9 / Gen9.5 (Skylake, Kaby Lake, Coffee Lake, Comet Lake — all share the Gen9 render arch)
             0x3185 | 0x3E9B | 0x5917 | 0x5916 => GpuGeneration::Gen9,
-            // Comet Lake (Gen9.5) — mobile + desktop SKUs (see NYX-Evolution.txt device table)
+            // Comet Lake (Gen9.5) — mobile + desktop SKUs. The 3D engine was brought up on 0x9BC4.
             0x9B41 | 0x9B21 | 0x9BCA | 0x9BAA | 0x9BCC | 0x9BAC
             | 0x9BC5 | 0x9BC8 | 0x9BA8 | 0x9BC4 | 0x9BA4 | 0x9BF6
             | 0x9BC6 | 0x9BE6 => GpuGeneration::Gen9,

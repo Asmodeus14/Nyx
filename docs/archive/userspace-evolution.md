@@ -1,3 +1,21 @@
+# Archive — Userspace platform evolution (std, apps, qclang)
+
+> **Archived.** This was the working roadmap for Nyx's userspace platform, kept at the repo root as
+> `NYX-Evolution.txt`. It is preserved verbatim below for its design reasoning (why a `nyx` std PAL
+> rather than a rustc fork, the SysV startup contract, the build-std mechanism).
+>
+> **What later shipped** (verified against the tree when archived):
+>
+> | Item | Outcome |
+> |---|---|
+> | A — Image Viewer | 🟢 `apps/imageviewer`; BMP/TGA plus PNG and JPEG via `libs/image` (`zune-jpeg`) |
+> | B — real `std` (`target_os = "nyx"`) | 🟢 PAL in `vendor/nyx-std/`, built by `Build-std.sh`; `terminal`, `notepad`, `qcstudio`, `stdgui` are std apps; `tests/stdhello` covers HashMap, `tests/stdchild` covers `std::process` |
+> | C — qclang on-device | 🟢 `apps/qcstudio` compiles QCLang on Nyx via the portable `qclang_compiler` library |
+>
+> The "STATUS SUMMARY" block below is the status *at the time it was written*; the table above
+> supersedes it. The current roadmap is [`docs/ROADMAP.md`](../ROADMAP.md).
+
+```text
 
 ================================================================================
 Nyx OS — Userspace Platform Evolution (std, apps, qclang)
@@ -191,3 +209,4 @@ BUILD / TEST NOTES (this workstream)
   iteration on the SysV/TLS/PAL bring-up; fall back to bare metal if it misbehaves.
 - Build everything in WSL Ubuntu (no Rust on the Windows host):
     wsl.exe -- bash -lc 'cd /mnt/c/CODE/Nyx && ./Build.sh'
+```
