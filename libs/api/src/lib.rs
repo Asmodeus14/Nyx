@@ -2286,6 +2286,12 @@ pub fn sys_gpu_health() -> Option<GpuHealth> {
     if rc == n { Some(h) } else { None }
 }
 
+/// How the boot-time keyboard repeat-rate setup went: 0 not tried, 1 set (250 ms / 30 cps),
+/// 2 no ACK for the command (unchanged), 3 no ACK for the rate (re-enabled, unchanged).
+pub fn sys_keyboard_typematic() -> u8 {
+    syscall(SYS_SCHED_STATS, 4, 0, 0, 0, 0, 0) as u8
+}
+
 /// Read one core's scheduler statistics. `None` if that core does not exist.
 pub fn sys_sched_stats(core: u64) -> Option<SchedStats> {
     let mut s = SchedStats::default();

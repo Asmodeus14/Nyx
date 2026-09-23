@@ -4154,6 +4154,10 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     unsafe { core::ptr::copy_nonoverlapping(&h as *const _ as *const u8, out, n) };
                     frame.rax = n as u64;
                 }
+                4 => {
+                    // How the boot-time keyboard repeat-rate handshake went (mouse::TYPEMATIC).
+                    frame.rax = crate::mouse::TYPEMATIC.load(core::sync::atomic::Ordering::Relaxed) as u64;
+                }
                 _ => { frame.rax = u64::MAX; }
             }
         }

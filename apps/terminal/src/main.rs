@@ -3856,6 +3856,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
                 self.output_history.push_str("  touchpad status   - which path drives the pointer (I2C enables itself at boot)\n");
                 self.output_history.push_str("  gpu               - render engine health, and which font the desktop is using\n");
+                self.output_history.push_str("  keyboard          - whether the fast key-repeat rate was set at boot\n");
                 self.output_history.push_str("  touchpad ptp      - multi-touch: 2-finger scroll + right-click, 3-finger swipes\n");
                 self.output_history.push_str("  touchpad mouse    - back to the touchpad's own mouse emulation\n");
                 self.output_history.push_str("  touchpad log      - last 8 multi-touch reports, raw and decoded\n");
@@ -4413,6 +4414,15 @@ impl NyxApp for TerminalApp {
                         _ => self.output_history.push_str("usage: touchpad speed <10-400>\n"),
                     }
                 }
+            } else if cmd == "keyboard" {
+                self.output_history.push_str(match sys_keyboard_typematic() {
+                    1 => "keyboard repeat: 250 ms delay, 30 characters/s (set at boot, acknowledged)\n",
+                    2 => "keyboard repeat: power-on default (500 ms, ~11/s) — the keyboard did not \
+                          acknowledge the set-rate command\n",
+                    3 => "keyboard repeat: power-on default — the rate byte was not acknowledged; the \
+                          keyboard was re-enabled\n",
+                    _ => "keyboard repeat: not attempted this boot\n",
+                });
             } else if cmd == "gpu" {
                 // Which font the desktop is in, and why. The shell falls back to the CPU bitmap
                 // font whenever the kernel refuses GPU text — so the refusal counts answer "is

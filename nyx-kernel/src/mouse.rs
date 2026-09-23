@@ -2,6 +2,15 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 use lazy_static::lazy_static;
 
+/// How the keyboard repeat-rate setup went at boot — the `keyboard` command reports it.
+pub static TYPEMATIC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub const TYPEMATIC_NOT_TRIED: u8 = 0;
+pub const TYPEMATIC_OK: u8 = 1;
+/// The keyboard did not acknowledge 0xF3 (set typematic): nothing changed.
+pub const TYPEMATIC_NO_ACK_CMD: u8 = 2;
+/// It acknowledged 0xF3 but not the rate byte: re-enabled, rate unchanged.
+pub const TYPEMATIC_NO_ACK_RATE: u8 = 3;
+
 const PS2_CMD_PORT: u16 = 0x64;
 const PS2_DATA_PORT: u16 = 0x60;
 
@@ -58,25 +67,37 @@ impl MouseDriver {
             self.wait_for_write(); self.command_port.write(0x60);
             self.wait_for_write(); self.data_port.write(status);
             
-            // ⚠️⚠️ THE KEYBOARD TYPEMATIC HANDSHAKE USED TO LIVE HERE, AND IT KILLED THE TOUCHPAD.
+            // ★ Keyboard repeat rate: 250 ms delay, 30 characters/s (0xF3, 0x00). The 8042 powers
+            //   up at its SLOWEST setting — 500 ms, then ~10.9 cps — which is most of why held keys
+            //   felt sluggish.
             //
-            // Setting the repeat rate (0xF3, 0x00 -> 250 ms delay / 30 cps) is a genuine
-            // improvement — the 8042 powers up at its SLOWEST setting, 500 ms then ~10.9 cps — but
-            // two attempts at it both left the pointer dead on real hardware, and it is not worth a
-            // dead pointer on a laptop.
+            // ⚠️⚠️ Two earlier attempts killed the (then PS/2) touchpad on the hardware. Both read
+            // the controller's replies BLINDLY: one byte after each command, whatever it was. The
+            // output buffer can hold stale bytes from the firmware at this point, so one stale byte
+            // shifts every "ACK" after it by one — and the mouse's own 0xFA ACK is then left behind
+            // for the packet decoder, where 0xFA (bit 3 set) looks like a packet start. Moving the
+            // handshake before 0xF6/0xF4 could not fix that, which is what was observed.
             //
-            // First attempt put it AFTER `0xF4` ("enable data reporting"), so the mouse was already
-            // streaming 3-byte packets into the same output buffer the handshake reads from.
-            // `wait_for_read` only tests status bit 0 (output buffer full), never bit 5 (AUX data),
-            // so it cannot tell a keyboard ACK from a mouse byte and the blind reads desynchronised
-            // the packet state machine. Moving it BEFORE `0xF6`/`0xF4` did NOT fix it, so that
-            // explanation was incomplete at best.
-            //
-            // ⚠️ QEMU reproduces NEITHER failure — its 8042 tolerates the interleaving and clicks
-            // keep working — so this cannot be developed here. Reintroducing it needs, at minimum:
-            // drain the output buffer first, then VERIFY each response is 0xFA instead of reading
-            // blindly, and treat a missing ACK as "skip the whole thing" rather than continuing.
-            // Until that can be tested against the real controller, the pointer wins.
+            // This version drains first, VERIFIES each reply is 0xFA (discarding any byte the
+            // status register marks as AUX), gives up on a missing ACK instead of reading on, and
+            // drains again so the mouse sequence below — unchanged from the known-good version —
+            // starts from an empty buffer. Interrupts are still off here (main.rs enables them
+            // after this), so no handler can take a reply first. The outcome is recorded in
+            // TYPEMATIC for the `keyboard` command: QEMU's 8042 cannot reproduce the old failure,
+            // so the hardware has to be able to say how this went.
+            self.drain();
+            let result = if !self.kbd_command(0xF3) {
+                TYPEMATIC_NO_ACK_CMD
+            } else if !self.kbd_command(0x00) {
+                // The keyboard took 0xF3 and is waiting for a parameter it did not acknowledge.
+                // "Enable" ends that state rather than leaving it to swallow the next byte.
+                let _ = self.kbd_command(0xF4);
+                TYPEMATIC_NO_ACK_RATE
+            } else {
+                TYPEMATIC_OK
+            };
+            TYPEMATIC.store(result, core::sync::atomic::Ordering::Relaxed);
+            self.drain();
 
             // 🚨 THE FIX: 0xF6 (Set Defaults) instead of 0xFF (Reset).
             // This prevents the hardware from flooding the buffer with 3 bytes and breaking the packet cycle!
@@ -85,6 +106,41 @@ impl MouseDriver {
 
             self.write_mouse(0xF4);
             self.wait_for_read(); let _ = self.data_port.read();
+        }
+    }
+
+    /// Empty the controller's output buffer. Bounded: a stuck status bit must not hang boot.
+    unsafe fn drain(&mut self) {
+        for _ in 0..32 {
+            if self.command_port.read() & 0x01 == 0 {
+                return;
+            }
+            let _ = self.data_port.read();
+        }
+    }
+
+    /// Send one byte to the KEYBOARD and wait for its reply. True only for a genuine 0xFA ACK.
+    ///
+    /// A byte the status register marks as AUX (bit 5) came from the mouse port — discarded, and the
+    /// wait continues. 0xFE (resend) or anything else is a failure. 20 ms is far longer than any
+    /// keyboard needs, and bounds the wait if there is no keyboard at all.
+    unsafe fn kbd_command(&mut self, byte: u8) -> bool {
+        self.wait_for_write();
+        self.data_port.write(byte);
+        let dl = crate::drivers::gpu::intel::render::SpinDeadline::new(20_000);
+        loop {
+            let status = self.command_port.read();
+            if status & 0x01 != 0 {
+                let b = self.data_port.read();
+                if status & 0x20 != 0 {
+                    continue; // mouse data, not our reply
+                }
+                return b == 0xFA;
+            }
+            if dl.expired() {
+                return false;
+            }
+            core::hint::spin_loop();
         }
     }
 
