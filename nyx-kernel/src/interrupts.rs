@@ -683,7 +683,9 @@ lazy_static! {
         
         // new x86-interrupt handler directly to slot 0x30 (48) outside the unsafe block
         idt[0x30].set_handler_fn(rtl8168_interrupt_handler);
-        
+        // 0x31 is the Wi-Fi MSI (pci.rs); 0x32 is the I2C-HID touchpad's level-triggered GSI.
+        idt[crate::drivers::i2c_hid::IRQ_VECTOR as usize].set_handler_fn(i2c_hid_interrupt_handler);
+
         idt
     };
 }
@@ -6138,6 +6140,26 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize, t
         return 0;
     }
     EBADF
+}
+
+/// The I2C-HID touchpad's "report ready" line (GSI 82 on the test laptop), level-triggered.
+///
+/// ★ Mask, flag, EOI — nothing else. A level-triggered line stays asserted until the host READS the
+/// report over I2C, which takes a few hundred microseconds of bus time and cannot happen here. So
+/// the entry is masked (or it would re-fire the instant EOI is sent), the poll in the `usb-hid` task
+/// reads exactly one report, and unmasks. If another report is already waiting, the still-asserted
+/// line fires again as soon as it is unmasked.
+///
+/// This is what stops the pointer drifting on its own: reading the input register WITHOUT waiting
+/// for this line returns the last report again, so its motion was being applied over and over.
+pub extern "x86-interrupt" fn i2c_hid_interrupt_handler(_stack_frame: x86_64::structures::idt::InterruptStackFrame) {
+    let gsi = crate::drivers::i2c_hid::IRQ_GSI.load(core::sync::atomic::Ordering::Relaxed);
+    if gsi != 0 {
+        crate::ioapic::set_masked(gsi, true);
+    }
+    crate::drivers::i2c_hid::IRQ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::drivers::i2c_hid::PENDING.store(true, core::sync::atomic::Ordering::Release);
+    crate::apic::end_of_interrupt();
 }
 
 pub extern "x86-interrupt" fn rtl8168_interrupt_handler(_stack_frame: x86_64::structures::idt::InterruptStackFrame) {

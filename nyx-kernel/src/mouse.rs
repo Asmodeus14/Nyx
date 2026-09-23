@@ -101,7 +101,11 @@ pub fn update_from_usb(dx: i8, dy: i8, buttons: u8) {
 /// Move the pointer by a relative delta in SCREEN convention (positive dy = down) and set the
 /// buttons (bit 0 left, bit 1 right, bit 2 middle). Shared by USB HID and the I2C-HID touchpad.
 pub fn update_relative(dx: i32, dy: i32, buttons: u8) {
-    let (nx, ny) = {
+    // ⚠️ Interrupts masked while MOUSE_STATE is held. Callers are kernel TASKS (IF=1) — the USB and
+    // I2C-HID pollers — and syscall 505 takes this same lock at IF=0. A task preempted while holding
+    // it would leave that syscall spinning on its core forever: the preemption-boundary deadlock.
+    // The PS/2 path never had this problem only because it runs inside its IRQ handler.
+    let (nx, ny) = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut state = MOUSE_STATE.lock();
         let new_x = state.x as i64 + (dx as i64);
         let new_y = state.y as i64 + (dy as i64);
@@ -111,7 +115,7 @@ pub fn update_relative(dx: i32, dy: i32, buttons: u8) {
         state.right_click = (buttons & 0x02) != 0;
         state.middle_click = (buttons & 0x04) != 0;
         (state.x, state.y)
-    };
+    });
     // Drive the hardware cursor plane directly (no-op if it isn't enabled). Lockless MMIO.
     crate::drivers::gpu::intel::cursor::move_to(nx, ny);
 }
