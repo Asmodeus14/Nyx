@@ -58,6 +58,9 @@ pub struct KernelStore {
     /// (attr-0 ch2). Used ONLY by the text scene's glyph mesh (`Scene::set_text_mesh`); every other path
     /// keeps its own `ps_off`, so this adds zero regression surface. 0 until placed.
     pub ps_text_off: u32,
+    /// Diagnostic: a constant-colour (magenta) PS with no sampler message at all — `gpu retry
+    /// solid`. 0 until placed.
+    pub ps_solid_off: u32,
 }
 
 impl KernelStore {
@@ -91,6 +94,7 @@ impl KernelStore {
             ps_opacity_off: 0,
             ps_rounded_off: 0,
             ps_text_off: 0,
+            ps_solid_off: 0,
         })
     }
 
@@ -720,6 +724,14 @@ pub unsafe fn build_and_dump_kernels(mmio_base: u64) -> Result<KernelStore, Rend
     let pst = build_ps_text();
     let ps_text_off = store.place(&pst)?;
     store.ps_text_off = ps_text_off;
+
+    // Diagnostic only (`gpu retry solid`): the simplest possible pixel shader — four movs and a
+    // headerless RT write. If this hangs too, the sampler is not the problem.
+    let pss = build_ps([1.0, 0.0, 1.0, 1.0]);
+    // Non-fatal: a diagnostic must never cost the real kernels their store.
+    if let Ok(off) = store.place(&pss) {
+        store.ps_solid_off = off;
+    }
 
     Ok(store)
 }

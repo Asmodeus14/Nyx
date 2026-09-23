@@ -102,9 +102,12 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
         return false;
     }
 
-    // Rebuild the scene only when the window SET changed (not on a pure move).
+    // Rebuild the scene only when the window SET changed (not on a pure move) — or when `gpu
+    // retry` changed the pixel shader, which is baked into it.
+    use core::sync::atomic::Ordering;
     let sig: Vec<(u32, u32, u32)> = quads.iter().map(|q| (q.tex_gva, q.src_w, q.src_h)).collect();
-    if ctx.scene.is_none() || ctx.sig != sig {
+    let forced = super::COMPOSITE_REBUILD.swap(false, Ordering::Relaxed);
+    if forced || ctx.scene.is_none() || ctx.sig != sig {
         let mut scene = match unsafe {
             eng.create_compositor_scene(0x1400_0000, sw, sh, pitch)
         } {
@@ -121,6 +124,19 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
         for q in quads {
             if unsafe { scene.add_window_quad(q.tex_gva, q.src_pitch, q.src_w, q.src_h) }.is_err() {
                 return false;
+            }
+        }
+        // `gpu retry`: bisect a pixel-stage hang by swapping the window quads' PS.
+        if let Some(k) = eng.kernels.as_ref() {
+            let over = match super::COMPOSITE_PS_MODE.load(Ordering::Relaxed) {
+                1 => k.ps_solid_off,
+                2 => k.ps_off,
+                _ => 0,
+            };
+            if over != 0 {
+                for m in scene.meshes.iter_mut() {
+                    m.ps_off = over;
+                }
             }
         }
         ctx.scene = Some(scene);
@@ -163,7 +179,6 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
     //
     // "Did the composite work" is the question the fallback actually turns on, so that is what gets
     // counted.
-    use core::sync::atomic::Ordering;
     if ok.is_err() {
         super::RENDER_HANGS.fetch_add(1, Ordering::Relaxed);
         // On a GPU hang the scene may be wedged; drop it so the next call rebuilds, and fall back.

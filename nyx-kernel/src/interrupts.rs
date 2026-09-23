@@ -4158,6 +4158,11 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     // How the boot-time keyboard repeat-rate handshake went (mouse::TYPEMATIC).
                     frame.rax = crate::mouse::TYPEMATIC.load(core::sync::atomic::Ordering::Relaxed) as u64;
                 }
+                5 => {
+                    // `gpu retry <mode>`: pick the compositor's pixel shader (0 normal, 1 solid
+                    // colour, 2 plain textured) and clear the latch so it tries again.
+                    frame.rax = crate::drivers::gpu::intel::render::retry_with_ps(arg2 as u32) as u64;
+                }
                 _ => { frame.rax = u64::MAX; }
             }
         }

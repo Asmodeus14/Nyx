@@ -2279,14 +2279,17 @@ pub struct GpuHealth {
     /// Boot self-tests, one bit each: 0 bring-up, 1 ring store, 2 ring PIPE_CONTROL fence,
     /// 3 batch buffer, 4 batch test attempted.
     pub boot_tests: u32,
-    pub _pad: u32,
+    /// The GPU's PCI device ID.
+    pub device_id: u32,
     /// The render engine's registers at the first hang this boot.
     pub first_hang: GpuHangSnapshot,
     /// The first failed composite/text/GL scene this boot: `fence_got` = last progress marker the
     /// engine wrote, `fence_want` = stream dwords, `_pad` = cause (1 ring full, 2 fence timeout).
     pub scene_hang: GpuHangSnapshot,
+    /// The compositor's pixel shader (`sys_gpu_retry`): 0 normal, 1 solid, 2 textured.
+    pub ps_mode: u32,
 }
-const _: () = assert!(core::mem::size_of::<GpuHealth>() == 168);
+const _: () = assert!(core::mem::size_of::<GpuHealth>() == 172);
 
 /// Mirrors the kernel's `render::HangSnapshot`.
 #[repr(C)]
@@ -2323,6 +2326,13 @@ pub fn sys_gpu_health() -> Option<GpuHealth> {
 /// 2 no ACK for the command (unchanged), 3 no ACK for the rate (re-enabled, unchanged).
 pub fn sys_keyboard_typematic() -> u8 {
     syscall(SYS_SCHED_STATS, 4, 0, 0, 0, 0, 0) as u8
+}
+
+/// Clear the render engine's hang latch and have the compositor try again with pixel shader
+/// `mode`: 0 normal, 1 solid colour (no texture sampling — windows turn magenta if it works),
+/// 2 plain textured (sampling, no opacity). True if the engine exists and took the request.
+pub fn sys_gpu_retry(mode: u32) -> bool {
+    syscall(SYS_SCHED_STATS, 5, mode as u64, 0, 0, 0, 0) == 1
 }
 
 /// Read one core's scheduler statistics. `None` if that core does not exist.

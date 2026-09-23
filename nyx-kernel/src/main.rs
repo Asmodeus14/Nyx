@@ -351,6 +351,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let head = unsafe { gpu.read_reg(0x22034) };
             let tail = unsafe { gpu.read_reg(0x22030) };
             crate::serial_println!("[DEBUG] Before Test: HEAD={:#x}, TAIL={:#x}", head, tail);
+            // For `gpu`: the 3D engine was brought up on a Comet Lake-H (0x9BC4); other SKUs
+            // are not proven, so the ID is part of every report.
+            crate::drivers::gpu::intel::render::DEVICE_ID
+                .store(gpu.device_id as u32, core::sync::atomic::Ordering::Relaxed);
             Some(gpu.mmio_base)
         } else {
             None

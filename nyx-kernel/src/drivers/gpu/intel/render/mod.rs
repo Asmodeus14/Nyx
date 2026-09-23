@@ -224,11 +224,14 @@ pub struct GpuHealth {
     pub gpu_present: u32,
     /// [`BOOT_TESTS`] bits.
     pub boot_tests: u32,
-    pub _pad: u32,
+    /// The GPU's PCI device ID ([`DEVICE_ID`]).
+    pub device_id: u32,
     /// The first hang of this boot ([`FIRST_HANG`]); `valid` 0 if there has been none.
     pub first_hang: HangSnapshot,
     /// The first failed scene submission ([`SCENE_HANG`]).
     pub scene_hang: HangSnapshot,
+    /// [`COMPOSITE_PS_MODE`].
+    pub ps_mode: u32,
 }
 
 pub fn health() -> GpuHealth {
@@ -245,10 +248,44 @@ pub fn health() -> GpuHealth {
         // busy, it is certainly present.
         gpu_present: RENDER_ENGINE.try_lock().map_or(true, |e| e.initialized) as u32,
         boot_tests: BOOT_TESTS.load(Relaxed),
-        _pad: 0,
+        device_id: DEVICE_ID.load(Relaxed),
         first_hang: FIRST_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
         scene_hang: SCENE_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
+        ps_mode: COMPOSITE_PS_MODE.load(Relaxed),
     }
+}
+
+/// The GPU's PCI device ID, set at boot. For `gpu`.
+pub static DEVICE_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Which pixel shader window quads use: 0 the normal one (textured + opacity), 1 a SOLID
+/// colour with no texture sampling, 2 plain textured (sampling, no opacity). Set by
+/// `gpu retry`, to bisect a pixel-stage hang on hardware.
+///
+/// ★ Hardware (2026-09-23, Dell, not the Comet Lake-H the 3D engine was brought up on): every
+/// composite stalls on the PIPE_CONTROL after mesh 0's 3DPRIMITIVE, with INSTDONE_1 =
+/// 0xffdfffff — every geometry unit DONE, only CS waiting. So the draw hangs in the pixel stage
+/// (dispatch, the sampler, or the RT write), which INSTDONE_1 does not cover. Solid vs
+/// textured tells the sampler apart from the rest.
+pub static COMPOSITE_PS_MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Set when the compositor must rebuild its cached scene (the PS is baked into it).
+pub static COMPOSITE_REBUILD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `gpu retry <mode>`: switch the compositor's pixel shader, forget the last failure and clear
+/// the latch, so the next composite tries again. False if there is no render engine.
+pub fn retry_with_ps(mode: u32) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if mode > 2 || DEVICE_ID.load(Relaxed) == 0 {
+        return false;
+    }
+    COMPOSITE_PS_MODE.store(mode, Relaxed);
+    COMPOSITE_REBUILD.store(true, Relaxed);
+    if let Some(mut s) = SCENE_HANG.try_lock() {
+        s.valid = 0;
+    }
+    RENDER_HANGS.store(0, Relaxed);
+    true
 }
 
 pub fn engine_is_wedged() -> bool {

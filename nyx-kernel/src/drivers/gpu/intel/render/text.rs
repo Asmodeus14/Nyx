@@ -109,6 +109,11 @@ pub fn draw_text(atlas_gva: u32, atlas_w: u32, atlas_h: u32, atlas_pitch: u32, g
         super::TEXT_REFUSED_WEDGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
+    // A `gpu retry` experiment is testing the COMPOSITOR's pixel shader. Text has its own and
+    // strikes the same latch, so it stands aside rather than muddy the result (the CPU draws it).
+    if super::COMPOSITE_PS_MODE.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return false;
+    }
     if glyphs.is_empty() {
         return true;
     }

@@ -4423,6 +4423,25 @@ impl NyxApp for TerminalApp {
                           keyboard was re-enabled\n",
                     _ => "keyboard repeat: not attempted this boot\n",
                 });
+            } else if let Some(arg) = cmd.strip_prefix("gpu retry") {
+                // Bisect the pixel-stage hang: clear the latch and let the compositor try again
+                // with a different pixel shader. Then `gpu` says whether it latched again.
+                let (mode, what) = match arg.trim() {
+                    "solid" => (1, "a SOLID magenta shader (no texture sampling) — if the GPU \
+                                    works, windows turn magenta; `gpu retry normal` restores them"),
+                    "tex" => (2, "the plain TEXTURED shader (sampling, no opacity)"),
+                    "" | "normal" => (0, "the normal shader"),
+                    _ => (99, ""),
+                };
+                if mode == 99 {
+                    self.output_history.push_str("usage: gpu retry [solid|tex|normal]\n");
+                } else if sys_gpu_retry(mode) {
+                    self.output_history.push_str(&format!(
+                        "render latch cleared; the compositor is retrying with {}.\n\
+                         Move a window, then run `gpu`.\n", what));
+                } else {
+                    self.output_history.push_str("gpu retry: no Intel render engine\n");
+                }
             } else if cmd == "gpu" {
                 // Which font the desktop is in, and why. The shell falls back to the CPU bitmap
                 // font whenever the kernel refuses GPU text — so the refusal counts answer "is
@@ -4456,7 +4475,11 @@ impl NyxApp for TerminalApp {
                             let t = h.boot_tests;
                             let r = |bit: u32| if t & (1 << bit) != 0 { "pass" } else { "FAIL" };
                             self.output_history.push_str(&format!(
-                                "  boot tests: bring-up {}  ring store {}  ring fence {}  batch {}\n",
+                                "  device {:#06x}{}   compositor shader: {}\n  \
+                                 boot tests: bring-up {}  ring store {}  ring fence {}  batch {}\n",
+                                h.device_id,
+                                if h.device_id == 0x9BC4 { " (the Comet Lake-H the 3D engine was built on)" } else { "" },
+                                match h.ps_mode { 1 => "SOLID test", 2 => "TEXTURED test", _ => "normal" },
                                 r(0), r(1), r(2),
                                 if t & (1 << 4) == 0 { "not run" } else { r(3) },
                             ));
