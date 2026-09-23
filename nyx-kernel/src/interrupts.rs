@@ -4446,6 +4446,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         | (PTP_ACTIVE.load(Relaxed) as u64) << 2
                         | ((MODE_RESULT.load(Relaxed) as u64) & 0x7) << 3
                         | (PTP_FAILED.load(Relaxed) as u64) << 6
+                        | (crate::drivers::i2c_hid::ADOPTED_PTP.load(Relaxed) as u64) << 7
                         | seq << 16
                         | (IRQ_COUNT.load(Relaxed) as u64) << 32;
                 }
@@ -4482,6 +4483,17 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         }
                         None => 0,
                     };
+                }
+                10 => {
+                    // op 10: reports received since the pointer was taken, 16 bits each, low to
+                    // high: mouse, touch pad, other IDs, empty/oversized reads (saturating).
+                    use core::sync::atomic::Ordering::Relaxed;
+                    use crate::drivers::i2c_hid::{COUNT_EMPTY, COUNT_MOUSE, COUNT_OTHER, COUNT_PTP};
+                    let c = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed).min(0xFFFF) as u64;
+                    frame.rax = c(&COUNT_MOUSE)
+                        | c(&COUNT_PTP) << 16
+                        | c(&COUNT_OTHER) << 32
+                        | c(&COUNT_EMPTY) << 48;
                 }
                 8 => {
                     // op 8: switch input mode. arg2 = 3 precision (multi-touch), anything else

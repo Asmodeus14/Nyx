@@ -4414,7 +4414,8 @@ impl NyxApp for TerminalApp {
             } else if cmd == "touchpad status" {
                 let s = sys_i2c_hid_status();
                 self.output_history.push_str(&format!(
-                    "pointer: {}\n  mode: {}\n  probes run: {}   interrupts taken: {}   speed: {}%\n",
+                    "pointer: {}\n  mode: {}{}\n  probes run: {}   interrupts taken: {}   speed: {}%\n  \
+                     reports: mouse {}  touch pad {}  other {}  empty {}\n",
                     if s.active {
                         "I2C touchpad"
                     } else if s.fell_back {
@@ -4430,9 +4431,15 @@ impl NyxApp for TerminalApp {
                     } else {
                         "mouse emulation (the touchpad's own firmware); `touchpad ptp` for multi-touch"
                     },
+                    if s.adopted_ptp {
+                        "\n    (the DEVICE switched itself to precision mode, and the driver followed)"
+                    } else {
+                        ""
+                    },
                     s.probes,
                     s.irqs,
                     sys_i2c_hid_speed(0),
+                    s.counts[0], s.counts[1], s.counts[2], s.counts[3],
                 ));
             } else if cmd == "touchpad log" {
                 // The last 8 reports received in precision mode: raw bytes beside what the kernel

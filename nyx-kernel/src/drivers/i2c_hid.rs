@@ -237,6 +237,35 @@ const _: () = assert!(core::mem::size_of::<LogEntry>() == 28);
 
 pub const LOG_LEN: usize = 8;
 
+/// Reports received since the pointer was last taken, by kind — `touchpad status`. Mouse (the
+/// mouse collection), touch pad (precision), other IDs, and empty/oversized reads.
+pub static COUNT_MOUSE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static COUNT_PTP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static COUNT_OTHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static COUNT_EMPTY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The device was found sending precision-mode reports while the driver was in mouse mode, and the
+/// driver followed it.
+pub static ADOPTED_PTP: AtomicBool = AtomicBool::new(false);
+
+/// IDs of the ELAN's collections, fixed per device but only known after parsing; cached here so
+/// `count_report` does not need the device. 0 = not yet known.
+static MOUSE_ID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PTP_ID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn count_report(id: u8) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = if id == 0xFE {
+        &COUNT_EMPTY
+    } else if id != 0 && id == MOUSE_ID.load(Relaxed) {
+        &COUNT_MOUSE
+    } else if id != 0 && id == PTP_ID.load(Relaxed) {
+        &COUNT_PTP
+    } else {
+        &COUNT_OTHER
+    };
+    c.fetch_add(1, Relaxed);
+}
+
 /// The last [`LOG_LEN`] reports received in precision mode, oldest first after rotation —
 /// `touchpad log`. ★ Exists because the first precision-mode build threw the pointer across the
 /// screen on hardware, and the device's real report layout was not known: raw bytes beside the
@@ -497,6 +526,12 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
                 ptp_trial_until: 0,
             });
             PTP_ACTIVE.store(false, Ordering::Release);
+            MOUSE_ID.store(p.mouse.report_id, Ordering::Relaxed);
+            PTP_ID.store(p.ptp.map_or(0, |t| t.report_id), Ordering::Relaxed);
+            for c in [&COUNT_MOUSE, &COUNT_PTP, &COUNT_OTHER, &COUNT_EMPTY] {
+                c.store(0, Ordering::Relaxed);
+            }
+            ADOPTED_PTP.store(false, Ordering::Relaxed);
             PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
             FELL_BACK.store(false, Ordering::Relaxed);
             POINTER_ACTIVE.store(true, Ordering::Release);
@@ -584,21 +619,36 @@ fn poll() {
                 PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
                 let id = if dev.p.uses_ids { buf[2] } else { 0 };
                 let body = &buf[if dev.p.uses_ids { 3 } else { 2 }..len];
+                count_report(id);
+                let is_ptp_id = dev.p.ptp.map_or(false, |t| t.report_id == id);
+                // ★ A precision-mode report while we think the device is in mouse mode: the
+                // DEVICE switched (after `touchpad handover` the firmware appears to do exactly
+                // that — the pointer went dead in "mouse mode" with nothing but a working reset).
+                // Follow the device instead of dropping every report it sends.
+                if is_ptp_id && !dev.ptp_on {
+                    dev.ptp_on = true;
+                    PTP_ACTIVE.store(true, Ordering::Release);
+                    let x_max = dev.p.ptp.map_or(1000, |t| t.x_max);
+                    dev.engine = crate::drivers::gesture::Engine::new(
+                        crate::drivers::gesture::Config::for_pad(x_max),
+                    );
+                    dev.asm = FrameAsm::EMPTY;
+                    ADOPTED_PTP.store(true, Ordering::Release);
+                }
                 if id == dev.p.mouse.report_id {
                     mouse_report(dev, body);
-                    if dev.ptp_on {
-                        log_report(&buf[2..len], 0xFF, 0, 0);
-                    }
-                } else if dev.ptp_on && dev.p.ptp.map_or(false, |t| t.report_id == id) {
+                    log_report(&buf[2..len], 0xFF, 0, 0);
+                } else if is_ptp_id {
                     let (n, x, y) = ptp_report(dev, body, now);
                     log_report(&buf[2..len], n, x, y);
-                } else if dev.ptp_on {
+                } else {
                     log_report(&buf[2..len], 0xFF, 0, 0);
                 }
-            } else if dev.ptp_on {
+            } else {
                 // Empty (len ≤ 2) or longer than the declared maximum. Logged too: after the
                 // first precision-mode attempt the log was EMPTY, and "no reports" could not be
                 // told apart from "reads that returned nothing". The whole buffer, length included.
+                count_report(0xFE);
                 log_report(&buf[..n.min(16)], 0xFE, len as i32, 0);
             }
         }

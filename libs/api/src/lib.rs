@@ -1035,6 +1035,10 @@ pub struct TouchpadStatus {
     pub mode_result: u8,
     /// Precision mode went silent on I2C and was reverted to mouse mode automatically.
     pub ptp_failed: bool,
+    /// The device was sending precision-mode reports while in "mouse mode", and the driver followed.
+    pub adopted_ptp: bool,
+    /// Reports since the pointer was taken: mouse collection, touch pad, other IDs, empty reads.
+    pub counts: [u32; 4],
     /// Probes completed, including the automatic one at boot.
     pub probes: u32,
     pub irqs: u32,
@@ -1048,6 +1052,11 @@ pub fn sys_i2c_hid_status() -> TouchpadStatus {
         ptp: v & 4 != 0,
         mode_result: ((v >> 3) & 0x7) as u8,
         ptp_failed: v & (1 << 6) != 0,
+        adopted_ptp: v & (1 << 7) != 0,
+        counts: {
+            let c = syscall(578, 10, 0, 0, 0, 0, 0);
+            [c as u32 & 0xFFFF, (c >> 16) as u32 & 0xFFFF, (c >> 32) as u32 & 0xFFFF, (c >> 48) as u32 & 0xFFFF]
+        },
         probes: ((v >> 16) & 0xFFFF) as u32,
         irqs: (v >> 32) as u32,
     }
