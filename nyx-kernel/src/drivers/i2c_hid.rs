@@ -687,7 +687,21 @@ fn mouse_report(dev: &mut Live, body: &[u8]) {
     dev.phys_buttons = buttons;
     // HID relative Y is positive DOWN, the screen's convention — no flip, unlike PS/2.
     crate::mouse::update_relative(mx, my, buttons | dev.pulse_buttons);
+
+    // ★ The touchpad's own two-finger scroll, as a wheel. In mouse mode the FIRMWARE does the
+    // gesture and reports it here — scrolling with no precision mode and no handover, which on this
+    // Dell silenced the I2C side entirely. Wheel +1 is a scroll UP: the view moves toward the top
+    // of the content, so the offset shrinks.
+    if let Some(w) = m.wheel {
+        let notches = w.extract(body).unwrap_or(0);
+        if notches != 0 {
+            SCROLL_ACCUM.fetch_add(-notches * WHEEL_STEP_PX, Ordering::Relaxed);
+        }
+    }
 }
+
+/// Pixels per wheel notch. Browsers use ~40–100; 48 is a line and a half of terminal text.
+const WHEEL_STEP_PX: i32 = 48;
 
 /// A report from the touch pad collection (precision mode): assemble the frame, interpret it, and
 /// turn the result into pointer motion, clicks, scroll and swipes.
@@ -1164,9 +1178,11 @@ fn explore(
     let mouse = hid_desc::mouse_layout(&d);
     match &mouse {
         Some(m) => {
-            let _ = writeln!(out, "  mouse layout: id {} x@{}+{} y@{}+{} btn1@{}",
+            let _ = writeln!(out, "  mouse layout: id {} x@{}+{} y@{}+{} btn1@{} wheel {} pan {}",
                 m.report_id, m.x.bit_off, m.x.size, m.y.bit_off, m.y.size,
-                m.buttons[0].map_or(-1, |b| b.bit_off as i32));
+                m.buttons[0].map_or(-1, |b| b.bit_off as i32),
+                m.wheel.map_or(alloc::string::String::from("none"), |f| alloc::format!("@{}+{}", f.bit_off, f.size)),
+                m.pan.map_or(alloc::string::String::from("none"), |f| alloc::format!("@{}+{}", f.bit_off, f.size)));
         }
         None => {
             let _ = writeln!(out, "  no relative mouse collection");

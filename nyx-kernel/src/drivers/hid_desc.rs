@@ -24,6 +24,8 @@ pub mod usage {
     pub const GD_X: u16 = 0x30;
     pub const GD_Y: u16 = 0x31;
     pub const GD_WHEEL: u16 = 0x38;
+    pub const PAGE_CONSUMER: u16 = 0x0C;
+    pub const CONSUMER_AC_PAN: u16 = 0x238;
 
     pub const DIG_TOUCH_PAD: u16 = 0x05;
     pub const DIG_FINGER: u16 = 0x22;
@@ -430,6 +432,12 @@ pub struct MouseLayout {
     pub buttons: [Option<Field>; 3],
     pub x: Field,
     pub y: Field,
+    /// Vertical wheel (Generic Desktop 0x38). ★ A touchpad in mouse mode reports its OWN
+    /// two-finger scroll here — the firmware does the gesture — so this is scrolling without
+    /// precision mode.
+    pub wheel: Option<Field>,
+    /// Horizontal scroll (Consumer page, AC Pan 0x238).
+    pub pan: Option<Field>,
 }
 
 pub fn mouse_layout(d: &Descriptor) -> Option<MouseLayout> {
@@ -442,7 +450,9 @@ pub fn mouse_layout(d: &Descriptor) -> Option<MouseLayout> {
         let x = d.find(app, PAGE_GENERIC_DESKTOP, GD_X, Some(true))?;
         let y = d.find(app, PAGE_GENERIC_DESKTOP, GD_Y, Some(true))?;
         let b = |n| d.find(app, PAGE_BUTTON, n, None);
-        return Some(MouseLayout { report_id: x.report_id, buttons: [b(1), b(2), b(3)], x, y });
+        let wheel = d.find(app, PAGE_GENERIC_DESKTOP, GD_WHEEL, None);
+        let pan = d.find(app, PAGE_CONSUMER, CONSUMER_AC_PAN, None);
+        return Some(MouseLayout { report_id: x.report_id, buttons: [b(1), b(2), b(3)], x, y, wheel, pan });
     }
     None
 }
@@ -656,6 +666,26 @@ mod tests {
         let b = d.find_feature(0x0D, 0x58).expect("button switch");
         assert_eq!((s.report_id, s.bit_off, b.bit_off), (7, 0, 1));
         assert_eq!(d.feature_report_len(7), 1);
+    }
+
+    /// A mouse with a wheel and AC Pan — the shape of a touchpad's mouse-mode collection, which
+    /// carries the firmware's own two-finger scroll.
+    #[test]
+    fn mouse_layout_finds_wheel_and_pan() {
+        let d = parse(&[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01,
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02,
+            0x95, 0x06, 0x81, 0x03,
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
+            0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06, // AC Pan, 8 bits relative
+            0xC0,
+        ]);
+        let m = mouse_layout(&d).expect("mouse");
+        assert_eq!(m.wheel.expect("wheel").bit_off, 24);
+        assert_eq!(m.pan.expect("pan").bit_off, 32);
+        // Wheel up one notch decodes as +1.
+        assert_eq!(m.wheel.unwrap().extract(&[0, 0, 0, 1, 0]), Some(1));
+        assert_eq!(m.wheel.unwrap().extract(&[0, 0, 0, 0xFF, 0]), Some(-1));
     }
 
     #[test]

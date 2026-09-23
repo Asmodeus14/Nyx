@@ -3859,7 +3859,8 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  touchpad mouse    - back to the touchpad's own mouse emulation\n");
                 self.output_history.push_str("  touchpad log      - last 8 multi-touch reports, raw and decoded\n");
                 self.output_history.push_str("  touchpad speed N  - pointer speed in percent (default 100; 10-400)\n");
-                self.output_history.push_str("  touchpad handover - firmware _DSM: EC stops PS/2 emulation (until power-off!)\n");
+                self.output_history.push_str("  touchpad handover - EXPERIMENTAL firmware _DSM. On the test Dell it silences I2C and\n");
+                self.output_history.push_str("                      leaves the touchpad on PS/2 until a power-off. Not needed normally.\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
                 self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
                 self.output_history.push_str("Scrollback:\n");
