@@ -380,7 +380,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
         iret_slice[0] = crate::thermal::nyx_task_manager_daemon as u64; 
         iret_slice[1] = 0x08; iret_slice[2] = 0x202;             
-        iret_slice[3] = thermal_task.kernel_stack_top; iret_slice[4] = 0x10;              
+        // RSP = top - 8: a task's entry must look CALLED (RSP ≡ 8 mod 16), not jumped to with an
+        // aligned stack. See `smp.rs` — the misalignment faulted ACPICA on this very task.
+        iret_slice[3] = thermal_task.kernel_stack_top - 8; iret_slice[4] = 0x10;
         let regs_ptr = iretq_ptr - 120;
         core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120); 
         let fxsave_ptr = (regs_ptr - 512) & !0xF;
@@ -400,7 +402,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
         iret_slice[0] = crate::process::nyx_idle_task as u64; 
         iret_slice[1] = 0x08; iret_slice[2] = 0x202;             
-        iret_slice[3] = idle_task.kernel_stack_top; iret_slice[4] = 0x10;              
+        iret_slice[3] = idle_task.kernel_stack_top - 8; iret_slice[4] = 0x10; // entered as if called
         let regs_ptr = iretq_ptr - 120;
         core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
         let fxsave_ptr = (regs_ptr - 512) & !0xF;
@@ -446,7 +448,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
             iret_slice[0] = crate::usb::nyx_usb_hid_task as u64;
             iret_slice[1] = 0x08; iret_slice[2] = 0x202;
-            iret_slice[3] = usb_task.kernel_stack_top; iret_slice[4] = 0x10;
+            iret_slice[3] = usb_task.kernel_stack_top - 8; iret_slice[4] = 0x10; // entered as if called
             let regs_ptr = iretq_ptr - 120;
             core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
             let fxsave_ptr = (regs_ptr - 512) & !0xF;
