@@ -1378,9 +1378,20 @@ impl TerminalApp {
             r.vendor_device & 0xFFFF, r.vendor_device >> 16, r.pmcsr_before, r.bar0,
             r.resets_before, r.comp_type, r.comp_param1,
         ));
+        if r.bar0_before != r.bar0 || r.assigned != 0 || r.status == 3 || r.status == 11 {
+            // The BAR assignment and every fact it was checked against — a refusal must say which
+            // check refused, or the next boot is a guess.
+            self.output_history.push_str(&format!(
+                "  BAR0         firmware left {:#x}; {}\n  address map  TOUUD {:#x}  highest BAR >4G {:#x}  \
+                 CPU {} phys bits  BAR size {:#x}\n",
+                r.bar0_before,
+                if r.assigned != 0 { format!("assigned {:#x}", r.bar0) } else { String::from("not assigned") },
+                r.touud, r.highest_bar_above_4g, r.phys_bits, r.bar0_size,
+            ));
+        }
         if r.stage >= 3 {
             self.output_history.push_str(&format!(
-                "  timing       {} hcnt={} lcnt={} hold={} ({})\n",
+                "  timing      {} hcnt={} lcnt={} hold={} ({})\n",
                 if r.mode == 2 { "fast 400k" } else { "standard 100k" },
                 r.hcnt, r.lcnt, r.hold,
                 if r.timing_from_fw != 0 { "firmware's values" } else { "our defaults" },

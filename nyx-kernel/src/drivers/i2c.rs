@@ -107,8 +107,14 @@ pub struct Controller {
 pub enum BringUpError {
     /// Vendor ID reads 0xFFFF: the function is hidden (the firmware's `IMn` mode is not PCI) or off.
     Absent,
-    /// BAR0 is unassigned.
-    NoBar,
+    /// BAR0 is unassigned and no address could be given to it safely. See [`BringUpInfo`] for which
+    /// check refused.
+    NoSafeAddress,
+    /// BAR0 is not the 4 KiB 64-bit memory BAR an LPSS controller has — this is not the device the
+    /// assignment logic was written for, so it is left alone.
+    UnexpectedBar,
+    /// Wrote an address into BAR0 and it did not read back.
+    AssignFailed,
     MapFailed,
     /// `IC_COMP_TYPE` was not [`DW_COMP_TYPE`] even after releasing reset. Payload is what it read.
     NotDesignware(u32),
@@ -121,11 +127,39 @@ pub enum BringUpError {
 pub struct BringUpInfo {
     pub vendor_device: u32,
     pub pmcsr_before: u32,
+    /// BAR0 as the firmware left it (address bits only), and as it was finally used.
+    pub bar0_before: u64,
     pub bar0: u64,
+    pub bar0_size: u32,
+    /// True if BAR0 was unassigned and this driver gave it an address.
+    pub assigned: bool,
+    /// Top of upper usable DRAM (host bridge TOUUD). Addresses above it route to PCI.
+    pub touud: u64,
+    /// Highest memory-BAR base any PCI function already has, above 4 GiB (0 = none).
+    pub highest_bar_above_4g: u64,
+    pub phys_bits: u32,
     pub resets_before: u32,
     pub comp_type: u32,
     pub comp_param1: u32,
 }
+
+/// Where an unassigned LPSS BAR0 is placed, with BAR1 immediately after it.
+///
+/// ★ This firmware leaves the Serial IO controllers in PCI mode with BAR0 = 0 and the function in
+/// D3 — measured on hardware: `PMCSR 0xb, BAR0 0x0`. The OS is expected to allocate it, as Windows'
+/// and Linux's PCI cores do from the root bridge's 64-bit window, which on Intel client platforms
+/// starts at 256 GiB. Linux puts these exact controllers at 0x40_1000_0000 on this platform family.
+///
+/// Nyx has no general PCI resource allocator, and the root window cannot be read from ACPI here
+/// (`PCI0._CRS` computes it from host-bridge PCI_Config fields, and `AcpiOsReadPciConfiguration`
+/// returns all-ones). So instead of trusting a window, [`assign_bar0`] proves the address is free:
+/// above TOUUD (so it routes to PCI, not DRAM), within the CPU's physical address width, and above
+/// every BAR any device already has.
+const ASSIGN_BASE: u64 = 0x40_1000_0000;
+/// The bottom of the region nothing else may occupy for [`ASSIGN_BASE`] to be safe. A BAR below
+/// this cannot reach ASSIGN_BASE: 64-bit BARs are aligned to their size, so a BAR at base B < 256
+/// GiB covering 257 GiB would have to be ≥ 256 GiB large.
+const ASSIGN_REGION: u64 = 0x40_0000_0000;
 
 #[inline(always)]
 fn rd(base: u64, off: u64) -> u32 {
@@ -153,6 +187,142 @@ fn find_cap(bus: u8, dev: u8, func: u8, id: u8) -> Option<u8> {
         guard += 1;
     }
     None
+}
+
+/// BAR0's address bits, 64-bit aware. 0 for an I/O BAR.
+fn bar0_address(bus: u8, dev: u8, func: u8) -> u64 {
+    bar_address(bus, dev, func, 0x10).0
+}
+
+/// A memory BAR at config offset `off`: (address, is_64bit). An I/O BAR reads as (0, false).
+fn bar_address(bus: u8, dev: u8, func: u8, off: u8) -> (u64, bool) {
+    let lo = PciDriver::read_config(bus, dev, func, off);
+    if lo & 1 != 0 {
+        return (0, false);
+    }
+    let is64 = (lo >> 1) & 3 == 2;
+    let mut addr = (lo & !0xF) as u64;
+    if is64 {
+        addr |= (PciDriver::read_config(bus, dev, func, off + 4) as u64) << 32;
+    }
+    (addr, is64)
+}
+
+/// Size a 64-bit memory BAR by the all-ones probe, restoring it afterwards.
+///
+/// ⚠️ Only ever called on the controller being brought up, with its memory decode OFF — sizing
+/// rewrites the BAR, and a device decoding while that happens answers at a garbage address. It is
+/// never done to any other device: those are live (the GPU, the NVMe disk) and this is not boot.
+fn size_bar64(bus: u8, dev: u8, func: u8, off: u8) -> u64 {
+    let lo = PciDriver::read_config(bus, dev, func, off);
+    let hi = PciDriver::read_config(bus, dev, func, off + 4);
+    PciDriver::write_config(bus, dev, func, off, 0xFFFF_FFFF);
+    PciDriver::write_config(bus, dev, func, off + 4, 0xFFFF_FFFF);
+    let mlo = PciDriver::read_config(bus, dev, func, off);
+    let mhi = PciDriver::read_config(bus, dev, func, off + 4);
+    PciDriver::write_config(bus, dev, func, off, lo);
+    PciDriver::write_config(bus, dev, func, off + 4, hi);
+    let mask = ((mhi as u64) << 32) | (mlo & !0xF) as u64;
+    if mask == 0 { 0 } else { (!mask).wrapping_add(1) }
+}
+
+/// The highest address any OTHER PCI function already claims above 4 GiB: memory BAR bases, and
+/// the top of every bridge's prefetchable window (a window routes its whole range downstream, so
+/// its LIMIT is what matters). 0 if nothing is up there.
+///
+/// Read-only: bases are read, never sized — see [`size_bar64`] for why.
+fn highest_claim_above_4g(skip: (u8, u8, u8)) -> u64 {
+    let mut top = 0u64;
+    for d in PciDriver::new().scan() {
+        if (d.bus, d.device, d.func) == skip {
+            continue;
+        }
+        let header = (PciDriver::read_config(d.bus, d.device, d.func, 0x0C) >> 16) & 0x7F;
+        let nbars = match header {
+            0 => 6,
+            1 => 2,
+            _ => 0,
+        };
+        let mut i = 0u8;
+        while i < nbars {
+            let (addr, is64) = bar_address(d.bus, d.device, d.func, 0x10 + i * 4);
+            if addr >= 0x1_0000_0000 {
+                top = top.max(addr);
+            }
+            i += if is64 { 2 } else { 1 };
+        }
+        if header == 1 {
+            // Prefetchable window: base/limit in 0x24 (bits 31:20 of each), upper halves 0x28/0x2C.
+            let pl = PciDriver::read_config(d.bus, d.device, d.func, 0x24);
+            let base_hi = PciDriver::read_config(d.bus, d.device, d.func, 0x28) as u64;
+            let limit_hi = PciDriver::read_config(d.bus, d.device, d.func, 0x2C) as u64;
+            let base = (base_hi << 32) | (((pl & 0xFFF0) as u64) << 16);
+            let limit = (limit_hi << 32) | ((((pl >> 16) & 0xFFF0) as u64) << 16) | 0xF_FFFF;
+            if base <= limit && limit >= 0x1_0000_0000 {
+                top = top.max(limit);
+            }
+        }
+    }
+    top
+}
+
+/// Give an unassigned LPSS BAR0 (and its BAR1) an address, or explain why not.
+fn assign_bar0(bus: u8, dev: u8, func: u8, info: &mut BringUpInfo) -> Result<u64, BringUpError> {
+    let lo = PciDriver::read_config(bus, dev, func, 0x10);
+    if lo & 1 != 0 || (lo >> 1) & 3 != 2 {
+        return Err(BringUpError::UnexpectedBar);
+    }
+
+    // Decode off for everything below: sizing and reprogramming a live BAR is how a device ends up
+    // answering at an address that belongs to something else.
+    let cmd = PciDriver::read_config(bus, dev, func, 0x04) & 0xFFFF;
+    PciDriver::write_config(bus, dev, func, 0x04, cmd & !0x6);
+
+    let size = size_bar64(bus, dev, func, 0x10);
+    info.bar0_size = size as u32;
+    if size != 0x1000 {
+        return Err(BringUpError::UnexpectedBar);
+    }
+
+    // TOUUD (host bridge 00:00.0, 0xA8): everything at or above it routes to PCI rather than DRAM.
+    let touud = ((PciDriver::read_config(0, 0, 0, 0xAC) as u64) << 32
+        | PciDriver::read_config(0, 0, 0, 0xA8) as u64)
+        & 0x0000_007F_FFF0_0000;
+    info.touud = touud;
+    let phys_bits = unsafe { core::arch::x86_64::__cpuid(0x8000_0008).eax & 0xFF };
+    info.phys_bits = phys_bits;
+    let highest = highest_claim_above_4g((bus, dev, func));
+    info.highest_bar_above_4g = highest;
+
+    let end = ASSIGN_BASE + 0x2000;
+    let safe = phys_bits >= 39
+        && end <= (1u64 << phys_bits.min(63))
+        && touud != 0
+        && touud <= ASSIGN_REGION
+        && highest < ASSIGN_REGION
+        // The identity mapping must not land on anything already mapped at that virtual address.
+        && unsafe { !crate::memory::user_addr_mapped(ASSIGN_BASE) }
+        && unsafe { !crate::memory::user_addr_mapped(ASSIGN_BASE + 0x1000) };
+    if !safe {
+        return Err(BringUpError::NoSafeAddress);
+    }
+
+    PciDriver::write_config(bus, dev, func, 0x10, ASSIGN_BASE as u32);
+    PciDriver::write_config(bus, dev, func, 0x14, (ASSIGN_BASE >> 32) as u32);
+    if bar0_address(bus, dev, func) != ASSIGN_BASE {
+        return Err(BringUpError::AssignFailed);
+    }
+
+    // BAR1 is the LPSS config-space mirror. Unused here, but a BAR left at zero with memory decode
+    // on claims physical page 0 — so it gets the next page, if it is the same 4 KiB 64-bit shape.
+    let (b1, b1_64) = bar_address(bus, dev, func, 0x18);
+    if b1_64 && b1 < 0x10_0000 && size_bar64(bus, dev, func, 0x18) == 0x1000 {
+        PciDriver::write_config(bus, dev, func, 0x18, (ASSIGN_BASE + 0x1000) as u32);
+        PciDriver::write_config(bus, dev, func, 0x1C, ((ASSIGN_BASE + 0x1000) >> 32) as u32);
+    }
+
+    info.assigned = true;
+    Ok(ASSIGN_BASE)
 }
 
 impl Controller {
@@ -187,23 +357,23 @@ impl Controller {
             }
         }
 
-        // Memory space + bus master.
+        let bar = bar0_address(bus, dev, func);
+        info.bar0_before = bar;
+        // ⚠️ "Unassigned" is anything that is not a plausible MMIO address, not just zero. The
+        // first hardware run mapped BAR0 = 0 and read physical page 0 as if it were the
+        // controller — and leaving page 0 mapped means a kernel null dereference no longer faults.
+        let bar = if bar < 0x10_0000 || bar & 0xFFF != 0 {
+            assign_bar0(bus, dev, func, info)?
+        } else {
+            bar
+        };
+        info.bar0 = bar;
+
+        // Memory space + bus master — only now that BAR0 holds a real address.
         let cmd = PciDriver::read_config(bus, dev, func, 0x04);
         if cmd & 0x6 != 0x6 {
             PciDriver::write_config(bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x6);
         }
-
-        let bar = PciDriver::new()
-            .get_bar_address(
-                &crate::pci::PciDevice {
-                    bus, device: dev, func,
-                    vendor_id: id as u16, device_id: (id >> 16) as u16,
-                    class_id: 0, subclass_id: 0,
-                },
-                0,
-            )
-            .ok_or(BringUpError::NoBar)?;
-        info.bar0 = bar;
 
         // ⚠️ With interrupts masked: `map_mmio` takes MEMORY_MANAGER, which does not mask them
         // itself, and a syscall on this core taking it after a preemption here would deadlock.

@@ -38,7 +38,7 @@ pub mod status {
     pub const OK: u32 = 0;
     pub const NO_ACPI: u32 = 1;
     pub const PCI_ABSENT: u32 = 2;
-    pub const NO_BAR: u32 = 3;
+    pub const NO_SAFE_ADDRESS: u32 = 3;
     pub const MAP_FAILED: u32 = 4;
     pub const NOT_DESIGNWARE: u32 = 5;
     pub const DISABLE_TIMEOUT: u32 = 6;
@@ -46,6 +46,8 @@ pub mod status {
     pub const TIMEOUT: u32 = 8;
     pub const BAD_DESCRIPTOR: u32 = 9;
     pub const TOO_LONG: u32 = 10;
+    pub const UNEXPECTED_BAR: u32 = 11;
+    pub const ASSIGN_FAILED: u32 = 12;
 }
 
 /// Published probe outcome. Mirrored field-for-field by `nyx_api::I2cHidProbe` — keep them in step.
@@ -74,6 +76,16 @@ pub struct ProbeResult {
     pub bar0: u64,
     /// The raw descriptor bytes as read — printed whole, so a garbled one can be diagnosed.
     pub desc: [u8; 32],
+    /// BAR0 as the firmware left it. 0 on this laptop — see `drivers::i2c::ASSIGN_BASE`.
+    pub bar0_before: u64,
+    /// The facts the BAR assignment was checked against.
+    pub touud: u64,
+    pub highest_bar_above_4g: u64,
+    pub bar0_size: u32,
+    /// 1 if this probe gave BAR0 its address.
+    pub assigned: u32,
+    pub phys_bits: u32,
+    pub _pad: u32,
 }
 
 impl ProbeResult {
@@ -81,10 +93,12 @@ impl ProbeResult {
         seq: 0, stage: 0, status: 0, abort_source: 0, vendor_device: 0, pmcsr_before: 0,
         resets_before: 0, comp_type: 0, comp_param1: 0, mode: 0, hcnt: 0, lcnt: 0, hold: 0,
         timing_from_fw: 0, slave_addr: 0, desc_reg: 0, bar0: 0, desc: [0; 32],
+        bar0_before: 0, touud: 0, highest_bar_above_4g: 0, bar0_size: 0, assigned: 0,
+        phys_bits: 0, _pad: 0,
     };
 }
 
-const _: () = assert!(core::mem::size_of::<ProbeResult>() == 104);
+const _: () = assert!(core::mem::size_of::<ProbeResult>() == 144);
 
 /// Length of an I2C-HID descriptor, and the only `wHIDDescLength` the spec allows.
 const HID_DESC_LEN: usize = 30;
@@ -128,6 +142,12 @@ fn run() -> ProbeResult {
     r.comp_type = info.comp_type;
     r.comp_param1 = info.comp_param1;
     r.bar0 = info.bar0;
+    r.bar0_before = info.bar0_before;
+    r.touud = info.touud;
+    r.highest_bar_above_4g = info.highest_bar_above_4g;
+    r.bar0_size = info.bar0_size;
+    r.assigned = info.assigned as u32;
+    r.phys_bits = info.phys_bits;
     let mut ctl = match brought {
         Ok(c) => c,
         Err(e) => {
@@ -136,7 +156,9 @@ fn run() -> ProbeResult {
             }
             r.status = match e {
                 BringUpError::Absent => status::PCI_ABSENT,
-                BringUpError::NoBar => status::NO_BAR,
+                BringUpError::NoSafeAddress => status::NO_SAFE_ADDRESS,
+                BringUpError::UnexpectedBar => status::UNEXPECTED_BAR,
+                BringUpError::AssignFailed => status::ASSIGN_FAILED,
                 BringUpError::MapFailed => status::MAP_FAILED,
                 BringUpError::NotDesignware(_) => status::NOT_DESIGNWARE,
                 BringUpError::DisableTimeout => status::DISABLE_TIMEOUT,

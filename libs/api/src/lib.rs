@@ -972,6 +972,15 @@ pub struct I2cHidProbe {
     pub desc_reg: u32,
     pub bar0: u64,
     pub desc: [u8; 32],
+    /// BAR0 as the firmware left it, before any assignment.
+    pub bar0_before: u64,
+    pub touud: u64,
+    pub highest_bar_above_4g: u64,
+    pub bar0_size: u32,
+    /// 1 if the probe gave BAR0 its address.
+    pub assigned: u32,
+    pub phys_bits: u32,
+    pub _pad: u32,
 }
 
 impl Default for I2cHidProbe {
@@ -981,7 +990,7 @@ impl Default for I2cHidProbe {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<I2cHidProbe>() == 104);
+const _: () = assert!(core::mem::size_of::<I2cHidProbe>() == 144);
 
 /// Ask the kernel to bring up the touchpad's I2C controller and read its HID descriptor.
 ///
@@ -1004,7 +1013,7 @@ pub fn i2c_hid_status_text(status: u32) -> &'static str {
         0 => "ok",
         1 => "no ACPI data — `acpi probe 13` has not published a device",
         2 => "PCI function absent (reads 0xFFFF) — firmware has it hidden or off",
-        3 => "BAR0 unassigned",
+        3 => "BAR0 unassigned, and no address could be proven free to give it",
         4 => "could not map BAR0",
         5 => "not a Designware I2C block (IC_COMP_TYPE wrong) — still in reset or powered down?",
         6 => "controller would not disable",
@@ -1012,6 +1021,8 @@ pub fn i2c_hid_status_text(status: u32) -> &'static str {
         8 => "transfer timed out — bus stuck or controller not clocking",
         9 => "descriptor read, but it is not a valid HID descriptor",
         10 => "transfer larger than the FIFO",
+        11 => "BAR0 is not the 4 KiB 64-bit BAR an LPSS controller has — left alone",
+        12 => "wrote an address into BAR0 and it did not read back",
         _ => "unknown",
     }
 }
