@@ -1,818 +1,116 @@
-# Nyx OS
+# Nyx
 
-**An experimental open-source operating system for the intersection of classical computing, quantum execution, and AI-driven system intelligence.**
+**A bare-metal operating system written in Rust — its own kernel, its own GPU driver, its own
+desktop — that runs real hardware, speaks enough of the Linux ABI to run Rust `std`, musl and
+libc++ programs, and treats a quantum processor as a compute resource beside the CPU and GPU.**
 
-[![Rust](https://img.shields.io/badge/Rust-nightly-000000?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/Asmodeus14/Nyx/build.yaml?branch=master&label=build&logo=github&color=green)](https://github.com/Asmodeus14/Nyx/actions/workflows/build.yaml)
-[![Dev Containers](https://img.shields.io/badge/Dev%20Containers-supported-blue?logo=visualstudiocode)](https://github.com/Asmodeus14/Nyx/tree/master/.devcontainer)
-[![Status: Pre-Alpha](https://img.shields.io/badge/Status-Pre--Alpha-red)](https://github.com/Asmodeus14/Nyx)
-[![Stars](https://img.shields.io/github/stars/Asmodeus14/Nyx?style=social)](https://github.com/Asmodeus14/Nyx/stargazers)
+[![Rust](https://img.shields.io/badge/Rust-nightly--2026--07--01-000000?logo=rust&logoColor=white)](rust-toolchain.toml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](License)
+[![Build](https://img.shields.io/github/actions/workflow/status/Asmodeus14/Nyx/build.yaml?branch=master&label=build&logo=github)](https://github.com/Asmodeus14/Nyx/actions/workflows/build.yaml)
 
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Design Philosophy](#design-philosophy)
-- [Architecture](#architecture)
-- [Kernel Capabilities](#kernel-capabilities)
-- [Kernel ABI Reference](#kernel-abi-reference)
-  - [System Call Interface](#system-call-interface)
-  - [POSIX-Compatible Syscalls](#posix-compatible-syscalls)
-  - [Nyx Native Syscalls (501–574)](#nyx-native-syscalls-501574)
-  - [Interrupt Vector Table](#interrupt-vector-table)
-  - [Calling Convention](#calling-convention)
-- [QCLang — Quantum Programming Language](#qclang--quantum-programming-language)
-- [Quantum Subsystem — the QPU as a Compute Resource](#quantum-subsystem--the-qpu-as-a-compute-resource)
-- [Project Structure](#project-structure)
-- [Current Status](#current-status)
-- [Quick Start](#quick-start)
-- [Contributing](#contributing)
-- [License](#license)
+📚 **Full documentation: [`docs/`](docs/README.md)** — start with the
+[architecture overview](docs/ARCHITECTURE.md).
 
 ---
 
-## Overview
+## What Nyx is
 
-Nyx is a **bare-metal, monolithic operating system kernel** written in Rust, designed from the ground up as a unified execution platform for three classes of computation that have historically existed in isolation:
+- A **monolithic `no_std` Rust kernel** for x86-64, booted through UEFI, with per-core SMP
+  scheduling, per-process address spaces and a Linux-numbered syscall interface.
+- A **from-scratch Intel GPU stack**: blitter, display control, and a Gen9 3D engine with
+  hand-encoded shaders that composites the desktop and draws its text.
+- **Meridian**, a desktop whose window server is an ordinary userspace program.
+- A **userland** of Rust apps (both `no_std` and real `std`), plus C and C++ through musl and libc++.
+- A **quantum subsystem** that models a QPU as a device, simulates circuits locally, and has run a
+  Bell state on real IBM quantum hardware — while refusing, by construction, to call a simulator
+  "hardware".
 
-- **Classical computing** — conventional userspace processes running native ELF64 binaries
-- **Quantum computing** — first-class quantum circuit execution via the integrated QCLang toolchain
-- **AI-driven system intelligence** — an adaptive kernel entity that evolves its behavioral state based on hardware telemetry and user interaction
+Nyx is **pre-alpha**. It is developed against one laptop (Intel Comet Lake, UHD graphics `0x9BC4`)
+and also boots in QEMU.
 
-Nyx targets the `x86_64-unknown-none` bare-metal environment and boots via the `bootloader` crate ecosystem. It is currently in **Pre-Alpha** status and is under active development.
+## Current status
 
----
+🟢 implemented · 🟡 experimental · 🔴 broken · 🚧 in progress · ⬜ planned
 
-## Design Philosophy
-
-Nyx is built on five core principles:
-
-**Memory Safety First** — The entire kernel, userspace, and compiler toolchain are implemented in Rust. Unsafe code is isolated to hardware interface layers. The kernel enforces strict pointer validation on every userspace-supplied address before touching it.
-
-**Quantum Execution as a Native Primitive** — Rather than treating quantum computing as an external library or simulator, Nyx integrates quantum execution directly into the OS architecture via QCLang. Quantum programs compile through a dedicated Quantum Intermediate Representation (QIR) pipeline and execute within the kernel's execution model.
-
-**Security-First Architecture** — Nyx implements capability-based permissions, Ring 0 / Ring 3 privilege separation enforced via GDT and TSS, post-quantum cryptography primitives (SHA3-256 via hardware `RDRAND`), and a per-process address space with explicit user pointer validation on every syscall boundary.
-
-**Simulation-First Development** — All development targets QEMU first, enabling rapid iteration without physical hardware. Partial real hardware boot is functional and actively being extended.
-
-**Minimal Energy Footprint** — The thermal governor daemon and HWP (Hardware-managed Power Performance) subsystem actively manage CPU frequency and cooling. The idle task uses `HLT` to yield hardware power states between scheduling quanta.
-
----
+| Area | Status | Notes |
+|---|---|---|
+| Boot (UEFI), memory, paging, SMP | 🟢 | per-core schedulers, cross-core wakeups by IPI |
+| Syscalls | 🟢 | 65 Linux-numbered + 78 Nyx-native (501–578) — [KERNEL.md](docs/KERNEL.md#system-calls) |
+| Rust `std` on Nyx | 🟢 | `target_os = "nyx"`, via Nyx's own platform layer |
+| musl / libc++ | 🟢 | C and C++ programs run; a LibCore-style event loop probe passes |
+| Storage | 🟢 NVMe + ext4 · 🟡 AHCI | AHCI detects ports only |
+| Intel GPU: 2D, display, cursor | 🟢 | [GRAPHICS.md](docs/GRAPHICS.md) |
+| Intel GPU: 3D engine, compositing, GPU text | 🟢 | on the Gen9.5 test machine; CPU fallback everywhere |
+| Desktop (Meridian) | 🟢 | [UI.md](docs/UI.md) |
+| Input | 🟢 PS/2 keyboard, I2C-HID precision touchpad · 🟡 USB HID | touchpad gestures: tap, tap-and-drag, two-finger scroll, three-finger swipe |
+| Networking | 🟢 | RTL8168 Ethernet, Intel Wi-Fi (WPA2), DHCP, DNS, TCP, HTTPS |
+| Web | 🟢 text browser in the terminal · 🚧 Ladybird port | [ROADMAP.md](docs/ROADMAP.md) |
+| Quantum | 🟢 | local simulator, IonQ and IBM providers — [docs/quantum](docs/quantum/architecture.md) |
+| Audio, IPv6, modifier-key shortcuts | ⬜ | |
 
 ## Architecture
 
-Nyx is a **monolithic kernel** with a clean module boundary enforced by Rust's visibility system. All kernel subsystems run in Ring 0 under a single address space. Userspace processes run in Ring 3 under isolated per-process page tables.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        USERSPACE (Ring 3)                       │
-│   ELF64 Processes  │  QCLang Apps  │  GUI Applications          │
-├─────────────────────────────────────────────────────────────────┤
-│                     SYSCALL BOUNDARY (LSTAR MSR)                │
-├─────────────────────────────────────────────────────────────────┤
-│                       NYX KERNEL (Ring 0)                       │
-│                                                                 │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐     │
-│  │ Scheduler│  │  Memory  │  │   VFS /  │  │   Network    │     │
-│  │  (SMP)   │  │  Manager │  │  ext4    │  │  (smoltcp)   │     │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────────┘     │
-│                                                                 │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐     │
-│  │   ACPI / │  │   GUI /  │  │ Thermal  │  │    Entity    │     │
-│  │   APIC   │  │Compositor│  │ Governor │  │  (AI State)  │     │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────────┘     │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    HARDWARE DRIVERS                     │    │
-│  │  NVMe  │  AHCI  │  RTL8168  │  Intel GPU  │  xHCI USB   │    │
-│  │  Intel WiFi  │  PS/2  │  APIC Timer  │  I2C/SMBus       │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-
-Target: x86_64-unknown-none
-Boot:   bootloader_api (UEFI framebuffer handoff)
-Build:  Rust nightly + LLD linker + ACPICA C bridge (bindgen)
+```mermaid
+flowchart LR
+    subgraph U[ring 3]
+        APPS[apps] -->|IPC + shared memory| SHELL[shell: Meridian window server]
+    end
+    subgraph K[ring 0: nyx-kernel]
+        SYS[syscalls] --> CORE[memory · scheduler · VFS · ACPICA · smoltcp]
+        CORE --> DRV[drivers: NVMe · Intel GPU · Ethernet · Wi-Fi · touchpad · USB]
+    end
+    U -->|SYSCALL| SYS
+    DRV --> HW[hardware]
 ```
 
----
+Details: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [KERNEL.md](docs/KERNEL.md) ·
+[GRAPHICS.md](docs/GRAPHICS.md) · [UI.md](docs/UI.md) ·
+[network-architecture.md](docs/network-architecture.md)
 
-## Kernel Capabilities
+## Hardware
 
-### Memory Management
-
-- **Physical Frame Allocator** — `BootInfoFrameAllocator` walks boot-provided memory region descriptors to track available physical frames.
-- **4-Level Page Table Management** — Full PML4/PDPT/PD/PT manipulation via the `x86_64` crate. Supports dynamic allocation of user pages at arbitrary virtual addresses.
-- **Per-Process Address Space Isolation** — Each process receives its own CR3. `clone_user_address_space()` performs full PML4 duplication on `fork()`. `clear_user_address_space()` reclaims all user-mode pages on process exit.
-- **Kernel Heap** — Linked-list allocator backed by a fixed heap region initialized during boot.
-- **Memory-Mapped I/O** — `map_user_mmio()` maps physical MMIO regions into userspace VA for GPU and device access.
-- **Shared Memory** — Kernel-managed SHM registry supports `create_shm_block()` and `map_shm_block()` for zero-copy IPC between processes.
-- **mmap-style Allocation** — Per-process `mmap_bump` pointer supports demand-paged anonymous memory allocation from userspace.
-- **Physical ↔ Virtual Translation** — `virt_to_phys()` and `phys_to_virt()` are available kernel-wide for DMA and framebuffer setup.
-- **User Pointer Validation** — `is_valid_user_ptr(ptr, len)` enforces that all userspace-supplied pointers reference valid, mapped, Ring 3 accessible memory before any kernel operation proceeds.
-
-### Process and Task Management
-
-- **ELF64 Loader** — `load_elf()` parses and maps PT_LOAD segments from standard ELF64 binaries into the current process's address space.
-- **Ring 3 Entry** — `enter_userspace(entry, stack)` transitions from Ring 0 to Ring 3 via `iretq` with a properly constructed interrupt stack frame.
-- **Process Creation** — `Process::new()` allocates a fresh kernel stack, per-process page table, and assigns a unique PID via atomic counter.
-- **Thread Spawning** — `Process::new_thread(parent_cr3)` creates a thread sharing the parent's address space.
-- **fork()** — Full address space duplication via `clone_user_address_space()`.
-- **Cooperative and Preemptive Scheduling** — The scheduler (`scheduler.rs`) supports both timer-preemptive context switching (via APIC timer vector `0x40`) and voluntary yielding (via `int 0x41`). Context save/restore preserves all general-purpose registers plus FXSAVE state for SSE/FP continuity.
-- **Task States** — `Running`, `Ready`, `Blocked` (with `wake_tsc` deadline for timed wakeup).
-- **SMP Support** — `smp.rs` boots Application Processors (APs) via INIT/SIPI sequence. Each core receives its own `PerCpu` structure with an independent scheduler instance. `ACTIVE_CORES` tracks live cores atomically.
-- **Per-CPU Storage** — `percpu.rs` maintains per-core kernel stack pointer, user stack pointer (`user_rsp` for `swapgs`), and the per-core scheduler.
-- **IPC via Mailbox** — Each process has a `VecDeque<IpcMessage>` mailbox. Kernel-mediated `sys_ipc_send` and `sys_ipc_recv` support both blocking and non-blocking message passing across process boundaries, including cross-core wakeup.
-
-### Virtual Filesystem (VFS)
-
-- **Mount-Point Architecture** — `VirtualFileSystem` maintains a dynamic mount table. Arbitrary `FileSystem` trait implementations can be mounted at any path prefix.
-- **NVMe-backed ext4** — `NvmeLwExt4Fs` bridges the lwext4 C library to the Rust VFS layer via `ext4_wrapper.c`, providing full read/write ext4 filesystem access on NVMe hardware.
-- **Write-Ahead Log** — `WriteAheadLog` provides journaling semantics for filesystem mutations.
-- **File Descriptor Table** — Per-process FD tables support `File`, `Socket` (TCP and UDP), `PipeRead`, and `PipeWrite` descriptor types.
-- **Initrd via TARFS** — `tarfs.rs` mounts a baked-in TAR archive (`initrd.tar`, embedded at compile time via `include_bytes!`) to bootstrap the userspace environment before NVMe is available.
-- **VFS Operations** — `mount`, `unmount`, `read_file_alloc`, `list_dir`, `open_path`, `create_dir`, `create_file`, `write_file`, `delete_file`.
-
-### Interrupt and Exception Handling
-
-- **IDT** — Full 256-entry Interrupt Descriptor Table managed by the `x86_64` crate.
-- **Exception Handlers** — Breakpoint, Double Fault (on dedicated IST stack), General Protection Fault, Page Fault.
-- **PIC 8259** — Chained PIC initialization with explicit mask management. Legacy PIC is used during early boot before APIC takeover.
-- **APIC** — Local APIC initialization and timer setup (`init_timer()`). `end_of_interrupt()` sends EOI to the local APIC after each interrupt.
-- **I/O APIC** — `ioapic.rs` provides IRQ routing (`route_irq(irq, apic_id, vector)`) to direct hardware interrupts to specific CPU cores.
-- **SWAPGS Protocol** — All interrupt and syscall entry points execute `swapgs` when transitioning from Ring 3 to Ring 0, allowing safe access to per-CPU kernel data structures.
-- **Context Switching** — Timer, keyboard, mouse, and yield interrupts all call dedicated context switch functions that save/restore full register state including FXSAVE.
-
-### Network Stack
-
-- **RTL8168 Ethernet Driver** — PCIe Gigabit Ethernet driver with MSI interrupt support, DMA ring buffer management, and interrupt-driven packet processing.
-- **Intel WiFi (iwlwifi)** — Prototype driver for Intel wireless adapters.
-- **TCP/IP Stack** — Powered by `smoltcp 0.9` with IPv4, DHCPv4, TCP, UDP, ICMP, and DNS resolution.
-- **DHCP** — Dynamic IP address acquisition on any Ethernet network.
-- **DNS** — Asynchronous DNS resolution via `sys_dns_resolve` (syscall 534), defaulting to Google DNS (8.8.8.8) until DHCP provides nameserver configuration.
-- **Socket API** — Kernel-managed TCP and UDP sockets with `sys_socket`, `sys_connect`, `sendto`/`recvfrom` mapped to standard Linux syscall numbers (41, 42, 44, 45).
-
-### Graphics Subsystem
-
-- **Framebuffer** — UEFI linear framebuffer mapped and managed by `VgaPainter`. Supports software rendering to the raw pixel buffer.
-- **Double Buffering** — `BackBuffer` provides an off-screen back buffer with a `present()` blit to the screen painter.
-- **Intel GPU Driver** — Hardware-accelerated 2D rendering via Intel integrated GPU MMIO interface. Supports `fill_rect()` (BLT engine fill), `copy_rect()` (BLT engine copy), `wait_for_vsync()`, and `wait_for_idle()` via GPU command ring submission.
-- **Intel Gen9.5 3D Engine (RCS)** — A from-scratch 3D renderer driving the Comet Lake integrated GPU's RENDER command streamer in legacy ring-buffer mode. It brings up the render engine (forcewake, MOCS, GGTT), submits the full Gen9 3D pipeline directly to the RCS ring (STATE_BASE_ADDRESS, URB, hand-encoded EU vertex/pixel shaders, SBE/WM barycentric interpolation, back-face culling, binding tables, samplers), and renders textured, perspective-correct, indexed triangle meshes. Features proven on bare metal: MVP-transformed spinning meshes, multi-mesh scenes under one shared state-base, procedural textures via the sampler, render-to-texture (offscreen Y-tiled render targets), and **SSAA antialiasing** (2×2 supersampling with a free hardware-bilinear box-downsample resolve). Exposed to userspace as a mini-GL API (syscalls 514–516/527); a userspace client renders into its **own compositor window** — the engine resolves into a per-context backbuffer that the kernel copies into the client's window surface, so 3D apps compose alongside 2D windows instead of taking over the scanout. Validated end-to-end by the `glcube` app (a spinning textured cube in a window). Tested on real hardware only — QEMU cannot emulate the render engine.
-- **GPU Fallback** — All GPU operations fall back gracefully to CPU-side software rendering if the Intel GPU driver is unavailable.
-- **Window Manager** — `window.rs` maintains a list of application windows with position, size, and z-order. `WINDOW_MANAGER` is a global spinlock-protected instance.
-- **Desktop Compositor** — the userspace `compositor` app is an event-driven window server: it composites client SHM window buffers, decorations, taskbar, and start menu, redrawing only when something is dirty. **GPU-accelerated present path (U4):** each window's SHM pixel buffer is GGTT-mapped and drawn by the Gen9.5 render engine as one textured orthographic quad (`sys_gpu_composite`, 536) — the CPU stops copying per-pixel window data — with a full software-composite fallback so the desktop is never black. On top of that path: **per-window opacity** (windows fade in on open, via a src-over blend with the opacity written into the quad's alpha), **live GPU resize** (content tracks the frame every drag frame), **constant-radius rounded corners** (a CPU carve on the true window outline), soft **drop shadows** (a rounded-box signed-distance falloff, painter-ordered so an upper window's shadow lands on the window below), and a **functional window scrollbar** drawn by the compositor and driven back to the app over the window header (`content_h`/`scroll_off` fields + `MSG_SCROLL`; drag-thumb / click-track, no new syscall).
-  - **Smoothness & correctness passes:** **damage tracking** (D1) — the compositor recomposites the stable quad set every frame but presents only the changed rectangle to scanout (`sys_swap_buffers_rect`, 538); **owned-scanout page-flip** (P1) — the display plane's surface-base register is pointed at a framebuffer the kernel owns and flipped there, rather than relying on the firmware's default scanout mapping; **SHM reclamation on resize** (R1) — a `sys_unmap_shm`/`sys_destroy_shm` (540/539) ACK handshake frees a window's resized-away buffer instead of leaking it.
-  - **Window controls (U7):** resize from **any edge or corner** with the hardware cursor swapping to the matching resize double-arrow shape; **taskbar window buttons** with **real minimize** (a minimized window hides fully and lives as a taskbar button that restores/focuses it); maximize/restore; and **focus & hover polish** (the focused window keeps full-colour title-bar controls while background windows dim their surface, title, and traffic-light buttons; title-bar and taskbar buttons highlight on hover).
-  - The taskbar shows a **live wall clock** (`HH:MM:SS`) sourced from the hardware RTC via `sys_get_rtc` (528), ticking once per second even on an idle desktop. A lightweight **U0 instrumentation overlay** (`FPS NN  Xms`) tracks the composite frame time / frame rate that the GPU UI-acceleration work (`UI-ACCELERATION-PLAN.md`) is measured against.
-- **Proportional TTF UI font** — the entire UI renders in **DejaVu Sans**, a real proportional antialiased typeface rasterized from an embedded TTF (`ttf-parser` outlines filled by `ab_glyph_rasterizer`), replacing the old fixed 9×16 bitmap font. The compositor's **chrome text** (title bars, taskbar, clock, FPS, start menu) is drawn by the GPU text path (`sys_gpu_draw_text`, 537) — glyph quads sampling a coverage atlas, tinted per-quad — with a CPU `print_str` fallback in the same font so text is never blank.
-- **Mouse Input** — PS/2 mouse driver with atomic state (`MOUSE_STATE`) tracking X/Y position and button state. The cursor is drawn by the **display controller's hardware cursor plane** (U1): the kernel arms the plane once and then only writes `CUR_POS` straight from the mouse IRQ, so pointer motion costs zero window redraws; a software-composited cursor remains as an automatic fallback. (No scroll wheel yet — the PS/2 driver reports X/Y and buttons only.)
-- **Pixel Format** — BGRA 32-bit (4 bytes per pixel), stride-aware layout sourced from the UEFI framebuffer info.
-
-### ACPI and Power Management
-
-- **ACPICA Integration** — Full ACPICA library (Intel's reference ACPI implementation) is compiled as a C static library and linked into the kernel via `bindgen`-generated FFI bindings.
-- **DSDT Parsing** — ACPI DSDT table is parsed for device configuration and thermal zone information.
-- **Thermal Management** — `thermal.rs` reads Intel silicon temperature via `IA32_THERM_STATUS` MSR. Activates hardware P-state throttling via `IA32_HWP_REQUEST` when temperature exceeds threshold. Controls fan speed via ACPI EC writes and Dell SMBus protocol.
-- **HWP (Hardware P-states)** — Enabled via `IA32_PM_ENABLE` MSR. Configures performance hints dynamically based on thermal load.
-- **ACPI Power Off** — `acpi::poweroff()` triggers a clean S5 shutdown via ACPI.
-- **WiFi Power** — `power_on_wifi_via_acpi()` uses ACPI namespace evaluation to power-cycle the WiFi controller.
-
-### Storage Drivers
-
-- **NVMe** — Full NVMe PCIe driver with admin queue initialization, IO queue creation, and LBA block read/write. Namespace discovery via Identify Namespace command. Supports NVMe version query.
-- **AHCI** — SATA AHCI driver for HBA port enumeration, device type detection, and command execution via PRDT.
-
-### USB
-
-- **xHCI** — eXtensible Host Controller Interface driver with capability register parsing, operational register management, command ring, event ring, and doorbell support. Handles up to the controller-reported maximum port and slot count.
-
-### AI Entity System
-
-- **Genetic Seed** — A 32-byte SHA3-256 cryptographic identity derived from `RDRAND` hardware entropy on first boot and persisted to a hidden LBA sector on the NVMe disk. On subsequent boots, the seed is resurrected from storage, giving the entity a persistent cryptographic identity across power cycles.
-- **NyxState** — Four floating-point behavioral dimensions updated in real time by kernel subsystems:
-  - `energy` — driven by CPU scheduling activity and context switch frequency
-  - `entropy` — driven by memory pressure and filesystem I/O volume
-  - `stability` — driven by system uptime and absence of disruption
-  - `curiosity` — driven by mouse and keyboard input events
-- **Kernel Exposure** — Entity state is exposed to userspace via `sys_get_entity_seed` (syscall 520) and `sys_get_entity_state` (syscall 521), enabling userspace applications to observe and react to the kernel's behavioral state.
-
----
-
-## Kernel ABI Reference
-
-### System Call Interface
-
-Nyx implements the standard x86_64 Linux `SYSCALL`/`SYSRET` ABI. The kernel installs a syscall handler by writing to the `LSTAR` MSR. The calling convention for all syscalls is:
-
-| Register | Role |
-|----------|------|
-| `RAX` | Syscall number (input) / Return value (output) |
-| `RDI` | Argument 1 |
-| `RSI` | Argument 2 |
-| `RDX` | Argument 3 |
-| `R10` | Argument 4 |
-| `R8` | Argument 5 |
-| `R9` | Argument 6 |
-
-On error, `RAX` is set to a negative errno value (`EINVAL`, `EFAULT`, `EBADF`, `ENOMEM`). On success, `RAX` holds the return value (0 or a positive integer).
-
-`swapgs` is executed on entry and exit to allow access to the per-CPU kernel stack pointer stored in the `GS` base MSR.
-
----
-
-### POSIX-Compatible Syscalls
-
-These syscalls follow Linux x86_64 numbering and semantics, allowing standard ELF binaries to run without modification.
-
-| Number | Name | Arguments | Description |
-|--------|------|-----------|-------------|
-| `0` | `sys_read` | `fd, buf*, len` | Read from file descriptor |
-| `1` | `sys_write` | `fd, buf*, len` | Write to file descriptor |
-| `2` | `sys_open` | `path*, flags, mode` | Open a file, returns fd |
-| `3` | `sys_close` | `fd` | Close a file descriptor and release socket/pipe resources |
-| `9` | `sys_mmap` | `addr, len, prot, flags, fd, off` | Map memory pages into the calling process's address space |
-| `10` | `sys_mprotect` | `addr, len, prot` | Stub — returns 0 |
-| `12` | `sys_brk` | `addr` | Stub — returns 0 |
-| `13` | `sys_rt_sigaction` | `sig, act*, oact*` | Stub — returns 0 |
-| `14` | `sys_rt_sigprocmask` | `how, set*, oset*` | Stub — returns 0 |
-| `16` | `sys_ioctl` | `fd, cmd, arg` | Device-specific I/O control |
-| `20` | `sys_writev` | `fd, iov*, iovcnt` | Gather-write from iovec array |
-| `22` | `sys_pipe` | `fds*` | Create a unidirectional pipe; returns read/write fd pair |
-| `33` | `sys_dup2` | `oldfd, newfd` | Duplicate file descriptor |
-| `41` | `sys_socket` | `domain, type, protocol` | Create a network socket |
-| `42` | `sys_connect` | `fd, addr*, addrlen` | Connect socket to remote address |
-| `44` | `sys_sendto` | `fd, buf*, len, flags, addr*, addrlen` | Send data on a socket |
-| `45` | `sys_recvfrom` | `fd, buf*, len, flags, addr*, addrlen` | Receive data from a socket |
-| `57` | `sys_fork` | — | Fork the calling process; duplicates address space |
-| `58` | `sys_spawn_thread` | `entry, arg` | Spawn a new thread sharing the caller's address space |
-| `59` | `sys_execve` | `path*, argv*, envp*` | Replace process image with a new ELF binary |
-| `60` | `sys_exit` | `status` | Terminate the calling process |
-| `131` | `sys_sigaltstack` | `ss*, oss*` | Stub — returns 0 |
-| `158` | `sys_arch_prctl` | `code, addr` | Set/get architecture-specific thread state (TLS via `ARCH_SET_FS`) |
-| `218` | `sys_set_tid_address` | `tidptr*` | Stub — returns 1 |
-| `318` | `sys_getrandom` | `buf*, buflen, flags` | Fill buffer with hardware random bytes via `RDRAND` |
-
----
-
-### Nyx Native Syscalls (501–574)
-
-These syscalls are unique to Nyx OS and provide access to the kernel's quantum, graphics, AI, and system telemetry subsystems. They begin at number 500 to avoid conflicts with the Linux syscall table.
-
-⚠️ **The tables below are a selection, not the full list.** 501–574 are allocated with no gaps; the
-authoritative source is the `match` in `nyx-kernel/src/interrupts.rs`, and `tools/check_dup_syscall_arms.sh`
-verifies it. **Next free number: 575.** Run that script before adding an arm — `interrupts.rs` carries
-`#![allow(warnings)]`, so `unreachable_patterns` is suppressed and a duplicate arm silently shadows
-rather than failing to compile. That has cost this project real debugging time twice.
-
-#### Graphics & Display
-
-| Number | Name | Arguments | Returns | Description |
-|--------|------|-----------|---------|-------------|
-| `501` | `sys_gpu_fill_rect` | `x, y, w, h, color` | — | Draw a filled rectangle with a 32-bit ARGB hex color. Uses the Intel blitter hardware engine (BCS) when available, falling back to CPU SIMD copy. |
-| `502` | `sys_swap_buffers` | — | — | Blit the GPU back buffer (GGTT offset `0x900000` / GVA `0x1400_0000`) to the visible framebuffer (GGTT offset `0x100000`) via the Intel BLT engine. |
-| `503` | `sys_gpu_sync` | — | — | Submit a fence and block until the Intel GPU command ring is idle. Used to synchronize GPU fills and blits before CPU drawing. |
-| `504` | `sys_get_uptime_ms` | — | `u64` | Return current system uptime in milliseconds derived from TSC. Immune to CPU frequency scaling. |
-| `505` | `sys_get_mouse_state` | — | Packed `u64` | Returns mouse state packed as: `[x:16][y:16][lclick:1][rclick:1]` in bits 63–0. Read is interrupt-safe (disables IRQs around spinlock). |
-| `506` | `sys_get_key` | — | `u64` | Pop one keypress from the kernel key queue. Returns 0 if the queue is empty. |
-| `507` | `sys_get_screen_info` | `width*, height*, stride*` | `1` on success | Write screen width, height, and stride (in pixels) into caller-supplied pointers. |
-| `508` | `sys_map_framebuffer` | — | `u64` | Map the physical framebuffer into the calling process's virtual address space. Returns the user-space virtual address, or 0 on failure. |
-| `509` | `sys_gpu_map_shm` | `shm_id, gva` | `u64` | Map a shared memory segment's physical frames into the GPU GTT at the specified GVA. Returns 1 on success, 0 on failure. |
-| `512` | `sys_gpu_copy_rect` | `src_gva, dst_gva, w, h, dst_x, dst_y` | — | Submits an asynchronous `XY_SRC_COPY_BLT` command to the GPU blitter to copy a rectangle from a source GVA to a destination GVA. |
-| `513` | `sys_wait_vsync` | — | `0` | Block until the Intel GPU signals vertical sync. Provides tear-free rendering synchronization. |
-| `514` | `sys_gl_init` | `width, height, dst_pixels*` | `1`/`0` | Initialize the mini-GL 3D context for a `width`×`height` window. Allocates the supersampled (2×2 SSAA) Y-tiled scene render target plus a private linear resolve backbuffer, and records `dst_pixels` — the caller's own window pixel buffer (typically an SHM window) that each rendered frame is copied into. Must be called once before uploading meshes. |
-| `515` | `sys_gl_upload_mesh` | `desc*` | handle / `u64::MAX` | Upload a 3D mesh (interleaved position + varying vertices, `u32` indices, and a B8G8R8A8 texture) into the GL context. Data is copied into the kernel once. Returns the mesh handle (0-based index), or `u64::MAX` on error. Call before the first render. |
-| `516` | `sys_gl_render` | `mvps*, count` | `1`/`0` | Render one frame: transform and draw every uploaded mesh (one 16-float column-major MVP matrix each) into the supersampled render target, box-downsample to the private backbuffer (antialiased), and copy the result into the caller's window pixel buffer for the compositor to composite. On the first call the scene is finalized from the uploaded meshes. |
-| `527` | `sys_gl_reset` | — | `1` | Tear down the GL context (drop the scene and staged meshes) so it can be re-initialized and re-uploaded. |
-| `529` | `sys_cursor_init` | — | `1`/`0` | Bring up the display controller's **hardware cursor plane** (U1). Once armed, the kernel writes `CUR_POS` straight from the mouse IRQ, so pointer motion costs zero window redraws. Returns 1 if the plane came up. |
-| `535` | `sys_cursor_set_image` | `img*` (64×64 BGRA) | `1`/`0` | Upload a 64×64 ARGB cursor bitmap to the hardware cursor plane. Used to swap the pointer shape (arrow ↔ resize double-arrows) as the compositor's hit-test zone changes. |
-| `536` | `sys_gpu_composite` | `quads*, count` | `1`/`0` | Composite an array of window quads into the backbuffer with the Gen9.5 render engine — each quad is a GGTT-mapped SHM window drawn as one textured orthographic quad (with per-quad opacity + optional rounded-corner mask). Returns 0 on GPU failure so the caller can fall back to CPU compositing. |
-| `537` | `sys_gpu_draw_text` | `atlas_gva, atlas_w, atlas_h, atlas_pitch, glyphs*, count` | `1`/`0` | Draw a run of antialiased glyph quads (GPU text) sampling a coverage atlas, tinted per-quad to each label's colour. Used for the compositor's chrome text in the proportional UI font. |
-| `538` | `sys_swap_buffers_rect` | `x, y, w, h` | — | Present only a **damage rectangle** of the backbuffer to the owned scanout buffer (D1 damage tracking), instead of the whole framebuffer — the compositor's partial-frame present path. |
-
-#### VFS and Filesystem
-
-| Number | Name | Arguments | Returns | Description |
-|--------|------|-----------|---------|-------------|
-| `510` | `sys_list_dir_count` | `path*, path_len` | `u64` | Return the number of entries in the directory at the given VFS path. |
-| `511` | `sys_list_dir_entry` | `index, buf*, path*, path_len` | `u64` | Copy the name of directory entry at `index` into `buf`. Returns the number of bytes written. |
-
-#### System Information and Telemetry
-
-| Number | Name | Arguments | Returns | Description |
-|--------|------|-----------|---------|-------------|
-| `517` | `sys_get_hw_discovery` | `buf*, len` | `u64` | Write a hardware discovery report containing MCFG and MADT physical addresses into the caller's buffer. |
-| `518` | `sys_get_boot_log` | `buf*, len` | `u64` | Copy the kernel serial boot log (up to 8 KB) into the caller's buffer. |
-| `519` | `sys_alloc_pages` | `num_pages` | `u64` | Allocate `num_pages` anonymous pages from the process's `mmap_bump` allocator. Returns the virtual base address, or 0 on failure. |
-| `522` | `sys_get_active_cores` | — | `u64` | Return the number of CPU cores currently online and running in the SMP pool. |
-| `523` | `sys_get_context_switches` | — | `u64` | Return the global context switch counter since boot. |
-| `524` | `sys_get_system_info` | `SystemInfo*` | `0` | Populate a `SystemInfo` struct with: CPU temperature, active cooling state, CPU and GPU fan RPM, and up to 64 task descriptors (PID, name, CPU ticks, state). |
-| `525` | `sys_sleep_ms` | `ms` | `0` | Sleep for `ms` milliseconds. Sets the calling task to `Blocked` state with a TSC-derived wake deadline and yields the CPU. Wakes on timer expiry or external interrupt. |
-| `526` | `sys_get_dsdt_data` | `buf*, max_len` | `u64` | Copy the raw ACPI DSDT table bytes into the caller's buffer. Returns bytes copied. |
-| `528` | `sys_get_rtc` | — | Packed `u64` | Read the battery-backed CMOS/RTC wall clock. Returns the current date/time packed as `[year:24][month:8][day:8][hour:8][min:8][sec:8]` (bits 63–0), with all fields binary and 24-hour normalized by the kernel. Distinct from `sys_get_uptime_ms` (504), which is monotonic uptime, not calendar time. |
-
-#### AI Entity and Identity
-
-| Number | Name | Arguments | Returns | Description |
-|--------|------|-----------|---------|-------------|
-| `520` | `sys_get_entity_seed` | `buf*` | `1` on success | Copy the 32-byte cryptographic Genetic Seed into the caller's buffer. The seed is derived from hardware `RDRAND` entropy on first boot and persisted to NVMe across power cycles. |
-| `521` | `sys_get_entity_state` | `f32[4]*` | `1` on success | Write four `f32` values into the caller's buffer: `[energy, entropy, stability, curiosity]`. These values reflect the kernel's real-time behavioral state, updated continuously by subsystem activity. |
-
-#### Inter-Process Communication
-
-| Number | Name | Arguments | Returns | Description |
-|--------|------|-----------|---------|-------------|
-| `530` | `sys_create_shm` | `size` | `shm_id` | Allocate a shared memory block of `size` bytes. Returns an integer SHM ID that other processes can use to map the same physical memory. |
-| `531` | `sys_map_shm` | `shm_id` | `u64` | Map a previously created shared memory block into the calling process's address space. Returns the virtual address, aligned to a 2 MB boundary to prevent overlap with anonymous mmap. |
-| `532` | `sys_ipc_send` | `target_pid, msg_type, data1, data2` | `1` on success | Deliver an `IpcMessage` to the mailbox of the process identified by `target_pid`. If the target is blocked waiting for IPC (`wake_tsc == u64::MAX`), it is immediately woken. Thread-safe across SMP cores. |
-| `533` | `sys_ipc_recv` | `IpcMessage*, block` | `1` if message received | Receive one message from the calling process's mailbox. If `block == 1`, the task enters `Blocked` state and yields until a message arrives. If `block == 0`, returns 0 immediately if the mailbox is empty. |
-| `539` | `sys_destroy_shm` | `shm_id, base_vaddr` | `1`/`0` | Destroy a shared-memory block once it is single-owner: unmaps the caller's mapping and frees the backing physical frames. Used by the R1 resize-reclamation handshake so a resized-away window buffer is not leaked. |
-| `540` | `sys_unmap_shm` | `base_vaddr, size` | — | Release only the caller's mapping of an SHM range (unmap the pages) without freeing the physical frames — the owner still holds them. The compositor calls this on the old buffer after a resize, then ACKs the app to `sys_destroy_shm` it. |
-
-#### Network
-
-| Number | Name | Arguments | Returns | Description |
-|--------|------|-----------|---------|-------------|
-| `534` | `sys_dns_resolve` | `hostname*, hostname_len` | Packed IPv4 `u64` | Initiate a DNS A-record query for the given hostname. Returns the resolved IPv4 address packed into a `u64`, or 0 on failure or pending. |
-| `572` | `sys_dns_resolve_all` | `hostname*, hostname_len, out*` | Count | Up to 4 IPv4 addresses, so a client whose first address is unreachable has a fallback. Retries with a **fresh query** (3 × 4 s) rather than waiting longer on one — DNS is UDP, and nothing recovers a dropped datagram except sending another. |
-
-#### Quantum
-
-Discovery and introspection only. The kernel holds no gates, no circuits, no simulator and no
-networking — see [Quantum Subsystem](#quantum-subsystem--the-qpu-as-a-compute-resource). Both arms
-are read-only, take no lock and allocate nothing, because every syscall body runs with interrupts
-disabled.
-
-| Number | Name | Arguments | Returns | Description |
-|--------|------|-----------|---------|-------------|
-| `573` | `sys_quantum_enumerate` | `buf*, max_entries` | Count, or `-EFAULT` | Quantum devices the PCI probe found, as `QpuInfo` records. **Normally — and correctly — zero.** |
-| `574` | `sys_quantum_info` | `id, out*` | `0` / `-ENODEV` / `-EFAULT` | One device by id. |
-
----
-
-### Interrupt Vector Table
-
-| Vector | Source | Handler |
-|--------|--------|---------|
-| `0x03` | Breakpoint (`INT3`) | `breakpoint_handler` |
-| `0x08` | Double Fault | `double_fault_handler` (dedicated IST stack) |
-| `0x0D` | General Protection Fault | `gpf_handler` (prints IP and error code) |
-| `0x0E` | Page Fault | `pf_handler` (prints faulting address) |
-| `0x20` (32) | PIC Master — APIC Timer | `timer_interrupt_stub` → `timer_context_switch` |
-| `0x21` (33) | PIC Master — PS/2 Keyboard | `keyboard_interrupt_stub` → `keyboard_handler_impl` |
-| `0x2C` (44) | PIC Slave — PS/2 Mouse (IRQ 12) | `mouse_interrupt_stub` → `mouse_handler_impl` |
-| `0x30` (48) | RTL8168 MSI Ethernet | `rtl8168_interrupt_handler` → `ethernet_handler_impl` |
-| `0x40` (64) | APIC Timer (after APIC init) | `timer_interrupt_stub` → `timer_context_switch` |
-| `0x41` (65) | Software Yield (`INT 0x41`) | `yield_interrupt_stub` → `yield_context_switch` |
-| LSTAR MSR | `SYSCALL` instruction | `syscall_handler_asm` → `syscall_dispatcher` |
-
----
-
-### Calling Convention
-
-The x86_64 System V ABI is used for all Rust-to-Rust and Rust-to-C calls within the kernel. Exceptions:
-
-- **Context switch stubs** — Assembly stubs use `extern "C"` to call into Rust context switch functions, passing the current RSP as the sole argument and receiving the next RSP as the return value.
-- **ACPICA** — The ACPICA C library is compiled with `cc` and linked against `c_stubs.rs`, which provides `no_std` implementations of required C runtime functions (`memcpy`, `memset`, `strlen`, etc.).
-- **x86-interrupt ABI** — Exception and IRQ handlers that are registered directly in the IDT use `extern "x86-interrupt"`, which the Rust compiler handles correctly for interrupt frame management.
-
----
-
-### GDT Layout
-
-The Global Descriptor Table is a 9-entry structure initialized by `init_hardened_gdt()`:
-
-| Index | Segment | Privilege |
-|-------|---------|-----------|
-| 0 | Null | — |
-| 1 | Kernel Code (`CS`) | Ring 0 |
-| 2 | Kernel Data (`DS`, `ES`, `SS`) | Ring 0 |
-| 3 | User Data | Ring 3 |
-| 4 | User Code | Ring 3 |
-| 5 | User Data (compat) | Ring 3 |
-| 6 | User Code (compat) | Ring 3 |
-| 7–8 | TSS (128-bit system descriptor) | Ring 0 |
-
-The TSS provides two dedicated stacks: a Ring 0 privilege stack (32 KB) used on Ring 3 → Ring 0 transitions, and a Double Fault IST stack (20 KB).
-
----
-
-### Target Configuration
-
-```json
-{
-  "llvm-target": "x86_64-unknown-none",
-  "arch": "x86_64",
-  "target-endian": "little",
-  "target-pointer-width": 64,
-  "linker-flavor": "gnu-lld",
-  "panic-strategy": "abort",
-  "disable-redzone": true,
-  "relocation-model": "static",
-  "features": "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+aes,+pclmulqdq,-avx,-avx2"
-}
-```
-
-SSE through SSE4.2 and AES-NI are enabled. AVX/AVX2 are disabled to maintain compatibility with a broader range of x86_64 silicon.
-
----
-
-## QCLang — Quantum Programming Language
-
-QCLang is Nyx's native quantum programming language with a Rust-inspired syntax and a dedicated compiler toolchain.
-
-### Pipeline
-
-```
-QCLang Source (.qcl)
-        ↓
-    Lexer (tokenize)
-        ↓
-    Parser → AST
-        ↓
-  Semantic Analyzer (Affine Type Checking)
-        ↓
-   QIR Builder → QirModule
-        ↓
-   QIR Optimizer (Dead Qubit Elimination, Gate Cancellation)
-        ↓
-   QIR Analyzer (Circuit metrics: depth, qubit count, T-count)
-        ↓
-  Code Generator → OpenQASM 2.0
-        ↓
-   Quantum Simulator (optional execution)
-```
-
-### Language Features
-
-- **Affine Type System** — Qubits are affine types. A qubit register cannot be used after measurement, enforced at compile time by the semantic analyzer.
-- **`qreg` declarations** — Quantum registers initialized to a basis state: `qreg q[2] = |00>;`
-- **Gate application** — Standard quantum gates: `H`, `CNOT`, `X`, `Y`, `Z`, `S`, `T`, `Rx`, `Ry`, `Rz`, `CZ`, `SWAP`, `Toffoli`
-- **Measurement** — `let c: cbit = measure(q[0]);`
-- **Quantum control flow** — `qfor` loops and `qif` conditional gate application
-- **Classical integration** — Classical `let` bindings, arithmetic, and control flow interoperate with quantum operations
-
-### Example: Bell State
-
-```rust
-fn main() -> int {
-    // Allocate a 2-qubit register in |00⟩
-    qreg q[2] = |00>;
-
-    // Apply Hadamard to create superposition on q[0]
-    H(q[0]);
-
-    // Entangle q[0] and q[1]
-    CNOT(q[0], q[1]);
-
-    // Measure both qubits — results are correlated
-    let r1: cbit = measure(q[0]);
-    let r2: cbit = measure(q[1]);
-
-    // r1 == r2 with 100% probability due to entanglement
-    return 0;
-}
-```
-
-Full language specification is documented in `SYNTAX.md`.
-
----
-
-## Quantum Subsystem — the QPU as a Compute Resource
-
-Nyx models three compute substrates. QCLang above is the *language*; this is the **operating system's**
-model of quantum computation — a QPU as a discoverable resource alongside the CPU and GPU.
-
-```
-CPU   general-purpose classical    scheduler, PerCpu, SysMetrics
-GPU   parallel classical           drivers/gpu/intel, syscalls 501–538
-QPU   quantum                      libs/quantum, syscalls 573–574
-```
-
-**Status: a Bell state has been measured on real IBM quantum hardware from this OS.**
-
-### The rule the whole design is built around
-
-> Never report `HARDWARE` when Nyx is not driving physically attached quantum hardware.
-
-This is enforced by the type system, not by convention:
-
-| state | meaning |
+| | |
 |---|---|
-| `NOT PRESENT` | nothing, anywhere |
-| `SIMULATOR` | classical software on this CPU |
-| `REMOTE/hw` | a real QPU, reached over the network |
-| `REMOTE/sim` | a *cloud simulator* — remote, and still classical |
-| `HARDWARE` | a real QPU attached to this machine |
+| CPU | x86-64 with SSE4.2 and AES-NI — the userspace targets (`targets/x86_64-nyx.json`, `x86_64-unknown-nyx.json`) enable them; AVX is off |
+| Firmware | UEFI |
+| Storage | an NVMe drive with a GPT Linux partition formatted ext4 (the root filesystem) |
+| GPU | Intel Gen9 / Gen9.5 for acceleration; anything else gets the CPU renderer |
+| Network | Realtek RTL8168, Intel Wi-Fi 9462-class |
+| Verified on | one Comet Lake laptop, and QEMU (no GPU acceleration, Wi-Fi or touchpad there) |
 
-- `QpuStatus::Hardware` is produced in exactly one place in the tree — the kernel's PCI probe, on a
-  match against a device table that is **deliberately empty**. Nothing in userspace can construct it.
-- `SimBackend::info()` hardcodes `Simulator`; there is no setter.
-- A QPU that is attached but has no driver **refuses** rather than falling back to the simulator.
-  `QpuSession::backend_for` has no `Hardware` arm, so the fallback path does not exist.
-
-⚠️ **`REMOTE` alone would be a lie.** Providers serve classical simulators through the *same API,
-lifecycle and JSON* as their real processors — IonQ's `simulator` and `qpu.aria-1` differ by one
-string. Hence `remote_is_simulator`, and `REMOTE/sim` rendered distinctly everywhere.
-
-⚠️ **Counts and probabilities are different facts.** The local simulator samples shots and reports
-counts. IonQ returns a probability histogram and never says how many shots produced each bucket —
-turning `0.5` into "512 of 1024" would invent a measurement nobody made. `Readout` is an enum with
-**no conversion** between its arms.
-
-### Architecture
-
-```
- terminal   sysmon   qcstudio
-     └─────────┴─────────┘
-               │
-     libs/quantum-rt  (std)      QpuSession · backends · qclang adapter · providers
-               │
-   ┌───────────┼────────────┬──────────────┐
-   ▼           ▼            ▼              ▼
-SimBackend  IonqProvider  IbmProvider   (future hardware)
-               │
-        libs/json ─ libs/net (TLS 1.3)
-               │
-     libs/quantum  (no_std, ZERO deps)    QpuInfo · Circuit · trait QpuBackend · state-vector sim
-               │
-     nyx-kernel/src/quantum.rs            registry · PCI probe · syscalls 573/574
-```
-
-The kernel holds **no gates, no circuits, no simulator and no networking** — a device table, a probe,
-and two read-only syscalls. There is no local hardware to arbitrate for, the kernel has no async
-model, and a cloud provider is an HTTPS client with no business in ring 0.
-
-### Commands
-
-```
-quantum                          is a QPU present, and what is actually computing
-quantum devices                  every device, with what each one really is
-quantum run bell                 H(q0), CX(q0,q1), measure — expect only 00 and 11
-quantum simulate [file.ql]       compile real QCLang and run it
-quantum remote jobs              pick a past cloud job and collect its result
-quantum remote run <target>      a REAL cloud QPU. hardware targets are metered
-quantum stop                     cancel a running job
-```
-
-Credentials are **baked into the boot image at build time** from a gitignored
-`quantum-credentials.txt` — Nyx has no clipboard and cannot express a paste chord, and an IBM
-instance CRN is ~120 characters. See `quantum-credentials.example.txt`.
-
-### Providers
-
-| provider | status |
-|---|---|
-| Local state-vector simulator | 20 qubits, exact, no noise model — cross-checked against `qclang_compiler::statevector` on every `cargo test` |
-| **IonQ** | abstract gates, one auth header |
-| **IBM Quantum** | ISA circuits (OpenQASM 2.0, basis `cz/rz/sx/x`), heavy-hex placement without a SWAP router — Bell pairs and GHZ chains |
-| AWS Braket | blocked: SigV4 needs HMAC-SHA256; `libs/crypto` has only SHA-1 |
-
-⚠️ **No consumer gate-model QPU exists that Nyx can drive over PCIe.** A cryogenic QPU is a fridge
-plus a rack of control electronics; the one genuinely PCI-attached piece of quantum hardware is a
-QRNG, which is an entropy source and not a processor. The cloud is the only path to a non-simulated
-result, and `docs/quantum/limitations.md` is the honest account of why.
-
-Full documentation in **`docs/quantum/`** — architecture, device model, circuit IR, simulator,
-syscalls, security, remote providers, and what future hardware would require.
-
----
-
-## Project Structure
-
-```
-Nyx/
-├── .cargo/                     # Cargo configuration (linker, target)
-├── .devcontainer/              # Dev Container configuration (DOCKERFILE + devcontainer.json)
-├── .github/workflows/          # CI/CD pipelines (build, release)
-│
-├── nyx-kernel/                 # Rust monolithic kernel (Ring 0)
-│   ├── src/
-│   │   ├── main.rs             # Kernel entry point, boot sequence, PID 1 launch
-│   │   ├── interrupts.rs       # IDT, exception handlers, syscall dispatcher (all 500+ syscalls)
-│   │   ├── memory.rs           # Frame allocator, page tables, SHM, mmap
-│   │   ├── scheduler.rs        # Task states, socket kinds, file descriptors, round-robin scheduler
-│   │   ├── process.rs          # ELF loader, process/thread creation, fork, IPC message
-│   │   ├── vfs.rs              # VFS mount table, FileSystem trait, VirtualFileSystem
-│   │   ├── fs.rs               # NvmeLwExt4Fs — ext4 driver via lwext4 C bridge
-│   │   ├── pci.rs              # PCI enumeration (MCFG/legacy), BAR access
-│   │   ├── apic.rs             # Local APIC init, timer, SIPI
-│   │   ├── ioapic.rs           # I/O APIC IRQ routing
-│   │   ├── acpi.rs             # ACPICA bridge, thermal zones, WiFi power, DSDT export
-│   │   ├── smp.rs              # AP bootstrap, ACTIVE_CORES atomic
-│   │   ├── percpu.rs           # Per-CPU struct, GS base, kernel/user RSP
-│   │   ├── gdt.rs              # GDT, TSS, segment selectors
-│   │   ├── gui.rs              # VgaPainter, BackBuffer, framebuffer management
-│   │   ├── window.rs           # Window manager, z-order, WINDOW_MANAGER global
-│   │   ├── mouse.rs            # PS/2 mouse driver, MOUSE_STATE global
-│   │   ├── shell.rs            # Kernel key queue for userspace polling
-│   │   ├── usb.rs              # xHCI host controller driver
-│   │   ├── thermal.rs          # Intel silicon temperature, HWP, fan control
-│   │   ├── laptop_fans.rs      # Dell SMBus fan RPM telemetry
-│   │   ├── time.rs             # TSC calibration, UPTIME_MS atomic
-│   │   ├── rtc.rs              # MC146818 CMOS/RTC wall-clock reader (sys_get_rtc)
-│   │   ├── tarfs.rs            # Initrd TAR filesystem parser
-│   │   ├── allocator.rs        # Kernel heap initialization
-│   │   ├── serial.rs           # Serial port logging, BOOT_LOG buffer
-│   │   ├── vga_log.rs          # Framebuffer text logging (vga_println! macro)
-│   │   ├── executor.rs         # Async task executor (futures support)
-│   │   ├── task.rs             # Async task waker
-│   │   ├── c_stubs.rs          # no_std C runtime stubs for ACPICA FFI
-│   │   ├── partitioner.rs      # GPT partition table parser
-│   │   ├── installer.rs        # Initrd TAR extraction to ext4
-│   │   ├── entity/
-│   │   │   ├── seed.rs         # Genetic Seed — persistent cryptographic identity
-│   │   │   └── state.rs        # NyxState — real-time AI behavioral dimensions
-│   │   └── drivers/
-│   │       ├── nvme.rs         # NVMe PCIe driver (admin + IO queues)
-│   │       ├── ahci.rs         # SATA AHCI driver
-│   │       ├── net/
-│   │       │   ├── rtl8168.rs  # Realtek RTL8168 GbE driver (MSI, DMA ring)
-│   │       │   ├── iwlwifi.rs  # Intel WiFi prototype driver
-│   │       │   └── mod.rs      # smoltcp network interface, DHCP, DNS
-│   │       └── gpu/
-│   │           ├── mod.rs       # GPU driver dispatch / fallback
-│   │           └── intel/
-│   │               ├── mod.rs   # Intel iGPU: BLT engine, GGTT, forcewake, vsync
-│   │               └── render/  # Gen9.5 RCS 3D engine (from-scratch mini-GL)
-│   │                   ├── mod.rs      # RenderEngine bring-up, GVA map, boot self-test
-│   │                   ├── ring.rs     # RCS ring buffer submission
-│   │                   ├── cmd.rs      # 3D command / PIPE_CONTROL encoders
-│   │                   ├── urb.rs      # URB allocation
-│   │                   ├── eu.rs       # Hand-encoded EU vertex/pixel shader kernels
-│   │                   ├── state.rs    # STATE_BASE, surface/sampler/RT state, tiling
-│   │                   ├── math.rs     # Vec/Mat4, perspective, lookAt
-│   │                   ├── engine.rs   # Mesh/Scene/Texture API types
-│   │                   ├── pipeline.rs # draw_scene / draw_resolve (SSAA two-pass)
-│   │                   ├── gl.rs       # Persistent GL_CONTEXT (mini-GL syscalls 514–516/527)
-│   │                   └── decode.rs   # Offline command-stream decoder
-│   ├── acpica-core/            # ACPICA C source tree (Intel reference implementation)
-│   ├── acpica-includes/        # ACPICA header files
-│   ├── lwext4/                 # lwext4 C library (ext4 filesystem implementation)
-│   ├── ext4_wrapper.c          # Rust ↔ lwext4 bridge
-│   ├── custom_acpi.c           # Custom ACPICA OS layer implementation
-│   ├── build.rs                # bindgen codegen for ACPICA and lwext4 FFI
-│   └── Cargo.toml              # Kernel dependencies
-│
-├── tools/
-│   └── compiler/               # QCLang compiler toolchain
-│       └── src/
-│           ├── lexer.rs        # Tokenizer
-│           ├── parser.rs       # Recursive-descent parser → AST
-│           ├── ast.rs          # Abstract Syntax Tree definitions
-│           ├── semantics/      # Semantic analysis, affine type checking, symbol table
-│           ├── qir/            # Quantum Intermediate Representation
-│           │   ├── types.rs    # QubitId, CbitId, QirType, BitState
-│           │   ├── operations.rs # QirGate, QirOp definitions
-│           │   ├── builder.rs  # AST → QIR lowering
-│           │   ├── optimizer.rs # Dead qubit elimination, gate cancellation
-│           │   └── analysis.rs # Circuit depth, T-count, connectivity analysis
-│           ├── codegen/
-│           │   └── qasm.rs     # QIR → OpenQASM 2.0 code generator
-│           ├── simulator.rs    # Software quantum state vector simulator
-│           └── bin/qclang.rs   # CLI: compile, run, benchmark, info, update
-│
-├── apps/                       # Userspace applications (ELF64, Ring 3)
-│   ├── compositor/             # Windowing compositor (GPU-composited windows, opacity, rounded corners, shadows, scrollbar, damage tracking, page-flip, U7 window controls, GPU text)
-│   ├── terminal/               # Terminal emulator
-│   ├── explorer/               # File system explorer
-│   ├── sysmon/                 # System monitor (CPU, memory, tasks)
-│   ├── network/                # Network configuration manager
-│   ├── settings/               # System settings application
-│   ├── glcube/                 # mini-GL validation app (spinning textured cube in a window)
-│   └── init/                   # PID 1 init process
-│
-├── libs/                       # Shared userspace libraries
-│   ├── gui/                    # GUI widget toolkit (canvas, draw, effects, UI layout)
-│   ├── api/                    # Nyx OS system call bindings
-│   ├── net/                    # HTTP/1.1 + TLS 1.3 client (rustls), GET and POST
-│   ├── json/                   # Minimal JSON reader/writer — no_std, zero deps, depth-capped
-│   ├── quantum/                # QPU device model, circuit IR, backend trait, state-vector sim
-│   └── quantum-rt/             # Quantum runtime: sessions, qclang adapter, IonQ + IBM providers
-│
-├── nyx-recv/                   # Debug utilities
-│   ├── udp.py                  # UDP packet capture
-│   ├── decode.py               # Packet decoder
-│   └── dsdt.dsl                # Dumped ACPI DSDT (decompiled ASL source)
-│
-├── targets/
-│   ├── x86_64-nyx.json         # Custom Rust target specification
-│   └── linker.ld               # Kernel linker script
-│
-├── Build.sh                    # One-command full workspace build
-├── Cargo.toml                  # Rust workspace manifest
-├── rust-toolchain.toml         # Pinned nightly toolchain + llvm-tools-preview
-├── SYNTAX.md                   # QCLang language specification
-├── CLI.md                      # QCLang CLI reference
-├── CHANGELOG.md                # QCLang version history
-├── CONTRIBUTING.md             # Contribution guidelines
-└── PHASES.TXT                  # Detailed development roadmap (Phases 1–5)
-```
-
----
-
-## Current Status
-
-**Pre-Alpha — as of July 2026**
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| QCLang Compiler | ✅ Functional | v0.6.0 — full pipeline through OpenQASM output |
-| QIR Optimizer | ✅ Functional | Dead qubit elimination, gate cancellation |
-| Quantum Simulator | ✅ Functional | Software state vector simulator |
-| **QPU Subsystem** | ✅ Functional | QPU as a third compute substrate: device model, kernel registry, syscalls 573/574, `no_std` circuit IR + simulator |
-| **Cloud QPU (IonQ / IBM)** | ✅ **Hardware-verified** | **A Bell state measured on a real IBM QPU from Nyx.** IBM path: IAM auth, ISA circuits (OpenQASM 2.0), Primitives V2, job re-attach |
-| Kernel Boot (QEMU) | ✅ Functional | Full boot sequence to Ring 3 userspace |
-| Memory Management | ✅ Functional | 4-level paging, per-process isolation, SHM |
-| VFS / ext4 | ✅ Functional | Read/write ext4 via NVMe on real hardware |
-| NVMe Driver | ✅ Functional | Block read/write, IO queues |
-| RTL8168 Ethernet | ✅ Functional | DHCP, TCP/UDP, DNS |
-| Intel GPU (2D BLT) | ✅ Functional | fill_rect, copy_rect, vsync, double buffer |
-| Intel Gen9.5 3D (RCS) | ✅ Functional | From-scratch mini-GL: textured meshes, SSAA, render-to-texture (bare metal only) |
-| Desktop Compositor (GPU) | ✅ Functional | GPU-composited windows, opacity, rounded corners, shadows, damage tracking, page-flip present |
-| Window Controls (U7) | ✅ Functional | Resize any edge, taskbar buttons, real minimize, maximize, focus/hover |
-| UI Font | ✅ Functional | Proportional antialiased DejaVu Sans (TTF); GPU chrome text |
-| SMP (Multi-core) | ✅ Functional | AP bootstrap, per-CPU scheduler |
-| Syscall ABI | ✅ Functional | 40+ POSIX + 40+ Nyx native syscalls |
-| ACPI / Thermal | ✅ Functional | Temperature, HWP, fan control |
-| xHCI USB | 🔧 Prototype | Controller init; device enumeration in progress |
-| AI Entity System | ✅ Functional | Genetic seed persistence, real-time NyxState |
-| Real Hardware Boot | 🔧 Partial | Boots on select x86_64 laptops (Comet Lake) |
-| DRM / Nouveau | 🔧 Early | Handshake WIP for NVIDIA GPU support |
-| Intel WiFi | 🔧 Prototype | Driver skeleton; association pending |
-| AHCI / SATA | 🔧 Prototype | Port enumeration; R/W in progress |
-| Userspace Apps | 🔧 Early stage | Compositor, terminal, sysmon, explorer, settings, network, glcube |
-
----
-
-## Quick Start
-
-### Requirements
-
-- Rust nightly toolchain (pinned via `rust-toolchain.toml`)
-- QEMU (`qemu-system-x86_64`)
-- `lld` linker
-- `clang` and `bindgen` (for ACPICA and lwext4 C compilation)
-
-### Build and Run
+## Build & run
 
 ```bash
-# Clone the repository
-git clone https://github.com/Asmodeus14/Nyx.git
-cd Nyx
-
-# Build the entire workspace (kernel + userspace + compiler)
-./Build.sh
-
-# Run in QEMU
-./runner/run-qemu.sh
+./Build.sh          # build everything, pack the initrd, build the kernel image, launch QEMU
+CI=1 ./Build.sh     # build only
 ```
 
-For detailed CLI options, debug flags, and QEMU configuration see `CLI.md`.
+Requires the pinned nightly from `rust-toolchain.toml`, `clang` and `lld`. A QEMU boot additionally
+needs an NVMe disk image and a couple of flags — see **[BUILD.md](docs/BUILD.md)**, which also covers
+hardware flashing, host tests and CI.
 
-### Dev Container
+## Repository
 
-Nyx ships a fully configured Dev Container (`.devcontainer/`) that installs all build dependencies automatically. Open the repository in VS Code with the Dev Containers extension, or use GitHub Codespaces:
-
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?hide_repo_select=true&ref=master&repo=Asmodeus14/Nyx)
-
----
+| Path | |
+|---|---|
+| `nyx-kernel/` | the kernel (vendored ACPICA and lwext4 inside) |
+| `apps/` | userspace programs — `shell` is the window server |
+| `libs/` | userspace libraries (`api`, `gui`, `meridian`, `net`, `quantum`, …) |
+| `tools/compiler/` | the QCLang compiler — language docs in [`docs/qclang/`](docs/qclang/SYNTAX.md) |
+| `tools/runner/` | builds the UEFI image and launches QEMU |
+| `tests/` | POSIX conformance probe, `std` tests, C/C++ tests |
+| `vendor/` | Nyx's Rust `std` platform layer, musl |
+| `docs/` | documentation |
 
 ## Contributing
 
-Nyx is looking for contributors with expertise in:
-
-- Operating systems and kernel development
-- Rust `no_std` programming
-- Quantum programming languages and circuit optimization
-- x86_64 hardware driver development
-- Networking (TCP/IP stacks, device drivers)
-- Compiler construction and type systems
-
-**How to contribute:**
-
-1. Read `CONTRIBUTING.md` and `Code_Of_Conduct.md`
-2. Check open issues and the development roadmap in `PHASES.TXT`
-3. Fork the repository and create a feature branch
-4. Submit a pull request against `master`
-
-Priority areas: ext4 hardening (see `PHASES.TXT` Phase 1), Ethernet stack robustness (Phase 2), USB HID device enumeration, and NVIDIA DRM handshake.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [Code_Of_Conduct.md](Code_Of_Conduct.md). The current
+direction and open items are in [ROADMAP.md](docs/ROADMAP.md).
 
 ## License
 
-Nyx OS is licensed under the **Apache License 2.0**.
+Apache License 2.0 — see [`License`](License) and [`NOTICE.md`](NOTICE.md).
 
-See `License` and `NOTICE.md` for full terms.
-
-The following third-party components are included under their respective licenses:
-- **ACPICA** — Intel License (see `nyx-kernel/acpica-core/`)
-- **lwext4** — BSD 2-Clause (see `nyx-kernel/lwext4/LICENSE`)
-- **smoltcp** — MIT / Apache 2.0 dual license
-
----
-
-> *Nyx — because every great OS needs a bit of mystery and entanglement.*
->
-> **Let's build the future, one qubit at a time.**
+Third-party code keeps its own licence: ACPICA (`nyx-kernel/acpica-core/`, Intel — see its source
+headers), lwext4 (`nyx-kernel/lwext4/LICENSE`), the Inter and JetBrains Mono fonts (SIL Open Font
+License 1.1, `libs/meridian/fonts/`), and crates from crates.io under their own terms.
