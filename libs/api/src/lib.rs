@@ -1015,6 +1015,12 @@ pub fn sys_i2c_hid_enable() {
     syscall(578, 3, 0, 0, 0, 0, 0);
 }
 
+/// I2C touchpad pointer speed, in percent of the device's raw counts (clamped 10..=400 by the
+/// kernel). `0` only reads it. Returns the speed now in force.
+pub fn sys_i2c_hid_speed(pct: u32) -> u32 {
+    syscall(578, 5, pct as u64, 0, 0, 0, 0) as u32
+}
+
 /// Stop driving the pointer from I2C; PS/2 mouse bytes are accepted again.
 pub fn sys_i2c_hid_disable() {
     syscall(578, 4, 0, 0, 0, 0, 0);

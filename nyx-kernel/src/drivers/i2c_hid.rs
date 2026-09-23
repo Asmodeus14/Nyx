@@ -136,6 +136,11 @@ struct Live {
     mouse: crate::drivers::hid_desc::MouseLayout,
     /// Consecutive failed reads. Too many and the pointer goes back to PS/2.
     errors: u32,
+    /// Sub-pixel remainder of scaled motion, in hundredths of a pixel. Carried between reports so
+    /// that below 100% a slow finger still moves the pointer instead of every small delta
+    /// truncating to zero.
+    acc_x: i32,
+    acc_y: i32,
 }
 
 static LIVE: spin::Mutex<Option<Live>> = spin::Mutex::new(None);
@@ -144,9 +149,16 @@ static LIVE: spin::Mutex<Option<Live>> = spin::Mutex::new(None);
 /// from a bus that normally never fails.
 const MAX_CONSECUTIVE_ERRORS: u32 = 50;
 
-/// Pointer speed relative to raw report counts — the same ×2 the PS/2 path applies, so switching
-/// transports does not change how the pointer feels.
-const POINTER_GAIN: i32 = 2;
+/// Pointer speed as a percentage of raw report counts. `touchpad speed <pct>` sets it (syscall 578
+/// op 5).
+///
+/// ★ Started life as the PS/2 path's fixed ×2, on the theory that matching it would keep the feel.
+/// On the hardware that was "very fast, almost too sensitive": over I2C the ELAN part reports in
+/// finer counts than its PS/2 emulation did, so the same multiplier overshoots. 100% is the
+/// measured-by-hand starting point; the setting exists because the right value is a preference.
+pub static SPEED_PCT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+pub const SPEED_MIN: u32 = 10;
+pub const SPEED_MAX: u32 = 400;
 
 /// Called from the `usb-hid` task loop. Cheap when idle.
 pub fn service() {
@@ -277,6 +289,7 @@ fn run(enable: bool) -> ProbeResult {
         if let Some(mut l) = LIVE.try_lock() {
             *l = Some(Live {
                 ctl, addr: hid.slave_addr as u8, in_reg, max_in, uses_ids, mouse, errors: 0,
+                acc_x: 0, acc_y: 0,
             });
             POINTER_ACTIVE.store(true, Ordering::Release);
             r.active = 1;
@@ -333,8 +346,17 @@ fn poll() {
                         buttons |= 1 << i;
                     }
                 }
+                // Scale in hundredths, keeping the remainder (`/` truncates toward zero, so the
+                // remainder keeps its sign and motion is symmetric in both directions).
+                let pct = SPEED_PCT.load(Ordering::Relaxed) as i32;
+                dev.acc_x += dx * pct;
+                dev.acc_y += dy * pct;
+                let mx = dev.acc_x / 100;
+                let my = dev.acc_y / 100;
+                dev.acc_x -= mx * 100;
+                dev.acc_y -= my * 100;
                 // HID relative Y is positive DOWN, the screen's convention — no flip, unlike PS/2.
-                crate::mouse::update_relative(dx * POINTER_GAIN, dy * POINTER_GAIN, buttons);
+                crate::mouse::update_relative(mx, my, buttons);
             }
         }
     }

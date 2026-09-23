@@ -3854,6 +3854,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  touchpad i2c      - just the I2C part (~4 s: move a finger and click during it)\n");
                 self.output_history.push_str("  touchpad on       - initialise it; if reports arrive, it becomes the pointer (~6 s)\n");
                 self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
+                self.output_history.push_str("  touchpad speed N  - pointer speed in percent (default 100; 10-400)\n");
                 self.output_history.push_str("  touchpad handover - firmware _DSM: EC stops PS/2 emulation (until power-off!)\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
                 self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
@@ -4389,6 +4390,23 @@ impl NyxApp for TerminalApp {
                 sys_acpi_probe(13, 0);
                 sys_sleep_ms(1600);
                 self.touchpad_i2c_probe(true);
+            } else if cmd == "touchpad speed" || cmd.starts_with("touchpad speed ") {
+                let arg = cmd.strip_prefix("touchpad speed").unwrap_or("").trim();
+                if arg.is_empty() {
+                    let now = sys_i2c_hid_speed(0);
+                    self.output_history.push_str(&format!("touchpad speed: {}%\n", now));
+                } else {
+                    match arg.trim_end_matches('%').parse::<u32>() {
+                        Ok(v) if v > 0 => {
+                            let now = sys_i2c_hid_speed(v);
+                            self.output_history.push_str(&format!(
+                                "touchpad speed: {}%{}\n", now,
+                                if now != v { "  (clamped to 10..400)" } else { "" },
+                            ));
+                        }
+                        _ => self.output_history.push_str("usage: touchpad speed <10-400>\n"),
+                    }
+                }
             } else if cmd == "touchpad off" {
                 sys_i2c_hid_disable();
                 self.output_history.push_str("I2C touchpad released; PS/2 mouse bytes are accepted again.\n");

@@ -4429,6 +4429,16 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         .store(true, core::sync::atomic::Ordering::Release);
                     frame.rax = 1;
                 }
+                5 => {
+                    // op 5: pointer speed in percent. arg2 = 0 only reads it; otherwise it is set,
+                    // clamped to the sane range. Returns the value now in force.
+                    use crate::drivers::i2c_hid::{SPEED_MAX, SPEED_MIN, SPEED_PCT};
+                    if arg2 != 0 {
+                        let v = (arg2 as u32).clamp(SPEED_MIN, SPEED_MAX);
+                        SPEED_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    frame.rax = SPEED_PCT.load(core::sync::atomic::Ordering::Relaxed) as u64;
+                }
                 4 => {
                     // op 4: hand the pointer back to PS/2.
                     crate::drivers::i2c_hid::DISABLE
