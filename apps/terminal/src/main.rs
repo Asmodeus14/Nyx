@@ -4430,17 +4430,19 @@ impl NyxApp for TerminalApp {
                 match sys_gpu_health() {
                     None => self.output_history.push_str("gpu: no answer from the kernel\n"),
                     Some(h) => {
+                        // When the GPU refuses, the shell draws the SAME Meridian glyphs from its
+                        // atlas on the CPU — so this says who draws, not which font.
                         let verdict = if h.gpu_present == 0 {
-                            "no Intel render engine — text is ALWAYS the CPU bitmap font here"
+                            "no Intel render engine — the CPU draws all text (same Meridian font)"
                         } else if h.wedged != 0 {
-                            "render engine LATCHED OFF after repeated hangs — text is the CPU \
-                             bitmap font until reboot"
+                            "render engine LATCHED OFF after repeated hangs — the CPU draws text \
+                             and composites instead, until reboot"
                         } else if h.text_refused > 0 && h.text_drawn == 0 {
-                            "GPU text has never succeeded this boot — CPU bitmap font"
+                            "GPU text has never succeeded this boot — the CPU draws it instead"
                         } else if h.text_refused > 0 {
-                            "GPU text mostly works, but some batches fell back to the CPU font"
+                            "GPU text mostly works; some batches fell back to the CPU"
                         } else {
-                            "GPU text working — the smooth Meridian font"
+                            "GPU text working — the render engine draws it"
                         };
                         self.output_history.push_str(&format!(
                             "gpu: {}\n  render hangs {} of {} (latched: {})   GL hangs {}\n  \
@@ -4450,6 +4452,31 @@ impl NyxApp for TerminalApp {
                             h.gl_hangs,
                             h.text_drawn, h.text_refused, h.text_refused_wedged,
                         ));
+                        if h.gpu_present != 0 {
+                            let t = h.boot_tests;
+                            let r = |bit: u32| if t & (1 << bit) != 0 { "pass" } else { "FAIL" };
+                            self.output_history.push_str(&format!(
+                                "  boot tests: bring-up {}  ring store {}  ring fence {}  batch {}\n",
+                                r(0), r(1), r(2),
+                                if t & (1 << 4) == 0 { "not run" } else { r(3) },
+                            ));
+                            let s = h.first_hang;
+                            if s.valid != 0 {
+                                // Raw registers: ACTHD says where the engine is executing (ring vs
+                                // batch), IPEHR the command it choked on. Paste these as they are.
+                                self.output_history.push_str(&format!(
+                                    "  FIRST HANG: fence {:#010x} want {:#010x}\n    \
+                                     HEAD {:#x} TAIL {:#x} CTL {:#x} ACTHD {:#x}\n    \
+                                     IPEHR {:#010x} IPEIR {:#x} INSTDONE {:#010x} MI_MODE {:#x}\n    \
+                                     EIR {:#x} FAULT {:#010x} ERROR {:#x} FW_ACK {:#x}\n",
+                                    s.fence_got, s.fence_want, s.head, s.tail, s.ctl, s.acthd,
+                                    s.ipehr, s.ipeir, s.instdone, s.mi_mode,
+                                    s.eir, s.fault, s.error_gen6, s.fw_ack,
+                                ));
+                            } else {
+                                self.output_history.push_str("  no render hang this boot\n");
+                            }
+                        }
                     }
                 }
             } else if cmd == "touchpad status" {

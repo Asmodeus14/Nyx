@@ -2276,8 +2276,38 @@ pub struct GpuHealth {
     pub text_refused_wedged: u32,
     /// 1 if the Intel render engine initialised at all.
     pub gpu_present: u32,
+    /// Boot self-tests, one bit each: 0 bring-up, 1 ring store, 2 ring PIPE_CONTROL fence,
+    /// 3 batch buffer, 4 batch test attempted.
+    pub boot_tests: u32,
+    pub _pad: u32,
+    /// The render engine's registers at the first hang this boot.
+    pub first_hang: GpuHangSnapshot,
 }
-const _: () = assert!(core::mem::size_of::<GpuHealth>() == 32);
+const _: () = assert!(core::mem::size_of::<GpuHealth>() == 104);
+
+/// Mirrors the kernel's `render::HangSnapshot`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GpuHangSnapshot {
+    pub valid: u32,
+    pub fence_got: u32,
+    pub fence_want: u32,
+    pub head: u32,
+    pub tail: u32,
+    pub ctl: u32,
+    /// Where the command streamer is actually executing.
+    pub acthd: u32,
+    /// The command header the parser choked on.
+    pub ipehr: u32,
+    pub ipeir: u32,
+    pub instdone: u32,
+    pub mi_mode: u32,
+    pub eir: u32,
+    pub fault: u32,
+    pub error_gen6: u32,
+    pub fw_ack: u32,
+    pub _pad: u32,
+}
 
 pub fn sys_gpu_health() -> Option<GpuHealth> {
     let mut h = GpuHealth::default();

@@ -66,6 +66,51 @@ pub const GRDOM_FULL: u32 = 1 << 0;
 // Global fault register (already probed by the BLT self-test at 0x4094).
 pub const RENDER_FAULT_REG: u32 = 0x4094;
 
+// Hang forensics (i915's error-capture set for the render engine, Gen8/9 offsets).
+/// Active head: the address the command streamer is actually executing — in the ring, or inside a
+/// batch. Where it points is the single most telling number in a hang.
+pub const RCS_ACTHD: u32 = RCS_BASE + 0x74;
+/// Instruction parser error identity / header: the command dword the parser choked on.
+pub const RCS_IPEIR: u32 = RCS_BASE + 0x64;
+pub const RCS_IPEHR: u32 = RCS_BASE + 0x68;
+/// Which units are still busy.
+pub const RCS_INSTDONE: u32 = RCS_BASE + 0x6C;
+pub const RCS_MI_MODE: u32 = RCS_BASE + 0x9C;
+pub const RCS_EIR: u32 = RCS_BASE + 0xB0;
+/// Global error register (page-table faults and the like).
+pub const ERROR_GEN6: u32 = 0x40A0;
+
+/// The render engine's state at the first fence timeout of this boot — the `gpu` command.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HangSnapshot {
+    pub valid: u32,
+    pub fence_got: u32,
+    pub fence_want: u32,
+    pub head: u32,
+    pub tail: u32,
+    pub ctl: u32,
+    pub acthd: u32,
+    pub ipehr: u32,
+    pub ipeir: u32,
+    pub instdone: u32,
+    pub mi_mode: u32,
+    pub eir: u32,
+    pub fault: u32,
+    pub error_gen6: u32,
+    pub fw_ack: u32,
+    pub _pad: u32,
+}
+
+pub static FIRST_HANG: spin::Mutex<HangSnapshot> = spin::Mutex::new(HangSnapshot {
+    valid: 0, fence_got: 0, fence_want: 0, head: 0, tail: 0, ctl: 0, acthd: 0, ipehr: 0,
+    ipeir: 0, instdone: 0, mi_mode: 0, eir: 0, fault: 0, error_gen6: 0, fw_ack: 0, _pad: 0,
+});
+
+/// Boot self-test results, one bit each: 0 bring-up, 1 ring MI_STORE_DATA_IMM, 2 ring
+/// PIPE_CONTROL fence, 3 BATCH BUFFER (MI_STORE inside a batch), 4 the batch test was attempted.
+pub static BOOT_TESTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// How long to wait for the render fence before declaring the engine hung, in microseconds.
 ///
 /// This is a deadline for declaring the engine dead, NOT a performance knob — the same distinction
@@ -164,6 +209,11 @@ pub struct GpuHealth {
     pub text_refused_wedged: u32,
     /// 1 if the Intel render engine was initialised at all (0 in QEMU, which has no Intel GPU).
     pub gpu_present: u32,
+    /// [`BOOT_TESTS`] bits.
+    pub boot_tests: u32,
+    pub _pad: u32,
+    /// The first hang of this boot ([`FIRST_HANG`]); `valid` 0 if there has been none.
+    pub first_hang: HangSnapshot,
 }
 
 pub fn health() -> GpuHealth {
@@ -179,6 +229,9 @@ pub fn health() -> GpuHealth {
         // try_lock: this is read from a syscall at IF=0, and a draw may hold the engine. If it is
         // busy, it is certainly present.
         gpu_present: RENDER_ENGINE.try_lock().map_or(true, |e| e.initialized) as u32,
+        boot_tests: BOOT_TESTS.load(Relaxed),
+        _pad: 0,
+        first_hang: FIRST_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
     }
 }
 
@@ -582,7 +635,10 @@ impl RenderEngine {
     /// MI_BATCH_BUFFER_START (GGTT address space). The batch must fit in one page.
     pub unsafe fn exec_batch(&mut self, batch: &[u32]) -> Result<(), RenderError> {
         let batch_virt = self.batch_virt.ok_or(RenderError::NotInitialized)?;
-        if (batch.len() + 1) * 4 > 4096 {
+        // The batch plus BB_END, padded to a whole QWORD with MI_NOOP — the same rule i915 applies
+        // to batches as to the ring (see `rcs_submit`).
+        let total = (batch.len() + 1 + 1) & !1;
+        if total * 4 > 4096 {
             return Err(RenderError::RingFull); // batch too large for one page
         }
         let dst = batch_virt as *mut u32;
@@ -590,9 +646,12 @@ impl RenderEngine {
             dst.add(i).write_volatile(dw);
         }
         dst.add(batch.len()).write_volatile(cmd::MI_BATCH_BUFFER_END);
+        if total > batch.len() + 1 {
+            dst.add(batch.len() + 1).write_volatile(cmd::MI_NOOP);
+        }
 
         // Flush every touched cache line so the GPU's command fetch sees the batch.
-        let bytes = (batch.len() + 1) * 4;
+        let bytes = total * 4;
         let mut off = 0usize;
         while off < bytes {
             self.flush_line(batch_virt as usize + off);
@@ -666,6 +725,32 @@ impl RenderEngine {
                 let head = self.read_reg(RENDER_RING_HEAD);
                 let tail = self.read_reg(RENDER_RING_TAIL);
                 let fault = self.read_reg(RENDER_FAULT_REG);
+                // The FIRST hang's full engine state, kept for `gpu`. The log line below goes to a
+                // serial port the test laptop does not have — which is how this engine's hangs went
+                // undiagnosed for months. The first hang is the informative one: later ones may
+                // just be the aftermath.
+                if let Some(mut s) = FIRST_HANG.try_lock() {
+                    if s.valid == 0 {
+                        *s = HangSnapshot {
+                            valid: 1,
+                            fence_got: self.fence_virt.read_volatile(),
+                            fence_want: expected,
+                            head,
+                            tail,
+                            ctl: self.read_reg(RENDER_RING_CTL),
+                            acthd: self.read_reg(RCS_ACTHD),
+                            ipehr: self.read_reg(RCS_IPEHR),
+                            ipeir: self.read_reg(RCS_IPEIR),
+                            instdone: self.read_reg(RCS_INSTDONE),
+                            mi_mode: self.read_reg(RCS_MI_MODE),
+                            eir: self.read_reg(RCS_EIR),
+                            fault,
+                            error_gen6: self.read_reg(ERROR_GEN6),
+                            fw_ack: self.read_reg(FORCEWAKE_ACK_RENDER),
+                            _pad: 0,
+                        };
+                    }
+                }
                 // A SEPARATE counter, only for rate-limiting this log. `RENDER_HANGS` is the latch
                 // and is owned by `compositor::composite`; incrementing it here would double-count
                 // (two waits per composite) and re-introduce the flapping described above.
@@ -749,18 +834,34 @@ pub static RENDER_ENGINE: spin::Mutex<RenderEngine> = spin::Mutex::new(RenderEng
 pub fn init_render_engine(mmio_base: u64) -> bool {
     let mut eng = RENDER_ENGINE.lock();
     unsafe {
+        use core::sync::atomic::Ordering::Relaxed;
         if let Err(e) = eng.bring_up(mmio_base) {
             crate::serial_println!("[RCS] bring-up failed: {:?}", e);
             return false;
         }
+        BOOT_TESTS.fetch_or(1 << 0, Relaxed);
         if let Err(e) = eng.rcs_selftest() {
             crate::serial_println!("[RCS] ring self-test failed: {:?}", e);
             return false;
         }
-        // Phase 2: PIPE_CONTROL post-sync fence via the RING. We deliberately do NOT run
-        // any batch-buffer test here — batches leave the engine stuck (BB_END doesn't
-        // return on this HW) and would starve the subsequent pipeline submission.
+        BOOT_TESTS.fetch_or(1 << 1, Relaxed);
+        // Phase 2: PIPE_CONTROL post-sync fence via the RING.
         let pc_ok = eng.pipecontrol_ring_test().is_ok();
+        if pc_ok {
+            BOOT_TESTS.fetch_or(1 << 2, Relaxed);
+        }
+        // ★ The batch-buffer test, which this boot path used to skip on the belief that "BB_END
+        // doesn't return on this HW". Every composite and GPU text draw IS a batch, and they all
+        // hung — but the one odd-length ring submission (the 3-dword MI_BATCH_BUFFER_START, now
+        // padded, see `rcs_submit`) explains that without any such quirk. This proves or disproves
+        // it on every boot, and `gpu` reports which. Costs nothing if batches are still broken:
+        // the composite path would hang on the very same thing a moment later anyway.
+        if pc_ok {
+            BOOT_TESTS.fetch_or(1 << 4, Relaxed);
+            if eng.batch_mistore_test().is_ok() {
+                BOOT_TESTS.fetch_or(1 << 3, Relaxed);
+            }
+        }
 
         // Phase 3: encode the VS/PS kernels, place them in the instruction base, and
         // hex-dump for byte-diff against Mesa. Non-fatal (encoding validation step).
