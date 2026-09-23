@@ -28,6 +28,23 @@ libc++ programs, and treats a quantum processor as a compute resource beside the
 Nyx is **pre-alpha**. It is developed against one laptop (Intel Comet Lake, UHD graphics `0x9BC4`)
 and also boots in QEMU.
 
+## Screenshots
+
+![The QCLang studio: a Bell-pair program compiled on Nyx, its circuit, and exact measurement probabilities](docs/images/qclang-studio.png)
+
+| | | |
+|:---:|:---:|:---:|
+| ![Desktop](docs/images/desktop.png) | ![The Command launcher](docs/images/command.png) | ![Terminal running the local quantum simulator](docs/images/terminal.png) |
+| **Desktop** — a dock on the wallpaper, no taskbar | **The Command** (Super key) — search and launch | **Terminal** — `quantum run bell` on the state-vector simulator |
+| ![Files](docs/images/files.png) | ![System Monitor](docs/images/system-monitor.png) | ![Notepad](docs/images/notepad.png) |
+| **Files** — the ext4 root on NVMe | **System Monitor** | **Notepad** |
+| ![Image Viewer](docs/images/image-viewer.png) | ![Settings](docs/images/settings.png) | |
+| **Image Viewer** — JPEG decoded on Nyx | **Settings** | |
+
+<sub>Captured from Nyx running in QEMU (`./Build.sh` + the disk image in [BUILD.md](docs/BUILD.md)).
+QEMU has no Intel GPU, so these frames were composited on the CPU; on the Intel laptop the GPU
+composites the same pixels. Readings such as temperature come from QEMU's emulated hardware.</sub>
+
 ## Current status
 
 🟢 implemented · 🟡 experimental · 🔴 broken · 🚧 in progress · ⬜ planned

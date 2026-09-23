@@ -21,6 +21,12 @@ From the module docs of `apps/shell/src/main.rs`:
 Type: **Inter** (UI) and **JetBrains Mono** (code/terminal), embedded from `libs/meridian/fonts/`
 and rasterised into a multi-size coverage atlas at startup.
 
+| The desktop | The Command |
+|:---:|:---:|
+| ![The Meridian desktop: dock at bottom-left, status mark at bottom-right](images/desktop.png) | ![The Command launcher listing applications](images/command.png) |
+
+<sub>Captured in QEMU (CPU-composited). More in the [README](../README.md#screenshots).</sub>
+
 ## How a frame is made
 
 ```mermaid
