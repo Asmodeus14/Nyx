@@ -136,7 +136,7 @@ const DOCK: [Option<usize>; layout::DOCK_SLOTS] =
 /// string in `.rodata` proves neither. `parent alive` is the load-bearing line — the shell IS the
 /// desktop, so the shell going quiet after a dock click is indistinguishable from a whole-machine
 /// freeze from the outside, and this is what tells the two apart.
-fn launch(app: &App) {
+fn launch(app: &App) -> Option<u64> {
     let mut buf = [0u8; 128];
     let mut n = 0usize;
     for &b in app.bundle.as_bytes() {
@@ -151,17 +151,27 @@ fn launch(app: &App) {
     }
     let exec = match core::str::from_utf8(&buf[..n]) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return None,
     };
     breadcrumb("[LAUNCH] pre-fork: ", app.label);
-    if sys_fork() == 0 {
+    let pid = sys_fork();
+    if pid == 0 {
         breadcrumb("[LAUNCH] child: ", app.label);
         sys_execve(exec);
         breadcrumb("[LAUNCH] execve returned, exec FAILED: ", app.label);
         sys_exit(1);
     }
     breadcrumb("[LAUNCH] parent alive: ", app.label);
+    // The child's PID — the same process that will ask for a window, since execve keeps it. That
+    // request is how the shell knows the launch finished.
+    if pid > 0 { Some(pid as u64) } else { None }
 }
+
+/// How long a launch may show as in progress before it is given up on. An app that never opens a
+/// window (it failed to exec, or it crashed first) must not leave the desktop "working" forever.
+const LAUNCH_TIMEOUT_MS: usize = 15_000;
+/// One step of the launch indicator's three dots.
+const LAUNCH_STEP_MS: usize = 150;
 
 /// Case-insensitive substring match. Labels and queries are both ASCII, so this compares bytes.
 fn matches(label: &str, q: &[u8]) -> bool {
@@ -2285,6 +2295,16 @@ struct Shell {
     /// older value — building the next step on it would drag the view backwards. For a short while
     /// after sending, the next step builds on what was SENT instead.
     touch_scroll: Option<(usize, i32, usize)>,
+    /// An app being launched: (index into APPS, the forked PID, when). Cleared when that PID asks
+    /// for its first window, or after [`LAUNCH_TIMEOUT_MS`].
+    ///
+    /// ★ The loading indicator. A launch is fork + execve + the app loading its binary from NVMe
+    /// before it can ask for a window, and on the hardware that gap read as "stuck" — a click with
+    /// no visible answer. While this is set the pointer is the Working cursor and the app's dock
+    /// slot shows three stepping dots.
+    launching: Option<(usize, u64, usize)>,
+    /// The launch indicator's last drawn step, so the dock repaints only when it changes.
+    launch_step: usize,
     cursor: Shape,
     /// Cold-start stage 3 — the mark travelling from the kernel's screen to the corner.
     handoff: Handoff,
@@ -2460,6 +2480,8 @@ impl Shell {
             resize_edges: 0,
             scrolling: None,
             touch_scroll: None,
+            launching: None,
+            launch_step: usize::MAX,
             cursor: Shape::Pointer,
             handoff: Handoff::begin(),
             osd: None,
@@ -2780,7 +2802,7 @@ impl Shell {
 
         self.set_command(false);
         match action {
-            Action::Launch(app) => launch(&APPS[app]),
+            Action::Launch(app) => self.start_launch(app),
             Action::ToggleTheme => self.set_theme(if self.theme.is_dark {
                 Theme::light()
             } else {
@@ -3334,6 +3356,11 @@ impl Shell {
                     });
                     self.next_win_id += 1;
                     self.mark_full();
+                    // The app being launched has its window: the launch is over.
+                    if self.launching.map_or(false, |(_, pid, _)| pid == msg.sender_pid) {
+                        self.launching = None;
+                        self.mark_dock();
+                    }
                     sys_ipc_send(msg.sender_pid, MSG_WINDOW_CREATED, shm_id, 0);
                     // Straight after the ack, so an app launched into an already-light session
                     // paints light on its very first frame instead of flashing dark once.
@@ -3569,6 +3596,36 @@ impl Shell {
         sys_ipc_send(self.clients[idx].owner_pid, MSG_WINDOW_CLOSE, 0, 0);
         self.mark_win(r);
         self.mark_dock();
+    }
+
+    /// Launch `APPS[i]` and show that it is loading until its window arrives.
+    fn start_launch(&mut self, i: usize) {
+        if let Some(pid) = launch(&APPS[i]) {
+            self.launching = Some((i, pid, sys_get_time()));
+            self.launch_step = usize::MAX;
+            self.mark_dock();
+        }
+    }
+
+    /// Advance the launch indicator, and give up on a launch that never produced a window. Called
+    /// every pass of the main loop; asks for a frame only when a dot actually moves.
+    fn tick_launch(&mut self, now: usize) {
+        let Some((_, _, since)) = self.launching else { return };
+        // ⚠️ SATURATING, not wrapping. `now` is read once at the top of the main loop, BEFORE input
+        // is processed — so a launch started in this same pass stamps `since` slightly AFTER `now`.
+        // `wrapping_sub` turned that into a huge elapsed time and the timeout cleared the launch in
+        // the very pass that started it: the indicator never appeared (caught in QEMU).
+        let elapsed = now.saturating_sub(since);
+        if elapsed >= LAUNCH_TIMEOUT_MS {
+            self.launching = None;
+            self.mark_dock();
+            return;
+        }
+        let step = (elapsed / LAUNCH_STEP_MS) % 3;
+        if step != self.launch_step {
+            self.launch_step = step;
+            self.mark_dock();
+        }
     }
 
     /// Scroll the window under the pointer by `delta` pixels (positive = further down the content).
@@ -3930,7 +3987,7 @@ impl Shell {
         // The dock rests on the wallpaper, under nothing, so it is tested before the windows.
         if let Some(slot) = layout::dock_hit(self.screen_h, mx, my) {
             if let Some(i) = DOCK[slot] {
-                launch(&APPS[i]);
+                self.start_launch(i);
             }
             return;
         }
@@ -4126,7 +4183,11 @@ impl Shell {
     /// `Unavailable` needs a drop target that can refuse. Each is one arm here once its machinery
     /// exists.
     fn update_cursor(&mut self) {
-        let desired = if self.resizing.is_some() {
+        let desired = if self.launching.is_some() && self.resizing.is_none() && self.dragging.is_none() {
+            // An app is loading. The design's Working cursor, wherever the pointer is — the answer
+            // to a click that otherwise looks like it did nothing.
+            Shape::Working
+        } else if self.resizing.is_some() {
             Shape::for_edges(self.resize_edges).unwrap_or(Shape::Pointer)
         } else if self.dragging.is_some() {
             // A caption line being dragged. Reverts on release.
@@ -4788,6 +4849,8 @@ pub extern "C" fn _start() -> ! {
         //
         // Only while it is actually moving: the alpha is constant at 255 before 90 s and at 0 after
         // the ramp, so this asks for nothing at all except during the ramp itself.
+        // The launch indicator steps on its own clock, and times out a launch that never opened.
+        state.tick_launch(now);
         {
             let a = idle::chrome_alpha(state.idle_ms(now));
             if a != state.chrome_key {
@@ -5279,9 +5342,27 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
                 chrome_a,
             ),
         });
+        // Loading: three dots where the running dot goes, one lit at a time, stepping every
+        // LAUNCH_STEP_MS. It replaces the running dot for this slot while the launch is in flight.
+        let loading = state.launching.map_or(false, |(i, _, _)| DOCK[slot] == Some(i));
+        if loading {
+            if let Some(d) = layout::dock_dot(state.screen_h, slot) {
+                let gap = d.w * 2;
+                for k in 0..3i32 {
+                    let x = d.x + (k - 1) * gap;
+                    let lit = k as usize == state.launch_step.min(2);
+                    canvas.fill_rect(
+                        x.max(0) as usize,
+                        d.y.max(0) as usize,
+                        d.w as usize,
+                        d.h as usize,
+                        fade_to(if lit { theme.accent } else { theme.fg_4 }, ground, chrome_a),
+                    );
+                }
+            }
+        } else if running {
         // The running dot. Accent-tinted when active, so it is a CPU `fill_rect` and not a glyph —
         // the batched text shader carries one luminance and would render the accent as grey.
-        if running {
             if let Some(d) = layout::dock_dot(state.screen_h, slot) {
                 canvas.fill_rect(
                     d.x as usize,
