@@ -4002,7 +4002,7 @@ impl NyxApp for TerminalApp {
                         // `_REG` (which is fatal on this machine — mark 57) and 11 sets `ECRD`
                         // directly, which is what `_REG` exists to do. Extend this range when a step
                         // is added; 7 was silently rejected for a while and its dump never ran.
-                        // 13 is I2C-HID discovery (_STA/_CRS/_DSM/_ADR per PNP0C50 device).
+                        // 13 is I2C-HID discovery (_STA/_CRS/HID2/_ADR per PNP0C50 device).
                         Ok(s) if (1..=13).contains(&s) => {
                             sys_acpi_probe(s, depth);
                             if s == 1 {

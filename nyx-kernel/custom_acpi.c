@@ -52,12 +52,8 @@ int acpi_wake_cnvi_wifi(void) {
 // (see the cache note in acpi.rs). Call this from the thermal governor (IF=1) via an `acpi probe`
 // step, and have syscalls copy scalars out of the published cache.
 
-// Mixed-endian encoding of 3cdff6f7-4267-4555-ad05-b30a3d8938de, the standard "HID I2C Device"
-// _DSM UUID (the DSDT names it HIDG). Function 1 returns the HID descriptor register address.
-static const UINT8 NyxHidI2cDsmUuid[16] = {
-    0xF7, 0xF6, 0xDF, 0x3C, 0x67, 0x42, 0x55, 0x45,
-    0xAD, 0x05, 0xB3, 0x0A, 0x3D, 0x89, 0x38, 0xDE
-};
+// ⚠️ There is deliberately no HIDG _DSM UUID here any more — see NyxHidDescriptorRegister. The
+// handover call lives in git history (5db7eac) and belongs to the I2C-HID driver, not discovery.
 
 typedef struct {
     UINT32 valid;
@@ -143,38 +139,30 @@ static int NyxEvalInteger(ACPI_HANDLE Object, const char *Name, UINT64 *out) {
     return 1;
 }
 
-/* _DSM(HIDG, rev 1, func 1) -> the register at which the HID descriptor is read over I2C. */
+/* The register at which the HID descriptor is read over I2C.
+ *
+ * ⚠️⚠️ THIS MUST NOT CALL _DSM. The spec'd way to get this number is `_DSM(HIDG, 1, 1)`, and that
+ * is what the first version did — and it KILLED THE TOUCHPAD on every boot, because it also ran
+ * from the boot-time scan. On this firmware the touchpad's _DSM is not a pure query:
+ *
+ *     If (DRDY == Zero) { If (Arg0 == HIDG) { DRDY = One ; EV5 (Zero, Zero) } }
+ *     EV5 -> \_SB.PCI0.LPCB.ECDV.EDPE -> If (PMED == Zero) { PMED = One ; EISC (0x81, 0x20, Zero) }
+ *
+ * PMED is "PS/2 Mouse Emulation Disable". The first HIDG _DSM is the OS announcing "an I2C-HID
+ * driver is here", and the EC answers by switching the touchpad OFF the 8042 AUX port and onto
+ * I2C. (ECM9 re-sends it on resume — which is how you can tell it is EC state, not an AML
+ * variable.) With no I2C-HID driver yet, that left the machine with no pointer at all.
+ *
+ * So _DSM is the HANDOVER, not a probe. It belongs to the I2C-HID driver at the moment it can take
+ * the device (Phase 4), never to discovery. Here we read `HID2`, the plain Name this firmware's own
+ * _DSM hands to HIDD for function 1 (0x20 for the ALPS part). Evaluating a Name has no side
+ * effects. Firmware without HID2 reports 0; the driver then learns it during the handover. */
 static UINT32 NyxHidDescriptorRegister(ACPI_HANDLE Object) {
-    ACPI_OBJECT args[4];
-    ACPI_OBJECT_LIST arglist;
-    char local[128];
-    ACPI_BUFFER buf;
-
-    args[0].Type = ACPI_TYPE_BUFFER;
-    args[0].Buffer.Length = 16;
-    args[0].Buffer.Pointer = (UINT8 *)NyxHidI2cDsmUuid;
-    args[1].Type = ACPI_TYPE_INTEGER;
-    args[1].Integer.Value = 1;           /* revision */
-    args[2].Type = ACPI_TYPE_INTEGER;
-    args[2].Integer.Value = 1;           /* function 1: descriptor address */
-    args[3].Type = ACPI_TYPE_PACKAGE;    /* conventionally an empty package */
-    args[3].Package.Count = 0;
-    args[3].Package.Elements = NULL;
-
-    arglist.Count = 4;
-    arglist.Pointer = args;
-
-    buf.Length = sizeof(local);
-    buf.Pointer = local;
-
-    if (ACPI_FAILURE(AcpiEvaluateObject(Object, (char *)"_DSM", &arglist, &buf))) {
-        return 0;
+    UINT64 reg = 0;
+    if (NyxEvalInteger(Object, "HID2", &reg)) {
+        return (UINT32)reg;
     }
-    ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
-    if (!obj || obj->Type != ACPI_TYPE_INTEGER) {
-        return 0;
-    }
-    return (UINT32)obj->Integer.Value;
+    return 0;
 }
 
 static ACPI_STATUS I2cHidCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
@@ -234,22 +222,20 @@ static ACPI_STATUS I2cHidCallback(ACPI_HANDLE Object, UINT32 Level, void *Contex
     return AE_OK;
 }
 
-int acpi_find_i2c_hid(void) {
-    NyxI2cHidInfo scratch[8];
-    NyxHidScan scan;
-    for (int i = 0; i < 8; i++) {
-        NyxI2cHidInfo zero = {0};
-        scratch[i] = zero;
-    }
-    scan.out = scratch;
-    scan.max = 8;
-    scan.count = 0;
+/* Boot-time count only. Deliberately does NOT share I2cHidCallback: this runs on EVERY boot from
+ * scan_for_modern_inputs, so nothing it evaluates may touch the device — NyxHidDescriptorRegister
+ * records how a "harmless" query took the touchpad off PS/2. The full probe is `acpi probe 13`. */
+static ACPI_STATUS I2cHidCountCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
+    *((int *)Context) += 1;
+    return AE_OK;
+}
 
+int acpi_find_i2c_hid(void) {
+    int count = 0;
     /* AcpiGetDevices matches the _CID list as well as _HID, which is essential here: these devices
-     * carry a vendor-specific _HID patched in at _INI and only PNP0C50 as their _CID. A _HID-only
-     * matcher would find nothing. */
-    AcpiGetDevices((char *)"PNP0C50", I2cHidCallback, &scan, NULL);
-    return scan.count;
+     * carry a vendor-specific _HID patched in at _INI and only PNP0C50 as their _CID. */
+    AcpiGetDevices((char *)"PNP0C50", I2cHidCountCallback, &count, NULL);
+    return count;
 }
 
 /* Fill `out` with up to `max` present I2C-HID devices. Returns how many were written. */

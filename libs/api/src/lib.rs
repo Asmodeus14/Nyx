@@ -899,7 +899,7 @@ pub struct I2cHidInfo {
     /// Plain APIC interrupt (GSI) when `_CRS` returned an Interrupt rather than a GpioInt.
     /// ★ Non-zero means the IOAPIC routes this directly and NO GPIO driver is needed.
     pub irq_gsi: u32,
-    /// Register at which the HID descriptor is read, from `_DSM(HIDG, 1, 1)`.
+    /// Register at which the HID descriptor is read, read from the firmware's `HID2` Name — NOT `_DSM`, which is the PS/2 handover.
     pub hid_desc_reg: u32,
     /// Controller `_ADR`: `(device << 16) | function`. `0x00150001` is PCI 00:15.1.
     pub ctrl_adr: u32,

@@ -215,7 +215,7 @@ extern "C" {
     fn acpi_find_i2c_hid() -> i32;
     /// Fill `out` with up to `max` PRESENT I2C-HID devices; returns how many were written.
     ///
-    /// ⚠️ Evaluates AML (`_STA`, `_CRS`, `_DSM`, `_ADR`). Governor context only — never a syscall.
+    /// ⚠️ Evaluates AML (`_STA`, `_CRS`, `HID2`, `_ADR` — never `_DSM`, which hands the touchpad off PS/2). Governor context only — never a syscall.
     fn acpi_get_i2c_hid(out: *mut I2cHidInfo, max: i32) -> i32;
     
     // --- NEW: THE ACPICA FAN CONTROLLER ---
@@ -894,13 +894,13 @@ pub fn refresh_cache() {
             crate::postmortem::user_mark(107);
         }
         13 => {
-            // I2C-HID discovery. Evaluates _STA, _CRS (a Method here), _DSM and the controller's
+            // I2C-HID discovery. Evaluates _STA, _CRS (a Method here), the HID2 Name and the controller's
             // _ADR for every PNP0C50 device.
             //
             // ⚠️ Deliberately an opt-in probe step rather than something the boot path does. The
             // comment on PROBE is blunt about why: "three boots died on the governor's automatic
             // first pass and each guess at which call was responsible cost a power cycle." The
-            // breadcrumbs in `I2cHidCallback` (70/71/72) narrow a hang to _CRS, _DSM, or neither.
+            // breadcrumbs in `I2cHidCallback` (70/71/72) narrow a hang to _CRS, HID2, or neither.
             let mut buf = [I2cHidInfo::EMPTY; 4];
             let n = unsafe { acpi_get_i2c_hid(buf.as_mut_ptr(), 4) };
             let n = if n < 0 { 0 } else { (n as usize).min(4) };
