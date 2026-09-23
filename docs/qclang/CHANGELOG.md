@@ -1,5 +1,9 @@
 # Changelog
 
+> Historical record of the standalone QCLang compiler, kept as written. The crate is now at `0.2.2`
+> (`tools/compiler/Cargo.toml`) with no entry below for it, and the `[0.3.0] - Previous Release`
+> heading predates the 0.1.x/0.2.x numbering. Later compiler changes are in `git log -- tools/compiler`.
+
 All notable changes to the **QCLang** project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),

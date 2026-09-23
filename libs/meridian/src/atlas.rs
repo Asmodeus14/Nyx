@@ -279,9 +279,73 @@ pub struct Atlas {
     /// counter turns it into a number the shell can print.
     misses: AtomicU32,
     last_miss: AtomicU32,
+    /// Where the atlas pixels are mapped in THIS process — what [`Atlas::draw_cpu`] reads.
+    base: usize,
 }
 
 impl Atlas {
+    /// Draw a glyph run on the CPU, from the same atlas the GPU would sample.
+    ///
+    /// ★ The fallback for when the kernel refuses GPU text. It used to fall back to `nyx_gui`'s
+    /// bitmap font — a different typeface with different metrics, which on the hardware was the
+    /// desktop's ONLY font: the render engine never completes a batch there and latches off after 8
+    /// hangs (`gpu` reports "drawn 0"). The atlas needs no GPU at all; it is coverage in ordinary
+    /// memory, built at shell start regardless. So this keeps the real Meridian typography and the
+    /// exact metrics `measure` uses, and costs a few thousand pixel blends per frame.
+    ///
+    /// Better than the GPU path in one way: the batched text shader carries a single luminance per
+    /// quad, so accent-coloured text came out grey; this blends the full colour.
+    pub fn draw_cpu(&self, dst: &mut [u32], stride: usize, height: usize, quads: &[GlyphQuad]) {
+        let spx = (self.pitch / 4) as usize;
+        let src = unsafe { core::slice::from_raw_parts(self.base as *const u32, spx * self.h as usize) };
+        #[inline(always)]
+        fn div255(v: u32) -> u32 {
+            (v + 1 + (v >> 8)) >> 8
+        }
+        for q in quads {
+            // Quads map 1:1 onto their cell (layout places cell.w x cell.h), so the source origin
+            // is just the UV corner in texels.
+            let sx0 = (q.u0 * self.w as f32 + 0.5) as i32;
+            let sy0 = (q.v0 * self.h as f32 + 0.5) as i32;
+            // ⚠️ The colour's alpha byte is NOT used. The GPU text shader ignores it (fades are done
+            // by lerping the COLOUR toward the ground — see the shell's `fade_to`), so the shell's
+            // label colours do not keep it meaningful; honouring it here made every glyph invisible
+            // in the first QEMU run. Opacity comes from the glyph's coverage alone, as on the GPU.
+            let (fr, fg, fb) = ((q.color >> 16) & 0xFF, (q.color >> 8) & 0xFF, q.color & 0xFF);
+            for row in 0..q.dst_h as i32 {
+                let dy = q.dst_y + row;
+                let sy = sy0 + row;
+                if dy < 0 || dy as usize >= height || sy < 0 || sy as u32 >= self.h {
+                    continue;
+                }
+                let drow = dy as usize * stride;
+                let srow = sy as usize * spx;
+                for col in 0..q.dst_w as i32 {
+                    let dx = q.dst_x + col;
+                    let sx = sx0 + col;
+                    if dx < 0 || dx as usize >= stride || sx < 0 || sx as usize >= spx {
+                        continue;
+                    }
+                    let cov = src[srow + sx as usize] >> 24;
+                    if cov == 0 {
+                        continue;
+                    }
+                    let a = cov;
+                    let i = drow + dx as usize;
+                    if i >= dst.len() {
+                        continue;
+                    }
+                    let bg = dst[i];
+                    let inv = 255 - a;
+                    let r = div255(fr * a + ((bg >> 16) & 0xFF) * inv);
+                    let g = div255(fg * a + ((bg >> 8) & 0xFF) * inv);
+                    let b = div255(fb * a + (bg & 0xFF) * inv);
+                    dst[i] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+    }
+
     /// Plan, allocate, rasterize and GPU-map the atlas.
     ///
     /// Returns None if the SHM cannot be created or mapped, in which case the caller keeps using
@@ -337,6 +401,7 @@ impl Atlas {
             cells: p.cells,
             misses: AtomicU32::new(0),
             last_miss: AtomicU32::new(0),
+            base: vaddr as usize,
         })
     }
 

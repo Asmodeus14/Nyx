@@ -66,6 +66,241 @@ pub const GRDOM_FULL: u32 = 1 << 0;
 // Global fault register (already probed by the BLT self-test at 0x4094).
 pub const RENDER_FAULT_REG: u32 = 0x4094;
 
+// Hang forensics (i915's error-capture set for the render engine, Gen8/9 offsets).
+/// Active head: the address the command streamer is actually executing — in the ring, or inside a
+/// batch. Where it points is the single most telling number in a hang.
+pub const RCS_ACTHD: u32 = RCS_BASE + 0x74;
+/// Instruction parser error identity / header: the command dword the parser choked on.
+pub const RCS_IPEIR: u32 = RCS_BASE + 0x64;
+pub const RCS_IPEHR: u32 = RCS_BASE + 0x68;
+/// Which units are still busy.
+pub const RCS_INSTDONE: u32 = RCS_BASE + 0x6C;
+pub const RCS_MI_MODE: u32 = RCS_BASE + 0x9C;
+pub const RCS_EIR: u32 = RCS_BASE + 0xB0;
+/// Global error register (page-table faults and the like).
+pub const ERROR_GEN6: u32 = 0x40A0;
+
+/// The render engine's state at the first fence timeout of this boot — the `gpu` command.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HangSnapshot {
+    pub valid: u32,
+    pub fence_got: u32,
+    pub fence_want: u32,
+    pub head: u32,
+    pub tail: u32,
+    pub ctl: u32,
+    pub acthd: u32,
+    pub ipehr: u32,
+    pub ipeir: u32,
+    pub instdone: u32,
+    pub mi_mode: u32,
+    pub eir: u32,
+    pub fault: u32,
+    pub error_gen6: u32,
+    pub fw_ack: u32,
+    pub _pad: u32,
+}
+
+pub static FIRST_HANG: spin::Mutex<HangSnapshot> = spin::Mutex::new(HangSnapshot {
+    valid: 0, fence_got: 0, fence_want: 0, head: 0, tail: 0, ctl: 0, acthd: 0, ipehr: 0,
+    ipeir: 0, instdone: 0, mi_mode: 0, eir: 0, fault: 0, error_gen6: 0, fw_ack: 0, _pad: 0,
+});
+
+/// The first failed COMPOSITE of this boot — a separate path from [`FIRST_HANG`].
+///
+/// ★ `draw_scene` (the compositor, text and GL) does not wait through `wait_fence_value`; it has
+/// its own spin in `finish_submit_and_wait`. Hardware showed `render hangs 8 of 8` with
+/// `FIRST_HANG` still empty, which is how that was found. Here `fence_got` is the LAST PROGRESS
+/// MARKER the engine wrote (0x10/1..7 = prologue stage, 0x20+n = about to draw mesh n),
+/// `fence_want` is the stream length in dwords, and `_pad` is the cause: 1 = the ring never had
+/// room (submit refused), 2 = the fence never arrived.
+pub static SCENE_HANG: spin::Mutex<HangSnapshot> = spin::Mutex::new(HangSnapshot {
+    valid: 0, fence_got: 0, fence_want: 0, head: 0, tail: 0, ctl: 0, acthd: 0, ipehr: 0,
+    ipeir: 0, instdone: 0, mi_mode: 0, eir: 0, fault: 0, error_gen6: 0, fw_ack: 0, _pad: 0,
+});
+
+/// Boot self-test results, one bit each: 0 bring-up, 1 ring MI_STORE_DATA_IMM, 2 ring
+/// PIPE_CONTROL fence, 3 BATCH BUFFER (MI_STORE inside a batch), 4 the batch test was attempted.
+pub static BOOT_TESTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How long to wait for the render fence before declaring the engine hung, in microseconds.
+///
+/// This is a deadline for declaring the engine dead, NOT a performance knob — the same distinction
+/// that matters for `BLT_FENCE_TIMEOUT_US`, where setting it too tight abandoned real work and
+/// corrupted the screen. Steady-state cost is governed by [`RENDER_HANG_LIMIT`], not by this: once
+/// the path latches off, no further waits happen at all, so the timeout is only paid for the first
+/// few frames.
+///
+/// Chosen generously enough that a *working* render engine (on some other machine, or on this one
+/// once the underlying fence bug is fixed) is never given up on mid-composite.
+/// ⚠️ Budget is paid TWICE per composite — `draw_scene` performs two fence waits — so the worst
+/// case before the latch engages is `2 x this x RENDER_HANG_LIMIT`. At 20_000 that was 320 ms of
+/// stalling before the path switched off; measured on hardware as repeated 39,664 us windows.
+pub const FENCE_TIMEOUT_US: u64 = 5_000;
+
+/// Consecutive fence timeouts before the RCS composite path is latched off.
+///
+/// ★ Measured on hardware: the engine hung on *every* composite, ~4 times a second, 23.5 ms each —
+/// about 94 ms per second of core 0 spent with interrupts masked waiting for a fence that was never
+/// going to signal. Shortening the timeout bounds the damage; refusing to retry removes it. The
+/// compositor already handles a `false` return by compositing in software, so the fallback path is
+/// the one that was running anyway — it just no longer pays for a failed GPU attempt first.
+pub const RENDER_HANG_LIMIT: u32 = 8;
+
+/// Consecutive FAILED COMPOSITES. Incremented and cleared by `compositor::composite` — not by
+/// individual fence waits, which flap (two per composite).
+pub static RENDER_HANGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Fence timeouts seen, used only to rate-limit the diagnostic log line.
+pub static FENCE_TIMEOUT_LOGS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// A wall-clock budget for a spin loop.
+///
+/// ★★★ Every wait in this driver was bounded by an ITERATION COUNT, and that is how three separate
+/// fixes each missed the loop that was actually stalling. An iteration count means a different
+/// duration on every machine and in every loop body — 20,000,000 iterations of
+/// `clflush + mfence + read` measured ~23.5 ms here, while 1,000,000 of a bare register poll is
+/// well under a millisecond. So the numbers said nothing about time, could not be compared to each
+/// other, and could not be reasoned about from the source.
+///
+/// Expressed in microseconds, a budget means the same thing everywhere and shows up directly in the
+/// stall report. ⚠️ These are deadlines for declaring hardware DEAD, never throughput knobs: set one
+/// below the time real work takes and it abandons that work mid-flight, which corrupts output
+/// rather than saving time (see `BLT_FENCE_TIMEOUT_US`).
+#[derive(Clone, Copy)]
+pub struct SpinDeadline {
+    end: u64,
+}
+
+impl SpinDeadline {
+    #[inline(always)]
+    pub fn new(us: u64) -> Self {
+        let mhz = crate::time::TSC_MHZ.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        Self { end: crate::time::rdtsc().wrapping_add(mhz.saturating_mul(us)) }
+    }
+
+    #[inline(always)]
+    pub fn expired(&self) -> bool {
+        crate::time::rdtsc() >= self.end
+    }
+}
+
+/// Budget for a fence wait in the 3D pipeline. Same reasoning as [`FENCE_TIMEOUT_US`].
+pub const PIPELINE_FENCE_TIMEOUT_US: u64 = 20_000;
+/// Budget for waiting on ring space, or for a register ack. These complete in microseconds when the
+/// hardware is alive, so the only question is how long to wait before calling it dead.
+pub const RING_TIMEOUT_US: u64 = 5_000;
+
+/// True once the render engine has failed enough consecutive fences to stop trying.
+///
+/// Deliberately not permanent-by-construction: a successful wait clears the counter, so an engine
+/// that recovers (after a reset, or after forcewake/MOCS are re-established following RC6 — see the
+/// notes in this module) comes back on its own.
+/// GPU text batches (syscall 537) drawn, and refused. A refusal makes the shell fall back to the
+/// CPU bitmap font — a different typeface — so these two numbers are what the `gpu` command reads to
+/// say which font the desktop is in, instead of asking the user to judge it by eye.
+pub static TEXT_DRAWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static TEXT_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Of the refusals, those because the render engine is latched off after repeated hangs — as
+/// opposed to there being no Intel GPU at all, or one draw failing.
+pub static TEXT_REFUSED_WEDGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Snapshot for the `gpu` command (syscall 575 op 3). Mirrored by `nyx_api::GpuHealth`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuHealth {
+    /// Consecutive failed composites; the engine latches off at [`RENDER_HANG_LIMIT`].
+    pub render_hangs: u32,
+    pub hang_limit: u32,
+    /// 1 if the render engine is latched off right now.
+    pub wedged: u32,
+    pub gl_hangs: u32,
+    pub text_drawn: u32,
+    pub text_refused: u32,
+    pub text_refused_wedged: u32,
+    /// 1 if the Intel render engine was initialised at all (0 in QEMU, which has no Intel GPU).
+    pub gpu_present: u32,
+    /// [`BOOT_TESTS`] bits.
+    pub boot_tests: u32,
+    /// The GPU's PCI device ID ([`DEVICE_ID`]).
+    pub device_id: u32,
+    /// The first hang of this boot ([`FIRST_HANG`]); `valid` 0 if there has been none.
+    pub first_hang: HangSnapshot,
+    /// The first failed scene submission ([`SCENE_HANG`]).
+    pub scene_hang: HangSnapshot,
+    /// [`COMPOSITE_PS_MODE`].
+    pub ps_mode: u32,
+    /// [`MOCS_RESTORES`].
+    pub mocs_restores: u32,
+}
+
+pub fn health() -> GpuHealth {
+    use core::sync::atomic::Ordering::Relaxed;
+    GpuHealth {
+        render_hangs: RENDER_HANGS.load(Relaxed),
+        hang_limit: RENDER_HANG_LIMIT,
+        wedged: engine_is_wedged() as u32,
+        gl_hangs: gl::GL_HANGS.load(Relaxed),
+        text_drawn: TEXT_DRAWN.load(Relaxed),
+        text_refused: TEXT_REFUSED.load(Relaxed),
+        text_refused_wedged: TEXT_REFUSED_WEDGED.load(Relaxed),
+        // try_lock: this is read from a syscall at IF=0, and a draw may hold the engine. If it is
+        // busy, it is certainly present.
+        gpu_present: RENDER_ENGINE.try_lock().map_or(true, |e| e.initialized) as u32,
+        boot_tests: BOOT_TESTS.load(Relaxed),
+        device_id: DEVICE_ID.load(Relaxed),
+        first_hang: FIRST_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
+        scene_hang: SCENE_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
+        ps_mode: COMPOSITE_PS_MODE.load(Relaxed),
+        mocs_restores: MOCS_RESTORES.load(Relaxed),
+    }
+}
+
+/// The value `program_mocs` writes to every GFX MOCS entry (LLC write-back, i915 skl table).
+pub const MOCS_GFX_ENTRY: u32 = 0x0000_003B;
+
+/// How many times `ensure_ready` found the MOCS table lost (RC6) and re-programmed it. For `gpu`.
+pub static MOCS_RESTORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The GPU's PCI device ID, set at boot. For `gpu`.
+pub static DEVICE_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Which pixel shader window quads use: 0 the normal one (textured + opacity), 1 a SOLID
+/// colour with no texture sampling, 2 plain textured (sampling, no opacity). Set by
+/// `gpu retry`, to bisect a pixel-stage hang on hardware.
+///
+/// ★ Hardware (2026-09-23, Dell, not the Comet Lake-H the 3D engine was brought up on): every
+/// composite stalls on the PIPE_CONTROL after mesh 0's 3DPRIMITIVE, with INSTDONE_1 =
+/// 0xffdfffff — every geometry unit DONE, only CS waiting. So the draw hangs in the pixel stage
+/// (dispatch, the sampler, or the RT write), which INSTDONE_1 does not cover. Solid vs
+/// textured tells the sampler apart from the rest.
+pub static COMPOSITE_PS_MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Set when the compositor must rebuild its cached scene (the PS is baked into it).
+pub static COMPOSITE_REBUILD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `gpu retry <mode>`: switch the compositor's pixel shader, forget the last failure and clear
+/// the latch, so the next composite tries again. False if there is no render engine.
+pub fn retry_with_ps(mode: u32) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if mode > 2 || DEVICE_ID.load(Relaxed) == 0 {
+        return false;
+    }
+    COMPOSITE_PS_MODE.store(mode, Relaxed);
+    COMPOSITE_REBUILD.store(true, Relaxed);
+    if let Some(mut s) = SCENE_HANG.try_lock() {
+        s.valid = 0;
+    }
+    RENDER_HANGS.store(0, Relaxed);
+    true
+}
+
+pub fn engine_is_wedged() -> bool {
+    RENDER_HANGS.load(core::sync::atomic::Ordering::Relaxed) >= RENDER_HANG_LIMIT
+}
+
 // ---------------------------------------------------------------------------
 // GVA (GGTT) layout owned by the 3D engine. Chosen to avoid the BLT driver's
 // existing allocations (ring 0x1000_0000, backbuffer 0x1400_0000, fence
@@ -216,7 +451,7 @@ impl RenderEngine {
         // GFX (render) MOCS control: __GEN9_RCS0_MOCS0 = 0xC800 + i*4, 64 entries.
         // control = LE_3_WB(3) | LE_TC_2_LLC_ELLC(2<<2) | LE_LRUM(3<<4) = 0x3B.
         for i in 0..64u32 {
-            self.write_reg(0xC800 + i * 4, 0x0000_003B);
+            self.write_reg(0xC800 + i * 4, MOCS_GFX_ENTRY);
         }
         // L3 (LNCF) MOCS: GEN9_LNCFCMOCS = 0xB020 + i*4, 32 regs, two 16-bit entries each.
         // l3cc = L3_3_WB = 3<<4 = 0x30, packed low+high.
@@ -235,11 +470,10 @@ impl RenderEngine {
     pub unsafe fn forcewake_render(&self) {
         // Masked write: enable bit 0 (mask bit 16 set).
         self.write_reg(FORCEWAKE_RENDER, 0x0001_0001);
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(RING_TIMEOUT_US);
         while (self.read_reg(FORCEWAKE_ACK_RENDER) & 1) == 0 {
             core::hint::spin_loop();
-            t += 1;
-            if t > 1_000_000 {
+            if deadline.expired() {
                 crate::serial_println!("[RCS] WARN: render forcewake ack timeout (ack={:#x})",
                     self.read_reg(FORCEWAKE_ACK_RENDER));
                 break;
@@ -271,6 +505,20 @@ impl RenderEngine {
         // the earlier "reprogram MOCS every frame" defense was for an RC6 that isn't happening here.
         // If the ring ever IS found disabled (genuine context loss), the branch below restores MOCS +
         // GFX_MODE + ring pointers together, as bring_up does.
+        // ★★ MOCS is checked on its own, NOT only when the ring was lost.
+        //
+        // Since `park_gpu` started releasing forcewake (the July idle-heat fix), the GT really does
+        // enter RC6 — and with no hardware context, RC6 drops the MOCS tables while the ring
+        // registers survive. Hardware showed exactly that: CTL still 0x1, so the branch below
+        // never ran, and every composite then hung in the PIXEL stage (INSTDONE_1 = 0xffdfffff:
+        // all geometry done, only CS waiting) — even a constant-colour shader. Render-target writes
+        // with undefined caching never retire. Entry 0 reads back as programmed unless it was lost,
+        // so this is one MMIO read on the fast path.
+        if self.read_reg(0xC800) != MOCS_GFX_ENTRY {
+            self.program_mocs();
+            MOCS_RESTORES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+
         let ctl = self.read_reg(RENDER_RING_CTL);
         if (ctl & 0x1) == 0 {
             // Ring lost its programming while parked — re-arm it (mirrors bring_up's ring setup).
@@ -311,25 +559,23 @@ impl RenderEngine {
         // 1. Request reset (masked reg: set REQUEST_RESET bit 0).
         self.write_reg(RCS_RESET_CTL, (1 << 16) | (1 << 0));
         // 2. Wait until the engine reports READY_FOR_RESET (bit 1).
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(RING_TIMEOUT_US);
         while (self.read_reg(RCS_RESET_CTL) & (1 << 1)) == 0 {
             core::hint::spin_loop();
-            t += 1;
-            if t > 2_000_000 {
+            if deadline.expired() {
                 crate::serial_println!("[RCS] WARN: engine not ready-for-reset, forcing anyway");
                 break;
             }
         }
         // 3. Pulse the render reset domain via GEN6_GDRST.
         self.write_reg(GDRST, GRDOM_RENDER);
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(RING_TIMEOUT_US);
         loop {
             if (self.read_reg(GDRST) & GRDOM_RENDER) == 0 {
                 break;
             }
             core::hint::spin_loop();
-            t += 1;
-            if t > 5_000_000 {
+            if deadline.expired() {
                 crate::serial_println!("[RCS] ERROR: GDRST render reset timeout");
                 self.write_reg(RCS_RESET_CTL, 1 << 16); // release request
                 return Err(RenderError::ResetFailed);
@@ -435,7 +681,7 @@ impl RenderEngine {
         ];
         self.rcs_submit(&cmd)?;
 
-        let mut t = 0u32;
+        let deadline = SpinDeadline::new(PIPELINE_FENCE_TIMEOUT_US);
         loop {
             self.flush_line(self.fence_virt as usize);
             let v = self.fence_virt.read_volatile();
@@ -443,8 +689,7 @@ impl RenderEngine {
                 break;
             }
             core::hint::spin_loop();
-            t += 1;
-            if t > 20_000_000 {
+            if deadline.expired() {
                 let head = self.read_reg(RENDER_RING_HEAD);
                 let tail = self.read_reg(RENDER_RING_TAIL);
                 let fault = self.read_reg(RENDER_FAULT_REG);
@@ -466,7 +711,10 @@ impl RenderEngine {
     /// MI_BATCH_BUFFER_START (GGTT address space). The batch must fit in one page.
     pub unsafe fn exec_batch(&mut self, batch: &[u32]) -> Result<(), RenderError> {
         let batch_virt = self.batch_virt.ok_or(RenderError::NotInitialized)?;
-        if (batch.len() + 1) * 4 > 4096 {
+        // The batch plus BB_END, padded to a whole QWORD with MI_NOOP — the same rule i915 applies
+        // to batches as to the ring (see `rcs_submit`).
+        let total = (batch.len() + 1 + 1) & !1;
+        if total * 4 > 4096 {
             return Err(RenderError::RingFull); // batch too large for one page
         }
         let dst = batch_virt as *mut u32;
@@ -474,9 +722,12 @@ impl RenderEngine {
             dst.add(i).write_volatile(dw);
         }
         dst.add(batch.len()).write_volatile(cmd::MI_BATCH_BUFFER_END);
+        if total > batch.len() + 1 {
+            dst.add(batch.len() + 1).write_volatile(cmd::MI_NOOP);
+        }
 
         // Flush every touched cache line so the GPU's command fetch sees the batch.
-        let bytes = (batch.len() + 1) * 4;
+        let bytes = total * 4;
         let mut off = 0usize;
         while off < bytes {
             self.flush_line(batch_virt as usize + off);
@@ -516,24 +767,85 @@ impl RenderEngine {
         self.wait_fence_value(DONE)
     }
 
-    /// Spin until the fence page reads `expected` (or a hang timeout trips).
+    /// The engine's registers right now, for [`FIRST_HANG`] / [`SCENE_HANG`]. Must be taken BEFORE
+    /// any reset, which clears exactly the state it exists to capture.
+    pub(super) unsafe fn hang_snapshot(&self, got: u32, want: u32, cause: u32) -> HangSnapshot {
+        HangSnapshot {
+            valid: 1,
+            fence_got: got,
+            fence_want: want,
+            head: self.read_reg(RENDER_RING_HEAD),
+            tail: self.read_reg(RENDER_RING_TAIL),
+            ctl: self.read_reg(RENDER_RING_CTL),
+            acthd: self.read_reg(RCS_ACTHD),
+            ipehr: self.read_reg(RCS_IPEHR),
+            ipeir: self.read_reg(RCS_IPEIR),
+            instdone: self.read_reg(RCS_INSTDONE),
+            mi_mode: self.read_reg(RCS_MI_MODE),
+            eir: self.read_reg(RCS_EIR),
+            fault: self.read_reg(RENDER_FAULT_REG),
+            error_gen6: self.read_reg(ERROR_GEN6),
+            fw_ack: self.read_reg(FORCEWAKE_ACK_RENDER),
+            _pad: cause,
+        }
+    }
+
+    /// Spin until the fence page reads `expected`, or a **time** budget expires.
+    ///
+    /// ★★★ This was a 20,000,000-iteration count, and on real hardware it ran to completion on
+    /// **every single composite**: measured stalls of 23,541-23,544 us — a 3 us spread across nine
+    /// samples, which is the signature of a counter-bounded loop running out, not of waiting on a
+    /// device. The body is `clflush` + `mfence` + read + `pause`, so 20M iterations is ~24 ms here.
+    ///
+    /// Meaning: the render fence never signals on this machine, `EngineHang` is returned every
+    /// frame, the compositor silently falls back to software — and it burns 23.5 ms with interrupts
+    /// masked first, ~4 times a second. That was the largest single source of interactive latency
+    /// on the system, and it was invisible because the message below goes to a serial port this
+    /// laptop does not have.
+    ///
+    /// Two changes. The budget is now **time**, because an iteration count means a different
+    /// duration on every machine and happened to mean 24 ms on this one. And it is short: if the
+    /// engine is going to hang, learning that in 2 ms rather than 24 ms is most of the win.
+    /// Repeated failures then latch the path off entirely — see [`engine_is_wedged`].
     unsafe fn wait_fence_value(&self, expected: u32) -> Result<(), RenderError> {
-        let mut t = 0u32;
+        let mhz = crate::time::TSC_MHZ.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        let deadline = crate::time::rdtsc().wrapping_add(mhz * FENCE_TIMEOUT_US);
         loop {
             self.flush_line(self.fence_virt as usize);
             if self.fence_virt.read_volatile() == expected {
+                // ⚠️ Deliberately does NOT clear `RENDER_HANGS`. It used to, and that made the
+                // latch unreachable: a composite performs two fence waits, so one succeeding while
+                // the other timed out reset the count every frame. Strikes are counted per
+                // COMPOSITE in `compositor::composite` instead.
                 return Ok(());
             }
             core::hint::spin_loop();
-            t += 1;
-            if t > 20_000_000 {
+            if crate::time::rdtsc() >= deadline {
                 let head = self.read_reg(RENDER_RING_HEAD);
                 let tail = self.read_reg(RENDER_RING_TAIL);
                 let fault = self.read_reg(RENDER_FAULT_REG);
-                crate::serial_println!(
-                    "[RCS] fence wait timeout: got {:#010x} want {:#010x} HEAD={:#x} TAIL={:#x} FAULT={:#010x}",
-                    self.fence_virt.read_volatile(), expected, head, tail, fault
-                );
+                // The FIRST hang's full engine state, kept for `gpu`. The log line below goes to a
+                // serial port the test laptop does not have — which is how this engine's hangs went
+                // undiagnosed for months. The first hang is the informative one: later ones may
+                // just be the aftermath.
+                if let Some(mut s) = FIRST_HANG.try_lock() {
+                    if s.valid == 0 {
+                        *s = self.hang_snapshot(self.fence_virt.read_volatile(), expected, 0);
+                    }
+                }
+                // A SEPARATE counter, only for rate-limiting this log. `RENDER_HANGS` is the latch
+                // and is owned by `compositor::composite`; incrementing it here would double-count
+                // (two waits per composite) and re-introduce the flapping described above.
+                let n = FENCE_TIMEOUT_LOGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                // Rate-limited. When the engine is wedged this fires every frame, and
+                // `serial_println!` is itself a long interrupts-off operation (a byte-at-a-time
+                // UART spin) — logging unconditionally would make the stall it reports worse.
+                if n <= 3 || n % 512 == 0 {
+                    crate::serial_println!(
+                        "[RCS] fence timeout #{}: got {:#010x} want {:#010x} HEAD={:#x} TAIL={:#x} FAULT={:#010x}",
+                        n, self.fence_virt.read_volatile(), expected, head, tail, fault
+                    );
+                }
                 return Err(RenderError::EngineHang);
             }
         }
@@ -604,18 +916,34 @@ pub static RENDER_ENGINE: spin::Mutex<RenderEngine> = spin::Mutex::new(RenderEng
 pub fn init_render_engine(mmio_base: u64) -> bool {
     let mut eng = RENDER_ENGINE.lock();
     unsafe {
+        use core::sync::atomic::Ordering::Relaxed;
         if let Err(e) = eng.bring_up(mmio_base) {
             crate::serial_println!("[RCS] bring-up failed: {:?}", e);
             return false;
         }
+        BOOT_TESTS.fetch_or(1 << 0, Relaxed);
         if let Err(e) = eng.rcs_selftest() {
             crate::serial_println!("[RCS] ring self-test failed: {:?}", e);
             return false;
         }
-        // Phase 2: PIPE_CONTROL post-sync fence via the RING. We deliberately do NOT run
-        // any batch-buffer test here — batches leave the engine stuck (BB_END doesn't
-        // return on this HW) and would starve the subsequent pipeline submission.
+        BOOT_TESTS.fetch_or(1 << 1, Relaxed);
+        // Phase 2: PIPE_CONTROL post-sync fence via the RING.
         let pc_ok = eng.pipecontrol_ring_test().is_ok();
+        if pc_ok {
+            BOOT_TESTS.fetch_or(1 << 2, Relaxed);
+        }
+        // ★ The batch-buffer test, which this boot path used to skip on the belief that "BB_END
+        // doesn't return on this HW". Every composite and GPU text draw IS a batch, and they all
+        // hung — but the one odd-length ring submission (the 3-dword MI_BATCH_BUFFER_START, now
+        // padded, see `rcs_submit`) explains that without any such quirk. This proves or disproves
+        // it on every boot, and `gpu` reports which. Costs nothing if batches are still broken:
+        // the composite path would hang on the very same thing a moment later anyway.
+        if pc_ok {
+            BOOT_TESTS.fetch_or(1 << 4, Relaxed);
+            if eng.batch_mistore_test().is_ok() {
+                BOOT_TESTS.fetch_or(1 << 3, Relaxed);
+            }
+        }
 
         // Phase 3: encode the VS/PS kernels, place them in the instruction base, and
         // hex-dump for byte-diff against Mesa. Non-fatal (encoding validation step).

@@ -111,8 +111,8 @@ Phase 9's requirement, and the reason `nyx_net::Error` has the variants it does:
 
 There are **no modifier chords on this machine** — the kernel builds `pc_keyboard` with
 `HandleControl::Ignore` and the key path is a `VecDeque<char>`, so Ctrl and Alt are dropped at the
-driver. There is also no scroll wheel. Available: ↑/↓ (command history), PageUp/PageDown/Home/End
-(scrollback), Enter, Backspace. Unhandled private-use keys are swallowed rather than typed as boxes.
+driver. Available: ↑/↓ (command history), PageUp/PageDown/Home/End (scrollback), Enter, Backspace,
+and two-finger scrolling on the precision touchpad, which reaches the terminal as `MSG_SCROLL`. Unhandled private-use keys are swallowed rather than typed as boxes.
 
 ## Known gaps
 

@@ -30,6 +30,7 @@ pub mod brand_gen;
 pub mod boot_screen;
 pub mod random;
 pub mod scheduler;
+pub mod schedstats;
 pub mod pci;
 // The QPU as a discoverable compute resource. Discovery and introspection only — no gates, no
 // circuits, no simulator, no networking. See `docs/quantum/architecture.md` for why the kernel's
@@ -256,6 +257,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::memory::identity_map_low_memory();
         time::init();
         crate::time::calibrate_tsc();
+        // Measure the APIC timer against the PIT. Report-only — `init_timer` still programs the
+        // count it always did. BSP only, and it has to sit between `apic::init` (which maps the
+        // LAPIC) and `init_timer` (which arms it).
+        crate::apic::calibrate_timer();
         ioapic::init();
         
         let bsp_apic_id = apic_ids[0] as u8;
@@ -293,9 +298,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::acpi::boot_checkpoint("post-nvme");
     
     unsafe {
-        if let Some(ref mut driver) = crate::fs::GLOBAL_NVME { 
-            driver.create_io_queues(); 
+        if let Some(ref mut driver) = crate::fs::GLOBAL_NVME {
+            driver.create_io_queues();
         }
+        // Must follow `create_io_queues` — the check issues real I/O reads. Proves on this specific
+        // device that an 8-block command returns the same bytes as eight 1-block commands, which is
+        // what gates the 4 KiB read chunking that removes ~7 of every 8 NVMe round trips from the
+        // ELF loader. See `fs::nvme_enable_fast_reads`.
+        crate::fs::nvme_enable_fast_reads();
         crate::entity::awaken_entity(&mut crate::fs::GLOBAL_NVME);
     }
     crate::acpi::boot_checkpoint("post-entity");
@@ -341,6 +351,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let head = unsafe { gpu.read_reg(0x22034) };
             let tail = unsafe { gpu.read_reg(0x22030) };
             crate::serial_println!("[DEBUG] Before Test: HEAD={:#x}, TAIL={:#x}", head, tail);
+            // For `gpu`: the 3D engine was brought up on a Comet Lake-H (0x9BC4); other SKUs
+            // are not proven, so the ID is part of every report.
+            crate::drivers::gpu::intel::render::DEVICE_ID
+                .store(gpu.device_id as u32, core::sync::atomic::Ordering::Relaxed);
             Some(gpu.mmio_base)
         } else {
             None
@@ -370,7 +384,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
         iret_slice[0] = crate::thermal::nyx_task_manager_daemon as u64; 
         iret_slice[1] = 0x08; iret_slice[2] = 0x202;             
-        iret_slice[3] = thermal_task.kernel_stack_top; iret_slice[4] = 0x10;              
+        // RSP = top - 8: a task's entry must look CALLED (RSP ≡ 8 mod 16), not jumped to with an
+        // aligned stack. See `smp.rs` — the misalignment faulted ACPICA on this very task.
+        iret_slice[3] = thermal_task.kernel_stack_top - 8; iret_slice[4] = 0x10;
         let regs_ptr = iretq_ptr - 120;
         core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120); 
         let fxsave_ptr = (regs_ptr - 512) & !0xF;
@@ -390,7 +406,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
         iret_slice[0] = crate::process::nyx_idle_task as u64; 
         iret_slice[1] = 0x08; iret_slice[2] = 0x202;             
-        iret_slice[3] = idle_task.kernel_stack_top; iret_slice[4] = 0x10;              
+        iret_slice[3] = idle_task.kernel_stack_top - 8; iret_slice[4] = 0x10; // entered as if called
         let regs_ptr = iretq_ptr - 120;
         core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
         let fxsave_ptr = (regs_ptr - 512) & !0xF;
@@ -413,6 +429,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     percpu.scheduler.tasks.push(idle_task);    
     percpu.scheduler.tasks.push(init_process); 
     percpu.scheduler.tasks.push(thermal_task); 
+
+    // USB HID poller. Nothing called `poll_all_mice`, so the xHCI driver enumerated devices,
+    // configured their interrupt endpoints and then never collected a single report — a USB
+    // keyboard or mouse did nothing at all.
+    //
+    // ⚠️ Built with `new_idle_ap`'s RESERVED PID range (0xFFFF_0000+), not `Process::new()`. The
+    // boot daemons occupy the well-known low numbers and apps hardcode COMPOSITOR_PID=4 for their
+    // window IPC (libs/gui/app.rs); taking an ordinary PID here would shift the compositor off 4
+    // and break every app's ability to open a window. That regression has happened before — it is
+    // why the reserved range exists.
+    //
+    // `is_idle` is cleared: the constructor is shared with the AP idle tasks, but this one is real
+    // work and must not be treated as a last-resort fallback by the scheduler.
+    {
+        let mut usb_task = crate::process::Process::new_idle_ap()
+            .expect("Failed to create USB HID task");
+        usb_task.is_idle = false;
+        usb_task.name = *b"usb-hid         ";
+        unsafe {
+            let iretq_ptr = usb_task.kernel_stack_top - 40;
+            let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
+            iret_slice[0] = crate::usb::nyx_usb_hid_task as u64;
+            iret_slice[1] = 0x08; iret_slice[2] = 0x202;
+            iret_slice[3] = usb_task.kernel_stack_top - 8; iret_slice[4] = 0x10; // entered as if called
+            let regs_ptr = iretq_ptr - 120;
+            core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
+            let fxsave_ptr = (regs_ptr - 512) & !0xF;
+            crate::process::init_fpu_state(fxsave_ptr as u64);
+            let final_rsp = fxsave_ptr - 16;
+            let bottom = core::slice::from_raw_parts_mut(final_rsp as *mut u64, 2);
+            bottom[0] = regs_ptr; bottom[1] = 0;
+            usb_task.saved_rsp = final_rsp;
+        }
+        percpu.scheduler.tasks.push(usb_task);
+    }
+
     
     percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32] = 1;
 

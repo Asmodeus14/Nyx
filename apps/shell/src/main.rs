@@ -136,7 +136,7 @@ const DOCK: [Option<usize>; layout::DOCK_SLOTS] =
 /// string in `.rodata` proves neither. `parent alive` is the load-bearing line — the shell IS the
 /// desktop, so the shell going quiet after a dock click is indistinguishable from a whole-machine
 /// freeze from the outside, and this is what tells the two apart.
-fn launch(app: &App) {
+fn launch(app: &App) -> Option<u64> {
     let mut buf = [0u8; 128];
     let mut n = 0usize;
     for &b in app.bundle.as_bytes() {
@@ -151,17 +151,27 @@ fn launch(app: &App) {
     }
     let exec = match core::str::from_utf8(&buf[..n]) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return None,
     };
     breadcrumb("[LAUNCH] pre-fork: ", app.label);
-    if sys_fork() == 0 {
+    let pid = sys_fork();
+    if pid == 0 {
         breadcrumb("[LAUNCH] child: ", app.label);
         sys_execve(exec);
         breadcrumb("[LAUNCH] execve returned, exec FAILED: ", app.label);
         sys_exit(1);
     }
     breadcrumb("[LAUNCH] parent alive: ", app.label);
+    // The child's PID — the same process that will ask for a window, since execve keeps it. That
+    // request is how the shell knows the launch finished.
+    if pid > 0 { Some(pid as u64) } else { None }
 }
+
+/// How long a launch may show as in progress before it is given up on. An app that never opens a
+/// window (it failed to exec, or it crashed first) must not leave the desktop "working" forever.
+const LAUNCH_TIMEOUT_MS: usize = 15_000;
+/// One step of the launch indicator's three dots.
+const LAUNCH_STEP_MS: usize = 150;
 
 /// Case-insensitive substring match. Labels and queries are both ASCII, so this compares bytes.
 fn matches(label: &str, q: &[u8]) -> bool {
@@ -1622,9 +1632,20 @@ fn paint_text(atlas: Option<&Atlas>, canvas: &mut Canvas, labels: &[Label], icon
         }
         if sys_gpu_draw_text(a.gva, a.w, a.h, a.pitch, &glyphs) {
             sys_gpu_sync();
+            TEXT_ON_GPU.store(true, core::sync::atomic::Ordering::Relaxed);
             return true;
         }
+        // ★ GPU refused: draw the SAME glyphs from the SAME atlas on the CPU. On the test laptop the
+        // render engine never completes a batch (`gpu`: drawn 0, latched), so this — not the GPU —
+        // is what draws the desktop's text there. The metrics are the atlas's either way, so
+        // `measure` stays right (TEXT_ON_GPU means "atlas text", GPU or not).
+        let (w, h) = (canvas.width, canvas.height);
+        a.draw_cpu(canvas.buffer, w, h, &glyphs);
+        TEXT_ON_GPU.store(true, core::sync::atomic::Ordering::Relaxed);
+        return false;
     }
+    // No atlas at all (its SHM could not be created): the bitmap font, measured as such.
+    TEXT_ON_GPU.store(false, core::sync::atomic::Ordering::Relaxed);
     for l in labels {
         if l.x < 0 || l.y < 0 {
             continue;
@@ -1707,10 +1728,22 @@ fn fit(atlas: Option<&Atlas>, style: Style, text: &str, budget: i32) -> String {
 /// build, so right-aligned text stays right-aligned on the degraded path instead of drifting.
 fn measure(atlas: Option<&Atlas>, style: Style, text: &str) -> i32 {
     match atlas {
-        Some(a) => a.measure(style, text) as i32,
-        None => Canvas::text_width(text, 1) as i32,
+        Some(a) if TEXT_ON_GPU.load(core::sync::atomic::Ordering::Relaxed) => a.measure(style, text) as i32,
+        _ => Canvas::text_width(text, 1) as i32,
     }
 }
+
+/// Whether the last frame's text actually went through the GPU atlas.
+///
+/// ★ `measure` has to measure in the font that will DRAW the text. `paint_text` falls back to
+/// `nyx_gui`'s CPU font whenever `sys_gpu_draw_text` fails — no Intel GPU, or the render engine
+/// latched off after repeated hangs — and that font is narrower than the atlas's 20px light. Measuring
+/// in the atlas while drawing in the fallback put the Command's caret further from the query with
+/// every letter typed, and skews anything centred or right-aligned the same way.
+///
+/// Updated once per frame by `paint_text`, so a switch between paths is one frame late. Starts true:
+/// the GPU path is the normal case, and the first frame corrects it if not.
+static TEXT_ON_GPU: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 // ─────────────────────────────── The Command ───────────────────────────────
 
@@ -2266,6 +2299,21 @@ struct Shell {
     resizing: Option<usize>,
     resize_edges: u8,
     scrolling: Option<usize>,
+    /// The last two-finger scroll target sent: (client index, offset, when). The app writes its
+    /// offset back to its header asynchronously, so during a fast scroll the header still shows an
+    /// older value — building the next step on it would drag the view backwards. For a short while
+    /// after sending, the next step builds on what was SENT instead.
+    touch_scroll: Option<(usize, i32, usize)>,
+    /// An app being launched: (index into APPS, the forked PID, when). Cleared when that PID asks
+    /// for its first window, or after [`LAUNCH_TIMEOUT_MS`].
+    ///
+    /// ★ The loading indicator. A launch is fork + execve + the app loading its binary from NVMe
+    /// before it can ask for a window, and on the hardware that gap read as "stuck" — a click with
+    /// no visible answer. While this is set the pointer is the Working cursor and the app's dock
+    /// slot shows three stepping dots.
+    launching: Option<(usize, u64, usize)>,
+    /// The launch indicator's last drawn step, so the dock repaints only when it changes.
+    launch_step: usize,
     cursor: Shape,
     /// Cold-start stage 3 — the mark travelling from the kernel's screen to the corner.
     handoff: Handoff,
@@ -2375,6 +2423,14 @@ struct Shell {
     /// The panel level to put back on wake, captured the moment before sleep dropped it. `None`
     /// means sleep never touched it: either this display has no PWM backlight, or we have not slept.
     bright_before_sleep: Option<u32>,
+    /// A keystroke already pulled off the queue by the blocking idle wait at the bottom of the
+    /// frame loop, waiting to be handled by `process_input` on the next pass.
+    ///
+    /// ★ The loop used to idle with `sleep(2)` and poll for keys separately, which put the poll
+    /// interval straight into keystroke latency. It now BLOCKS on the key instead — but the key it
+    /// receives has to reach `process_input` rather than be swallowed by the wait, and
+    /// `process_input` is the single place that knows what to do with one.
+    pending_key: Option<char>,
     /// The animation key of the last drawn idle frame — `(dx, dy, lid)`. The idle screen is redrawn
     /// only when this changes, which is a handful of frames a second rather than sixty.
     idle_key: (i32, i32, bool),
@@ -2432,6 +2488,9 @@ impl Shell {
             resizing: None,
             resize_edges: 0,
             scrolling: None,
+            touch_scroll: None,
+            launching: None,
+            launch_step: usize::MAX,
             cursor: Shape::Pointer,
             handoff: Handoff::begin(),
             osd: None,
@@ -2474,6 +2533,7 @@ impl Shell {
             last_input: 0,
             phase: Phase::Active,
             bright_before_sleep: None,
+            pending_key: None,
             idle_key: (i32::MIN, i32::MIN, false),
             auth: Auth::load(),
             locked: false,
@@ -2691,9 +2751,16 @@ impl Shell {
         let kinds: Vec<CmdEntry> = all.iter().map(|h| h.kind).collect();
         let n = layout::command_visible(self.screen_h, &kinds);
         all.truncate(n);
+        // ★ Damage the panel as it was AND as it will be — not the whole screen. This runs on every
+        // keystroke typed into the Command, and `mark_full` here made each one a full-screen
+        // recomposite plus a CPU scrim blend over every pixel of the desktop, which is why typing
+        // into search lagged. The panel only changes height, so the union of the old and new
+        // extents covers everything that can differ; the scrim is re-blended inside that rect by
+        // the partial-frame path. Opening and closing still repaint everything (`set_command`).
+        self.mark_command();
         self.hits = all;
         self.cmd_sel = layout::command_first(&self.kinds());
-        self.mark_full();
+        self.mark_command();
     }
 
     /// The result list as bare entry kinds — what every `layout::command_*` function takes.
@@ -2744,7 +2811,7 @@ impl Shell {
 
         self.set_command(false);
         match action {
-            Action::Launch(app) => launch(&APPS[app]),
+            Action::Launch(app) => self.start_launch(app),
             Action::ToggleTheme => self.set_theme(if self.theme.is_dark {
                 Theme::light()
             } else {
@@ -3213,6 +3280,10 @@ impl Shell {
         if self.cmd_open {
             let sel = self.cmd_sel;
             self.rebuild_command();
+            // This runs on the 1 Hz heartbeat, which must stay a FULL frame (see the loop). Now that
+            // `rebuild_command` damages only the panel, say so explicitly, or the non-empty rect
+            // would quietly turn the heartbeat into a partial one while the Command is open.
+            self.mark_full();
             // Keep the selection where the user left it — a link state change once a second must not
             // yank the highlight back to the top row under their finger. Only if that index is still
             // a selectable row, though; `rebuild_command`'s own first-row default covers the rest.
@@ -3294,6 +3365,11 @@ impl Shell {
                     });
                     self.next_win_id += 1;
                     self.mark_full();
+                    // The app being launched has its window: the launch is over.
+                    if self.launching.map_or(false, |(_, pid, _)| pid == msg.sender_pid) {
+                        self.launching = None;
+                        self.mark_dock();
+                    }
                     sys_ipc_send(msg.sender_pid, MSG_WINDOW_CREATED, shm_id, 0);
                     // Straight after the ack, so an app launched into an already-light session
                     // paints light on its very first frame instead of flashing dark once.
@@ -3531,6 +3607,70 @@ impl Shell {
         self.mark_dock();
     }
 
+    /// Launch `APPS[i]` and show that it is loading until its window arrives.
+    fn start_launch(&mut self, i: usize) {
+        if let Some(pid) = launch(&APPS[i]) {
+            self.launching = Some((i, pid, sys_get_time()));
+            self.launch_step = usize::MAX;
+            self.mark_dock();
+        }
+    }
+
+    /// Advance the launch indicator, and give up on a launch that never produced a window. Called
+    /// every pass of the main loop; asks for a frame only when a dot actually moves.
+    fn tick_launch(&mut self, now: usize) {
+        let Some((_, _, since)) = self.launching else { return };
+        // ⚠️ SATURATING, not wrapping. `now` is read once at the top of the main loop, BEFORE input
+        // is processed — so a launch started in this same pass stamps `since` slightly AFTER `now`.
+        // `wrapping_sub` turned that into a huge elapsed time and the timeout cleared the launch in
+        // the very pass that started it: the indicator never appeared (caught in QEMU).
+        let elapsed = now.saturating_sub(since);
+        if elapsed >= LAUNCH_TIMEOUT_MS {
+            self.launching = None;
+            self.mark_dock();
+            return;
+        }
+        let step = (elapsed / LAUNCH_STEP_MS) % 3;
+        if step != self.launch_step {
+            self.launch_step = step;
+            self.mark_dock();
+        }
+    }
+
+    /// Scroll the window under the pointer by `delta` pixels (positive = further down the content).
+    fn apply_touch_scroll(&mut self, delta: i32, now: usize) {
+        // The modal surfaces own the pointer; nothing behind them scrolls.
+        if self.cmd_open || self.ent_open {
+            return;
+        }
+        let idx = match self
+            .window_at(self.mx, self.my)
+            .filter(|&i| !self.clients[i].win.folded)
+        {
+            Some(i) => i,
+            None => return,
+        };
+        let r = self.clients[idx].win.r;
+        let (content_h, off) = client_scroll(&self.clients[idx]);
+        let max = content_h as i32 - r.h;
+        if max <= 0 {
+            return; // nothing to scroll
+        }
+        // Build on the last target SENT to this window if that was recent; the header lags it.
+        const HEADER_LAG_MS: usize = 150;
+        let base = match self.touch_scroll {
+            Some((i, t, at)) if i == idx && now.wrapping_sub(at) < HEADER_LAG_MS => t,
+            _ => off as i32,
+        };
+        let target = (base + delta).clamp(0, max);
+        if target != base {
+            sys_ipc_send(self.clients[idx].owner_pid, MSG_SCROLL, target as u64, 0);
+            self.touch_scroll = Some((idx, target, now));
+            // The scrollbar thumb moves with it.
+            self.mark_win(r);
+        }
+    }
+
     fn process_input(&mut self, now: usize) {
         // ⚠️ `process_input` runs at ~500 Hz, not once per frame. That is why idle is timed from
         // here and not from the render loop: a wake has to be felt on the *next* frame, and polling
@@ -3538,7 +3678,8 @@ impl Shell {
         // responsiveness is the whole point.
         let was = self.phase;
 
-        if let Some(key) = sys_read_key() {
+        // Take whatever the blocking idle wait already collected, else look for a fresh one.
+        if let Some(key) = self.pending_key.take().or_else(sys_read_key) {
             self.last_input = now;
             // The lock OWNS the keyboard, exactly as the Command does. Nothing reaches the desktop
             // or the focused app while it is up — that is what makes it a gate rather than a
@@ -3559,6 +3700,16 @@ impl Shell {
         self.mx = (mx_raw as i32).clamp(0, self.screen_w - 1);
         self.my = (my_raw as i32).clamp(0, self.screen_h - 1);
         self.left = left;
+
+        // ★ Two-finger scroll from the precision touchpad — the first scroll input this desktop
+        // has ever had. It goes to the window under the pointer through the same MSG_SCROLL the
+        // scrollbar drag uses, so every app that already scrolls by its bar scrolls by touch too.
+        // Non-blocking (a counter swap in the kernel): the window server must never wait.
+        let scroll = sys_touchpad_take_scroll();
+        if scroll != 0 {
+            self.last_input = now;
+            self.apply_touch_scroll(scroll, now);
+        }
 
         let moved = self.mx != self.prev_mx || self.my != self.prev_my;
         if moved && !self.hw_cursor {
@@ -3705,12 +3856,13 @@ impl Shell {
                     }
                 }
                 keys::UP => {
+                    // The selection plate moves inside the panel; nothing outside it changes.
                     self.cmd_sel = layout::command_step(&self.kinds(), self.cmd_sel, -1);
-                    self.mark_full();
+                    self.mark_command();
                 }
                 keys::DOWN => {
                     self.cmd_sel = layout::command_step(&self.kinds(), self.cmd_sel, 1);
-                    self.mark_full();
+                    self.mark_command();
                 }
                 '\t' => {
                     // ⇥ refine: adopt the selected result's name as the query. Not completion for
@@ -3844,7 +3996,7 @@ impl Shell {
         // The dock rests on the wallpaper, under nothing, so it is tested before the windows.
         if let Some(slot) = layout::dock_hit(self.screen_h, mx, my) {
             if let Some(i) = DOCK[slot] {
-                launch(&APPS[i]);
+                self.start_launch(i);
             }
             return;
         }
@@ -4040,7 +4192,11 @@ impl Shell {
     /// `Unavailable` needs a drop target that can refuse. Each is one arm here once its machinery
     /// exists.
     fn update_cursor(&mut self) {
-        let desired = if self.resizing.is_some() {
+        let desired = if self.launching.is_some() && self.resizing.is_none() && self.dragging.is_none() {
+            // An app is loading. The design's Working cursor, wherever the pointer is — the answer
+            // to a click that otherwise looks like it did nothing.
+            Shape::Working
+        } else if self.resizing.is_some() {
             Shape::for_edges(self.resize_edges).unwrap_or(Shape::Pointer)
         } else if self.dragging.is_some() {
             // A caption line being dragged. Reverts on release.
@@ -4702,6 +4858,8 @@ pub extern "C" fn _start() -> ! {
         //
         // Only while it is actually moving: the alpha is constant at 255 before 90 s and at 0 after
         // the ramp, so this asks for nothing at all except during the ramp itself.
+        // The launch indicator steps on its own clock, and times out a launch that never opened.
+        state.tick_launch(now);
         {
             let a = idle::chrome_alpha(state.idle_ms(now));
             if a != state.chrome_key {
@@ -4741,7 +4899,20 @@ pub extern "C" fn _start() -> ! {
         }
 
         if !state.needs_redraw && now.wrapping_sub(last_frame) < ms_per_frame {
-            sys_sleep_ms(2);
+            // ★ Block for a keystroke instead of sleeping through the gap.
+            //
+            // This was `sys_sleep_ms(2)`, with keys polled separately at the top of the loop. While
+            // UPTIME_MS ran fast that sleep was really ~0.36 ms, so the shell happened to poll at
+            // ~2,700 Hz; fixing the clock made it an honest 2 ms and therefore made keystrokes up
+            // to 2 ms later. Blocking removes the interval from the latency entirely — the keyboard
+            // IRQ wakes this directly — and stops ~500 pointless syscalls a second.
+            //
+            // ⚠️ The timeout is what makes this safe in the WINDOW SERVER. It must never block
+            // indefinitely: a missed wake here would stop the desktop, not just one app. On
+            // timeout it behaves exactly as the old sleep did.
+            if let Some(k) = sys_read_key_wait(2) {
+                state.pending_key = Some(k);
+            }
             continue;
         }
         last_frame = now;
@@ -5180,9 +5351,27 @@ fn render(state: &mut Shell, fb: &mut [u32], atlas: Option<&Atlas>) {
                 chrome_a,
             ),
         });
+        // Loading: three dots where the running dot goes, one lit at a time, stepping every
+        // LAUNCH_STEP_MS. It replaces the running dot for this slot while the launch is in flight.
+        let loading = state.launching.map_or(false, |(i, _, _)| DOCK[slot] == Some(i));
+        if loading {
+            if let Some(d) = layout::dock_dot(state.screen_h, slot) {
+                let gap = d.w * 2;
+                for k in 0..3i32 {
+                    let x = d.x + (k - 1) * gap;
+                    let lit = k as usize == state.launch_step.min(2);
+                    canvas.fill_rect(
+                        x.max(0) as usize,
+                        d.y.max(0) as usize,
+                        d.w as usize,
+                        d.h as usize,
+                        fade_to(if lit { theme.accent } else { theme.fg_4 }, ground, chrome_a),
+                    );
+                }
+            }
+        } else if running {
         // The running dot. Accent-tinted when active, so it is a CPU `fill_rect` and not a glyph —
         // the batched text shader carries one luminance and would render the accent as grey.
-        if running {
             if let Some(d) = layout::dock_dot(state.screen_h, slot) {
                 canvas.fill_rect(
                     d.x as usize,

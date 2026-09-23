@@ -1,5 +1,10 @@
 # QCLang Command Line Interface (CLI)
 
+> Checked in the 2026-09 documentation audit against `tools/compiler/src/bin/qclang.rs`: every
+> command below exists. The binary is behind the `cli` feature —
+> `cargo build -p qclang_compiler --features cli --bin qclang`. There is also a `version`
+> subcommand not described here. Flags and output formats were not individually re-verified.
+
 The `qclang` CLI is the primary tool for interacting with the QCLang compiler. It is designed for professional quantum systems programming, handling compilation, optimization, package management, and benchmarking.
 
 ## Global Options

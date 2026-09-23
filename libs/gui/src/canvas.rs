@@ -119,13 +119,38 @@ impl<'a> Canvas<'a> {
             return;
         }
 
-        // --- STANDARD PATH FOR TRANSPARENT COLORS ---
+        // --- CONSTANT-COLOUR BLEND ---
+        //
+        // ★ This is the Command's scrim: one translucent fill over the WHOLE framebuffer, on every
+        // full frame while it is open. It used to call `alpha_blend` per pixel — a bounds check and
+        // three integer divisions each, ~2M times a frame at 1080p — which made everything slow
+        // while the Command was up. The colour is constant, so its share of each channel is
+        // computed once, and the divide by 255 is the exact shift identity
+        // `x / 255 == (x + 1 + (x >> 8)) >> 8` (checked for every x in 0..=255*255). Same pixels
+        // as `alpha_blend`, bit for bit.
+        //
+        // Rows are clipped to the canvas width. The old per-index check let a rect overhanging the
+        // right edge wrap onto the start of the next row.
+        let inv = 255 - a;
+        let fr = ((color >> 16) & 0xFF) * a;
+        let fg = ((color >> 8) & 0xFF) * a;
+        let fb = (color & 0xFF) * a;
+        let x_end = x.saturating_add(w).min(self.width);
+        if x >= x_end { return; }
+        #[inline(always)]
+        fn div255(v: u32) -> u32 { (v + 1 + (v >> 8)) >> 8 }
         for cy in 0..h {
-            for cx in 0..w {
-                let idx = (y + cy) * self.width + (x + cx);
-                if idx < self.buffer.len() { 
-                    self.buffer[idx] = alpha_blend(color, self.buffer[idx]);
-                }
+            let row = y + cy;
+            if row >= self.height { break; }
+            let start = row * self.width + x;
+            let end = (row * self.width + x_end).min(self.buffer.len());
+            if start >= end { break; }
+            for px in &mut self.buffer[start..end] {
+                let bg = *px;
+                let r = div255(fr + ((bg >> 16) & 0xFF) * inv);
+                let g = div255(fg + ((bg >> 8) & 0xFF) * inv);
+                let b = div255(fb + (bg & 0xFF) * inv);
+                *px = 0xFF00_0000 | (r << 16) | (g << 8) | b;
             }
         }
     }

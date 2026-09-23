@@ -137,6 +137,20 @@ pub struct XhciController {
     ep1_cycles: Vec<bool>,
     ep1_indices: Vec<usize>,
     ep1_configured: Vec<bool>,
+    /// HID boot protocol per slot: 1 = keyboard, 2 = mouse, 0 = unknown/not HID.
+    ///
+    /// ★ Enumeration configured the interrupt endpoint but never recorded WHAT the device was, so
+    /// every report was parsed as a mouse. A keyboard's boot report has a completely different
+    /// shape (byte 0 = modifiers, bytes 2..8 = keycodes), so its bytes were being fed to the cursor
+    /// as dx/dy — which is why plugging in a USB keyboard could only ever move the pointer.
+    hid_protocol: Vec<u8>,
+    /// Previous keycodes per slot. The boot protocol reports the keys currently HELD, not
+    /// transitions, so a new press is only detectable by diffing against the last report —
+    /// otherwise holding a key would repeat it at the polling rate.
+    kbd_prev: Vec<[u8; 6]>,
+    /// Previous modifier byte per slot, so the Super key (which has no usage ID of its own) can be
+    /// detected as an edge rather than re-fired on every report while held.
+    kbd_prev_mods: Vec<u8>,
     ep1_dci: Vec<u8>, 
     
     ep1_halted: Vec<bool>,
@@ -192,6 +206,9 @@ impl XhciController {
         let mut ep1_cycles = Vec::with_capacity(max_slots);
         let mut ep1_indices = Vec::with_capacity(max_slots);
         let mut ep1_configured = Vec::with_capacity(max_slots);
+        let mut hid_protocol = Vec::with_capacity(max_slots);
+        let mut kbd_prev = Vec::with_capacity(max_slots);
+        let mut kbd_prev_mods = Vec::with_capacity(max_slots);
         let mut ep1_dci = Vec::with_capacity(max_slots);
         let mut ep1_halted = Vec::with_capacity(max_slots);
         let mut mouse_pending = Vec::with_capacity(max_slots);
@@ -209,6 +226,9 @@ impl XhciController {
             ep1_cycles.push(true);
             ep1_indices.push(0);
             ep1_configured.push(false);
+            hid_protocol.push(0u8);
+            kbd_prev.push([0u8; 6]);
+            kbd_prev_mods.push(0u8);
             ep1_dci.push(0);
             ep1_halted.push(false);
             mouse_pending.push(false);
@@ -225,6 +245,7 @@ impl XhciController {
             scratchpad_array: core::ptr::null_mut(), scratchpad_pages: Vec::new(),
             ep0_rings, ep0_rings_phys, ep0_cycles, ep0_indices, 
             ep1_rings, ep1_rings_phys, ep1_cycles, ep1_indices, ep1_configured, ep1_dci,
+            hid_protocol, kbd_prev, kbd_prev_mods,
             ep1_halted, mouse_pending, mouse_buf_virt, mouse_buf_phys,
             cmd_index: 0, cmd_cycle: true, event_index: 0, event_cycle: true,
             ctx_size: caps.context_size(),
@@ -463,14 +484,53 @@ impl XhciController {
                             let b4 = *buffer.add(4);
                             let b5 = *buffer.add(5);
                             
-                            if b0 != 0 || b1 != 0 || b2 != 0 || b3 != 0 {
-                                crate::serial_println!("[USB] HID [{}]: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", s, b0, b1, b2, b3, b4, b5);
-                                
-                                let buttons = b1;
-                                let dx = b2 as i8; 
-                                let dy = b3 as i8;
-                                
-                                crate::mouse::update_from_usb(dx, dy, buttons);
+                            // ⚠️ Dispatch on the interface protocol recorded at enumeration. This
+                            // used to unconditionally parse every report as a mouse, so a USB
+                            // keyboard's modifier/keycode bytes were fed to the cursor as dx/dy.
+                            //
+                            // The `serial_println!` that used to fire here on EVERY report is gone:
+                            // it is a byte-at-a-time UART spin, and at HID polling rates it would
+                            // dominate the very input path this exists to make fast — on a machine
+                            // with no serial port to read it.
+                            match self.hid_protocol[s] {
+                                1 => {
+                                    // Boot keyboard: [modifiers, reserved, k0..k5].
+                                    let keys = [b2, b3, b4, b5, *buffer.add(6), *buffer.add(7)];
+                                    let prev = self.kbd_prev[s];
+                                    for &k in keys.iter() {
+                                        // 0 = empty slot; 1..3 are roll-over/error codes, not keys.
+                                        if k > 3 && !prev.contains(&k) {
+                                            crate::shell::handle_hid_key(k, b0);
+                                        }
+                                    }
+                                    // Super has no usage ID — it lives in the modifier byte, so it
+                                    // can only be seen as an edge.
+                                    const GUI: u8 = 0b1000_1000; // bit3 LGui, bit7 RGui
+                                    if (b0 & GUI) != 0 && (self.kbd_prev_mods[s] & GUI) == 0 {
+                                        crate::shell::handle_hid_super();
+                                    }
+                                    self.kbd_prev[s] = keys;
+                                    self.kbd_prev_mods[s] = b0;
+                                }
+                                _ => {
+                                    // Mouse. Default arm on purpose: a device reporting no usable
+                                    // protocol still moves the pointer, which is what this path
+                                    // always did.
+                                    //
+                                    // ⚠️ buttons/dx/dy are read from b1/b2/b3, NOT the b0/b1/b2 a
+                                    // textbook boot-mouse report would use. That one-byte offset
+                                    // is pre-existing and presumably matches the device this was
+                                    // brought up against (a leading report ID would explain it).
+                                    // Left exactly as it was: it is the only part of this path with
+                                    // any hardware evidence behind it, and "correcting" it blind
+                                    // would trade a working pointer for a theory.
+                                    if b0 != 0 || b1 != 0 || b2 != 0 || b3 != 0 {
+                                        let buttons = b1;
+                                        let dx = b2 as i8;
+                                        let dy = b3 as i8;
+                                        crate::mouse::update_from_usb(dx, dy, buttons);
+                                    }
+                                }
                             }
                         }
                     }
@@ -811,6 +871,18 @@ impl XhciController {
                                                     if desc_len == 0 { break; }
                                                     let desc_type = cfg_desc[scan_idx + 1];
                                                     
+                                                    // Interface descriptor: bInterfaceClass at +5,
+                                                    // bInterfaceProtocol at +7. Class 3 is HID;
+                                                    // protocol 1 = keyboard, 2 = mouse. Without
+                                                    // this every device was assumed to be a mouse.
+                                                    if desc_type == 4 && desc_len >= 9
+                                                        && scan_idx + 7 < scan_len
+                                                        && cfg_desc[scan_idx + 5] == 3
+                                                    {
+                                                        self.hid_protocol[id as usize] =
+                                                            cfg_desc[scan_idx + 7];
+                                                    }
+
                                                     if desc_type == 5 { 
                                                         let ep_addr = cfg_desc[scan_idx + 2];
                                                         let attr = cfg_desc[scan_idx + 3];
@@ -852,5 +924,45 @@ impl XhciController {
                 }
             }
         }
+    }
+}
+/// How often the USB HID poller runs, in milliseconds.
+///
+/// 8 ms matches the interval a full-speed HID interrupt endpoint is specified at, so polling faster
+/// would only re-read the same report. This is a stop-gap: the xHCI interrupter is configured but
+/// nothing services its event ring, so the reports have to be collected by asking. Driving it from
+/// the interrupt instead removes both the latency floor and the idle cost.
+pub const HID_POLL_MS: u64 = 8;
+
+/// Kernel task that collects USB HID reports and feeds them into the input path.
+///
+/// ★★ Without this, `poll_all_mice` was called from NOWHERE. The xHCI driver enumerated devices,
+/// configured their interrupt endpoints, set boot protocol and SET_IDLE — and then no one ever
+/// asked for the data, so a USB keyboard or mouse did nothing at all. All of the hard work already
+/// existed; what was missing was something to turn the handle.
+///
+/// ⚠️ A dedicated task rather than the timer ISR: a USB transfer is far too much work for an
+/// interrupt handler that runs with interrupts masked, and putting it there would recreate exactly
+/// the stalls this project just spent its time removing.
+pub extern "C" fn nyx_usb_hid_task() {
+    loop {
+        // `try_lock`, never `lock`. This task is preemptible (IF=1) while the USB syscalls and the
+        // PCI enumeration path take this same mutex with interrupts masked — blocking here would be
+        // the preemption-boundary deadlock documented in drivers/net/mod.rs. Missing a poll costs
+        // one 8 ms interval.
+        if let Some(mut guard) = USB_CONTROLLER.try_lock() {
+            if let Some(ctrl) = guard.as_mut() {
+                unsafe { ctrl.poll_all_mice(); }
+            }
+        }
+        // I2C-HID bring-up, when the `touchpad` command asks for it. Lives here rather than in its
+        // own task because a new kernel task needs a reserved PID (see kernel_main's comment on
+        // COMPOSITOR_PID), and this loop already runs at IF=1 where the probe's sleeps are legal.
+        crate::drivers::i2c_hid::service();
+        // 4 ms while the I2C touchpad is the pointer: its reports are only as fresh as this poll,
+        // and 8 ms is visible as cursor lag. Back to the USB rate otherwise.
+        let period = if crate::drivers::i2c_hid::POINTER_ACTIVE
+            .load(core::sync::atomic::Ordering::Relaxed) { 4 } else { HID_POLL_MS };
+        crate::scheduler::kernel_sleep_ms(period);
     }
 }

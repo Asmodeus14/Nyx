@@ -1,7 +1,7 @@
 use x86_64::{PhysAddr, VirtAddr};
 use alloc::vec::Vec;
 use alloc::collections::VecDeque;
-use crate::scheduler::{FileDescriptor, TaskState};
+use crate::scheduler::{FileDescriptor, TaskState, WaitReason};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(C)]
@@ -511,6 +511,19 @@ pub struct Process {
     // FS (native TLS via arch_prctl) keep distinct thread-locals across preemption. 0 = never set
     // (harmless for no_std apps that never touch FS).
     pub saved_fs_base: u64,
+    /// What this task is blocked waiting for. Meaningless unless `state == Blocked`.
+    ///
+    /// Paired with `wake_tsc`, which stays the DEADLINE: `Ipc` + a finite `wake_tsc` means "wake on
+    /// a message or at this time, whichever comes first" — the primitive a GUI frame loop needs and
+    /// could not previously express. See [`crate::scheduler::WaitReason`].
+    pub wait_reason: WaitReason,
+    /// TSC at the moment this task last became runnable; 0 = not waiting to run.
+    ///
+    /// Exists purely to measure wake-to-run latency — the delay between an event making a task
+    /// ready and the scheduler actually giving it the CPU. That number is the one that decides
+    /// whether input feels instant, and nothing could observe it before. Stamped wherever a task
+    /// moves into `Ready`, consumed and cleared when it is picked.
+    pub ready_tsc: u64,
 }
 
 impl Process {
@@ -544,6 +557,8 @@ impl Process {
             futex_addr: 0,
             exit_code: 0,
             saved_fs_base: 0,
+            ready_tsc: 0,
+            wait_reason: WaitReason::None,
         })
     }
 
@@ -574,6 +589,8 @@ impl Process {
             futex_addr: 0,
             exit_code: 0,
             saved_fs_base: 0,
+            ready_tsc: 0,
+            wait_reason: WaitReason::None,
         })
     }
 
@@ -614,6 +631,8 @@ impl Process {
             futex_addr: 0,
             exit_code: 0,
             saved_fs_base: 0,
+            ready_tsc: 0,
+            wait_reason: WaitReason::None,
         })
     }
 }

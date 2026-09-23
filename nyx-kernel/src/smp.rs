@@ -132,7 +132,17 @@ pub extern "C" fn ap_main(_apic_id: u32, logical_id: usize) -> ! {
             let iret_slice = core::slice::from_raw_parts_mut(iretq_ptr as *mut u64, 5);
             iret_slice[0] = crate::process::nyx_idle_task as u64;
             iret_slice[1] = 0x08; iret_slice[2] = 0x202;
-            iret_slice[3] = idle_task.kernel_stack_top; iret_slice[4] = 0x10;
+            // ★ RSP = top - 8, for every kernel task started through a crafted iretq frame.
+            //
+            // The SysV ABI requires RSP ≡ 8 (mod 16) at a function's first instruction — the state
+            // right after a `call` pushed its return address. `kernel_stack_top` is 16-aligned, so
+            // entering with RSP = top left every such task misaligned by 8 for its entire life.
+            // Compiled code is entitled to assume the alignment: ACPICA's
+            // AcpiExSystemMemorySpaceHandler spills an XMM register with `movaps [rsp+0x10]`, which
+            // #GPs on a misaligned address. That is how `touchpad handover` panicked the machine
+            // on the thermal governor while the same `_DSM` ran fine at boot on the aligned boot
+            // stack. The slot at top-8 plays the return address; these tasks never return.
+            iret_slice[3] = idle_task.kernel_stack_top - 8; iret_slice[4] = 0x10;
             let regs_ptr = iretq_ptr - 120;
             core::ptr::write_bytes(regs_ptr as *mut u8, 0, 120);
             let fxsave_ptr = (regs_ptr - 512) & !0xF;

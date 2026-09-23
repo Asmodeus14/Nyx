@@ -39,30 +39,321 @@ int acpi_wake_cnvi_wifi(void) {
 // ==========================================
 // 2. THE MODERN I2C-HID SCANNER
 // ==========================================
-static ACPI_STATUS I2cHidCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
-    ACPI_BUFFER Buffer;
-    Buffer.Length = ACPI_ALLOCATE_BUFFER;
-    Buffer.Pointer = NULL;
+// An I2C-HID touchpad cannot be described statically. This DSDT declares the SAME device slot on
+// four different I2C buses and patches its _HID and slave address at _INI from an NVS variable
+// (SDS0) — the one slot becomes WCOM4831@0x0A, ALPS0000@0x2C, ELAN2097@0x10, NTRG0001@0x07,
+// SYNA2393 or DLL077A depending on which panel the factory fitted, and _STA says which is real.
+// Worse, `_CRS` here is a Method whose result depends on OSYS and SDM0, so even the resource
+// template cannot be read statically. Every number a driver needs must come from evaluated AML.
+//
+// ⚠️ AML EVALUATION CONTEXT. Nothing here may be called from a syscall: SYSCALL runs with IF=0 and
+// AcpiEvaluateObject takes the interpreter mutex, allocates, and can end in a firmware SMI — that
+// is the preemption-boundary deadlock that wedged the machine on `panel` and `battery`
+// (see the cache note in acpi.rs). Call this from the thermal governor (IF=1) via an `acpi probe`
+// step, and have syscalls copy scalars out of the published cache.
 
-    // We found one! Increment the counter that Rust gave us a pointer to.
-    *((int*)Context) += 1; 
-    
-    // (Optional) If we wanted to parse the exact hardware path string, we do it here.
-    AcpiGetName(Object, ACPI_FULL_PATHNAME, &Buffer);
-    if (Buffer.Pointer) {
-        AcpiOsFree(Buffer.Pointer);
+// ⚠️ Discovery never evaluates the HIDG _DSM — see NyxHidDescriptorRegister. The one caller is
+// acpi_i2c_hid_handover, which is the handover itself and is opt-in.
+
+typedef struct {
+    UINT32 valid;
+    UINT32 sta;
+    UINT32 slave_addr;
+    UINT32 speed_hz;
+    UINT32 gpio_pin;
+    UINT32 irq_gsi;       /* plain APIC interrupt, when _CRS returns one instead of a GpioInt */
+    UINT32 hid_desc_reg;
+    UINT32 ctrl_adr;      /* controller _ADR: (device << 16) | function */
+    char   path[72];
+    char   ctrl_path[72];
+    /* Board-tuned Designware SCL timings for this controller, from the NVS variables the firmware
+     * keeps per LPSS I2C bus (SSHn/SSLn/SSDn = standard mode high/low/SDA hold, FMHn/FMLn/FMDn =
+     * fast mode). Zero = not found; the driver falls back to conservative defaults. */
+    UINT32 ss_hcnt, ss_lcnt, ss_hold;
+    UINT32 fm_hcnt, fm_lcnt, fm_hold;
+    /* The root bridge's 64-bit MMIO window, as the firmware's PCI0._CRS would report it: the plain
+     * NVS Names M64B/M64L. Read directly because _CRS itself also touches PCI_Config, which our
+     * OS layer answers with all-ones. Zero length = no 64-bit window. */
+    UINT64 m64_base, m64_len;
+} NyxI2cHidInfo;
+
+typedef struct {
+    NyxI2cHidInfo *out;
+    int            max;
+    int            count;
+} NyxHidScan;
+
+static ACPI_STATUS NyxHidResourceCb(ACPI_RESOURCE *Resource, void *Context) {
+    NyxI2cHidInfo *info = (NyxI2cHidInfo *)Context;
+
+    if (Resource->Type == ACPI_RESOURCE_TYPE_SERIAL_BUS) {
+        if (Resource->Data.CommonSerialBus.Type == ACPI_RESOURCE_SERIAL_TYPE_I2C) {
+            ACPI_RESOURCE_I2C_SERIALBUS *i2c = &Resource->Data.I2cSerialBus;
+            info->slave_addr = i2c->SlaveAddress;
+            info->speed_hz   = i2c->ConnectionSpeed;
+            /* Which controller this hangs off, e.g. "\\_SB.PCI0.I2C1" — resolved to a PCI
+             * bus/device/function below via that controller's _ADR. */
+            if (i2c->ResourceSource.StringPtr) {
+                int i = 0;
+                for (; i < (int)sizeof(info->ctrl_path) - 1
+                       && i2c->ResourceSource.StringPtr[i]; i++) {
+                    info->ctrl_path[i] = i2c->ResourceSource.StringPtr[i];
+                }
+                info->ctrl_path[i] = 0;
+            }
+        }
+    } else if (Resource->Type == ACPI_RESOURCE_TYPE_GPIO) {
+        ACPI_RESOURCE_GPIO *gpio = &Resource->Data.Gpio;
+        /* Only the INTERRUPT-type GPIO is the "report ready" line. A GpioIo entry here would be a
+         * reset or power-enable pin, which is a different thing and must not be mistaken for it. */
+        if (gpio->ConnectionType == ACPI_RESOURCE_GPIO_TYPE_INT
+            && gpio->PinTableLength > 0 && gpio->PinTable) {
+            info->gpio_pin = gpio->PinTable[0];
+        }
+    } else if (Resource->Type == ACPI_RESOURCE_TYPE_EXTENDED_IRQ) {
+        /* ★ This device's _CRS is a Method that returns EITHER a GpioInt OR a plain Interrupt,
+         * chosen by OSYS and SDM0. On this machine it returns the plain Interrupt — so the
+         * touchpad's "report ready" line is an ordinary APIC GSI that the IOAPIC can route, NOT a
+         * GPIO pad. Capturing it is what tells us a GPIO controller driver is unnecessary; without
+         * this field the answer looks like "no interrupt at all". */
+        ACPI_RESOURCE_EXTENDED_IRQ *irq = &Resource->Data.ExtendedIrq;
+        if (irq->InterruptCount > 0) {
+            info->irq_gsi = irq->Interrupts[0];
+        }
+    } else if (Resource->Type == ACPI_RESOURCE_TYPE_IRQ) {
+        ACPI_RESOURCE_IRQ *irq = &Resource->Data.Irq;
+        if (irq->InterruptCount > 0) {
+            info->irq_gsi = irq->Interrupts[0];
+        }
+    }
+    return AE_OK;
+}
+
+/* Evaluate an object expecting an Integer. Fixed stack buffer: the result is small and bounded, so
+ * there is no reason to take the ACPI_ALLOCATE_BUFFER path and own a free. Returns 1 on success. */
+static int NyxEvalInteger(ACPI_HANDLE Object, const char *Name, UINT64 *out) {
+    char local[96];
+    ACPI_BUFFER buf;
+    buf.Length = sizeof(local);
+    buf.Pointer = local;
+
+    if (ACPI_FAILURE(AcpiEvaluateObject(Object, (char *)Name, NULL, &buf))) {
+        return 0;
+    }
+    ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
+    if (!obj || obj->Type != ACPI_TYPE_INTEGER) {
+        return 0;
+    }
+    *out = obj->Integer.Value;
+    return 1;
+}
+
+/* The register at which the HID descriptor is read over I2C.
+ *
+ * ⚠️⚠️ THIS MUST NOT CALL _DSM. The spec'd way to get this number is `_DSM(HIDG, 1, 1)`, and that
+ * is what the first version did — and it KILLED THE TOUCHPAD on every boot, because it also ran
+ * from the boot-time scan. On this firmware the touchpad's _DSM is not a pure query:
+ *
+ *     If (DRDY == Zero) { If (Arg0 == HIDG) { DRDY = One ; EV5 (Zero, Zero) } }
+ *     EV5 -> \_SB.PCI0.LPCB.ECDV.EDPE -> If (PMED == Zero) { PMED = One ; EISC (0x81, 0x20, Zero) }
+ *
+ * PMED is "PS/2 Mouse Emulation Disable". The first HIDG _DSM is the OS announcing "an I2C-HID
+ * driver is here", and the EC answers by switching the touchpad OFF the 8042 AUX port and onto
+ * I2C. (ECM9 re-sends it on resume — which is how you can tell it is EC state, not an AML
+ * variable.) With no I2C-HID driver yet, that left the machine with no pointer at all.
+ *
+ * So _DSM is the HANDOVER, not a probe. It belongs to the I2C-HID driver at the moment it can take
+ * the device (Phase 4), never to discovery. Here we read `HID2`, the plain Name this firmware's own
+ * _DSM hands to HIDD for function 1 (0x20 for the ALPS part). Evaluating a Name has no side
+ * effects. Firmware without HID2 reports 0; the driver then learns it during the handover. */
+static UINT32 NyxHidDescriptorRegister(ACPI_HANDLE Object) {
+    UINT64 reg = 0;
+    if (NyxEvalInteger(Object, "HID2", &reg)) {
+        return (UINT32)reg;
+    }
+    return 0;
+}
+
+static ACPI_STATUS I2cHidCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
+    NyxHidScan *scan = (NyxHidScan *)Context;
+    if (scan->count >= scan->max) {
+        return AE_OK;
     }
 
-    return AE_OK; 
+    NyxI2cHidInfo *info = &scan->out[scan->count];
+    UINT64 sta = 0;
+
+    /* A device with no _STA is present by definition; one WITH _STA must have bit 0 set. Three of
+     * the four touch devices this firmware declares are templates for boards this is not, and
+     * _STA is the only thing that distinguishes them. */
+    if (NyxEvalInteger(Object, "_STA", &sta)) {
+        info->sta = (UINT32)sta;
+        if ((sta & 0x01) == 0) {
+            return AE_OK;
+        }
+    } else {
+        info->sta = 0x0F;
+    }
+
+    /* Fixed buffer, not ACPI_ALLOCATE_BUFFER — a path is bounded and this avoids owning a free. */
+    ACPI_BUFFER namebuf;
+    namebuf.Length = sizeof(info->path);
+    namebuf.Pointer = info->path;
+    if (ACPI_FAILURE(AcpiGetName(Object, ACPI_FULL_PATHNAME, &namebuf))) {
+        info->path[0] = 0;
+    }
+
+    nyx_mark(70);
+    AcpiWalkResources(Object, (char *)"_CRS", NyxHidResourceCb, info);
+    nyx_mark(71);
+    info->hid_desc_reg = NyxHidDescriptorRegister(Object);
+    nyx_mark(72);
+
+    /* Resolve the controller path to a PCI address. _ADR on an LPSS controller encodes
+     * (device << 16) | function, so 0x00150001 is 00:15.1. */
+    if (info->ctrl_path[0]) {
+        ACPI_HANDLE ctrl;
+        if (ACPI_SUCCESS(AcpiGetHandle(NULL, info->ctrl_path, &ctrl))) {
+            UINT64 adr = 0;
+            if (NyxEvalInteger(ctrl, "_ADR", &adr)) {
+                info->ctrl_adr = (UINT32)adr;
+            }
+        }
+
+        /* The timing variables are named by the controller's bus index — the digit ending
+         * "\_SB.PCI0.I2Cn". They are plain Names in the NVS region: reading them has no side
+         * effects, unlike the device's _DSM (see NyxHidDescriptorRegister). */
+        int len = 0;
+        while (len < (int)sizeof(info->ctrl_path) && info->ctrl_path[len]) len++;
+        char n = len > 0 ? info->ctrl_path[len - 1] : 0;
+        if (n >= '0' && n <= '9') {
+            char name[7] = { '\\', 'S', 'S', 'H', n, 0, 0 };
+            UINT64 v;
+            UINT32 *dst[6] = { &info->ss_hcnt, &info->ss_lcnt, &info->ss_hold,
+                               &info->fm_hcnt, &info->fm_lcnt, &info->fm_hold };
+            const char *pfx[6] = { "SSH", "SSL", "SSD", "FMH", "FML", "FMD" };
+            for (int i = 0; i < 6; i++) {
+                name[1] = pfx[i][0]; name[2] = pfx[i][1]; name[3] = pfx[i][2];
+                if (NyxEvalInteger(NULL, name, &v)) {
+                    *dst[i] = (UINT32)v;
+                }
+            }
+        }
+    }
+
+    {
+        UINT64 v;
+        if (NyxEvalInteger(NULL, "\\M64B", &v)) info->m64_base = v;
+        if (NyxEvalInteger(NULL, "\\M64L", &v)) info->m64_len = v;
+    }
+
+    /* Only claim the entry if it is usable. Slave address 0 means the _CRS walk found no I2C
+     * descriptor, which makes every other field meaningless — publishing it would aim the driver
+     * at an address that does not exist. */
+    if (info->slave_addr != 0) {
+        info->valid = 1;
+        scan->count += 1;
+    }
+    return AE_OK;
+}
+
+/* Boot-time count only. Deliberately does NOT share I2cHidCallback: this runs on EVERY boot from
+ * scan_for_modern_inputs, so nothing it evaluates may touch the device — NyxHidDescriptorRegister
+ * records how a "harmless" query took the touchpad off PS/2. The full probe is `acpi probe 13`. */
+static ACPI_STATUS I2cHidCountCallback(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
+    *((int *)Context) += 1;
+    return AE_OK;
 }
 
 int acpi_find_i2c_hid(void) {
-    int device_count = 0;
-    
-    // PNP0C50 is the industry standard Hardware ID for I2C Human Interface Devices
-    AcpiGetDevices((char*)"PNP0C50", I2cHidCallback, &device_count, NULL);
-                      
-    return device_count;
+    int count = 0;
+    /* AcpiGetDevices matches the _CID list as well as _HID, which is essential here: these devices
+     * carry a vendor-specific _HID patched in at _INI and only PNP0C50 as their _CID. */
+    AcpiGetDevices((char *)"PNP0C50", I2cHidCountCallback, &count, NULL);
+    return count;
+}
+
+/* Fill `out` with up to `max` present I2C-HID devices. Returns how many were written. */
+int acpi_get_i2c_hid(NyxI2cHidInfo *out, int max) {
+    NyxHidScan scan;
+    for (int i = 0; i < max; i++) {
+        NyxI2cHidInfo zero = {0};
+        out[i] = zero;
+    }
+    scan.out = out;
+    scan.max = max;
+    scan.count = 0;
+
+    AcpiGetDevices((char *)"PNP0C50", I2cHidCallback, &scan, NULL);
+    return scan.count;
+}
+
+/* ⚠️⚠️ THE PS/2 → I2C HANDOVER. Opt-in only (`acpi probe 14`, via `touchpad handover`).
+ *
+ * The HID-over-I2C `_DSM` (UUID 3cdff6f7-4267-4555-ad05-b30a3d8938de, the DSDT's HIDG), function 1.
+ * Nominally it returns the HID descriptor register. On this firmware its FIRST call also runs
+ * `EV5` -> `ECDV.EDPE`, which sets PMED and sends EC command 0x81/0x20: PS/2 mouse emulation off.
+ * That is the whole point of calling it — it is how Windows and Linux announce an I2C-HID driver —
+ * and also why it killed the pointer when discovery called it at boot. Nothing may call this until
+ * the I2C driver is ready to take the device. There is no known way to undo it short of a reboot. */
+static const UINT8 NyxHidI2cDsmUuid[16] = {
+    0xF7, 0xF6, 0xDF, 0x3C, 0x67, 0x42, 0x55, 0x45,
+    0xAD, 0x05, 0xB3, 0x0A, 0x3D, 0x89, 0x38, 0xDE
+};
+
+typedef struct {
+    int handed_over;   /* devices whose _DSM evaluated successfully */
+    UINT32 reg;        /* what function 1 returned for the last one */
+} NyxHandover;
+
+static ACPI_STATUS I2cHidHandoverCb(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
+    NyxHandover *h = (NyxHandover *)Context;
+    UINT64 sta = 0;
+    /* Only the device that is actually present — the other three slots are templates. */
+    if (NyxEvalInteger(Object, "_STA", &sta) && (sta & 0x01) == 0) {
+        return AE_OK;
+    }
+
+    ACPI_OBJECT args[4];
+    ACPI_OBJECT_LIST arglist;
+    char local[128];
+    ACPI_BUFFER buf;
+    args[0].Type = ACPI_TYPE_BUFFER;
+    args[0].Buffer.Length = 16;
+    args[0].Buffer.Pointer = (UINT8 *)NyxHidI2cDsmUuid;
+    args[1].Type = ACPI_TYPE_INTEGER;
+    args[1].Integer.Value = 1;           /* revision */
+    args[2].Type = ACPI_TYPE_INTEGER;
+    args[2].Integer.Value = 1;           /* function 1: descriptor address */
+    args[3].Type = ACPI_TYPE_PACKAGE;
+    args[3].Package.Count = 0;
+    args[3].Package.Elements = NULL;
+    arglist.Count = 4;
+    arglist.Pointer = args;
+    buf.Length = sizeof(local);
+    buf.Pointer = local;
+
+    nyx_mark(73);
+    ACPI_STATUS st = AcpiEvaluateObject(Object, (char *)"_DSM", &arglist, &buf);
+    nyx_mark(74);
+    if (ACPI_SUCCESS(st)) {
+        ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
+        if (obj && obj->Type == ACPI_TYPE_INTEGER) {
+            h->reg = (UINT32)obj->Integer.Value;
+        }
+        h->handed_over += 1;
+    }
+    return AE_OK;
+}
+
+/* Returns the number of devices handed over; `*reg` gets function 1's answer. */
+int acpi_i2c_hid_handover(UINT32 *reg) {
+    NyxHandover h;
+    h.handed_over = 0;
+    h.reg = 0;
+    AcpiGetDevices((char *)"PNP0C50", I2cHidHandoverCb, &h, NULL);
+    if (reg) *reg = h.reg;
+    return h.handed_over;
 }
 
 // ==========================================

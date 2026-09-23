@@ -16,6 +16,38 @@ pub enum TaskState {
     Empty,
 }
 
+/// Why a `Blocked` task is blocked — i.e. what event should wake it.
+///
+/// ## Why this exists
+///
+/// ★ Before this, `Blocked` carried no reason, so every waker had to guess. The keyboard and mouse
+/// ISRs guessed by waking **every** task with a finite `wake_tsc` — which meant a moving PS/2 mouse
+/// (3-4 IRQs per motion event, up to 200 Hz) dragged every sleeping task on the core to `Ready`,
+/// each costing an O(n) scan, a full context switch and a 1 KiB FPU save/restore. It also silently
+/// broke `sleep()` system-wide: `sys_sleep_ms` treats a cleared `wake_tsc` as a legal early return,
+/// so while the mouse moved, every app's 16 ms frame sleep, `wifiagent`'s 500 ms and `init`'s
+/// 1000 ms all returned immediately.
+///
+/// With a reason recorded, a waker can wake exactly the tasks waiting for the thing that happened.
+///
+/// ⚠️ `wake_tsc` remains the DEADLINE and is orthogonal: a task can be `Ipc` with a deadline (wake
+/// on a message *or* at a time), which is precisely what a GUI app's frame loop needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReason {
+    /// Not blocked, or blocked with no specific waker (deadline only).
+    None,
+    /// `sleep`/`nanosleep` — nothing but the clock should wake this.
+    Timer,
+    /// Waiting in `ipc_recv`. Woken by `ipc_send`, or by the deadline if it has one.
+    Ipc,
+    /// Waiting for keyboard/mouse input. Woken by the input ISRs.
+    Input,
+    /// Waiting on a futex word.
+    Futex,
+    /// `wait4` — waiting for a child to exit.
+    Child,
+}
+
 #[derive(Clone)]
 pub enum SocketKind {
     Udp(smoltcp::iface::SocketHandle),
@@ -92,16 +124,256 @@ static HB_TICK: AtomicU64 = AtomicU64::new(0);
 /// look for, and it is invisible to a per-core snapshot.
 static HB_CORE_LAST_MS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
 
+/// Block the calling KERNEL task for `ms`, then return.
+///
+/// Shared by the thermal governor and the USB HID poller, which previously each would have carried
+/// their own copy. Marks the wait as [`WaitReason::Timer`], so the input ISRs — which wake only
+/// `Input` waiters — correctly leave it alone.
+///
+/// ⚠️ Kernel tasks only. It enables interrupts and yields, so the caller must hold no lock and must
+/// not be inside a syscall that promised atomicity.
+pub fn kernel_sleep_ms(ms: u64) {
+    let wake_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed) + ms;
+
+    unsafe {
+        x86_64::instructions::interrupts::enable();
+        loop {
+            let percpu = crate::percpu::current();
+            let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+            if curr_idx < percpu.scheduler.tasks.len() {
+                let task = &mut percpu.scheduler.tasks[curr_idx];
+                task.state = TaskState::Blocked;
+                task.wake_tsc = wake_ms;
+                task.wait_reason = WaitReason::Timer;
+            }
+
+            core::arch::asm!("int 0x41");
+
+            if crate::time::UPTIME_MS.load(Ordering::Relaxed) >= wake_ms {
+                break;
+            }
+            // Woken early by something other than the deadline; park rather than spin.
+            x86_64::instructions::hlt();
+        }
+        x86_64::instructions::interrupts::disable();
+    }
+}
+
+/// Wake every task blocked on INPUT, on EVERY core. Returns true if one on THIS core woke (the
+/// caller should then reschedule); remote cores that gained a Ready task get a reschedule IPI.
+///
+/// ★ The input ISRs used to scan only their own core — and the keyboard and mouse IRQs are routed
+/// to the BSP, while `place_task` has spread processes across all cores since the multi-core
+/// work. A window server that happened to live on core 3 was never woken by a keystroke: it
+/// found the key only when its own 2 ms `read_key_wait` timeout expired and core 3's next tick
+/// ran it. Cross-core writes to `state` follow the pattern `ipc_send` and futex wake already use
+/// (the `tasks` Vec is pre-reserved and never reallocates; only its OWNER pushes).
+///
+/// Call from the ISR, interrupts masked.
+pub fn wake_input_waiters() -> bool {
+    let cores = match unsafe { &mut crate::percpu::PER_CPU } {
+        Some(c) => c,
+        None => return false,
+    };
+    let here = crate::percpu::current().logical_id;
+    let active = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst).clamp(1, cores.len());
+    let mut local = false;
+    for (i, core) in cores[..active].iter_mut().enumerate() {
+        let mut woke = false;
+        for task in core.scheduler.tasks.iter_mut() {
+            if task.state == TaskState::Blocked && task.wait_reason == WaitReason::Input {
+                task.state = TaskState::Ready;
+                task.wake_tsc = 0;
+                task.wait_reason = WaitReason::None;
+                // Stamped so wake-to-run measures input latency specifically: the gap between
+                // the key/mouse IRQ and the woken task reaching the CPU.
+                task.ready_tsc = crate::schedstats::rdtsc();
+                woke = true;
+            }
+        }
+        if woke {
+            crate::schedstats::with(|s| s.wakeups += 1);
+            if i == here {
+                local = true;
+            } else {
+                kick_core(core.apic_id);
+            }
+        }
+    }
+    local
+}
+
+/// Tell another core that a task on it just became Ready, so it schedules now rather than at
+/// its next timer tick (up to a full quantum later — the rest of the cross-core input delay).
+pub fn kick_core(apic_id: u32) {
+    crate::apic::send_ipi(apic_id, crate::apic::RESCHED_VECTOR);
+}
+
+/// Place a newly created task on the least-loaded core and return which one took it.
+///
+/// ★★★ This is the change that makes the machine multi-core at all. `fork` and `clone` pushed onto
+/// the CALLING core unconditionally, and since every process descends from init on core 0, the
+/// entire system ran there. Measured on 8-core hardware over 42 s: core 0 did 21,349 context
+/// switches while cores 1-7 took ~42,000 timer interrupts each and switched task **zero** times —
+/// seven cores doing nothing, expensively.
+///
+/// Placement is by live load (see [`Scheduler::load`]), with a deliberate bias to the caller's own
+/// core: a fresh task shares its parent's address space and page tables, so keeping it local is
+/// worth more than perfect balance. Only a core that is genuinely less loaded wins it.
+///
+/// ⚠️ Handover goes through the target's INBOX, never a direct push into its `tasks`. See
+/// [`Scheduler::inbox`] for why writing another core's Vec is unsound.
+///
+/// Safety: caller must ensure `PER_CPU` is initialised.
+pub unsafe fn place_task(task: Process, local_id: usize) -> Option<usize> {
+    let cores = match &mut crate::percpu::PER_CPU {
+        Some(c) => c,
+        None => return None,
+    };
+    let active = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst).min(cores.len());
+    if active <= 1 {
+        return match cores[local_id].scheduler.alloc_slot(task) {
+            Ok(_) => Some(local_id),
+            Err(_) => None,
+        };
+    }
+
+    let local_load = cores[local_id].scheduler.load();
+    let mut best = local_id;
+    // Strictly-less-than, plus the +1 margin below, so a tie never moves a task off its parent's
+    // core for nothing.
+    let mut best_load = local_load;
+    for i in 0..active {
+        if i == local_id {
+            continue;
+        }
+        let l = cores[i].scheduler.load();
+        if l + 1 < best_load {
+            best_load = l;
+            best = i;
+        }
+    }
+
+    if best == local_id {
+        return match cores[local_id].scheduler.alloc_slot(task) {
+            Ok(_) => Some(local_id),
+            Err(_) => None,
+        };
+    }
+
+    // Remote: hand off via the inbox and let the owner splice it in on its next tick.
+    cores[best].scheduler.inbox.lock().push(task);
+    Some(best)
+}
+
 pub struct Scheduler {
     pub tasks: Vec<Process>,
     pub core_task_idx: [usize; 32],
+    /// Tasks handed to this core by a DIFFERENT core, waiting to be adopted.
+    ///
+    /// ★ This is how work reaches a core other than the one that created it, and it exists because
+    /// the obvious alternative is unsound. `tasks` is only ever mutated by its owning core, and
+    /// several syscalls (`ipc_send`, `futex` wake, `wait4`, `sysinfo`) *iterate other cores'*
+    /// `tasks` to find a pid. A remote `push` that reallocated the Vec under one of those walks
+    /// would leave it following a freed pointer. Handing the task through a lock-guarded inbox and
+    /// letting the OWNER splice it in keeps every mutation of `tasks` on its own core.
+    ///
+    /// The lock is only ever taken to hand over or to drain, never on the scheduling hot path —
+    /// `schedule` checks emptiness with a `try_lock` and skips it entirely in the common case.
+    pub inbox: spin::Mutex<Vec<Process>>,
 }
+
+/// Slots reserved per core, so `tasks` never reallocates.
+///
+/// ⚠️ Load-bearing for memory safety, not just performance. The cross-core scans above read
+/// `tasks` while its owner may be pushing; if the Vec's backing store can move, those reads are a
+/// use-after-free. Reserving up front pins the allocation, so a remote reader may observe a stale
+/// length but never a dangling pointer. Slots are also RECYCLED rather than appended (see
+/// `alloc_slot`), so the reservation is a ceiling on live tasks, not on total tasks ever created.
+const TASK_SLOTS: usize = 192;
 
 impl Scheduler {
     pub fn new() -> Self {
         Self {
-            tasks: Vec::new(),
+            tasks: Vec::with_capacity(TASK_SLOTS),
             core_task_idx: [0; 32],
+            inbox: spin::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Find a home for a new task: recycle a dead slot if there is one, else append.
+    ///
+    /// ★★ Recycling rather than appending is what stops `tasks` growing for the life of the boot.
+    /// `TaskState::Empty` is a tombstone left by `wait4`/thread-reap, and nothing ever removed one —
+    /// so every per-tick O(n) pass (the wake sweep, the round-robin search) walked every process
+    /// that had *ever* existed. Entries cannot simply be removed instead, because `core_task_idx`
+    /// holds an INDEX into this Vec and removing would silently re-point every core at the wrong
+    /// task.
+    ///
+    /// On failure the task is handed BACK rather than dropped — `Err(task)`. A dropped `Process`
+    /// here would be a process that silently ceased to exist, which is a far worse outcome than
+    /// refusing the placement; every caller has somewhere else to put it.
+    pub fn alloc_slot(&mut self, task: Process) -> Result<usize, Process> {
+        if let Some(i) = self
+            .tasks
+            .iter()
+            .position(|t| t.state == TaskState::Empty)
+        {
+            self.tasks[i] = task;
+            return Ok(i);
+        }
+        if self.tasks.len() < TASK_SLOTS {
+            self.tasks.push(task);
+            return Ok(self.tasks.len() - 1);
+        }
+        Err(task)
+    }
+
+    /// Live, schedulable tasks on this core — the real load, for placement decisions.
+    ///
+    /// ⚠️ NOT `tasks.len()`. That is what the old thread-spawn balancer used, and it counts the
+    /// idle task plus every Zombie/Empty tombstone — so a core that had reaped a few processes
+    /// looked permanently busier than one that had not, and placement drifted to whichever core had
+    /// done least work historically rather than least work now.
+    pub fn load(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                !t.is_idle
+                    && t.state != TaskState::Empty
+                    && t.state != TaskState::Zombie
+            })
+            .count()
+    }
+
+    /// Adopt anything another core has handed us. Owner-only; called from `schedule`.
+    fn drain_inbox(&mut self) {
+        // `try_lock`, and only when a handover is actually pending: this runs on every tick of
+        // every core, and blocking here would put a cross-core lock on the scheduling hot path.
+        // Missing a handover costs one tick — the next pass picks it up.
+        // Take the whole queue out under the lock and release it immediately, rather than holding
+        // it across the slot search. Shorter critical section, and it keeps the lock off the path
+        // that another core may be spinning on.
+        let taken = {
+            let mut pending = match self.inbox.try_lock() {
+                Some(g) if !g.is_empty() => g,
+                _ => return,
+            };
+            core::mem::take(&mut *pending)
+        };
+
+        let mut rejected = Vec::new();
+        for task in taken {
+            match self.alloc_slot(task) {
+                Ok(_) => crate::schedstats::with(|s| s.migrations += 1),
+                // Full. Kept, not dropped — dropping a `Process` here would make a process vanish.
+                Err(t) => rejected.push(t),
+            }
+        }
+        if !rejected.is_empty() {
+            // Blocking `lock` on this rare path: a `try_lock` that failed would drop the tasks it
+            // is trying to preserve, which is the one outcome this whole branch exists to avoid.
+            self.inbox.lock().extend(rejected);
         }
     }
 
@@ -109,9 +381,16 @@ impl Scheduler {
     /// selects the next ready process, swaps the hardware memory space (CR3),
     /// and returns the stack pointer of the new process.
     pub fn schedule(&mut self, current_rsp: u64) -> u64 {
+        // Adopt anything another core handed us. Must happen before the emptiness check below, or
+        // a core whose only task arrives by handover would never pick it up.
+        self.drain_inbox();
+
         if self.tasks.is_empty() {
             return current_rsp;
         }
+
+        let sched_entry_tsc = crate::schedstats::rdtsc();
+        crate::schedstats::with(|s| s.schedule_calls += 1);
 
         // --- 1. WAKE UP SLEEPING TASKS (UPTIME CLOCK) ---
         let current_ms = crate::time::UPTIME_MS.load(Ordering::Relaxed);
@@ -122,6 +401,14 @@ impl Scheduler {
                 if current_ms >= task.wake_tsc {
                     task.state = TaskState::Ready;
                     task.wake_tsc = 0; // Clear the timer
+                    // The deadline was the waker, so the reason is spent. Left set, a task that
+                    // timed out of `ipc_recv` would still look like an IPC waiter to `ipc_send`.
+                    task.wait_reason = WaitReason::None;
+                    // Stamped here so the wake-to-run histogram measures the gap between becoming
+                    // runnable and actually getting the CPU — which for a timer wake is the
+                    // scheduler's own responsiveness, with no driver in the way.
+                    task.ready_tsc = sched_entry_tsc;
+                    crate::schedstats::with(|s| s.wakeups += 1);
                 }
             }
         }
@@ -171,6 +458,26 @@ impl Scheduler {
                             && (t.state == TaskState::Ready || t.state == TaskState::Running)
                     })
                     .count();
+
+                // Piggy-backed on the heartbeat's existing once-a-second walk rather than adding a
+                // per-tick scan of its own: these are gauges, a 1 Hz sample is plenty, and the
+                // whole point of this module is to not become the overhead it measures.
+                //
+                // `tasks_dead` is the interesting one — Zombie/Empty entries are never reclaimed,
+                // so it only ever climbs, and every O(n) pass above walks them forever.
+                {
+                    let dead = self
+                        .tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Zombie || t.state == TaskState::Empty)
+                        .count();
+                    let total = self.tasks.len();
+                    crate::schedstats::with(|s| {
+                        s.rq_len = runnable as u64;
+                        s.tasks_dead = dead as u64;
+                        s.tasks_live = (total - dead) as u64;
+                    });
+                }
                 let idle_ms =
                     current_ms.saturating_sub(HB_LAST_USER_MS.load(Ordering::Relaxed));
 
@@ -230,7 +537,11 @@ impl Scheduler {
             // No normal user/kernel tasks are ready to run. Let the CPU sleep!
             if let Some(idle_idx) = fallback_idle_idx {
                 next_idx = idle_idx;
+                crate::schedstats::with(|s| s.idle_entries += 1);
             } else {
+                crate::schedstats::with(|s| {
+                    s.sched_cycles += crate::schedstats::rdtsc().saturating_sub(sched_entry_tsc)
+                });
                 return current_rsp; // Absolute worst-case fallback
             }
         }
@@ -239,6 +550,15 @@ impl Scheduler {
         self.core_task_idx[logical_id] = next_idx;
         let next_process = &mut self.tasks[next_idx];
         next_process.state = TaskState::Running;
+
+        // ★ The gap between `schedule_calls` and `switches` is pure waste: a full interrupt entry,
+        // 512 bytes of FXSAVE and 512 of FXRSTOR spent to conclude that the task already running
+        // should keep running. Counting both is what makes that waste visible.
+        if next_idx != curr_idx {
+            crate::schedstats::with(|s| s.switches += 1);
+        }
+        crate::schedstats::note_wake_to_run(next_process.ready_tsc);
+        next_process.ready_tsc = 0;
 
         // 🚨 5. THE HARDWARE BRAIN SWAP 🚨
         unsafe {
@@ -269,8 +589,13 @@ impl Scheduler {
         }
 
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        
+
+        let rsp = next_process.saved_rsp;
+        crate::schedstats::with(|s| {
+            s.sched_cycles += crate::schedstats::rdtsc().saturating_sub(sched_entry_tsc)
+        });
+
         // 6. Return the saved stack pointer so the assembly `iretq` resumes the new process
-        next_process.saved_rsp
+        rsp
     }
 }

@@ -163,9 +163,82 @@ pub fn init_intel_acpica() {
 // ==========================================
 // 3. CUSTOM ACPI METHODS
 // ==========================================
+/// One I2C-HID device as ACPI describes it.
+///
+/// ⚠️ `#[repr(C)]` and the field order IS the ABI — it mirrors `NyxI2cHidInfo` in `custom_acpi.c`
+/// byte for byte. The C side memcpy's into an array of these.
+///
+/// ★ Every field here has to be read from evaluated AML; none of it can be hardcoded. This DSDT
+/// declares the same touch-device slot on four I2C buses and patches its `_HID` and slave address
+/// at `_INI` from an NVS variable, so the identity depends on which panel the factory fitted, and
+/// `_CRS` is a Method whose result additionally depends on `OSYS`/`SDM0`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct I2cHidInfo {
+    pub valid: u32,
+    pub sta: u32,
+    pub slave_addr: u32,
+    pub speed_hz: u32,
+    pub gpio_pin: u32,
+    /// Plain APIC interrupt, when `_CRS` returns an Interrupt instead of a GpioInt. Non-zero here
+    /// means the IOAPIC can route it directly and no GPIO driver is required.
+    pub irq_gsi: u32,
+    pub hid_desc_reg: u32,
+    /// Controller `_ADR`: `(device << 16) | function`. `0x00150001` is PCI 00:15.1.
+    pub ctrl_adr: u32,
+    pub path: [u8; 72],
+    pub ctrl_path: [u8; 72],
+    /// Board-tuned Designware SCL timings (standard mode high/low/SDA hold, then fast mode), from
+    /// the firmware's per-bus NVS variables `SSHn/SSLn/SSDn/FMHn/FMLn/FMDn`. Zero = not found.
+    pub ss_hcnt: u32,
+    pub ss_lcnt: u32,
+    pub ss_hold: u32,
+    pub fm_hcnt: u32,
+    pub fm_lcnt: u32,
+    pub fm_hold: u32,
+    /// Root bridge 64-bit MMIO window (firmware NVS `M64B`/`M64L`). Length 0 = none.
+    pub m64_base: u64,
+    pub m64_len: u64,
+}
+
+impl I2cHidInfo {
+    pub const EMPTY: I2cHidInfo = I2cHidInfo {
+        valid: 0,
+        sta: 0,
+        slave_addr: 0,
+        speed_hz: 0,
+        gpio_pin: 0,
+        irq_gsi: 0,
+        hid_desc_reg: 0,
+        ctrl_adr: 0,
+        path: [0; 72],
+        ctrl_path: [0; 72],
+        ss_hcnt: 0,
+        ss_lcnt: 0,
+        ss_hold: 0,
+        fm_hcnt: 0,
+        fm_lcnt: 0,
+        fm_hold: 0,
+        m64_base: 0,
+        m64_len: 0,
+    };
+
+    /// PCI device and function decoded from `ctrl_adr`.
+    pub fn pci_dev_func(&self) -> (u8, u8) {
+        (((self.ctrl_adr >> 16) & 0xFF) as u8, (self.ctrl_adr & 0xFF) as u8)
+    }
+}
+
 extern "C" {
     fn acpi_wake_cnvi_wifi() -> i32;
-    fn acpi_find_i2c_hid() -> i32; 
+    fn acpi_find_i2c_hid() -> i32;
+    /// Fill `out` with up to `max` PRESENT I2C-HID devices; returns how many were written.
+    ///
+    /// ⚠️ Evaluates AML (`_STA`, `_CRS`, `HID2`, `_ADR` — never `_DSM`, which hands the touchpad off PS/2). Governor context only — never a syscall.
+    fn acpi_get_i2c_hid(out: *mut I2cHidInfo, max: i32) -> i32;
+    /// ⚠️ The PS/2 -> I2C handover: evaluates the touchpad's HIDG `_DSM`, which on this firmware
+    /// tells the EC to stop PS/2 mouse emulation. Opt-in only (`acpi probe 14`).
+    fn acpi_i2c_hid_handover(reg: *mut u32) -> i32;
     
     // --- NEW: THE ACPICA FAN CONTROLLER ---
     fn acpi_set_fan_state(turn_on: i32) -> i32;
@@ -417,6 +490,20 @@ pub struct AcpiCache {
     /// False until the governor's first pass has run — so "no panel" and "not asked yet" are
     /// distinguishable, which is the distinction this whole path keeps getting wrong.
     pub ready: bool,
+
+    /// I2C-HID devices found by `acpi probe 13`, and how many are populated.
+    ///
+    /// Four slots because this firmware declares the touch device on I2C0..I2C3; at most one of
+    /// them is real on any given board, but reporting which ones were rejected is worth more than
+    /// reporting only the survivor.
+    pub i2c_hid: [I2cHidInfo; 4],
+    pub i2c_hid_n: usize,
+    /// True once step 13 has actually run, so "no touchpad" and "never asked" stay distinguishable.
+    pub i2c_hid_probed: bool,
+    /// Result of `acpi probe 14`: -1 never run, else how many devices were handed over.
+    pub i2c_hid_handover: i32,
+    /// What the handover `_DSM` returned (function 1: the HID descriptor register).
+    pub i2c_hid_handover_reg: u32,
 }
 
 impl AcpiCache {
@@ -427,6 +514,11 @@ impl AcpiCache {
         panel_levels: [0; 64],
         panel_n: 0,
         panel_pct: u32::MAX,
+        i2c_hid: [I2cHidInfo::EMPTY; 4],
+        i2c_hid_n: 0,
+        i2c_hid_probed: false,
+        i2c_hid_handover: -1,
+        i2c_hid_handover_reg: 0,
         bcl_status: 5,
         bqc_status: 5,
         battery: Battery {
@@ -447,7 +539,7 @@ impl AcpiCache {
     };
 }
 
-static CACHE: spin::Mutex<AcpiCache> = spin::Mutex::new(AcpiCache::EMPTY);
+pub static CACHE: spin::Mutex<AcpiCache> = spin::Mutex::new(AcpiCache::EMPTY);
 
 /// A brightness change asked for by userspace, in percent. `-1` means nothing pending.
 ///
@@ -828,6 +920,40 @@ pub fn refresh_cache() {
                 c.ready = true;
             }
             crate::postmortem::user_mark(107);
+        }
+        13 => {
+            // I2C-HID discovery. Evaluates _STA, _CRS (a Method here), the HID2 Name and the controller's
+            // _ADR for every PNP0C50 device.
+            //
+            // ⚠️ Deliberately an opt-in probe step rather than something the boot path does. The
+            // comment on PROBE is blunt about why: "three boots died on the governor's automatic
+            // first pass and each guess at which call was responsible cost a power cycle." The
+            // breadcrumbs in `I2cHidCallback` (70/71/72) narrow a hang to _CRS, HID2, or neither.
+            let mut buf = [I2cHidInfo::EMPTY; 4];
+            let n = unsafe { acpi_get_i2c_hid(buf.as_mut_ptr(), 4) };
+            let n = if n < 0 { 0 } else { (n as usize).min(4) };
+            if let Some(mut c) = CACHE.try_lock() {
+                c.i2c_hid = buf;
+                c.i2c_hid_n = n;
+                c.i2c_hid_probed = true;
+            }
+        }
+        14 => {
+            // ⚠️⚠️ The PS/2 -> I2C handover. Only ever from `touchpad handover`, after the I2C
+            // driver has proven it can talk to the device: this makes the EC stop PS/2 mouse
+            // emulation, and nothing undoes it short of a reboot. Breadcrumbs 73/74 bracket the
+            // `_DSM` itself.
+            let mut reg = 0u32;
+            let n = unsafe { acpi_i2c_hid_handover(&mut reg) };
+            if n > 0 {
+                // Every handover path (boot automation and `touchpad handover`) comes through here.
+                crate::drivers::i2c_hid::HANDED_OVER
+                    .store(true, core::sync::atomic::Ordering::Release);
+            }
+            if let Some(mut c) = CACHE.try_lock() {
+                c.i2c_hid_handover = n;
+                c.i2c_hid_handover_reg = reg;
+            }
         }
         6 => {
             let want = BRIGHT_REQUEST.swap(-1, core::sync::atomic::Ordering::Relaxed);
@@ -1443,10 +1569,29 @@ pub fn scan_for_modern_inputs() {
     crate::vga_println!("[ACPI] Scanning for I2C Trackpads...");
     
     let count = unsafe { acpi_find_i2c_hid() };
-    
+
     if count > 0 {
         crate::serial_println!("[ACPI] SUCCESS: Found {} I2C-HID device(s)!", count);
         crate::vga_println!("[ACPI] Found {} I2C-HID device(s)!", count);
+
+        // ★ Full discovery (what `acpi probe 13` does), HERE rather than on the governor, so the
+        // touchpad can take over the pointer as soon as the scheduler starts instead of ~8 s later.
+        //
+        // Why this is the safe place for it: it is single-threaded — before the APs are started,
+        // before the scheduler exists — so nothing else can be inside the AML interpreter at the
+        // same time, which is the hazard that routes every RUNTIME evaluation through the governor.
+        // And what it evaluates is exactly probe 13's set (_STA, _CRS, the HID2 and NVS Names,
+        // _ADR), proven on the hardware across many runs before being moved here. It still never
+        // evaluates `_DSM`, which is the PS/2 handover (see `custom_acpi.c`).
+        let mut buf = [I2cHidInfo::EMPTY; 4];
+        let n = unsafe { acpi_get_i2c_hid(buf.as_mut_ptr(), 4) };
+        let n = if n < 0 { 0 } else { (n as usize).min(4) };
+        if let Some(mut c) = CACHE.try_lock() {
+            c.i2c_hid = buf;
+            c.i2c_hid_n = n;
+            c.i2c_hid_probed = true;
+        }
+        crate::serial_println!("[ACPI] I2C-HID discovery at boot: {} usable device(s)", n);
     } else {
         crate::serial_println!("[ACPI] No I2C-HID devices found. It might be USB-based.");
         crate::vga_println!("[ACPI] No I2C-HID found.");

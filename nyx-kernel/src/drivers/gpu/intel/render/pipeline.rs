@@ -327,7 +327,7 @@ impl RenderEngine {
         self.flush_line(self.fence_virt as usize);
         self.rcs_submit(cs.as_slice())?;
 
-        let mut t = 0u32;
+        let deadline = super::SpinDeadline::new(super::PIPELINE_FENCE_TIMEOUT_US);
         let mut last = 0u32;
         let mut hung = false;
         loop {
@@ -340,8 +340,10 @@ impl RenderEngine {
                 break;
             }
             core::hint::spin_loop();
-            t += 1;
-            if t > 30_000_000 {
+            // Time-bounded, not iteration-bounded — see `SpinDeadline`. 30,000,000 iterations of
+            // this body (clflush + mfence + read) is tens of milliseconds, which is why this loop
+            // kept showing up in stall reports as a fixed ~23.5 ms window.
+            if deadline.expired() {
                 let fault = self.read_reg(super::RENDER_FAULT_REG);
                 crate::serial_println!(
                     "[TRI] pipeline HUNG. last_progress={:#x} FAULT={:#010x} HEAD={:#x}",
@@ -676,7 +678,7 @@ impl RenderEngine {
         self.rcs_submit(cs.as_slice())?;
 
         // Wait for completion / detect hang (reuses the triangle's fault-dump logic).
-        let mut t = 0u32;
+        let deadline = super::SpinDeadline::new(super::PIPELINE_FENCE_TIMEOUT_US);
         let mut last = 0u32;
         let mut hung = false;
         loop {
@@ -685,8 +687,10 @@ impl RenderEngine {
             if v != last { last = v; }
             if v == DONE { break; }
             core::hint::spin_loop();
-            t += 1;
-            if t > 30_000_000 {
+            // Time-bounded, not iteration-bounded — see `SpinDeadline`. 30,000,000 iterations of
+            // this body (clflush + mfence + read) is tens of milliseconds, which is why this loop
+            // kept showing up in stall reports as a fixed ~23.5 ms window.
+            if deadline.expired() {
                 let fault = self.read_reg(super::RENDER_FAULT_REG);
                 crate::serial_println!(
                     "[CUBE] HUNG. last_progress={:#x} FAULT={:#010x} HEAD={:#x}",
@@ -1248,10 +1252,11 @@ impl RenderEngine {
         self.fence_virt.write_volatile(0);
         self.flush_line(self.fence_virt as usize);
         if self.rcs_submit(cs.as_slice()).is_err() {
+            self.note_scene_hang(self.fence_virt.read_volatile(), cs.len() as u32, 1);
             return true;
         }
 
-        let mut t = 0u32;
+        let deadline = super::SpinDeadline::new(super::PIPELINE_FENCE_TIMEOUT_US);
         let mut last = 0u32;
         loop {
             self.flush_line(self.fence_virt as usize);
@@ -1259,8 +1264,12 @@ impl RenderEngine {
             if v != last { last = v; }
             if v == DONE { break; }
             core::hint::spin_loop();
-            t += 1;
-            if t > 30_000_000 {
+            // Time-bounded, not iteration-bounded — see `SpinDeadline`. 30,000,000 iterations of
+            // this body (clflush + mfence + read) is tens of milliseconds, which is why this loop
+            // kept showing up in stall reports as a fixed ~23.5 ms window.
+            if deadline.expired() {
+                // Before `reset_render` below wipes the evidence.
+                self.note_scene_hang(last, cs.len() as u32, 2);
                 let fault = self.read_reg(super::RENDER_FAULT_REG);
                 crate::serial_println!(
                     "[SCENE] HUNG. last_progress={:#x} FAULT={:#010x} HEAD={:#x}",
@@ -1538,6 +1547,15 @@ impl RenderEngine {
                 px += 1;
             }
             py += 1;
+        }
+    }
+
+    /// Record the first failed scene submission of this boot — see [`super::SCENE_HANG`].
+    unsafe fn note_scene_hang(&self, last_progress: u32, dwords: u32, cause: u32) {
+        if let Some(mut s) = super::SCENE_HANG.try_lock() {
+            if s.valid == 0 {
+                *s = self.hang_snapshot(last_progress, dwords, cause);
+            }
         }
     }
 

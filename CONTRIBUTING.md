@@ -1,15 +1,25 @@
-# Contributing to NyxOS
+# Contributing to Nyx
 
-If you are looking to contribute to the kernel, the QCLang soul engine, or the bare-metal graphics stack, your code must align with the current Phase roadmap.
+Thanks for looking. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first, and
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for where the project is heading.
 
-## Contribution Rules:
+## Rules
 
-1. **Bare Metal First:** If it works in QEMU but panics on real hardware, the PR will be rejected. Always test your commits against the provided `.devcontainer` build environment and flash it to a physical machine.
-2. **Zero Overhead:** The Nyx Entity (`nyx-entityd`) must run seamlessly in the background. Do not introduce blocking operations in the kernel scheduler that stall the entity's state loop.
-3. **No External Dependencies (Kernel):** The `nyx-kernel` is strictly `#![no_std]`. Rely only on `core`, `alloc`, and raw hardware I/O. 
-4. **Preserve the Aesthetic:** Keep the code minimal, deeply documented, and clean. If you are touching the rendering stack, respect the minimalist cyberpunk geometry.
+1. **Hardware is the final test.** QEMU is the fast loop ([`docs/BUILD.md`](docs/BUILD.md)), but it
+   has no Intel GPU, Wi-Fi or touchpad and its timing differs from real silicon. A change that works
+   in QEMU and fails on hardware is not done. Say what you tested on.
+2. **The kernel is `#![no_std]`.** `core`, `alloc` and the vendored C (ACPICA, lwext4) only.
+3. **Never block the window server.** `apps/shell` draws the whole desktop; any wait it makes needs a
+   timeout.
+4. **Syscalls:** the next free native number is recorded in [`docs/KERNEL.md`](docs/KERNEL.md#system-calls).
+   Run `tools/check_dup_syscall_arms.sh` before adding one — a duplicate arm shadows silently.
+5. **Document what is true.** If you change behaviour, update the doc that describes it. Mark
+   anything you could not verify as *Verification required* rather than guessing.
+6. **No GPL code.** Nyx is Apache-2.0. Linux may be read for facts, never copied — see
+   [`docs/linux-cross-reference.md`](docs/linux-cross-reference.md).
 
-## How to Submit:
-* Ensure the GitHub Actions `build.yaml` passes completely.
-* Open a PR detailing exactly what hardware you tested the changes on.
-* Wait for a core maintainer to review the architecture.
+## Submitting
+
+- Make sure the GitHub Actions workflow (`.github/workflows/build.yaml`) passes.
+- Run the host tests for any library you touched ([`docs/BUILD.md`](docs/BUILD.md#host-tests)).
+- Open a pull request that says what you changed and what hardware (or QEMU) you tested it on.

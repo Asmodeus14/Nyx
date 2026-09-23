@@ -2,16 +2,25 @@ use alloc::vec::Vec;
 use crate::gdt::PerCoreGdt;
 use x86_64::registers::model_specific::Msr;
 
-#[repr(C)] 
+/// ⚠️ The first three fields are an ABI with hand-written assembly and must not move.
+/// `syscall_handler_asm` does `mov gs:[8], rsp` / `mov rsp, gs:[0]` (interrupts.rs), `percpu::current`
+/// reads `gs:[0x10]`, and `Scheduler::schedule` writes the new kernel stack by casting `&PerCpu` to
+/// `*mut u64` and storing at offset 0. So: `kernel_rsp` @0, `user_rsp` @8, `self_ptr` @0x10.
+/// **Append new fields at the end.**
+#[repr(C)]
 pub struct PerCpu {
-    pub kernel_rsp: u64,        
-    pub user_rsp: u64,          
-    pub self_ptr: *mut PerCpu,  
+    pub kernel_rsp: u64,
+    pub user_rsp: u64,
+    pub self_ptr: *mut PerCpu,
     pub logical_id: usize,
     pub apic_id: u32,
     pub scheduler: crate::scheduler::Scheduler,
     pub stack_top: u64,
     pub gdt_state: PerCoreGdt,
+    /// Scheduler instrumentation. Last on purpose — see the ABI note above. Written only by this
+    /// core, from already-non-preemptible contexts, so no atomics; `align(64)` on the type keeps it
+    /// off any cache line another core touches.
+    pub stats: crate::schedstats::SchedStats,
 }
 
 pub static mut PER_CPU: Option<Vec<PerCpu>> = None;
@@ -35,6 +44,7 @@ pub fn init(apic_ids: &[u32]) {
             scheduler: sched,
             stack_top,
             gdt_state,
+            stats: crate::schedstats::SchedStats::new(),
         });
     }
 

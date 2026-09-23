@@ -880,6 +880,268 @@ pub fn sys_acpi_probe(step: u8, arg: u32) {
     syscall(SYS_ACPI_PROBE, step as u64, arg as u64, 0, 0, 0, 0);
 }
 
+/// One I2C-HID device as ACPI describes it. `repr(C)`; mirrors `acpi::I2cHidInfo` in the kernel,
+/// and the two must move together.
+///
+/// ★ None of this can be hardcoded. The DSDT declares the same touch-device slot on four I2C buses
+/// and patches its `_HID` and slave address at `_INI` from an NVS variable, so which one is real —
+/// and what address it answers on — depends on the panel the factory fitted.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct I2cHidInfo {
+    pub valid: u32,
+    /// `_STA`. Bit 0 clear means the firmware declares the slot but no device is fitted.
+    pub sta: u32,
+    pub slave_addr: u32,
+    pub speed_hz: u32,
+    /// GPIO pin carrying "report ready". 0 when `_CRS` returned a plain Interrupt instead.
+    pub gpio_pin: u32,
+    /// Plain APIC interrupt (GSI) when `_CRS` returned an Interrupt rather than a GpioInt.
+    /// ★ Non-zero means the IOAPIC routes this directly and NO GPIO driver is needed.
+    pub irq_gsi: u32,
+    /// Register at which the HID descriptor is read, read from the firmware's `HID2` Name — NOT `_DSM`, which is the PS/2 handover.
+    pub hid_desc_reg: u32,
+    /// Controller `_ADR`: `(device << 16) | function`. `0x00150001` is PCI 00:15.1.
+    pub ctrl_adr: u32,
+    pub path: [u8; 72],
+    pub ctrl_path: [u8; 72],
+    /// Board-tuned Designware SCL timings (standard mode high/low/SDA hold, then fast mode), from
+    /// the firmware's per-bus NVS variables `SSHn/SSLn/SSDn/FMHn/FMLn/FMDn`. Zero = not found.
+    pub ss_hcnt: u32,
+    pub ss_lcnt: u32,
+    pub ss_hold: u32,
+    pub fm_hcnt: u32,
+    pub fm_lcnt: u32,
+    pub fm_hold: u32,
+    /// Root bridge 64-bit MMIO window (firmware NVS `M64B`/`M64L`). Length 0 = none.
+    pub m64_base: u64,
+    pub m64_len: u64,
+}
+
+impl Default for I2cHidInfo {
+    fn default() -> Self {
+        // Not derivable: `[u8; 72]` has no Default impl.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+// Same ABI guard as SysMetrics/SchedStats: the kernel memcpy's these bytes, so a field added on one
+// side and not the other must break the build rather than reinterpret every field after it.
+const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 216);
+
+impl I2cHidInfo {
+    /// PCI device and function decoded from `ctrl_adr`.
+    pub fn pci_dev_func(&self) -> (u8, u8) {
+        (((self.ctrl_adr >> 16) & 0xFF) as u8, (self.ctrl_adr & 0xFF) as u8)
+    }
+}
+
+/// Read slot `index` of the kernel's I2C-HID table. `None` if unpopulated.
+///
+/// ⚠️ Returns whatever `acpi probe 13` last published — it evaluates nothing itself. Request the
+/// probe, give the governor a tick to run it, then read.
+pub fn sys_i2c_hid_info(index: u32) -> Option<I2cHidInfo> {
+    let mut info = I2cHidInfo::default();
+    let rc = syscall(577, index as u64, (&mut info as *mut I2cHidInfo) as u64, 0, 0, 0, 0);
+    if rc == 1 { Some(info) } else { None }
+}
+
+/// Outcome of an I2C-HID controller bring-up + HID descriptor read (syscall 578).
+///
+/// Mirrors `nyx-kernel/src/drivers/i2c_hid.rs` `ProbeResult` field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct I2cHidProbe {
+    pub seq: u32,
+    /// How far it got: 0 none, 1 ACPI data, 2 PCI function, 3 controller up, 4 descriptor read,
+    /// 5 descriptor valid.
+    pub stage: u32,
+    /// Why it stopped (see [`i2c_hid_status_text`]). 0 = every stage passed.
+    pub status: u32,
+    /// `IC_TX_ABRT_SOURCE` on an abort. Bit 0 = address not acknowledged.
+    pub abort_source: u32,
+    pub vendor_device: u32,
+    pub pmcsr_before: u32,
+    pub resets_before: u32,
+    pub comp_type: u32,
+    pub comp_param1: u32,
+    /// 1 = standard mode (100 kHz), 2 = fast mode (400 kHz).
+    pub mode: u32,
+    pub hcnt: u32,
+    pub lcnt: u32,
+    pub hold: u32,
+    pub timing_from_fw: u32,
+    pub slave_addr: u32,
+    pub desc_reg: u32,
+    pub bar0: u64,
+    pub desc: [u8; 32],
+    /// BAR0 as the firmware left it, before any assignment.
+    pub bar0_before: u64,
+    pub touud: u64,
+    /// Where every other device's claims above 4 GiB provably end, and the address BAR0 was
+    /// offered — reported even when the checks refused it.
+    pub claims_end_above_4g: u64,
+    pub candidate: u64,
+    /// The window the candidate had to fall inside.
+    pub m64_base: u64,
+    pub m64_len: u64,
+    pub bar0_size: u32,
+    /// 1 if the probe gave BAR0 its address.
+    pub assigned: u32,
+    pub phys_bits: u32,
+    /// 1 if, after this probe, the I2C touchpad drives the pointer.
+    pub active: u32,
+}
+
+impl Default for I2cHidProbe {
+    fn default() -> Self {
+        // SAFETY: plain integers and a byte array; all-zero is a valid value.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<I2cHidProbe>() == 168);
+
+/// Ask the kernel to bring up the touchpad's I2C controller and read its HID descriptor.
+///
+/// ⚠️ Needs `acpi probe 13` to have run first — it is what says which controller and address.
+pub fn sys_i2c_hid_probe_request() {
+    syscall(578, 1, 0, 0, 0, 0, 0);
+}
+
+/// Probe, then initialise the touchpad (SET_POWER, RESET) and — if mouse reports then arrive — make
+/// it the pointer, ignoring PS/2 mouse bytes. Read the outcome as with a plain probe.
+pub fn sys_i2c_hid_enable() {
+    syscall(578, 3, 0, 0, 0, 0, 0);
+}
+
+/// I2C touchpad pointer speed, in percent of the device's raw counts (clamped 10..=400 by the
+/// kernel). `0` only reads it. Returns the speed now in force.
+pub fn sys_i2c_hid_speed(pct: u32) -> u32 {
+    syscall(578, 5, pct as u64, 0, 0, 0, 0) as u32
+}
+
+/// I2C touchpad live status.
+#[derive(Clone, Copy, Debug)]
+pub struct TouchpadStatus {
+    /// The I2C touchpad drives the pointer.
+    pub active: bool,
+    /// It did, went silent while PS/2 kept talking, and handed the pointer back.
+    pub fell_back: bool,
+    /// Precision (multi-touch) mode is on: gestures are interpreted by the kernel.
+    pub ptp: bool,
+    /// Last mode switch: 0 none yet, 1 ok, 2 device has no Input Mode, 3 bus error, 4 no device,
+    /// 5 implausible X/Y range.
+    pub mode_result: u8,
+    /// Precision mode went silent on I2C and was reverted to mouse mode automatically.
+    pub ptp_failed: bool,
+    /// The device was sending precision-mode reports while in "mouse mode", and the driver followed.
+    pub adopted_ptp: bool,
+    /// Reports since the pointer was taken: mouse collection, touch pad, other IDs, empty reads.
+    pub counts: [u32; 4],
+    /// Last precision-mode switch: bit 0 Win8 blob present, bit 1 read; bit 2 Selective Reporting
+    /// present, bit 3 set.
+    pub mode_note: u8,
+    /// Probes completed, including the automatic one at boot.
+    pub probes: u32,
+    pub irqs: u32,
+}
+
+pub fn sys_i2c_hid_status() -> TouchpadStatus {
+    let v = syscall(578, 6, 0, 0, 0, 0, 0);
+    TouchpadStatus {
+        active: v & 1 != 0,
+        fell_back: v & 2 != 0,
+        ptp: v & 4 != 0,
+        mode_result: ((v >> 3) & 0x7) as u8,
+        ptp_failed: v & (1 << 6) != 0,
+        adopted_ptp: v & (1 << 7) != 0,
+        mode_note: ((v >> 8) & 0xF) as u8,
+        counts: {
+            let c = syscall(578, 10, 0, 0, 0, 0, 0);
+            [c as u32 & 0xFFFF, (c >> 16) as u32 & 0xFFFF, (c >> 32) as u32 & 0xFFFF, (c >> 48) as u32 & 0xFFFF]
+        },
+        probes: ((v >> 16) & 0xFFFF) as u32,
+        irqs: (v >> 32) as u32,
+    }
+}
+
+/// Take the touchpad's accumulated two-finger scroll, in pixels; positive = the view moves down
+/// the content. Never blocks — safe from the window server's frame loop.
+pub fn sys_touchpad_take_scroll() -> i32 {
+    syscall(578, 7, 0, 0, 0, 0, 0) as i64 as i32
+}
+
+/// One report from the precision-mode log. Mirrors `i2c_hid::LogEntry`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TouchpadLogEntry {
+    pub len: u8,
+    /// Touching contacts decoded from this report; 0xFF = not a touch pad report.
+    pub n: u8,
+    pub _pad: [u8; 2],
+    pub x: i32,
+    pub y: i32,
+    pub raw: [u8; 16],
+}
+const _: () = assert!(core::mem::size_of::<TouchpadLogEntry>() == 28);
+
+/// The last 8 reports received in precision mode, oldest first: raw bytes beside what the kernel
+/// decoded from them.
+pub fn sys_touchpad_log() -> [TouchpadLogEntry; 8] {
+    let mut log = [TouchpadLogEntry::default(); 8];
+    syscall(578, 9, log.as_mut_ptr() as u64, 0, 0, 0, 0);
+    log
+}
+
+/// Ask for precision (multi-touch) mode, or back to the device's mouse emulation. Poll
+/// [`sys_i2c_hid_status`] for the outcome.
+pub fn sys_i2c_hid_set_mode(ptp: bool) {
+    syscall(578, 8, if ptp { 3 } else { 0 }, 0, 0, 0, 0);
+}
+
+/// Stop driving the pointer from I2C; PS/2 mouse bytes are accepted again.
+pub fn sys_i2c_hid_disable() {
+    syscall(578, 4, 0, 0, 0, 0, 0);
+}
+
+/// The last probe result, with its sequence number (0 = never run). `None` if the kernel was
+/// writing it at that instant — ask again.
+pub fn sys_i2c_hid_probe_result() -> Option<(u32, I2cHidProbe)> {
+    let mut r = I2cHidProbe::default();
+    let rc = syscall(578, 0, (&mut r as *mut I2cHidProbe) as u64, 0, 0, 0, 0);
+    if rc > u32::MAX as u64 { None } else { Some((rc as u32, r)) }
+}
+
+/// The probe's Phase 3 findings as text — report descriptor summary and input-register samples.
+/// Returns how many bytes were written into `buf`.
+pub fn sys_i2c_hid_probe_text(buf: &mut [u8]) -> usize {
+    let rc = syscall(578, 2, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    if rc > buf.len() as u64 { 0 } else { rc as usize }
+}
+
+/// Human-readable meaning of [`I2cHidProbe::status`].
+pub fn i2c_hid_status_text(status: u32) -> &'static str {
+    match status {
+        0 => "ok",
+        1 => "no ACPI data — `acpi probe 13` has not published a device",
+        2 => "PCI function absent (reads 0xFFFF) — firmware has it hidden or off",
+        3 => "BAR0 unassigned, and no address could be proven free to give it",
+        4 => "could not map BAR0",
+        5 => "not a Designware I2C block (IC_COMP_TYPE wrong) — still in reset or powered down?",
+        6 => "controller would not disable",
+        7 => "transfer aborted",
+        8 => "transfer timed out — bus stuck or controller not clocking",
+        9 => "descriptor read, but it is not a valid HID descriptor",
+        10 => "transfer larger than the FIFO",
+        11 => "BAR0 is not the 4 KiB 64-bit BAR an LPSS controller has — left alone",
+        12 => "wrote an address into BAR0 and it did not read back",
+        13 => "ACPI gave no controller address (_ADR unresolved) — refusing to guess, since 0 is the host bridge",
+        14 => "the PCI function ACPI named is not a serial-bus controller — nothing touched",
+        _ => "unknown",
+    }
+}
+
 pub const SYS_BATTERY: u64 = 561;
 
 /// The ACPI control-method battery (`PNP0C0A`), from `_BIF` and `_BST`.
@@ -1081,6 +1343,19 @@ pub fn sys_get_mouse() -> (usize, usize, bool, bool) {
     let left = ((m >> 1) & 1) == 1;
     let right = (m & 1) == 1;
     (x, y, left, right)
+}
+
+/// Wait up to `timeout_ms` for a keystroke. `None` if none arrived.
+///
+/// ★ Blocks in the kernel on `WaitReason::Input`, so the keyboard IRQ wakes the caller directly
+/// rather than the caller discovering the key on its next poll. Replaces polling [`sys_read_key`]
+/// on a timer, which put the poll interval straight into keystroke latency.
+///
+/// ⚠️ ALWAYS pass a real timeout. The window server calls this, and it must never block
+/// indefinitely — a missed wake there stops the whole desktop.
+pub fn sys_read_key_wait(timeout_ms: u64) -> Option<char> {
+    let k = syscall(576, timeout_ms, 0, 0, 0, 0, 0);
+    if k == 0 { None } else { core::char::from_u32(k as u32) }
 }
 
 pub fn sys_read_key() -> Option<char> {
@@ -1823,6 +2098,255 @@ pub fn sys_get_metrics() -> Option<SysMetrics> {
     if rc == 0 { Some(m) } else { None }
 }
 
+/// Scheduler instrumentation — see [`SchedGlobals`], [`SchedStats`] and [`sys_sched_stats`].
+pub const SYS_SCHED_STATS: u64 = 575;
+
+/// Number of power-of-two buckets in each [`SchedStats`] histogram. Mirrors
+/// `nyx_kernel::schedstats::HIST_BUCKETS`.
+pub const SCHED_HIST_BUCKETS: usize = 32;
+
+/// Retained long interrupts-off windows per core. Mirrors `schedstats::GAP_RING_LEN`.
+pub const SCHED_GAP_RING_LEN: usize = 16;
+
+/// Distinct syscalls in the cumulative stall tally. Mirrors `schedstats::GAP_TALLY_LEN`.
+pub const SCHED_GAP_TALLY_LEN: usize = 8;
+
+/// Cumulative stalls attributed to one syscall. Mirrors `schedstats::GapTally`.
+///
+/// ★ The ring shows the most RECENT stalls; this survives past 16 samples and collapses to one line
+/// per offender, so "what stalls most" is answerable at a glance instead of by transcribing a list.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GapTally {
+    /// Syscall number; `u64::MAX` means "not in a syscall", or an unused slot when `count == 0`.
+    pub syscall: u64,
+    pub count: u64,
+    /// Summed TSC cycles, so a mean can be shown — a rare 40 ms stall and a frequent 6 ms one need
+    /// telling apart.
+    pub total_cycles: u64,
+}
+
+/// One observed interrupts-off window. Mirrors `schedstats::GapSample`.
+///
+/// ★ A single worst-case sample was not actionable: the histogram showed dozens of 13-27 ms stalls
+/// per run, but the one retained sample was always the boot-time `execve`, which says nothing about
+/// steady state. A short history lets a *recurring* cause name itself.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GapSample {
+    pub cycles: u64,
+    pub syscall: u64,
+    /// Uptime in ms when seen — distinguishes boot-time stalls from steady-state ones.
+    pub at_ms: u64,
+    /// Bit 0: still inside `syscall` when observed. Clear is the normal case for a syscall-caused
+    /// stall, since `sysretq` restores IF before the suppressed tick is delivered.
+    pub flags: u64,
+}
+
+/// Machine-wide scheduler facts. `repr(C)`; mirrors `schedstats::SchedGlobals` in the kernel and
+/// the two must move together, same contract as [`SysMetrics`].
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct SchedGlobals {
+    /// Measured duration of one scheduler tick, in microseconds. **`0` = calibration did not run.**
+    ///
+    /// The kernel has always *assumed* 1000 here — `timer_context_switch` adds 1 to `UPTIME_MS` per
+    /// tick — while programming a hardcoded APIC count that nothing ever measured. If this reads
+    /// anything other than ~1000, every `sleep`, every socket timeout and the compositor's frame
+    /// pacing are denominated in a unit of that length instead of a millisecond.
+    pub tick_period_us: u64,
+    pub apic_ticks_per_ms: u64,
+    /// Calibrated TSC rate, for turning the cycle counts in [`SchedStats`] into time.
+    pub tsc_mhz: u64,
+    pub uptime_ms: u64,
+    pub active_cores: u64,
+    pub context_switches: u64,
+    pub timer_initial_count: u64,
+    /// `1` when the kernel was built with the `sched_stats` feature. When `0`, every per-core block
+    /// reads zero because the instrumentation was compiled out — which is otherwise
+    /// indistinguishable from a machine that never scheduled anything.
+    pub stats_enabled: u64,
+}
+
+/// One core's scheduler statistics. `repr(C)`, mirroring `schedstats::SchedStats`.
+///
+/// ⚠️ The kernel snapshots this from a *live* per-CPU block with no synchronisation (deliberately —
+/// a lock here would sit in the timer ISR). Individual fields are always real values, but they are
+/// not guaranteed mutually consistent: a histogram need not sum to its counter.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct SchedStats {
+    pub schedule_calls: u64,
+    /// Times the running task actually changed. The gap between this and `schedule_calls` is pure
+    /// overhead — an interrupt entry plus 1 KiB of FPU save/restore spent to change nothing.
+    pub switches: u64,
+    pub voluntary: u64,
+    pub involuntary: u64,
+    pub idle_entries: u64,
+    pub wakeups: u64,
+    pub migrations: u64,
+    pub ticks: u64,
+    pub rq_len: u64,
+    pub tasks_live: u64,
+    /// Zombie/Empty tombstones, which are never reclaimed — so this only climbs, and every per-tick
+    /// O(n) scan walks them.
+    pub tasks_dead: u64,
+    pub sched_cycles: u64,
+    pub last_tick_tsc: u64,
+    /// Longest observed interval between consecutive timer interrupts, in TSC cycles. Because the
+    /// APIC timer is periodic, anything beyond one tick period is time this core could not take an
+    /// interrupt.
+    pub max_gap_tsc: u64,
+    /// The syscall executing when `max_gap_tsc` was seen; `u64::MAX` if the core was not in one.
+    pub max_gap_syscall: u64,
+    pub cur_syscall: u64,
+    pub gap_hist: [u32; SCHED_HIST_BUCKETS],
+    pub wake_hist: [u32; SCHED_HIST_BUCKETS],
+    pub max_wake_tsc: u64,
+    pub sys_hist: [u32; SCHED_HIST_BUCKETS],
+    pub sys_entry_tsc: u64,
+    /// Longest single syscall on this core, in TSC cycles, and which one.
+    ///
+    /// ★ Measured INSIDE the syscall, and therefore the only trustworthy attribution for a long
+    /// interrupts-off window. `max_gap_syscall` cannot see it: `SYSCALL` masks interrupts and
+    /// `sysretq` restores IF, so the suppressed timer interrupt only lands once the syscall has
+    /// already returned.
+    pub max_sys_cycles: u64,
+    pub max_sys_id: u64,
+    pub last_syscall: u64,
+    /// Cycle threshold above which a gap is recorded; derived at runtime from the tick period and
+    /// TSC rate. 0 = calibration had not landed yet, so nothing was recorded.
+    pub gap_threshold: u64,
+    pub gap_ring: [GapSample; SCHED_GAP_RING_LEN],
+    pub gap_ring_head: u64,
+    /// Total long gaps ever seen; may far exceed the ring length. Against uptime this is the stall
+    /// RATE, which matters more than any single sample.
+    pub gap_ring_count: u64,
+    pub gap_tally: [GapTally; SCHED_GAP_TALLY_LEN],
+    /// Reschedule IPIs received: another core woke a task here and kicked this one.
+    pub resched_ipis: u64,
+}
+
+impl Default for SchedStats {
+    fn default() -> Self {
+        // Not derivable: `[u32; 32]` has no `Default` impl.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+// Size assertions, same guard as `WindowHeader` and `QpuInfo`: the kernel memcpy's these bytes, so a
+// field added on one side of the ring boundary and not the other must break the build rather than
+// silently reinterpret every field after it.
+const _: () = assert!(core::mem::size_of::<SchedGlobals>() == 64);
+const _: () = assert!(core::mem::size_of::<SchedStats>() == 1344);
+const _: () = assert!(core::mem::align_of::<SchedStats>() == 64);
+
+/// Read the machine-wide scheduler facts. `None` if the kernel rejected the buffer.
+pub fn sys_sched_globals() -> Option<SchedGlobals> {
+    let mut g = SchedGlobals::default();
+    let n = core::mem::size_of::<SchedGlobals>() as u64;
+    let rc = syscall(SYS_SCHED_STATS, 0, 0, (&mut g as *mut SchedGlobals) as u64, n, 0, 0);
+    if rc == n { Some(g) } else { None }
+}
+
+/// Copy the kernel's build stamp into `out`; returns bytes written, 0 on failure.
+///
+/// ★ Exists so a report can say which image produced it. A stale flash makes a fixed kernel and an
+/// unfixed one emit identical-looking diagnostics, and comparing two such reports across boots
+/// leads straight to chasing a bug that is already fixed — which has now cost this project a cycle
+/// twice. `acpi log` carries the same stamp for the same reason.
+pub fn sys_sched_build_stamp(out: &mut [u8]) -> usize {
+    let rc = syscall(
+        SYS_SCHED_STATS, 2, 0, out.as_mut_ptr() as u64, out.len() as u64, 0, 0);
+    if rc == u64::MAX { 0 } else { rc as usize }
+}
+
+/// GPU render-engine health. Mirrors `render::GpuHealth` in the kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GpuHealth {
+    /// Consecutive failed composites; the engine latches off at `hang_limit`.
+    pub render_hangs: u32,
+    pub hang_limit: u32,
+    /// 1 if the render engine is latched off now: GPU composite and GPU text both refused.
+    pub wedged: u32,
+    pub gl_hangs: u32,
+    /// GPU text batches drawn / refused (the shell then uses the CPU bitmap font).
+    pub text_drawn: u32,
+    pub text_refused: u32,
+    /// Of those refusals, how many because the engine was latched off.
+    pub text_refused_wedged: u32,
+    /// 1 if the Intel render engine initialised at all.
+    pub gpu_present: u32,
+    /// Boot self-tests, one bit each: 0 bring-up, 1 ring store, 2 ring PIPE_CONTROL fence,
+    /// 3 batch buffer, 4 batch test attempted.
+    pub boot_tests: u32,
+    /// The GPU's PCI device ID.
+    pub device_id: u32,
+    /// The render engine's registers at the first hang this boot.
+    pub first_hang: GpuHangSnapshot,
+    /// The first failed composite/text/GL scene this boot: `fence_got` = last progress marker the
+    /// engine wrote, `fence_want` = stream dwords, `_pad` = cause (1 ring full, 2 fence timeout).
+    pub scene_hang: GpuHangSnapshot,
+    /// The compositor's pixel shader (`sys_gpu_retry`): 0 normal, 1 solid, 2 textured.
+    pub ps_mode: u32,
+    /// Times the render engine's MOCS table was found wiped (by RC6) and re-programmed.
+    pub mocs_restores: u32,
+}
+const _: () = assert!(core::mem::size_of::<GpuHealth>() == 176);
+
+/// Mirrors the kernel's `render::HangSnapshot`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GpuHangSnapshot {
+    pub valid: u32,
+    pub fence_got: u32,
+    pub fence_want: u32,
+    pub head: u32,
+    pub tail: u32,
+    pub ctl: u32,
+    /// Where the command streamer is actually executing.
+    pub acthd: u32,
+    /// The command header the parser choked on.
+    pub ipehr: u32,
+    pub ipeir: u32,
+    pub instdone: u32,
+    pub mi_mode: u32,
+    pub eir: u32,
+    pub fault: u32,
+    pub error_gen6: u32,
+    pub fw_ack: u32,
+    pub _pad: u32,
+}
+
+pub fn sys_gpu_health() -> Option<GpuHealth> {
+    let mut h = GpuHealth::default();
+    let n = core::mem::size_of::<GpuHealth>() as u64;
+    let rc = syscall(SYS_SCHED_STATS, 3, 0, (&mut h as *mut GpuHealth) as u64, n, 0, 0);
+    if rc == n { Some(h) } else { None }
+}
+
+/// How the boot-time keyboard repeat-rate setup went: 0 not tried, 1 set (250 ms / 30 cps),
+/// 2 no ACK for the command (unchanged), 3 no ACK for the rate (re-enabled, unchanged).
+pub fn sys_keyboard_typematic() -> u8 {
+    syscall(SYS_SCHED_STATS, 4, 0, 0, 0, 0, 0) as u8
+}
+
+/// Clear the render engine's hang latch and have the compositor try again with pixel shader
+/// `mode`: 0 normal, 1 solid colour (no texture sampling — windows turn magenta if it works),
+/// 2 plain textured (sampling, no opacity). True if the engine exists and took the request.
+pub fn sys_gpu_retry(mode: u32) -> bool {
+    syscall(SYS_SCHED_STATS, 5, mode as u64, 0, 0, 0, 0) == 1
+}
+
+/// Read one core's scheduler statistics. `None` if that core does not exist.
+pub fn sys_sched_stats(core: u64) -> Option<SchedStats> {
+    let mut s = SchedStats::default();
+    let n = core::mem::size_of::<SchedStats>() as u64;
+    let rc = syscall(SYS_SCHED_STATS, 1, core, (&mut s as *mut SchedStats) as u64, n, 0, 0);
+    if rc == n { Some(s) } else { None }
+}
+
 pub fn sys_sleep_ms(ms: u64) {
     syscall(525, ms, 0, 0, 0, 0, 0);
 }
@@ -1860,6 +2384,21 @@ pub fn sys_ipc_send(target_pid: u64, msg_type: u64, data1: u64, data2: u64) -> b
 
 pub fn sys_ipc_recv(msg_ptr: *mut IpcMessage, block: bool) -> bool {
     syscall(533, msg_ptr as u64, if block { 1 } else { 0 }, 0, 0, 0, 0) == 1
+}
+
+/// Wait for a message, but no longer than `timeout_ms`. `true` if one was delivered.
+///
+/// ★ This is the primitive a GUI frame loop actually wants, and until now it did not exist. Apps
+/// drove themselves with `sleep(16)` plus a non-blocking [`sys_ipc_recv`], which means a keystroke
+/// forwarded by the window server waits up to a whole frame before the app even looks — and the app
+/// wakes 62 times a second regardless of whether anything happened.
+///
+/// Blocking with a deadline collapses both: the kernel wakes the task the instant `ipc_send`
+/// delivers, and otherwise at the timeout, so the message path is immediate and the idle path stops
+/// spinning. Pass the frame budget as the timeout and the loop still paces itself exactly as before
+/// when nothing arrives.
+pub fn sys_ipc_recv_timeout(msg_ptr: *mut IpcMessage, timeout_ms: u64) -> bool {
+    syscall(533, msg_ptr as u64, 2, timeout_ms, 0, 0, 0) == 1
 }
 
 pub fn sys_socket(domain: u64, typ: u64, protocol: u64) -> i64 {

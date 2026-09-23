@@ -65,6 +65,20 @@ fn screen_dims() -> Option<(u32, u32, u32)> {
 /// CPU compositing. A LINEAR-pitch violation (window width not 16-aligned) fails the whole call so the
 /// compositor CPU-composites that frame — correct, just not accelerated.
 pub fn composite(quads: &[WindowQuad]) -> bool {
+    // ★ Refuse immediately once the render engine has proven itself wedged.
+    //
+    // Measured on hardware: the RCS fence never signalled, so every composite ran its wait to the
+    // end and returned EngineHang — 23.5 ms of interrupts-off time, roughly 4 times a second,
+    // before falling back to software compositing regardless. The fallback is what was actually
+    // drawing the desktop; the GPU attempt contributed nothing but latency. Returning `false` takes
+    // the same path, minus the stall.
+    //
+    // Self-clearing: any successful fence resets the counter (see `super::RENDER_HANGS`), so an
+    // engine that recovers — after a reset, or once forcewake/MOCS are re-established following
+    // RC6 — is picked up again without a reboot.
+    if super::engine_is_wedged() {
+        return false;
+    }
     if quads.is_empty() {
         return true; // nothing to composite; wallpaper alone is correct
     }
@@ -87,10 +101,17 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
     if !eng.initialized || eng.kernels.is_none() {
         return false;
     }
+    // ★ The GT may have parked (RC6) since the last draw: `park_gpu` releases forcewake after
+    // 1 s idle on the promise that every render path runs this first. This path did not, and
+    // drew with the MOCS tables RC6 had wiped — every draw hung in the pixel stage.
+    unsafe { eng.ensure_ready() };
 
-    // Rebuild the scene only when the window SET changed (not on a pure move).
+    // Rebuild the scene only when the window SET changed (not on a pure move) — or when `gpu
+    // retry` changed the pixel shader, which is baked into it.
+    use core::sync::atomic::Ordering;
     let sig: Vec<(u32, u32, u32)> = quads.iter().map(|q| (q.tex_gva, q.src_w, q.src_h)).collect();
-    if ctx.scene.is_none() || ctx.sig != sig {
+    let forced = super::COMPOSITE_REBUILD.swap(false, Ordering::Relaxed);
+    if forced || ctx.scene.is_none() || ctx.sig != sig {
         let mut scene = match unsafe {
             eng.create_compositor_scene(0x1400_0000, sw, sh, pitch)
         } {
@@ -107,6 +128,19 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
         for q in quads {
             if unsafe { scene.add_window_quad(q.tex_gva, q.src_pitch, q.src_w, q.src_h) }.is_err() {
                 return false;
+            }
+        }
+        // `gpu retry`: bisect a pixel-stage hang by swapping the window quads' PS.
+        if let Some(k) = eng.kernels.as_ref() {
+            let over = match super::COMPOSITE_PS_MODE.load(Ordering::Relaxed) {
+                1 => k.ps_solid_off,
+                2 => k.ps_off,
+                _ => 0,
+            };
+            if over != 0 {
+                for m in scene.meshes.iter_mut() {
+                    m.ps_off = over;
+                }
             }
         }
         ctx.scene = Some(scene);
@@ -139,11 +173,25 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
     let ok = unsafe {
         eng.draw_scene(scene, &mvps, 0x1400_0000, 0, sw, sh, pitch, 0, 0, false, true, false, false)
     };
+    // ★★ Strike-counting lives HERE, at composite granularity, not inside `wait_fence_value`.
+    //
+    // It was per-fence, and that could never latch: `draw_scene` performs TWO fence waits per
+    // composite, and when one succeeded while the other timed out, the success reset the counter —
+    // so it flapped 0 -> 1 -> 0 -> 1 forever. The hardware evidence was a stall of 39,664 us, i.e.
+    // almost exactly 2 x the 20,000 us timeout, still arriving 10 times a second long after the
+    // latch should have fired.
+    //
+    // "Did the composite work" is the question the fallback actually turns on, so that is what gets
+    // counted.
     if ok.is_err() {
+        super::RENDER_HANGS.fetch_add(1, Ordering::Relaxed);
         // On a GPU hang the scene may be wedged; drop it so the next call rebuilds, and fall back.
         ctx.scene = None;
         ctx.sig.clear();
         return false;
     }
+    // Only a WHOLE successful composite clears the strikes, so an engine that half-works cannot
+    // hold the path open indefinitely.
+    super::RENDER_HANGS.store(0, Ordering::Relaxed);
     true
 }

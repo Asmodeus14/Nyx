@@ -10,45 +10,113 @@ use crate::vfs::FsError;
 // ==========================================
 pub static mut GLOBAL_NVME: Option<NvmeDriver> = None;
 
-#[no_mangle]
-pub extern "C" fn nyx_nvme_read_block(sector: u64, buf: *mut u8) -> bool {
+/// Sectors per cached chunk. 8 x 512 = 4096, which is exactly what one NVMe command can move
+/// through PRP1 alone (see `NvmeDriver::read_blocks`).
+const CHUNK_SECTORS: u64 = 8;
+
+/// One chunk of the disk, and which chunk it is. `u64::MAX` = empty.
+///
+/// A single entry, not a real cache: lwext4 walks a file sequentially, so consecutive 512-byte
+/// requests almost always fall in the same 4 KiB chunk. One entry turns eight round trips into one;
+/// anything larger buys little and would need eviction logic.
+static mut CHUNK_BUF: [u8; 4096] = [0; 4096];
+static mut CHUNK_BASE: u64 = u64::MAX;
+
+/// Set once at boot by `nvme_enable_fast_reads` after the device has proven multi-block reads work.
+static mut MULTIBLOCK_OK: bool = false;
+
+/// Called after the NVMe driver is up. Gates the 4 KiB read path on the device actually agreeing
+/// that 8 logical blocks are 4096 bytes — see `NvmeDriver::verify_multiblock`.
+pub fn nvme_enable_fast_reads() {
     unsafe {
         if let Some(ref mut driver) = GLOBAL_NVME {
-            // 🔥 MILESTONE 1.6 VERIFICATION:
-            // The NVMe driver requires strict 4096-byte page-aligned buffers for PRP DMA transfers.
-            // However, lwext4 natively addresses logical sectors in 512-byte increments.
-            // We safely allocate a 4K aligned buffer, perform the DMA read, and extract ONLY 
-            // the 512-byte logical sector requested by the VFS to prevent buffer overrun corruption.
-            let mut align_buf = alloc::vec![0u8; 8192];
-            let ptr_addr = align_buf.as_ptr() as usize;
-            let offset = (4096 - (ptr_addr % 4096)) % 4096;
-            
-            let slice_4k = core::slice::from_raw_parts_mut(align_buf.as_mut_ptr().add(offset), 4096);
-            
-            if driver.read_block(sector, slice_4k) {
-                core::ptr::copy_nonoverlapping(slice_4k.as_ptr(), buf, 512);
-                return true;
+            MULTIBLOCK_OK = driver.verify_multiblock();
+            CHUNK_BASE = u64::MAX;
+            if MULTIBLOCK_OK {
+                crate::serial_println!("[NVME] multi-block reads verified; 4 KiB chunking enabled.");
+            } else {
+                crate::serial_println!(
+                    "[NVME] multi-block read check FAILED; staying on one block per request.");
             }
         }
     }
-    false
+}
+
+/// Drop the cached chunk. Must be called by every write path — a stale chunk would hand back
+/// pre-write data and silently corrupt whatever read it next.
+#[inline]
+fn invalidate_chunk() {
+    unsafe { CHUNK_BASE = u64::MAX; }
+}
+
+#[no_mangle]
+pub extern "C" fn nyx_nvme_read_block(sector: u64, buf: *mut u8) -> bool {
+    unsafe {
+        let driver = match GLOBAL_NVME {
+            Some(ref mut d) => d,
+            None => return false,
+        };
+
+        // ★ This used to `alloc::vec![0u8; 8192]` per 512-byte sector, purely to hand the driver a
+        // 4 KiB-aligned slice — which the driver never needed: it DMAs into its own aligned
+        // `DATA_BUF` and copies out. So every sector paid an 8 KiB allocation AND its zeroing, then
+        // a free, all under the allocator's `without_interrupts`. Reading a 1.4 MB binary meant
+        // ~2,900 of those: some 23 MB of memset to deliver 1.4 MB.
+        //
+        // Worse, each sector was a separate NVMe round trip. With SYSCALL masking interrupts and
+        // the driver polling, that serialised ~2,900 device latencies with the timer dead —
+        // measured as **102 ms inside one `execve`**, the largest interrupts-off window on the
+        // machine.
+        if !MULTIBLOCK_OK {
+            // Device did not prove multi-block reads; behave as before, minus the pointless
+            // allocation.
+            if driver.read_block(sector, &mut CHUNK_BUF) {
+                core::ptr::copy_nonoverlapping(CHUNK_BUF.as_ptr(), buf, 512);
+                return true;
+            }
+            return false;
+        }
+
+        let base = sector & !(CHUNK_SECTORS - 1);
+        if CHUNK_BASE != base {
+            if !driver.read_blocks(base, CHUNK_SECTORS as u16, &mut CHUNK_BUF) {
+                CHUNK_BASE = u64::MAX;
+                return false;
+            }
+            CHUNK_BASE = base;
+        }
+        let off = ((sector - base) * 512) as usize;
+        core::ptr::copy_nonoverlapping(CHUNK_BUF.as_ptr().add(off), buf, 512);
+        true
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn nyx_nvme_write_block(sector: u64, buf: *const u8) -> bool {
     unsafe {
-        if let Some(ref mut driver) = GLOBAL_NVME {
-            let mut align_buf = alloc::vec![0u8; 8192];
-            let ptr_addr = align_buf.as_ptr() as usize;
-            let offset = (4096 - (ptr_addr % 4096)) % 4096;
-            
-            let slice_4k = core::slice::from_raw_parts_mut(align_buf.as_mut_ptr().add(offset), 4096);
-            core::ptr::copy_nonoverlapping(buf, slice_4k.as_mut_ptr(), 512);
-            
-            return driver.write_block(sector, slice_4k);
-        }
+        // ⚠️ FIRST, and unconditionally. The read path caches a 4 KiB chunk, and this sector may
+        // sit inside the cached one — serving a later read from a chunk captured before this write
+        // would hand back stale bytes and silently corrupt the filesystem. Invalidating even on the
+        // failure paths below is deliberate: a write that may have partially landed must not leave
+        // a chunk we still believe in.
+        invalidate_chunk();
+
+        let driver = match GLOBAL_NVME {
+            Some(ref mut d) => d,
+            None => return false,
+        };
+
+        // Writes stay one block per command. The read path batches because it is the hot path and
+        // its access pattern is sequential; batching writes would need read-modify-write of the
+        // surrounding chunk, which is a correctness risk for no measured gain.
+        //
+        // A static staging buffer rather than the old per-call `vec![0u8; 8192]` — the driver DMAs
+        // from its own aligned page, so the alignment that allocation existed to arrange was never
+        // used. Distinct from CHUNK_BUF so a write cannot clobber a chunk mid-read.
+        static mut WRITE_BUF: [u8; 4096] = [0; 4096];
+        core::ptr::copy_nonoverlapping(buf, WRITE_BUF.as_mut_ptr(), 512);
+        driver.write_block(sector, &WRITE_BUF)
     }
-    false
 }
 
 extern "C" {

@@ -677,13 +677,16 @@ lazy_static! {
             idt[0x41].set_handler_addr(VirtAddr::new(yield_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Keyboard.as_usize()].set_handler_addr(VirtAddr::new(keyboard_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Mouse.as_usize()].set_handler_addr(VirtAddr::new(mouse_interrupt_stub as *const () as u64));
+            idt[crate::apic::RESCHED_VECTOR as usize].set_handler_addr(VirtAddr::new(resched_ipi_stub as *const () as u64));
             
             // REMOVE the old ethernet_interrupt_stub line from inside the unsafe block
         }
         
         // new x86-interrupt handler directly to slot 0x30 (48) outside the unsafe block
         idt[0x30].set_handler_fn(rtl8168_interrupt_handler);
-        
+        // 0x31 is the Wi-Fi MSI (pci.rs); 0x32 is the I2C-HID touchpad's level-triggered GSI.
+        idt[crate::drivers::i2c_hid::IRQ_VECTOR as usize].set_handler_fn(i2c_hid_interrupt_handler);
+
         idt
     };
 }
@@ -1102,6 +1105,35 @@ mouse_interrupt_stub:
 2:
     iretq
 
+.global resched_ipi_stub
+resched_ipi_stub:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
+    push rax; push rbx; push rcx; push rdx; push rbp; push rsi; push rdi
+    push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
+    mov rax, rsp
+    and rsp, -16
+    sub rsp, 512
+    fxsave [rsp]
+    sub rsp, 8
+    push rax
+    mov rdi, rsp
+    call resched_ipi_context_switch
+    mov rsp, rax
+    pop rbx
+    add rsp, 8
+    fxrstor [rsp]
+    mov rsp, rbx
+    pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
+    pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+
 .global ethernet_interrupt_stub
 ethernet_interrupt_stub:
     test qword ptr [rsp + 8], 3
@@ -1132,6 +1164,7 @@ extern "C" {
     fn timer_interrupt_stub(); 
     fn keyboard_interrupt_stub();
     fn mouse_interrupt_stub();
+    fn resched_ipi_stub();
     fn ethernet_interrupt_stub();
     fn syscall_handler_asm();
     fn yield_interrupt_stub();
@@ -1147,9 +1180,28 @@ pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
     }
 
     // --- THE TRUE WALL CLOCK ---
-    crate::time::UPTIME_MS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    //
+    // ★★★ Was `fetch_add(1)`, which was wrong three ways at once and they compounded:
+    //   1. it asserts the tick is 1 ms; measured on this laptop the tick was ~27 ms,
+    //   2. **every core** ran it into this one global atomic, so the clock's rate was
+    //      `cores / tick_period` and changed as cores came online — the per-core tick counts in
+    //      `sched` summed exactly to `UPTIME_MS`, which is how that was confirmed, and
+    //   3. a tick lost to an interrupts-off window lost time permanently, so the only clock in the
+    //      system ran slow precisely when the machine was busiest.
+    //
+    // Deriving it from the TSC fixes all three at once, and is why the tick may now be made 27x
+    // faster without the clock racing 27x ahead. `fetch_max` rather than `store`: every core writes
+    // it, and two cores reading the TSC microseconds apart must never let the clock step backwards.
+    crate::time::UPTIME_MS.fetch_max(
+        crate::time::uptime_ms_now(), core::sync::atomic::Ordering::Relaxed);
     // ---------------------------
-    
+
+    // ★ One `rdtsc`, and it measures the thing this whole investigation turns on. The APIC timer is
+    // periodic, so the interval between two ticks on this core IS one tick period — unless the core
+    // spent part of that interval unable to take an interrupt. See schedstats::note_tick.
+    crate::schedstats::note_tick();
+    crate::schedstats::with(|s| s.involuntary += 1);
+
     let percpu = crate::percpu::current();
     
     // Increment the tick counter BEFORE we schedule a new task
@@ -1190,7 +1242,9 @@ pub extern "C" fn timer_context_switch(current_rsp: u64) -> u64 {
 pub extern "C" fn yield_context_switch(current_rsp: u64) -> u64 {
     // 🚨 NO EOI IS SENT HERE. This prevents APIC corruption! 🚨
     if x86_64::registers::model_specific::GsBase::read().as_u64() == 0 { return current_rsp; }
-    
+
+    crate::schedstats::with(|s| s.voluntary += 1);
+
     let percpu = crate::percpu::current();
     let new_rsp = percpu.scheduler.schedule(current_rsp);
     
@@ -1217,17 +1271,42 @@ pub extern "C" fn keyboard_context_switch(current_rsp: u64) -> u64 {
     // 2. SAFE EOI (Fired exactly ONCE!)
     crate::apic::end_of_interrupt(); 
     
-    // 3. Human Input Override
+    // 3. Wake input waiters, and reschedule ONLY if that actually woke something.
+    let mut woke_someone = false;
     if x86_64::registers::model_specific::GsBase::read().as_u64() != 0 {
-        let percpu = crate::percpu::current();
-        for task in percpu.scheduler.tasks.iter_mut() {
-            if task.state == crate::scheduler::TaskState::Blocked && task.wake_tsc > 0 && task.wake_tsc != u64::MAX {
-                task.state = crate::scheduler::TaskState::Ready;
-                task.wake_tsc = 0;
-            }
-        }
+        // ★ Wake only tasks actually waiting on INPUT — on EVERY core (see
+        // `scheduler::wake_input_waiters`). This used to wake every task with a finite `wake_tsc`
+        // (the thundering herd: O(n) + a context switch per PS/2 byte, and `sleep()` broken while
+        // the mouse moved); `ipc_send` wakes blocked receivers directly, which is what should
+        // always have carried input.
+        woke_someone = crate::scheduler::wake_input_waiters();
     }
-    yield_context_switch(current_rsp) 
+
+    // ★ Only reschedule if there is a newly-runnable task to reschedule TO.
+    //
+    // This used to tail-call `yield_context_switch` unconditionally, so every PS/2 byte forced a
+    // full pass of the scheduler — and the PS/2 mouse emits one IRQ per byte, three or four per
+    // motion event, up to ~200 Hz. Measured over 12 s of continuous pointer movement: 32% of all
+    // `schedule()` calls changed nothing (vs 3% idle), about 1150 wasted context switches per
+    // second, each paying a 512-byte FXSAVE and a 512-byte FXRSTOR to arrive back at the task it
+    // interrupted.
+    //
+    // Returning `current_rsp` unchanged means "resume exactly what you interrupted", which is the
+    // correct answer when nothing became runnable. The next timer tick will schedule normally.
+    if woke_someone {
+        yield_context_switch(current_rsp)
+    } else {
+        current_rsp
+    }
+}
+
+/// Another core woke a task on this one (`scheduler::kick_core`): schedule now instead of at the
+/// next tick. Spurious kicks are harmless — `schedule` just picks the same task again.
+#[no_mangle]
+pub extern "C" fn resched_ipi_context_switch(current_rsp: u64) -> u64 {
+    crate::apic::end_of_interrupt();
+    crate::schedstats::with(|s| s.resched_ipis += 1);
+    yield_context_switch(current_rsp)
 }
 
 #[no_mangle]
@@ -1238,17 +1317,33 @@ pub extern "C" fn mouse_context_switch(current_rsp: u64) -> u64 {
     // 2. SAFE EOI (Fired exactly ONCE!)
     crate::apic::end_of_interrupt(); 
     
-    // 3. Human Input Override
+    // 3. Wake input waiters, and reschedule ONLY if that actually woke something.
+    let mut woke_someone = false;
     if x86_64::registers::model_specific::GsBase::read().as_u64() != 0 {
-        let percpu = crate::percpu::current();
-        for task in percpu.scheduler.tasks.iter_mut() {
-            if task.state == crate::scheduler::TaskState::Blocked && task.wake_tsc > 0 && task.wake_tsc != u64::MAX {
-                task.state = crate::scheduler::TaskState::Ready;
-                task.wake_tsc = 0;
-            }
-        }
+        // ★ Wake only tasks actually waiting on INPUT — on EVERY core (see
+        // `scheduler::wake_input_waiters`). This used to wake every task with a finite `wake_tsc`
+        // (the thundering herd: O(n) + a context switch per PS/2 byte, and `sleep()` broken while
+        // the mouse moved); `ipc_send` wakes blocked receivers directly, which is what should
+        // always have carried input.
+        woke_someone = crate::scheduler::wake_input_waiters();
     }
-    yield_context_switch(current_rsp) 
+
+    // ★ Only reschedule if there is a newly-runnable task to reschedule TO.
+    //
+    // This used to tail-call `yield_context_switch` unconditionally, so every PS/2 byte forced a
+    // full pass of the scheduler — and the PS/2 mouse emits one IRQ per byte, three or four per
+    // motion event, up to ~200 Hz. Measured over 12 s of continuous pointer movement: 32% of all
+    // `schedule()` calls changed nothing (vs 3% idle), about 1150 wasted context switches per
+    // second, each paying a 512-byte FXSAVE and a 512-byte FXRSTOR to arrive back at the task it
+    // interrupted.
+    //
+    // Returning `current_rsp` unchanged means "resume exactly what you interrupted", which is the
+    // correct answer when nothing became runnable. The next timer tick will schedule normally.
+    if woke_someone {
+        yield_context_switch(current_rsp)
+    } else {
+        current_rsp
+    }
 }
 
 #[no_mangle]
@@ -1262,6 +1357,17 @@ pub extern "C" fn keyboard_handler_impl() {
     // Make codes only, so a key RELEASE cannot trigger it on its way past.
     if scancode < 0x80 {
         crate::boot_screen::key_pressed();
+    }
+    // F12 dumps the scheduler statistics. One relaxed atomic store and nothing else — the printing
+    // happens from the thermal governor, which runs with interrupts enabled. Doing the I/O here
+    // would mask interrupts for tens of milliseconds and forge the very latency being reported;
+    // see `schedstats::DUMP_REQUEST`.
+    //
+    // F12 because it reaches this handler intact: the driver drops Ctrl and Alt (there are no
+    // modifier chords on this system), so a chord could not be expressed even if we wanted one.
+    const SCANCODE_F12: u8 = 0x58;
+    if scancode == SCANCODE_F12 {
+        crate::schedstats::request_dump();
     }
     crate::shell::handle_key(scancode);
     // 🚨 EOI REMOVED FROM HERE!
@@ -1447,11 +1553,19 @@ fn rtc_packed_to_unix(p: u64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatcher(frame: &mut SyscallStackFrame) {
+    // Bracketed out here for exactly the reason the signal delivery below is: the inner function
+    // has dozens of early `return`s, so anything that must run on every syscall has to wrap it
+    // rather than live inside it. `cur_syscall` is also what attributes a long interrupts-off
+    // window to a specific syscall when the tick-gap probe trips (see schedstats).
+    crate::schedstats::note_syscall_enter(frame.rax);
+
     syscall_dispatch_inner(frame);
     // Wrapped rather than appended to the body: the dispatcher has dozens of early `return`s, and
     // any one of them would skip delivery — a signal that only arrives after *some* syscalls is
     // worse than one that never arrives, because the bug is intermittent.
     unsafe { deliver_pending_signal(frame); }
+
+    crate::schedstats::note_syscall_exit();
 }
 
 fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
@@ -2442,8 +2556,16 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
             thread.saved_rsp = final_rsp;
 
-            frame.rax = tid;                         // the parent sees the new tid
-            percpu.scheduler.tasks.push(thread);
+            // Placed by load rather than pushed onto this core. A thread shares its parent's
+            // address space, so any core can run it; pinning every one to the caller is what left
+            // seven of eight cores idle. `place_task` still prefers the local core on a tie.
+            match unsafe { crate::scheduler::place_task(thread, percpu.logical_id) } {
+                Some(_) => frame.rax = tid,          // the parent sees the new tid
+                // Every core's task table is full. Reported rather than ignored: the slot table is
+                // finite now (it has to be — see `TASK_SLOTS`), so this is a real, reachable
+                // outcome and silently dropping the thread would hang the caller waiting on it.
+                None => frame.rax = EAGAIN as u64,
+            }
         },
 
         57 => { // SYS_FORK
@@ -2543,9 +2665,15 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             child.saved_rsp = final_rsp;
 
             // 4. The parent process receives the child's actual PID!
-            frame.rax = child.pid;
-
-            percpu.scheduler.tasks.push(child);
+            //
+            // Placed by load. The child has its own CoW address space, so it is free to run
+            // anywhere; pushing it onto the caller is why everything descended from init and stayed
+            // on core 0.
+            let child_pid = child.pid;
+            match unsafe { crate::scheduler::place_task(child, percpu.logical_id) } {
+                Some(_) => frame.rax = child_pid,
+                None => frame.rax = EAGAIN as u64,
+            }
             crate::serial::bc("fork]");
             crate::postmortem::mark(crate::postmortem::PM_FORK_DONE);
         },
@@ -2602,30 +2730,19 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
 
             thread.saved_rsp = final_rsp;
-            frame.rax = thread.pid;
-            
-            // --- THE TRUE SMP LOAD BALANCER ---
-            unsafe {
-                let active_cores = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
-                let mut target_core = percpu.logical_id;
-                let mut min_tasks = usize::MAX;
+            let thread_pid = thread.pid;
 
-                // 1. Scan all active CPU cores
-                if let Some(all_cores) = &mut crate::percpu::PER_CPU {
-                    for i in 0..active_cores {
-                        let count = all_cores[i].scheduler.tasks.len();
-                        
-                        // 2. Find the core with the lightest workload
-                        if count < min_tasks {
-                            min_tasks = count;
-                            target_core = i;
-                        }
-                    }
-                    
-                    crate::serial_println!("[SMP] Load Balancer: Offloading Thread to Core {} (Tasks: {})", target_core, min_tasks);
-                    
-                    // 3. Inject the thread directly into the idle core's hardware queue!
-                    all_cores[target_core].scheduler.tasks.push(thread);
+            // Placement now goes through the shared policy in `scheduler::place_task`, which fixes
+            // three things this arm's hand-rolled balancer got wrong:
+            //   * it ranked cores by `tasks.len()`, which counts the idle task and every Zombie /
+            //     Empty tombstone — so a core that had reaped processes looked permanently busier,
+            //   * it pushed **directly into another core's `tasks` Vec** with no lock, racing every
+            //     cross-core scan in `ipc_send`/`futex`/`wait4` (handover is via the inbox now), and
+            //   * it `serial_println!`d on every spawn, at IF=0, on a byte-at-a-time UART.
+            unsafe {
+                match crate::scheduler::place_task(thread, percpu.logical_id) {
+                    Some(_) => frame.rax = thread_pid,
+                    None => frame.rax = EAGAIN as u64,
                 }
             }
             // ----------------------------------
@@ -3293,6 +3410,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                         percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Blocked;
                         percpu.scheduler.tasks[curr_idx].wake_tsc = wake_ms;
+                        percpu.scheduler.tasks[curr_idx].wait_reason =
+                            crate::scheduler::WaitReason::Timer;
                         core::arch::asm!("int 0x41");
                         if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) >= wake_ms { break; }
                         x86_64::instructions::hlt();
@@ -3347,6 +3466,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                             let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                             percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Blocked;
                             percpu.scheduler.tasks[curr_idx].wake_tsc = cap;
+                            percpu.scheduler.tasks[curr_idx].wait_reason =
+                                crate::scheduler::WaitReason::Futex;
                             percpu.scheduler.tasks[curr_idx].futex_addr = uaddr;
 
                             core::arch::asm!("int 0x41");
@@ -3373,6 +3494,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                                         && task.state == crate::scheduler::TaskState::Blocked {
                                         task.state = crate::scheduler::TaskState::Ready;
                                         task.wake_tsc = 0;
+                                        task.ready_tsc = crate::schedstats::rdtsc();
                                         task.futex_addr = 0;
                                         woken += 1;
                                     }
@@ -3443,6 +3565,8 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                         percpu.scheduler.tasks[curr_idx].state = crate::scheduler::TaskState::Blocked;
                         percpu.scheduler.tasks[curr_idx].wake_tsc = now + 20; // re-scan every 20 ms
+                        percpu.scheduler.tasks[curr_idx].wait_reason =
+                            crate::scheduler::WaitReason::Child;
                         core::arch::asm!("int 0x41");
                         x86_64::instructions::hlt();
                     }
@@ -3565,16 +3689,53 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         },
 
         503 => { // sys_gpu_sync
-             unsafe {
-                 if let Some(gpu) = crate::drivers::gpu::intel::INTEL_GPU.lock().as_mut() {
-                     gpu.submit_fence();
-                     gpu.wait_for_idle();
-                     // NOTE: deliberately does NOT park here. Parking at every frame's sync point
-                     // cost a forcewake wake + RC6 exit on the next submission and made the desktop
-                     // sluggish. The GT is parked by the thermal governor once it has been idle for
-                     // GPU_PARK_IDLE_MS — see `maybe_park_gpu`.
-                 }
-             }
+            // ★★ Submit under the lock; wait WITHOUT it, and with interrupts enabled.
+            //
+            // This arm used to hold `INTEL_GPU` across the entire fence wait at IF=0, and after the
+            // render-engine stalls were latched off it became the largest remaining source of
+            // interactive latency on the machine: measured at **128 windows averaging 9,689 us,
+            // ~2 per second**. Those are REAL blits completing — a timeout would read 100 ms — so
+            // unlike the wedged RCS fence this wait cannot be shortened without abandoning work
+            // that is genuinely in flight, which corrupts the screen (see `BLT_FENCE_TIMEOUT_US`).
+            //
+            // But it does not need to be uninterruptible, and it does not need the driver lock:
+            // the fence page is a plain `*mut u32` and polling it touches no driver state. Holding
+            // the lock also blocked every other core's GPU syscall for those 9.7 ms — which matters
+            // now that tasks actually run on other cores.
+            //
+            // NOTE: deliberately does NOT park here. Parking at every frame's sync point cost a
+            // forcewake wake + RC6 exit on the next submission and made the desktop sluggish. The
+            // GT is parked by the thermal governor once idle for GPU_PARK_IDLE_MS.
+            let pending = unsafe {
+                let mut g = crate::drivers::gpu::intel::INTEL_GPU.lock();
+                g.as_mut().map(|gpu| (gpu.fence_virt, gpu.submit_fence()))
+            };
+            if let Some((fence_virt, target)) = pending {
+                if !fence_virt.is_null() {
+                    unsafe {
+                        x86_64::instructions::interrupts::enable();
+                        // ⚠️ The budget is WALL CLOCK and we are now preemptible, so time spent
+                        // descheduled counts against it. Left deliberately generous (100 ms vs the
+                        // ~10 ms a real blit takes): expiring early here would abandon a live blit
+                        // and tear the screen, which is far worse than waiting a little longer.
+                        let deadline = crate::drivers::gpu::intel::render::SpinDeadline::new(
+                            crate::drivers::gpu::intel::BLT_FENCE_TIMEOUT_US,
+                        );
+                        // Signed compare: the fence counter wraps, and another core may push it
+                        // PAST our target in the meantime — which still satisfies us.
+                        while (core::ptr::read_volatile(fence_virt) as i32)
+                            .wrapping_sub(target as i32)
+                            < 0
+                        {
+                            if deadline.expired() {
+                                break;
+                            }
+                            core::hint::spin_loop();
+                        }
+                        x86_64::instructions::interrupts::disable();
+                    }
+                }
+            }
         },
 
         504 => {
@@ -3898,6 +4059,107 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             }
             frame.rax = 0;
         }
+        575 => {
+            // SYS_SCHED_STATS(op, core, out_ptr, out_len) -> bytes written, or u64::MAX on error.
+            //   op 0: `SchedGlobals` — tick period, calibration, uptime, core count.
+            //   op 1: `SchedStats` for logical core `core`.
+            // Mirrors `nyx_api::{SchedGlobals, SchedStats}`; field order in schedstats.rs IS the ABI.
+            //
+            // ⚠️ op 1 reads ANOTHER core's live statistics block without synchronisation, and that
+            // is deliberate. The alternative — a lock around the per-CPU stats — would put a
+            // contended lock in the timer ISR, making the instrumentation a source of exactly the
+            // latency it exists to measure. The cost is that a snapshot can catch counters from
+            // side of an increment, so a histogram may not sum to its counter. For a diagnostic
+            // sampled by a human at 1 Hz that is a fair trade; it is NOT a basis for arithmetic
+            // that assumes internal consistency.
+            //
+            // Naturally-aligned u64 loads do not tear on x86-64, so individual fields are always a
+            // real past-or-present value — never a mixture of two.
+            let op = arg1;
+            let core_idx = arg2 as usize;
+            let out = arg3 as *mut u8;
+            let out_len = arg4 as usize;
+
+            match op {
+                0 => {
+                    let g = crate::schedstats::globals();
+                    let n = core::mem::size_of::<crate::schedstats::SchedGlobals>();
+                    if out_len < n || !is_valid_user_ptr(out, n)
+                        || !unsafe { crate::memory::user_addr_mapped(arg3) } {
+                        frame.rax = u64::MAX;
+                        return;
+                    }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &g as *const _ as *const u8, out, n);
+                    }
+                    frame.rax = n as u64;
+                }
+                1 => {
+                    let n = core::mem::size_of::<crate::schedstats::SchedStats>();
+                    if out_len < n || !is_valid_user_ptr(out, n)
+                        || !unsafe { crate::memory::user_addr_mapped(arg3) } {
+                        frame.rax = u64::MAX;
+                        return;
+                    }
+                    // Bounded by the real length, not by ACTIVE_CORES: a core that failed to start
+                    // still has a PerCpu entry, and reporting its zeroed block is more informative
+                    // than refusing the request.
+                    let ok = unsafe {
+                        match &crate::percpu::PER_CPU {
+                            Some(cores) if core_idx < cores.len() => {
+                                let s = cores[core_idx].stats;
+                                core::ptr::copy_nonoverlapping(
+                                    &s as *const _ as *const u8, out, n);
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    frame.rax = if ok { n as u64 } else { u64::MAX };
+                }
+                2 => {
+                    // ★ Which kernel this actually is. `acpi log` has carried this for the same
+                    // reason — a stale flash once produced two boots of byte-identical output and
+                    // cost a cycle chasing a bug that was already fixed. It just happened again
+                    // here: a GPU fence fix read as "no effect" when the old image was running.
+                    // Any report that will be compared across boots must say which build it came
+                    // from.
+                    let stamp = env!("NYX_BUILD_STAMP").as_bytes();
+                    let n = stamp.len().min(out_len);
+                    if n == 0 || !is_valid_user_ptr(out, n)
+                        || !unsafe { crate::memory::user_addr_mapped(arg3) } {
+                        frame.rax = u64::MAX;
+                        return;
+                    }
+                    unsafe { core::ptr::copy_nonoverlapping(stamp.as_ptr(), out, n) };
+                    frame.rax = n as u64;
+                }
+                3 => {
+                    // GPU health for the `gpu` command: render-engine hang latch, and how many text
+                    // batches were drawn vs refused — which says which font the desktop is in.
+                    let h = crate::drivers::gpu::intel::render::health();
+                    let n = core::mem::size_of::<crate::drivers::gpu::intel::render::GpuHealth>();
+                    if out_len < n || !is_valid_user_ptr(out, n)
+                        || !unsafe { crate::memory::user_addr_mapped(arg3) } {
+                        frame.rax = u64::MAX;
+                        return;
+                    }
+                    unsafe { core::ptr::copy_nonoverlapping(&h as *const _ as *const u8, out, n) };
+                    frame.rax = n as u64;
+                }
+                4 => {
+                    // How the boot-time keyboard repeat-rate handshake went (mouse::TYPEMATIC).
+                    frame.rax = crate::mouse::TYPEMATIC.load(core::sync::atomic::Ordering::Relaxed) as u64;
+                }
+                5 => {
+                    // `gpu retry <mode>`: pick the compositor's pixel shader (0 normal, 1 solid
+                    // colour, 2 plain textured) and clear the latch so it tries again.
+                    frame.rax = crate::drivers::gpu::intel::render::retry_with_ps(arg2 as u32) as u64;
+                }
+                _ => { frame.rax = u64::MAX; }
+            }
+        }
         568 => {
             // SYS_POWER(action) — 0 = shut down, 1 = restart. Does not return on success.
             //
@@ -4091,9 +4353,13 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 frame.rax = 1;
             } else if is_valid_user_ptr(ptr as *const u8, bytes) {
                 let glyphs = unsafe { core::slice::from_raw_parts(ptr, count) };
-                frame.rax = crate::drivers::gpu::intel::render::text::draw_text(
+                let ok = crate::drivers::gpu::intel::render::text::draw_text(
                     atlas_gva, atlas_w, atlas_h, atlas_pitch, glyphs,
-                ) as u64;
+                );
+                use crate::drivers::gpu::intel::render::{TEXT_DRAWN, TEXT_REFUSED};
+                if ok { &TEXT_DRAWN } else { &TEXT_REFUSED }
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                frame.rax = ok as u64;
             } else {
                 frame.rax = EFAULT as u64;
             }
@@ -4110,7 +4376,244 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = m_val;
         },
 
+        577 => {
+            // SYS_I2C_HID_INFO(index, out_ptr) -> 1 if that slot is populated, else 0.
+            //
+            // ⚠️ Copies from the published cache and evaluates NOTHING. `acpi probe 13` — which
+            // runs on the thermal governor at IF=1 — is what fills it. Evaluating AML here would be
+            // the preemption-boundary deadlock that wedged this machine on `panel` and `battery`:
+            // SYSCALL runs with IF=0, and AcpiEvaluateObject takes the interpreter mutex,
+            // allocates, and on this laptop can end in a firmware SMI.
+            let idx = arg1 as usize;
+            let out = arg2 as *mut u8;
+            let n = core::mem::size_of::<crate::acpi::I2cHidInfo>();
+            if idx >= 4 || !is_valid_user_ptr(out, n)
+                || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                frame.rax = 0;
+                return;
+            }
+            // `try_lock`, never `lock` — both sides of this cache do, because the governor holds it
+            // at IF=1 while this runs at IF=0.
+            let got = match crate::acpi::CACHE.try_lock() {
+                Some(c) if c.i2c_hid_probed && idx < c.i2c_hid_n => {
+                    let e = c.i2c_hid[idx];
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(&e as *const _ as *const u8, out, n);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            frame.rax = if got { 1 } else { 0 };
+        },
+
+        578 => {
+            // SYS_I2C_HID_PROBE(op, out_ptr).
+            //   op 1: request a controller bring-up + HID descriptor read. Returns 1.
+            //   op 0: copy the last result to out_ptr. Returns its `seq` (0 = never run), or
+            //         u64::MAX if the result is being written right now — ask again.
+            //
+            // ⚠️ Does no I/O itself. Bring-up sleeps through a PCI power transition, which is not
+            // allowed at IF=0; the `usb-hid` kernel task does the work (drivers::i2c_hid::service).
+            match arg1 {
+                1 => {
+                    crate::drivers::i2c_hid::REQUEST
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    frame.rax = 1;
+                }
+                0 => {
+                    let out = arg2 as *mut u8;
+                    let n = core::mem::size_of::<crate::drivers::i2c_hid::ProbeResult>();
+                    if !is_valid_user_ptr(out, n)
+                        || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                    frame.rax = match crate::drivers::i2c_hid::RESULT.try_lock() {
+                        Some(r) => {
+                            let copy = *r;
+                            drop(r);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    &copy as *const _ as *const u8, out, n,
+                                );
+                            }
+                            copy.seq as u64
+                        }
+                        None => u64::MAX,
+                    };
+                }
+                3 => {
+                    // op 3: probe AND initialise; take the pointer if mouse reports arrive.
+                    crate::drivers::i2c_hid::ENABLE
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    crate::drivers::i2c_hid::REQUEST
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    frame.rax = 1;
+                }
+                6 => {
+                    // op 6: live status. bit 0 = I2C drives the pointer, bit 1 = it fell back to
+                    // PS/2 (I2C went silent while PS/2 kept talking), bits 16..31 = probes completed
+                    // (so the boot-time enable is observable), bits 32.. = interrupts taken.
+                    use core::sync::atomic::Ordering::Relaxed;
+                    use crate::drivers::i2c_hid::{FELL_BACK, IRQ_COUNT, POINTER_ACTIVE, RESULT};
+                    // bit 2 = precision (multi-touch) mode, bits 3..5 = last mode switch result.
+                    // bit 6 = precision mode went silent and was reverted to mouse mode.
+                    use crate::drivers::i2c_hid::{MODE_RESULT, PTP_ACTIVE, PTP_FAILED};
+                    let seq = RESULT.try_lock().map_or(0, |r| r.seq) as u64 & 0xFFFF;
+                    frame.rax = POINTER_ACTIVE.load(Relaxed) as u64
+                        | (FELL_BACK.load(Relaxed) as u64) << 1
+                        | (PTP_ACTIVE.load(Relaxed) as u64) << 2
+                        | ((MODE_RESULT.load(Relaxed) as u64) & 0x7) << 3
+                        | (PTP_FAILED.load(Relaxed) as u64) << 6
+                        | (crate::drivers::i2c_hid::ADOPTED_PTP.load(Relaxed) as u64) << 7
+                        | ((crate::drivers::i2c_hid::MODE_NOTE.load(Relaxed) as u64) & 0xF) << 8
+                        | seq << 16
+                        | (IRQ_COUNT.load(Relaxed) as u64) << 32;
+                }
+                7 => {
+                    // op 7: take the accumulated two-finger scroll, in pixels (positive = the view
+                    // moves down the content). Non-blocking by design: the shell calls this every
+                    // frame, and the shell must never block — it IS the window server.
+                    let v = crate::drivers::i2c_hid::SCROLL_ACCUM
+                        .swap(0, core::sync::atomic::Ordering::AcqRel);
+                    frame.rax = v as i64 as u64;
+                }
+                9 => {
+                    // op 9: copy the precision-mode report log (LOG_LEN entries of 28 bytes) to
+                    // arg2, oldest first. Returns the byte count.
+                    use crate::drivers::i2c_hid::{LogEntry, LOG_LEN, PTP_LOG};
+                    let n = core::mem::size_of::<LogEntry>() * LOG_LEN;
+                    let out = arg2 as *mut u8;
+                    if !is_valid_user_ptr(out, n) || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                    frame.rax = match PTP_LOG.try_lock() {
+                        Some(g) => {
+                            let (ring, next) = *g;
+                            drop(g);
+                            let mut ordered = ring;
+                            for i in 0..LOG_LEN {
+                                ordered[i] = ring[(next + i) % LOG_LEN];
+                            }
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(ordered.as_ptr() as *const u8, out, n);
+                            }
+                            n as u64
+                        }
+                        None => 0,
+                    };
+                }
+                10 => {
+                    // op 10: reports received since the pointer was taken, 16 bits each, low to
+                    // high: mouse, touch pad, other IDs, empty/oversized reads (saturating).
+                    use core::sync::atomic::Ordering::Relaxed;
+                    use crate::drivers::i2c_hid::{COUNT_EMPTY, COUNT_MOUSE, COUNT_OTHER, COUNT_PTP};
+                    let c = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed).min(0xFFFF) as u64;
+                    frame.rax = c(&COUNT_MOUSE)
+                        | c(&COUNT_PTP) << 16
+                        | c(&COUNT_OTHER) << 32
+                        | c(&COUNT_EMPTY) << 48;
+                }
+                8 => {
+                    // op 8: switch input mode. arg2 = 3 precision (multi-touch), anything else
+                    // mouse. Done by the kernel task; read the outcome from op 6.
+                    use core::sync::atomic::Ordering::Release;
+                    crate::drivers::i2c_hid::MODE_RESULT.store(0, Release);
+                    crate::drivers::i2c_hid::MODE_REQUEST
+                        .store(if arg2 == 3 { 2 } else { 1 }, Release);
+                    frame.rax = 1;
+                }
+                5 => {
+                    // op 5: pointer speed in percent. arg2 = 0 only reads it; otherwise it is set,
+                    // clamped to the sane range. Returns the value now in force.
+                    use crate::drivers::i2c_hid::{SPEED_MAX, SPEED_MIN, SPEED_PCT};
+                    if arg2 != 0 {
+                        let v = (arg2 as u32).clamp(SPEED_MIN, SPEED_MAX);
+                        SPEED_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    frame.rax = SPEED_PCT.load(core::sync::atomic::Ordering::Relaxed) as u64;
+                }
+                4 => {
+                    // op 4: hand the pointer back to PS/2.
+                    crate::drivers::i2c_hid::DISABLE
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    frame.rax = 1;
+                }
+                2 => {
+                    // op 2: copy the Phase 3 findings text (up to arg3 bytes). Returns its length.
+                    let out = arg2 as *mut u8;
+                    let cap = (arg3 as usize).min(crate::drivers::i2c_hid::REPORT_CAP);
+                    if cap == 0 || !is_valid_user_ptr(out, cap)
+                        || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                    frame.rax = match crate::drivers::i2c_hid::REPORT.try_lock() {
+                        Some(r) => {
+                            let n = r.len.min(cap);
+                            unsafe { core::ptr::copy_nonoverlapping(r.text.as_ptr(), out, n); }
+                            n as u64
+                        }
+                        None => 0,
+                    };
+                }
+                _ => frame.rax = EINVAL as u64,
+            }
+        },
+
         506 => { if let Some(c) = crate::shell::pop_key() { frame.rax = c as u64; } else { frame.rax = 0; } },
+
+        576 => {
+            // SYS_READ_KEY_WAIT(timeout_ms) -> char, or 0 if nothing arrived in time.
+            //
+            // ★★ This is what finally uses `WaitReason::Input`. The input ISRs have been waking
+            // only `Input` waiters since the thundering herd was removed — and until now NOTHING
+            // ever registered as one, so the mechanism was correct and unused.
+            //
+            // The window server polled `506` every 2 ms instead. That was ~2,700 Hz by accident
+            // while `UPTIME_MS` ran fast, and became an honest 500 Hz once the clock was fixed —
+            // so correcting the clock silently made keystrokes up to 2 ms later. Blocking removes
+            // the poll entirely: the keyboard IRQ wakes the waiter directly.
+            //
+            // ⚠️ ALWAYS with a timeout, never indefinitely. The shell IS the window server; a
+            // blocking call with no deadline there stops the desktop dead if the wake is ever
+            // missed. The timeout also preserves its frame cadence when no one is typing.
+            if let Some(c) = crate::shell::pop_key() {
+                frame.rax = c as u64;
+                return;
+            }
+            let deadline = crate::time::UPTIME_MS
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .saturating_add(arg1);
+            unsafe {
+                x86_64::instructions::interrupts::enable();
+                loop {
+                    if let Some(c) = crate::shell::pop_key() {
+                        frame.rax = c as u64;
+                        break;
+                    }
+                    if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed)
+                        >= deadline
+                    {
+                        frame.rax = 0;
+                        break;
+                    }
+                    let percpu = crate::percpu::current();
+                    let curr_idx =
+                        percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
+                    if curr_idx < percpu.scheduler.tasks.len() {
+                        let task = &mut percpu.scheduler.tasks[curr_idx];
+                        task.state = crate::scheduler::TaskState::Blocked;
+                        task.wake_tsc = deadline;
+                        task.wait_reason = crate::scheduler::WaitReason::Input;
+                    }
+                    core::arch::asm!("int 0x41");
+                }
+                x86_64::instructions::interrupts::disable();
+            }
+        },
 
         507 => { 
              unsafe {
@@ -4978,7 +5481,9 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     {
                         let task = &mut percpu.scheduler.tasks[curr_idx];
                         task.state = crate::scheduler::TaskState::Blocked;
-                        task.wake_tsc = wake_ms; 
+                        task.wake_tsc = wake_ms;
+                        // Timer, so the input ISRs leave it alone. `sleep(n)` now means n.
+                        task.wait_reason = crate::scheduler::WaitReason::Timer;
                     }
                     
                     // 2. Yield the CPU
@@ -4989,7 +5494,14 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                     let task = &mut percpu.scheduler.tasks[curr_idx];
                     
-                    if task.wake_tsc == 0 { break; } // Human Input Override (Mouse Touched!)
+                    // `schedule()`'s deadline sweep clears `wake_tsc` when the time arrives, so a
+                    // zero here means the sleep is genuinely over.
+                    //
+                    // ⚠️ This used to also mean "a key or mouse byte cancelled the sleep" — the
+                    // input ISRs cleared `wake_tsc` on every task indiscriminately, so `sleep(n)`
+                    // returned early for the whole system whenever the pointer moved. The ISRs now
+                    // wake only `WaitReason::Input` waiters, and this task blocks as `Timer`.
+                    if task.wake_tsc == 0 { break; }
                     if crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed) >= wake_ms { break; } // Time passed!
                     
                     // 4. If we woke up illegally (scheduler fallback), HALT to save battery!
@@ -5068,14 +5580,38 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             unsafe {
                 let active_cores = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
                 if let Some(cores) = &mut crate::percpu::PER_CPU {
+                    let here = crate::percpu::current().logical_id;
                     for i in 0..active_cores {
+                        let apic_id = cores[i].apic_id;
                         for task in cores[i].scheduler.tasks.iter_mut() {
                             if task.pid == target_pid {
                                 task.mailbox.push_back(msg);
-                                // If the task was sleeping forever waiting for IPC, wake it up!
-                                if task.state == crate::scheduler::TaskState::Blocked && task.wake_tsc == u64::MAX {
+                                // ★ Wake ANY receiver blocked in `ipc_recv`, not just one that was
+                                // parked forever.
+                                //
+                                // The old test was `wake_tsc == u64::MAX` — the "block indefinitely"
+                                // sentinel — so a receiver waiting with a DEADLINE was never woken
+                                // by the message it was waiting for; it sat until its timer expired.
+                                // That is the other half of the input-latency problem: the shell
+                                // forwards a keystroke with `ipc_send`, and the app only noticed on
+                                // its own 16 ms frame tick.
+                                //
+                                // Keyed on the reason rather than the deadline, so "wake on a
+                                // message or at time T, whichever is first" is finally expressible.
+                                if task.state == crate::scheduler::TaskState::Blocked
+                                    && task.wait_reason == crate::scheduler::WaitReason::Ipc
+                                {
                                     task.state = crate::scheduler::TaskState::Ready;
                                     task.wake_tsc = 0;
+                                    task.wait_reason = crate::scheduler::WaitReason::None;
+                                    task.ready_tsc = crate::schedstats::rdtsc();
+                                    crate::schedstats::with(|s| s.wakeups += 1);
+                                    // ★ A receiver on ANOTHER core would otherwise wait for that
+                                    // core's next tick — the shell forwards every keystroke to
+                                    // its app this way, so that was up to a quantum per key.
+                                    if i != here {
+                                        crate::scheduler::kick_core(apic_id);
+                                    }
                                 }
                                 found = true;
                                 break;
@@ -5091,13 +5627,30 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
         533 => { 
             // SYSCALL 533: sys_ipc_recv
             let msg_ptr = arg1 as *mut crate::process::IpcMessage;
-            let block = arg2 == 1;
-            
+            // mode: 0 = poll, 1 = block forever, 2 = block until a message OR `arg3` ms elapse.
+            //
+            // ★ Mode 2 is the one a GUI frame loop needs and could not express before. Apps used
+            // `sleep(16)` plus a non-blocking poll, which costs up to a full frame of latency on
+            // every keystroke and wakes the task 62 times a second whether or not anything
+            // happened. "Wake me on a message, or in 16 ms, whichever is first" collapses both into
+            // one blocking call — the message path becomes immediate and the idle path stops
+            // spinning.
+            let mode = arg2;
+            let block = mode == 1 || mode == 2;
+
             if !is_valid_user_ptr(msg_ptr as *const u8, core::mem::size_of::<crate::process::IpcMessage>()) {
                 frame.rax = EFAULT as u64; return;
             }
-            
+
             if block {
+                // u64::MAX keeps its historical meaning: no deadline, wait forever.
+                let deadline = if mode == 2 {
+                    crate::time::UPTIME_MS
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        .saturating_add(arg3)
+                } else {
+                    u64::MAX
+                };
                 unsafe {
                     // Re-enable interrupts to prevent timer deadlocks
                     x86_64::instructions::interrupts::enable();
@@ -5105,23 +5658,39 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         let percpu = crate::percpu::current();
                         let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                         let task = &mut percpu.scheduler.tasks[curr_idx];
-                        
+
                         if let Some(msg) = task.mailbox.pop_front() {
                             *msg_ptr = msg;
                             frame.rax = 1;
                             break;
                         }
-                        
+
+                        // Timed out with nothing delivered. Reported as 0, the same as a failed
+                        // poll — a frame loop wants "nothing arrived", not an error.
+                        if deadline != u64::MAX
+                            && crate::time::UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed)
+                                >= deadline
+                        {
+                            frame.rax = 0;
+                            break;
+                        }
+
                         task.state = crate::scheduler::TaskState::Blocked;
-                        task.wake_tsc = u64::MAX; 
-                        
-                        core::arch::asm!("int 0x41"); 
-                        
+                        task.wake_tsc = deadline;
+                        // Ipc, so `ipc_send` wakes this task the moment a message lands — and the
+                        // input ISRs, which no longer wake everything, leave it alone.
+                        task.wait_reason = crate::scheduler::WaitReason::Ipc;
+
+                        core::arch::asm!("int 0x41");
+
                         let percpu = crate::percpu::current();
                         let curr_idx = percpu.scheduler.core_task_idx[percpu.logical_id as usize % 32];
                         let task = &mut percpu.scheduler.tasks[curr_idx];
-                        
-                        if task.mailbox.is_empty() {
+
+                        // ⚠️ Only halt when there is genuinely nothing to do AND no deadline to
+                        // race. With a deadline this `hlt` would sleep past it on an idle machine,
+                        // turning a 16 ms frame timeout into "until the next unrelated interrupt".
+                        if task.mailbox.is_empty() && deadline == u64::MAX {
                             x86_64::instructions::hlt();
                         }
                     }
@@ -5673,6 +6242,26 @@ pub extern "C" fn sys_connect(fd: usize, addr_ptr: *const u8, addr_len: usize, t
         return 0;
     }
     EBADF
+}
+
+/// The I2C-HID touchpad's "report ready" line (GSI 82 on the test laptop), level-triggered.
+///
+/// ★ Mask, flag, EOI — nothing else. A level-triggered line stays asserted until the host READS the
+/// report over I2C, which takes a few hundred microseconds of bus time and cannot happen here. So
+/// the entry is masked (or it would re-fire the instant EOI is sent), the poll in the `usb-hid` task
+/// reads exactly one report, and unmasks. If another report is already waiting, the still-asserted
+/// line fires again as soon as it is unmasked.
+///
+/// This is what stops the pointer drifting on its own: reading the input register WITHOUT waiting
+/// for this line returns the last report again, so its motion was being applied over and over.
+pub extern "x86-interrupt" fn i2c_hid_interrupt_handler(_stack_frame: x86_64::structures::idt::InterruptStackFrame) {
+    let gsi = crate::drivers::i2c_hid::IRQ_GSI.load(core::sync::atomic::Ordering::Relaxed);
+    if gsi != 0 {
+        crate::ioapic::set_masked(gsi, true);
+    }
+    crate::drivers::i2c_hid::IRQ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::drivers::i2c_hid::PENDING.store(true, core::sync::atomic::Ordering::Release);
+    crate::apic::end_of_interrupt();
 }
 
 pub extern "x86-interrupt" fn rtl8168_interrupt_handler(_stack_frame: x86_64::structures::idt::InterruptStackFrame) {

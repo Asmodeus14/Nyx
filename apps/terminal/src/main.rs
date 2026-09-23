@@ -935,6 +935,524 @@ impl TerminalApp {
         }
     }
 
+    /// `sched` — what the scheduler is actually doing, and how long a tick actually is.
+    ///
+    /// ★ The headline is the first line. `timer_context_switch` adds 1 to `UPTIME_MS` per APIC
+    /// timer interrupt, which asserts that a tick is exactly one millisecond — while `init_timer`
+    /// programs a hardcoded count that nothing ever measured against a real clock. Every `sleep`,
+    /// every socket timeout, and this desktop's frame pacing are denominated in that unit. If the
+    /// measured period is not ~1000 us, they all mean something other than what they say.
+    ///
+    /// Second headline: `UPTIME_MS` is incremented by EVERY core, into one shared atomic. So the
+    /// clock's rate is (cores / tick period) — it depends on how many cores came up, and it changed
+    /// as they did. The "clock runs" line states that error directly rather than leaving it to be
+    /// inferred.
+    ///
+    /// This is the first process-visibility tool on the system; there is no `ps`, `top` or `uptime`.
+    fn cmd_sched(&mut self, arg: &str) {
+        let g = match sys_sched_globals() {
+            Some(g) => g,
+            None => {
+                self.output_history
+                    .push_str("sched: kernel rejected the request (syscall 575 missing?)\n");
+                return;
+            }
+        };
+
+        if g.stats_enabled == 0 {
+            self.output_history.push_str(
+                "sched: this kernel was built WITHOUT the `sched_stats` feature.\n\
+                 \x20 Every per-core counter below will read zero — that is the build, not the \
+                 machine.\n",
+            );
+        }
+
+        let mhz = g.tsc_mhz.max(1);
+        // cycles -> microseconds. TSC_MHZ is cycles per microsecond by definition.
+        let us = |cycles: u64| cycles / mhz;
+
+        let mut out = String::new();
+        out.push_str("Clock\n");
+        if g.tick_period_us == 0 {
+            out.push_str(
+                "  tick period       NOT MEASURED — calibration did not run.\n\
+                 \x20                   Everything below that depends on it is unknown, not \
+                 assumed.\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "  tick period       {} us   <- the kernel assumes 1000\n",
+                g.tick_period_us
+            ));
+        }
+        out.push_str(&format!(
+            "  APIC timer        {} ticks/ms (div 16), initial count {:#x}\n",
+            g.apic_ticks_per_ms, g.timer_initial_count
+        ));
+        out.push_str(&format!(
+            "  TSC               {} MHz\n  uptime            {} ms (as the kernel counts it)   cores {}\n",
+            g.tsc_mhz, g.uptime_ms, g.active_cores
+        ));
+
+        // Sum ticks across cores so the clock-rate claim is about the machine, not one core.
+        let ncores = g.active_cores.max(1) as usize;
+        let mut cores: Vec<SchedStats> = Vec::new();
+        for i in 0..ncores {
+            match sys_sched_stats(i as u64) {
+                Some(s) => cores.push(s),
+                None => break,
+            }
+        }
+        let total_ticks: u64 = cores.iter().map(|c| c.ticks).sum();
+
+        if g.tick_period_us > 0 && total_ticks > 0 {
+            // Real time elapsed = ticks on ONE core x period. Using the total across cores would
+            // count the same wall-clock interval once per core.
+            let per_core_ticks = cores.iter().map(|c| c.ticks).max().unwrap_or(0);
+            let real_ms = per_core_ticks.saturating_mul(g.tick_period_us) / 1000;
+            if real_ms > 0 {
+                // x100 to keep two decimals in integer arithmetic — no float formatting here.
+                let ratio_x100 = g.uptime_ms.saturating_mul(100) / real_ms;
+                out.push_str(&format!(
+                    "  clock runs        {}.{:02}x real time  ({} ms elapsed, kernel says {})\n",
+                    ratio_x100 / 100,
+                    ratio_x100 % 100,
+                    real_ms,
+                    g.uptime_ms
+                ));
+                out.push_str(
+                    "  \x20                 (UPTIME_MS is bumped by EVERY core into one atomic)\n",
+                );
+            }
+        }
+
+        if cores.is_empty() {
+            self.output_history.push_str(&out);
+            self.output_history
+                .push_str("\nsched: no per-core statistics available.\n");
+            return;
+        }
+
+        out.push_str("\nPer core\n");
+        out.push_str(
+            "  cpu   ticks   sched()  switch   waste   volu  invol    idle   wake   rq  live/dead  sched%\n",
+        );
+        for (i, c) in cores.iter().enumerate() {
+            // ★ The number this whole exercise is about: calls to schedule() that did NOT change
+            // the running task. Each one is a full interrupt entry plus 512 bytes of FXSAVE and 512
+            // of FXRSTOR spent to decide to keep doing what it was already doing.
+            let waste = c.schedule_calls.saturating_sub(c.switches);
+            // Share of this core's time spent inside schedule(), as a percentage of the real time
+            // its own ticks account for.
+            let real_cycles = c.ticks.saturating_mul(g.tick_period_us).saturating_mul(mhz);
+            let pct = if real_cycles > 0 {
+                c.sched_cycles.saturating_mul(1000) / real_cycles
+            } else {
+                0
+            };
+            out.push_str(&format!(
+                "  {:>3} {:>7} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>6} {:>4} {:>4}/{:<4} {}.{}%\n",
+                i,
+                c.ticks,
+                c.schedule_calls,
+                c.switches,
+                waste,
+                c.voluntary,
+                c.involuntary,
+                c.idle_entries,
+                c.wakeups,
+                c.rq_len,
+                c.tasks_live,
+                c.tasks_dead,
+                pct / 10,
+                pct % 10
+            ));
+        }
+        // Cross-core wakes: a keystroke or IPC message woke a task living on another core, which
+        // was kicked to run it at once instead of at its next tick.
+        out.push_str("  reschedule IPIs received:");
+        for (i, c) in cores.iter().enumerate() {
+            out.push_str(&format!(" cpu{} {}", i, c.resched_ipis));
+        }
+        out.push('\n');
+
+        out.push_str("\nWorst observed\n");
+        for (i, c) in cores.iter().enumerate() {
+            if c.max_gap_tsc == 0 && c.max_wake_tsc == 0 {
+                continue;
+            }
+            let gap_us = us(c.max_gap_tsc);
+            // Anything beyond one tick period is time this core could not take an interrupt: the
+            // APIC timer is periodic, so it should have fired and did not.
+            let over = if g.tick_period_us > 0 && gap_us > g.tick_period_us {
+                gap_us - g.tick_period_us
+            } else {
+                0
+            };
+            let who = if c.max_gap_syscall == u64::MAX {
+                String::from("not in a syscall")
+            } else {
+                format!("syscall {}", c.max_gap_syscall)
+            };
+            out.push_str(&format!(
+                "  cpu{}  wake->run {} us   longest tick gap {} us",
+                i,
+                us(c.max_wake_tsc),
+                gap_us
+            ));
+            if over > 0 {
+                out.push_str(&format!("  => ~{} us interrupts-off, last syscall {}", over, who));
+            }
+            out.push('\n');
+            // ★ The authoritative attribution. The tick-gap line above can only name whichever
+            // syscall most recently ran, because a syscall that masks interrupts does not see the
+            // suppressed timer tick until after `sysretq` has already restored IF and cleared the
+            // "currently in" marker. This one is timed INSIDE the call, so it cannot be fooled —
+            // and when the two agree, the gap and the syscall are the same event.
+            if c.max_sys_cycles > 0 {
+                out.push_str(&format!(
+                    "          longest syscall {} us  (syscall {})\n",
+                    us(c.max_sys_cycles),
+                    c.max_sys_id as i64
+                ));
+            }
+        }
+
+        // ★ The recent-stall history. Printed unconditionally rather than behind `hist`, because
+        // this is the one thing here that names a cause: a stall that repeats shows the same
+        // syscall over and over, while a one-off (boot, `execve`) appears once with an early
+        // `at` timestamp and is pushed out. The rate line matters more than any single row.
+        {
+            let total: u64 = cores.iter().map(|c| c.gap_ring_count).sum();
+            if total == 0 {
+                out.push_str("\n  No stalls over 3 ticks recorded.\n");
+            } else {
+                out.push_str("\nStall rate (interrupts-off windows over 3 ticks)\n ");
+                for (i, c) in cores.iter().enumerate() {
+                    let rate_x100 = c.gap_ring_count.saturating_mul(100_000) / g.uptime_ms.max(1);
+                    out.push_str(&format!(
+                        " cpu{}:{} ({}.{:02}/s)",
+                        i,
+                        c.gap_ring_count,
+                        rate_x100 / 100,
+                        rate_x100 % 100
+                    ));
+                }
+                out.push('\n');
+
+                // Detail for the WORST core only. Printing every core's ring is ~136 lines on an
+                // 8-core machine, which pushes the one core that matters off the top of a terminal
+                // that has to be read on the device. The busiest core is the one with the stalls.
+                let (worst, wc) = cores
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, c)| c.gap_ring_count)
+                    .map(|(i, c)| (i, c))
+                    .unwrap();
+                out.push_str(&format!("\n  cpu{} — most recent, newest first\n", worst));
+                // 6, not 16: the ring is context for the tally below, and a long list pushes the
+                // summary that actually gets read off the top of the window.
+                let n = (wc.gap_ring_count as usize).min(SCHED_GAP_RING_LEN).min(6);
+                for k in 0..n {
+                    let idx = (wc.gap_ring_head as usize + SCHED_GAP_RING_LEN - 1 - k)
+                        % SCHED_GAP_RING_LEN;
+                    let s = &wc.gap_ring[idx];
+                    if s.cycles == 0 {
+                        continue;
+                    }
+                    let who = if s.syscall == u64::MAX {
+                        String::from("no syscall")
+                    } else {
+                        format!("syscall {}", s.syscall)
+                    };
+                    out.push_str(&format!(
+                        "      {:>7} us  at {:>7} ms  {} ({})\n",
+                        us(s.cycles),
+                        s.at_ms,
+                        who,
+                        if s.flags & 1 != 0 { "inside" } else { "just after" }
+                    ));
+                }
+
+                // ★ The cumulative answer to "what stalls most", on one line per core. The ring
+                // below only shows the last 16 samples, which is both incomplete and tedious to
+                // read off a laptop screen — this is the number to act on.
+                for (i, c) in cores.iter().enumerate() {
+                    if c.gap_ring_count == 0 {
+                        continue;
+                    }
+                    let mut t: Vec<&GapTally> =
+                        c.gap_tally.iter().filter(|t| t.count > 0).collect();
+                    t.sort_by(|a, b| b.total_cycles.cmp(&a.total_cycles));
+                    out.push_str(&format!("  cpu{} by syscall:", i));
+                    for e in t.iter().take(4) {
+                        let who = if e.syscall == u64::MAX {
+                            String::from("none")
+                        } else {
+                            format!("{}", e.syscall)
+                        };
+                        // Mean matters as much as count: a rare 40 ms stall and a frequent 6 ms one
+                        // are different problems with different fixes.
+                        out.push_str(&format!(
+                            "  {} x{} (avg {}us)",
+                            who,
+                            e.count,
+                            us(e.total_cycles / e.count.max(1))
+                        ));
+                    }
+                    out.push('\n');
+                }
+
+            }
+        }
+
+        if arg == "hist" {
+            out.push_str("\nHistograms (power-of-two buckets, microseconds)\n");
+            for (i, c) in cores.iter().enumerate() {
+                out.push_str(&format!("  cpu{}\n", i));
+                Self::push_hist(&mut out, "    tick gap ", &c.gap_hist, mhz);
+                Self::push_hist(&mut out, "    wake->run", &c.wake_hist, mhz);
+                Self::push_hist(&mut out, "    syscall  ", &c.sys_hist, mhz);
+            }
+        } else {
+            out.push_str("\n  `sched hist` for the full latency distributions.\n");
+        }
+
+        // ★ LAST, deliberately. This report is long and the terminal shows its tail, so a stamp at
+        // the top is scrolled off exactly when it is needed. Two boots of this output get compared
+        // routinely, and a stale flash makes a fixed kernel and an unfixed one produce
+        // indistinguishable numbers — that has now cost this project a debugging cycle twice, most
+        // recently a GPU fence fix that read as "no effect" because the old image was running.
+        // If this value has not changed since the last build, everything above came from the old
+        // kernel.
+        {
+            let mut stamp = [0u8; 48];
+            let n = sys_sched_build_stamp(&mut stamp);
+            if n > 0 {
+                out.push_str(&format!(
+                    "  kernel build stamp: {}\n",
+                    core::str::from_utf8(&stamp[..n]).unwrap_or("?")
+                ));
+            }
+        }
+
+        self.output_history.push_str(&out);
+    }
+
+    /// Render one power-of-two histogram as `lo-hi us: count` lines, skipping empty buckets.
+    ///
+    /// Empty buckets are skipped rather than printed as zeros because the interesting distributions
+    /// here are extremely sparse — a handful of populated buckets spread across a 32-bucket range —
+    /// and 32 lines of mostly zeros per histogram per core does not fit in a terminal window.
+    fn push_hist(out: &mut String, label: &str, hist: &[u32; SCHED_HIST_BUCKETS], mhz: u64) {
+        let total: u64 = hist.iter().map(|&n| n as u64).sum();
+        if total == 0 {
+            out.push_str(&format!("{}  (no samples)\n", label));
+            return;
+        }
+        out.push_str(&format!("{}  n={}\n", label, total));
+        for (i, &n) in hist.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let lo_cycles = 1u64 << i;
+            let hi_cycles = lo_cycles.saturating_mul(2) - 1;
+            // Sub-microsecond buckets all collapse to "0" in integer us, so show cycles there
+            // instead of three identical-looking rows.
+            if hi_cycles < mhz {
+                out.push_str(&format!(
+                    "      {:>10}-{:<10} cyc : {}\n",
+                    lo_cycles, hi_cycles, n
+                ));
+            } else {
+                out.push_str(&format!(
+                    "      {:>10}-{:<10} us  : {}\n",
+                    lo_cycles / mhz,
+                    hi_cycles / mhz,
+                    n
+                ));
+            }
+        }
+    }
+
+    /// `touchpad` — what ACPI says about the I2C-HID touchpad.
+    ///
+    /// ★ Everything printed here has to come from evaluated AML. This laptop's DSDT declares the
+    /// same touch-device slot on FOUR I2C buses and patches its `_HID` and slave address at `_INI`
+    /// from an NVS variable — the one slot becomes WCOM4831@0x0A, ALPS0000@0x2C, ELAN2097@0x10,
+    /// NTRG0001@0x07, SYNA2393 or DLL077A depending on the panel fitted — and `_CRS` is a Method
+    /// whose result additionally depends on `OSYS`/`SDM0`. There is nothing here to hardcode.
+    ///
+    /// ⚠️ The kernel evaluates none of it on its own. `acpi probe 13` asks the thermal governor,
+    /// which runs at IF=1, to do it on its next tick; AML in a syscall is the preemption-boundary
+    /// deadlock that wedged this machine on `panel` and `battery`. So this requests, waits a beat,
+    /// then reads the published cache.
+    fn cmd_touchpad(&mut self) {
+        sys_acpi_probe(13, 0);
+        self.output_history
+            .push_str("Asked the governor to evaluate ACPI for I2C-HID devices (probe 13)...\n");
+        // The governor ticks at 1 Hz, so one tick plus margin.
+        sys_sleep_ms(1600);
+
+        let mut found = 0;
+        for i in 0..4u32 {
+            let info = match sys_i2c_hid_info(i) {
+                Some(d) => d,
+                None => continue,
+            };
+            found += 1;
+            let path = core::str::from_utf8(&info.path)
+                .unwrap_or("?")
+                .trim_end_matches('\0');
+            let ctrl = core::str::from_utf8(&info.ctrl_path)
+                .unwrap_or("?")
+                .trim_end_matches('\0');
+            let (dev, func) = info.pci_dev_func();
+            self.output_history.push_str(&format!(
+                "\n{}\n  controller   {}\n               = PCI 00:{:02x}.{}  (_ADR {:#010x})\n  \
+                 address      {:#04x} @ {} Hz\n  HID desc reg {:#06x}\n  interrupt    {}\n  \
+                 _STA         {:#x}\n",
+                path, ctrl, dev, func, info.ctrl_adr,
+                info.slave_addr, info.speed_hz, info.hid_desc_reg,
+                // ★ Which of these is populated decides whether a GPIO driver is needed at all.
+                // This device's `_CRS` is a Method returning EITHER a GpioInt OR a plain Interrupt,
+                // selected by `OSYS`/`SDM0`. An APIC GSI the IOAPIC can already route means the
+                // whole GPIO phase is unnecessary — and a blank field could not tell us that.
+                if info.irq_gsi != 0 {
+                    format!("APIC GSI {} — no GPIO driver needed", info.irq_gsi)
+                } else if info.gpio_pin != 0 {
+                    format!("GPIO pin {} — needs a GPIO driver", info.gpio_pin)
+                } else {
+                    String::from("none reported")
+                },
+                info.sta,
+            ));
+        }
+
+        if found == 0 {
+            self.output_history.push_str(
+                "No I2C-HID device reported.\n\
+                 \x20 Either the governor has not ticked yet (run `touchpad` again), or every \
+                 PNP0C50 slot\n\
+                 \x20 this firmware declares has _STA bit 0 clear — which is the EXPECTED result \
+                 for three\n\
+                 \x20 of the four, since they are templates for other board builds.\n\
+                 \x20 If it never reports, check `acpi log` FIRST: this depends on the namespace \
+                 having loaded.\n",
+            );
+        } else {
+            self.output_history.push_str(&format!("\n{} device(s).\n", found));
+            self.touchpad_i2c_probe(false);
+        }
+    }
+
+    /// Phase 2: bring up the I2C controller and read the touchpad's HID descriptor over the bus.
+    ///
+    /// ⚠️ Does NOT hand the touchpad over from PS/2 — that is the device's `_DSM`, which nothing
+    /// here calls. The pointer keeps working whatever this prints.
+    fn touchpad_i2c_probe(&mut self, enable: bool) {
+        let before = sys_i2c_hid_probe_result().map(|(s, _)| s).unwrap_or(0);
+        if enable {
+            sys_i2c_hid_enable();
+        } else {
+            sys_i2c_hid_probe_request();
+        }
+        self.output_history.push_str("\nI2C: bringing up the controller and reading the HID descriptor...\n");
+
+        // The kernel task that runs it wakes every 8 ms; bring-up sleeps ~11 ms, and Phase 3a then
+        // watches the input register for 3 s. This window cannot say "move your finger NOW" —
+        // the terminal only redraws once the command returns — so the instruction is in `help`.
+        let mut result = None;
+        for _ in 0..400 {
+            sys_sleep_ms(20);
+            if let Some((seq, r)) = sys_i2c_hid_probe_result() {
+                if seq != before {
+                    result = Some(r);
+                    break;
+                }
+            }
+        }
+        let r = match result {
+            Some(r) => r,
+            None => {
+                self.output_history.push_str("  no answer from the kernel task within 8 s.\n");
+                return;
+            }
+        };
+
+        let stages = ["nothing", "ACPI data", "PCI function", "controller up",
+                      "descriptor read", "descriptor valid", "report descriptor parsed",
+                      "input reports seen"];
+        self.output_history.push_str(&format!(
+            "  reached      {} (stage {}/7)\n  status       {}\n  PCI id       {:04x}:{:04x}  \
+             PMCSR {:#x}  BAR0 {:#x}\n  LPSS resets  {:#x} before release\n  IC_COMP_TYPE {:#010x}  \
+             PARAM_1 {:#010x}\n",
+            stages.get(r.stage as usize).copied().unwrap_or("?"), r.stage,
+            i2c_hid_status_text(r.status),
+            r.vendor_device & 0xFFFF, r.vendor_device >> 16, r.pmcsr_before, r.bar0,
+            r.resets_before, r.comp_type, r.comp_param1,
+        ));
+        if r.bar0_before != r.bar0 || r.assigned != 0 || r.status == 3 || r.status == 11 {
+            // The BAR assignment and every fact it was checked against — a refusal must say which
+            // check refused, or the next boot is a guess.
+            self.output_history.push_str(&format!(
+                "  BAR0         firmware left {:#x}; {} (candidate {:#x})\n  address map  TOUUD {:#x}  \
+                 claims >4G end at {:#x}  CPU {} phys bits  BAR size {:#x}\n  \
+                 64-bit window {}\n",
+                r.bar0_before,
+                if r.assigned != 0 { format!("assigned {:#x}", r.bar0) } else { String::from("not assigned") },
+                r.candidate, r.touud, r.claims_end_above_4g, r.phys_bits, r.bar0_size,
+                if r.m64_len != 0 {
+                    format!("{:#x}..{:#x} (firmware M64B/M64L)", r.m64_base, r.m64_base + r.m64_len)
+                } else {
+                    String::from("none declared")
+                },
+            ));
+        }
+        if r.stage >= 3 {
+            self.output_history.push_str(&format!(
+                "  timing      {} hcnt={} lcnt={} hold={} ({})\n",
+                if r.mode == 2 { "fast 400k" } else { "standard 100k" },
+                r.hcnt, r.lcnt, r.hold,
+                if r.timing_from_fw != 0 { "firmware's values" } else { "our defaults" },
+            ));
+        }
+        if r.status == 7 {
+            self.output_history.push_str(&format!(
+                "  abort src    {:#x}{}\n", r.abort_source,
+                if r.abort_source & 1 != 0 {
+                    "  — nobody acknowledged address; the part may only answer on I2C \
+                     after the PS/2 handover"
+                } else { "" },
+            ));
+        }
+        if r.stage >= 4 {
+            let mut hex = String::new();
+            for (i, b) in r.desc[..30].iter().enumerate() {
+                hex.push_str(&format!("{:02x}", b));
+                hex.push(if i == 14 { '\n' } else { ' ' });
+                if i == 14 { hex.push_str("               "); }
+            }
+            self.output_history.push_str(&format!("  descriptor   {}\n", hex));
+        }
+        if r.stage >= 5 {
+            let w = |i: usize| u16::from_le_bytes([r.desc[i], r.desc[i + 1]]);
+            self.output_history.push_str(&format!(
+                "  ★ valid HID descriptor: vendor {:04x} product {:04x} version {:04x}\n    \
+                 report desc {} bytes @ reg {:#06x}, input reg {:#06x} (max {} bytes), \
+                 command reg {:#06x}, data reg {:#06x}\n",
+                w(20), w(22), w(24), w(4), w(6), w(8), w(10), w(16), w(18),
+            ));
+        }
+        // Phase 3a findings: report descriptor summary and input-register samples.
+        let mut text = [0u8; 1536];
+        let n = sys_i2c_hid_probe_text(&mut text);
+        if n > 0 {
+            self.output_history.push('\n');
+            self.output_history.push_str(core::str::from_utf8(&text[..n]).unwrap_or("(garbled)\n"));
+        }
+    }
+
     /// `wifi …` — the whole radio, from a prompt.
     ///
     /// ★ Meridian step 20 retires `apps/wifi`, the standalone picker, and with it the only graphical
@@ -3339,6 +3857,21 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  battery | bat     - ACPI control-method battery: charge, rate, health (READ ONLY)\n");
                 self.output_history.push_str("  acpi ls [path]    - walk the ACPI namespace   acpi probe <n> [depth] - one evaluation\n");
                 self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
+                self.output_history.push_str("  touchpad          - what ACPI says about the I2C-HID touchpad, then read it over I2C\n");
+                self.output_history.push_str("  touchpad i2c      - just the I2C part: re-initialise and retake the pointer\n");
+                self.output_history.push_str("  touchpad on       - same, after refreshing the ACPI data (multi-touch mode is kept)\n");
+                self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
+                self.output_history.push_str("  touchpad status   - which path drives the pointer (I2C enables itself at boot)\n");
+                self.output_history.push_str("  gpu               - render engine health, and which font the desktop is using\n");
+                self.output_history.push_str("  keyboard          - whether the fast key-repeat rate was set at boot\n");
+                self.output_history.push_str("  touchpad ptp      - multi-touch: 2-finger scroll + right-click, 3-finger swipes\n");
+                self.output_history.push_str("  touchpad mouse    - back to the touchpad's own mouse emulation\n");
+                self.output_history.push_str("  touchpad log      - last 8 multi-touch reports, raw and decoded\n");
+                self.output_history.push_str("  touchpad speed N  - pointer speed in percent (default 100; 10-400)\n");
+                self.output_history.push_str("  touchpad handover - EXPERIMENTAL firmware _DSM. On the test Dell it silences I2C and\n");
+                self.output_history.push_str("                      leaves the touchpad on PS/2 until a power-off. Not needed normally.\n");
+                self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
+                self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
                 self.output_history.push_str("Scrollback:\n");
                 self.output_history.push_str("  PageUp / PageDown - page through history   Home / End - jump to top / live end\n");
                 self.output_history.push_str("  (or drag the scrollbar; new output follows only when you are at the bottom)\n");
@@ -3591,7 +4124,8 @@ impl NyxApp for TerminalApp {
                         // `_REG` (which is fatal on this machine — mark 57) and 11 sets `ECRD`
                         // directly, which is what `_REG` exists to do. Extend this range when a step
                         // is added; 7 was silently rejected for a while and its dump never ran.
-                        Ok(s) if (1..=12).contains(&s) => {
+                        // 13 is I2C-HID discovery (_STA/_CRS/HID2/_ADR per PNP0C50 device).
+                        Ok(s) if (1..=14).contains(&s) => {
                             sys_acpi_probe(s, depth);
                             if s == 1 {
                                 self.output_history.push_str(&format!(
@@ -3861,6 +4395,266 @@ impl NyxApp for TerminalApp {
                          \x20 again after a while — the bytes that MOVE are charge/current/voltage.\n",
                     );
                 }
+            } else if cmd == "touchpad i2c" {
+                // The bus probe alone, reusing whatever `acpi probe 13` last published.
+                self.touchpad_i2c_probe(false);
+            } else if cmd == "touchpad on" {
+                // Initialise the touchpad over I2C and, if mouse reports arrive, make it the
+                // pointer. Refreshes the ACPI half first so this works as the first command of a boot.
+                sys_acpi_probe(13, 0);
+                sys_sleep_ms(1600);
+                self.touchpad_i2c_probe(true);
+            } else if cmd == "touchpad speed" || cmd.starts_with("touchpad speed ") {
+                let arg = cmd.strip_prefix("touchpad speed").unwrap_or("").trim();
+                if arg.is_empty() {
+                    let now = sys_i2c_hid_speed(0);
+                    self.output_history.push_str(&format!("touchpad speed: {}%\n", now));
+                } else {
+                    match arg.trim_end_matches('%').parse::<u32>() {
+                        Ok(v) if v > 0 => {
+                            let now = sys_i2c_hid_speed(v);
+                            self.output_history.push_str(&format!(
+                                "touchpad speed: {}%{}\n", now,
+                                if now != v { "  (clamped to 10..400)" } else { "" },
+                            ));
+                        }
+                        _ => self.output_history.push_str("usage: touchpad speed <10-400>\n"),
+                    }
+                }
+            } else if cmd == "keyboard" {
+                self.output_history.push_str(match sys_keyboard_typematic() {
+                    1 => "keyboard repeat: 250 ms delay, 30 characters/s (set at boot, acknowledged)\n",
+                    2 => "keyboard repeat: power-on default (500 ms, ~11/s) — the keyboard did not \
+                          acknowledge the set-rate command\n",
+                    3 => "keyboard repeat: power-on default — the rate byte was not acknowledged; the \
+                          keyboard was re-enabled\n",
+                    _ => "keyboard repeat: not attempted this boot\n",
+                });
+            } else if let Some(arg) = cmd.strip_prefix("gpu retry") {
+                // Bisect the pixel-stage hang: clear the latch and let the compositor try again
+                // with a different pixel shader. Then `gpu` says whether it latched again.
+                let (mode, what) = match arg.trim() {
+                    "solid" => (1, "a SOLID magenta shader (no texture sampling) — if the GPU \
+                                    works, windows turn magenta; `gpu retry normal` restores them"),
+                    "tex" => (2, "the plain TEXTURED shader (sampling, no opacity)"),
+                    "" | "normal" => (0, "the normal shader"),
+                    _ => (99, ""),
+                };
+                if mode == 99 {
+                    self.output_history.push_str("usage: gpu retry [solid|tex|normal]\n");
+                } else if sys_gpu_retry(mode) {
+                    self.output_history.push_str(&format!(
+                        "render latch cleared; the compositor is retrying with {}.\n\
+                         Move a window, then run `gpu`.\n", what));
+                } else {
+                    self.output_history.push_str("gpu retry: no Intel render engine\n");
+                }
+            } else if cmd == "gpu" {
+                // Which font the desktop is in, and why. The shell falls back to the CPU bitmap
+                // font whenever the kernel refuses GPU text — so the refusal counts answer "is
+                // the text smooth or pixelated?" without asking anyone to judge it by eye.
+                match sys_gpu_health() {
+                    None => self.output_history.push_str("gpu: no answer from the kernel\n"),
+                    Some(h) => {
+                        // When the GPU refuses, the shell draws the SAME Meridian glyphs from its
+                        // atlas on the CPU — so this says who draws, not which font.
+                        let verdict = if h.gpu_present == 0 {
+                            "no Intel render engine — the CPU draws all text (same Meridian font)"
+                        } else if h.wedged != 0 {
+                            "render engine LATCHED OFF after repeated hangs — the CPU draws text \
+                             and composites instead, until reboot"
+                        } else if h.text_refused > 0 && h.text_drawn == 0 {
+                            "GPU text has never succeeded this boot — the CPU draws it instead"
+                        } else if h.text_refused > 0 {
+                            "GPU text mostly works; some batches fell back to the CPU"
+                        } else {
+                            "GPU text working — the render engine draws it"
+                        };
+                        self.output_history.push_str(&format!(
+                            "gpu: {}\n  render hangs {} of {} (latched: {})   GL hangs {}\n  \
+                             text batches: drawn {}  refused {} ({} because latched)\n",
+                            verdict,
+                            h.render_hangs, h.hang_limit, if h.wedged != 0 { "YES" } else { "no" },
+                            h.gl_hangs,
+                            h.text_drawn, h.text_refused, h.text_refused_wedged,
+                        ));
+                        if h.gpu_present != 0 {
+                            let t = h.boot_tests;
+                            let r = |bit: u32| if t & (1 << bit) != 0 { "pass" } else { "FAIL" };
+                            self.output_history.push_str(&format!(
+                                "  device {:#06x}{}   compositor shader: {}\n  \
+                                 MOCS restored after power-down: {} times\n  \
+                                 boot tests: bring-up {}  ring store {}  ring fence {}  batch {}\n",
+                                h.device_id,
+                                if h.device_id == 0x9BC4 { " (the Comet Lake-H the 3D engine was built on)" } else { "" },
+                                match h.ps_mode { 1 => "SOLID test", 2 => "TEXTURED test", _ => "normal" },
+                                h.mocs_restores,
+                                r(0), r(1), r(2),
+                                if t & (1 << 4) == 0 { "not run" } else { r(3) },
+                            ));
+                            let s = h.first_hang;
+                            if s.valid != 0 {
+                                // Raw registers: ACTHD says where the engine is executing (ring vs
+                                // batch), IPEHR the command it choked on. Paste these as they are.
+                                self.output_history.push_str(&format!(
+                                    "  FIRST HANG: fence {:#010x} want {:#010x}\n    \
+                                     HEAD {:#x} TAIL {:#x} CTL {:#x} ACTHD {:#x}\n    \
+                                     IPEHR {:#010x} IPEIR {:#x} INSTDONE {:#010x} MI_MODE {:#x}\n    \
+                                     EIR {:#x} FAULT {:#010x} ERROR {:#x} FW_ACK {:#x}\n",
+                                    s.fence_got, s.fence_want, s.head, s.tail, s.ctl, s.acthd,
+                                    s.ipehr, s.ipeir, s.instdone, s.mi_mode,
+                                    s.eir, s.fault, s.error_gen6, s.fw_ack,
+                                ));
+                            } else {
+                                self.output_history.push_str("  no fence-wait hang this boot\n");
+                            }
+                            // The composite/text path has its own wait — this is the one that
+                            // latches the engine off.
+                            let s = h.scene_hang;
+                            if s.valid != 0 {
+                                let stage = match s.fence_got {
+                                    0 => "before the first marker (engine never started the stream)".into(),
+                                    0x10 => "prologue start (cache invalidate)".into(),
+                                    1 => "after PIPELINE_SELECT".into(),
+                                    2 => "after STATE_BASE_ADDRESS".into(),
+                                    3 => "after URB setup".into(),
+                                    4 => "after VS/HS/DS/GS state".into(),
+                                    6 => "all draws issued, waiting on the RT flush".into(),
+                                    7 => "RT flushed, final fence write missing".into(),
+                                    n if n >= 0x20 && n < 0x100 => format!("drawing mesh {}", n - 0x20),
+                                    n => format!("unknown marker {:#x}", n),
+                                };
+                                self.output_history.push_str(&format!(
+                                    "  FIRST SCENE FAILURE: {}\n    last marker {:#x} = {}\n    \
+                                     stream {} dwords  HEAD {:#x} TAIL {:#x} CTL {:#x} ACTHD {:#x}\n    \
+                                     IPEHR {:#010x} IPEIR {:#x} INSTDONE {:#010x} MI_MODE {:#x}\n    \
+                                     EIR {:#x} FAULT {:#010x} ERROR {:#x} FW_ACK {:#x}\n",
+                                    if s._pad == 1 { "ring had no room (submit refused)" } else { "fence never arrived" },
+                                    s.fence_got, stage,
+                                    s.fence_want, s.head, s.tail, s.ctl, s.acthd,
+                                    s.ipehr, s.ipeir, s.instdone, s.mi_mode,
+                                    s.eir, s.fault, s.error_gen6, s.fw_ack,
+                                ));
+                            } else {
+                                self.output_history.push_str("  no scene failure this boot\n");
+                            }
+                        }
+                    }
+                }
+            } else if cmd == "touchpad status" {
+                let s = sys_i2c_hid_status();
+                self.output_history.push_str(&format!(
+                    "pointer: {}\n  mode: {}{}\n  probes run: {}   interrupts taken: {}   speed: {}%\n  \
+                     reports: mouse {}  touch pad {}  other {}  empty {}\n",
+                    if s.active {
+                        "I2C touchpad"
+                    } else if s.fell_back {
+                        "PS/2 — I2C was active but went silent while PS/2 kept talking, so it fell back"
+                    } else {
+                        "PS/2 (I2C not enabled — it normally enables itself during boot; try `touchpad on`)"
+                    },
+                    if s.ptp {
+                        "precision (multi-touch): tap, 2-finger scroll/right-click, 3-finger swipe"
+                    } else if s.ptp_failed {
+                        "mouse emulation — precision mode went silent on I2C and was reverted \
+                         automatically (`touchpad log` shows what arrived)"
+                    } else {
+                        "mouse emulation (the touchpad's own firmware); `touchpad ptp` for multi-touch"
+                    },
+                    if s.adopted_ptp {
+                        "\n    (the DEVICE switched itself to precision mode, and the driver followed)"
+                    } else {
+                        ""
+                    },
+                    s.probes,
+                    s.irqs,
+                    sys_i2c_hid_speed(0),
+                    s.counts[0], s.counts[1], s.counts[2], s.counts[3],
+                ));
+            } else if cmd == "touchpad log" {
+                // The last 8 reports received in precision mode: raw bytes beside what the kernel
+                // decoded. Read against the "finger 1:" line of `touchpad`.
+                let log = sys_touchpad_log();
+                let mut any = false;
+                for e in log.iter().filter(|e| e.len > 0) {
+                    any = true;
+                    let mut hex = String::new();
+                    for b in &e.raw[..e.len as usize] {
+                        hex.push_str(&format!("{:02x} ", b));
+                    }
+                    let decoded = if e.n == 0xFE {
+                        format!("(empty or oversized read: length field {})", e.x)
+                    } else if e.n == 0xFF {
+                        String::from("(not a touch report)")
+                    } else if e.n == 0 {
+                        String::from("no finger")
+                    } else {
+                        format!("{} finger(s), first at {},{}", e.n, e.x, e.y)
+                    };
+                    self.output_history.push_str(&format!("  {}  -> {}\n", hex, decoded));
+                }
+                if !any {
+                    self.output_history.push_str("No precision-mode reports logged yet (`touchpad ptp`, then touch the pad).\n");
+                }
+            } else if cmd == "touchpad ptp" || cmd == "touchpad mouse" {
+                let ptp = cmd == "touchpad ptp";
+                sys_i2c_hid_set_mode(ptp);
+                // The kernel task picks the request up within a few ms; give it up to half a second.
+                let mut result = 0u8;
+                for _ in 0..25 {
+                    sys_sleep_ms(20);
+                    result = sys_i2c_hid_status().mode_result;
+                    if result != 0 {
+                        break;
+                    }
+                }
+                self.output_history.push_str(match (result, ptp) {
+                    (1, true) => "★ precision mode on — ON TRIAL: touch the pad within 10 s, or it goes back to\n  \
+                                  mouse mode by itself. One finger moves, tap clicks, two-finger tap right-clicks,\n  \
+                                  two fingers scroll, three-finger swipe up/down opens/closes the Command.\n  \
+                                  `touchpad mouse` goes back; `touchpad log` shows what arrived.\n",
+                    (1, false) => "Mouse emulation on: the touchpad's own firmware interprets fingers again.\n",
+                    (2, _) => "This touchpad declares no Input Mode feature — precision mode is unavailable.\n",
+                    (3, _) => "The mode switch failed on the I2C bus; the touchpad is unchanged.\n",
+                    (4, _) => "The I2C touchpad is not active (`touchpad status`); nothing to switch.\n",
+                    (5, _) => "Refused: the touchpad's X/Y range parsed as implausibly small, which would \
+                               make the pointer jump. Paste `touchpad` output.\n",
+                    _ => "No answer from the kernel task within 0.5 s.\n",
+                });
+                if ptp && result == 1 {
+                    // What happened beyond Input Mode — Linux hid-multitouch's enabling steps.
+                    let n = sys_i2c_hid_status().mode_note;
+                    let step = |present: bool, done: bool| {
+                        if !present { "not in this device's descriptor" } else if done { "done" } else { "FAILED" }
+                    };
+                    self.output_history.push_str(&format!(
+                        "  Win8 blob read: {}\n  selective reporting (surface + button switch): {}\n",
+                        step(n & 1 != 0, n & 2 != 0),
+                        step(n & 4 != 0, n & 8 != 0),
+                    ));
+                }
+            } else if cmd == "touchpad off" {
+                sys_i2c_hid_disable();
+                self.output_history.push_str("I2C touchpad released; PS/2 mouse bytes are accepted again.\n");
+            } else if cmd == "touchpad handover" {
+                // ⚠️ The firmware handover: the touchpad's HIDG _DSM, which on this laptop makes the
+                // EC stop PS/2 mouse emulation. Only worth running if `touchpad on` saw no reports.
+                sys_acpi_probe(14, 0);
+                sys_sleep_ms(1600);
+                self.output_history.push_str(
+                    "Firmware handover (_DSM) requested. The PS/2 pointer is now off until a full \
+                     power-off.\nRe-initialising the touchpad over I2C, as Windows and Linux do after \
+                     the handover:\n",
+                );
+                // The EC may reset the touchpad when it lets go of it. Re-initialise straight away
+                // so the pointer is back in (proven) mouse mode before precision mode is tried —
+                // on the hardware, going handover -> ptp directly left the pointer dead.
+                self.touchpad_i2c_probe(true);
+            } else if cmd == "touchpad" || cmd.starts_with("touchpad ") {
+                self.cmd_touchpad();
+            } else if cmd == "sched" || cmd.starts_with("sched ") {
+                let arg = cmd.strip_prefix("sched").unwrap_or("").trim();
+                self.cmd_sched(arg);
             } else if cmd == "battery" || cmd == "bat" {
                 // ACPI control-method battery. Depends on the namespace actually having loaded, so
                 // if this says "no battery" the first thing to check is `acpi log`, not the battery.

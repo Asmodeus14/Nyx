@@ -129,5 +129,6 @@ its window. `get` does not.
 | 569–571 | WiFi RX counters, NOSNAP dump, RX ring state (diagnostics) |
 | 572 | dns_resolve_all — up to 4 addresses |
 
-Next free: **573**. Duplicates are silent (`#![allow(warnings)]` hides `unreachable_patterns`) — run
+This table lists the networking syscalls only; the full, current allocation (and the next free
+number) is in [KERNEL.md](KERNEL.md#system-calls). Duplicates are silent (`#![allow(warnings)]` hides `unreachable_patterns`) — run
 `tools/check_dup_syscall_arms.sh` before claiming one.
