@@ -93,7 +93,7 @@ The runner connects QEMU's serial port to stdio, so the kernel log is readable.
 
 **Shortcut:** `tools/demo/run-demo.sh` does all of the above — disk image, firmware, flags — and
 serves the display in a browser via noVNC at `http://localhost:6080/`. By default it downloads the
-prebuilt image from the `demo` GitHub release; `NYX_IMG=target/x86_64-unknown-none/release/nyx-kernel.efi.img`
+prebuilt image from the latest GitHub release; `NYX_IMG=target/x86_64-unknown-none/release/nyx-kernel.efi.img`
 runs your own build. The same script backs the Codespaces demo (`.devcontainer/demo/`).
 
 What QEMU does **not** exercise: the Intel GPU (no render engine, so GPU composite/text fall back

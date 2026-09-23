@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Boot Nyx in QEMU and show its screen in a web browser (noVNC).
 #
-# This is the "try it without building it" path: by default it downloads the prebuilt demo image
-# from the GitHub release, creates the NVMe disk the kernel needs, boots it headless, and serves the
+# This is the "try it without building it" path: by default it downloads the prebuilt image
+# from the latest GitHub release, creates the NVMe disk the kernel needs, boots it headless, and serves the
 # display at http://localhost:6080. The Codespaces demo (.devcontainer/demo/) runs exactly this.
 #
 #   tools/demo/run-demo.sh                              # download the release image and run it
@@ -17,8 +17,8 @@
 set -euo pipefail
 
 DIR=${NYX_DEMO_DIR:-$HOME/.nyx-demo}
-IMG_URL=${NYX_IMG_URL:-https://github.com/Asmodeus14/Nyx/releases/download/demo/nyx-demo.img}
-IMG=${NYX_IMG:-$DIR/nyx-demo.img}
+IMG_URL=${NYX_IMG_URL:-https://github.com/Asmodeus14/Nyx/releases/latest/download/nyx-x86_64.img}
+IMG=${NYX_IMG:-$DIR/nyx-x86_64.img}
 DISK=$DIR/nvme.img
 PORT=${NYX_WEB_PORT:-6080}
 NOVNC_DIR=${NOVNC_DIR:-/usr/share/novnc}
