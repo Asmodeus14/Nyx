@@ -1030,8 +1030,11 @@ pub struct TouchpadStatus {
     pub fell_back: bool,
     /// Precision (multi-touch) mode is on: gestures are interpreted by the kernel.
     pub ptp: bool,
-    /// Last mode switch: 0 none yet, 1 ok, 2 device has no Input Mode, 3 bus error, 4 no device.
+    /// Last mode switch: 0 none yet, 1 ok, 2 device has no Input Mode, 3 bus error, 4 no device,
+    /// 5 implausible X/Y range.
     pub mode_result: u8,
+    /// Precision mode went silent on I2C and was reverted to mouse mode automatically.
+    pub ptp_failed: bool,
     /// Probes completed, including the automatic one at boot.
     pub probes: u32,
     pub irqs: u32,
@@ -1044,6 +1047,7 @@ pub fn sys_i2c_hid_status() -> TouchpadStatus {
         fell_back: v & 2 != 0,
         ptp: v & 4 != 0,
         mode_result: ((v >> 3) & 0x7) as u8,
+        ptp_failed: v & (1 << 6) != 0,
         probes: ((v >> 16) & 0xFFFF) as u32,
         irqs: (v >> 32) as u32,
     }

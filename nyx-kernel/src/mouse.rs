@@ -161,6 +161,17 @@ pub fn handle_interrupt(packet_byte: u8) {
         if n < PS2_FALLBACK_BYTES {
             return;
         }
+        // ★ In precision mode, silence means precision mode is what failed — not I2C. On the
+        // hardware, switching to it stopped every I2C report while the EC's PS/2 emulation started
+        // emitting garbage (the pointer zig-zagged, ran to the bottom and vanished). I2C mouse mode
+        // is proven, so go back to THAT, and keep ignoring PS/2 rather than trusting its garbage.
+        if crate::drivers::i2c_hid::PTP_ACTIVE.load(Relaxed) {
+            crate::drivers::i2c_hid::PTP_ACTIVE.store(false, Relaxed);
+            crate::drivers::i2c_hid::PTP_FAILED.store(true, Relaxed);
+            crate::drivers::i2c_hid::MODE_REQUEST.store(1, Relaxed);
+            crate::drivers::i2c_hid::PS2_WHILE_SILENT.store(0, Relaxed);
+            return;
+        }
         crate::drivers::i2c_hid::POINTER_ACTIVE.store(false, Relaxed);
         crate::drivers::i2c_hid::FELL_BACK.store(true, Relaxed);
         // This byte is mid-stream: fall through to the resync below, which drops it.

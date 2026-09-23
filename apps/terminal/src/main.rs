@@ -4424,6 +4424,9 @@ impl NyxApp for TerminalApp {
                     },
                     if s.ptp {
                         "precision (multi-touch): tap, 2-finger scroll/right-click, 3-finger swipe"
+                    } else if s.ptp_failed {
+                        "mouse emulation — precision mode went silent on I2C and was reverted \
+                         automatically (`touchpad log` shows what arrived)"
                     } else {
                         "mouse emulation (the touchpad's own firmware); `touchpad ptp` for multi-touch"
                     },
@@ -4442,7 +4445,9 @@ impl NyxApp for TerminalApp {
                     for b in &e.raw[..e.len as usize] {
                         hex.push_str(&format!("{:02x} ", b));
                     }
-                    let decoded = if e.n == 0xFF {
+                    let decoded = if e.n == 0xFE {
+                        format!("(empty or oversized read: length field {})", e.x)
+                    } else if e.n == 0xFF {
                         String::from("(not a touch report)")
                     } else if e.n == 0 {
                         String::from("no finger")

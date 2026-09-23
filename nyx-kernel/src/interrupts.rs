@@ -4438,12 +4438,14 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     use core::sync::atomic::Ordering::Relaxed;
                     use crate::drivers::i2c_hid::{FELL_BACK, IRQ_COUNT, POINTER_ACTIVE, RESULT};
                     // bit 2 = precision (multi-touch) mode, bits 3..5 = last mode switch result.
-                    use crate::drivers::i2c_hid::{MODE_RESULT, PTP_ACTIVE};
+                    // bit 6 = precision mode went silent and was reverted to mouse mode.
+                    use crate::drivers::i2c_hid::{MODE_RESULT, PTP_ACTIVE, PTP_FAILED};
                     let seq = RESULT.try_lock().map_or(0, |r| r.seq) as u64 & 0xFFFF;
                     frame.rax = POINTER_ACTIVE.load(Relaxed) as u64
                         | (FELL_BACK.load(Relaxed) as u64) << 1
                         | (PTP_ACTIVE.load(Relaxed) as u64) << 2
                         | ((MODE_RESULT.load(Relaxed) as u64) & 0x7) << 3
+                        | (PTP_FAILED.load(Relaxed) as u64) << 6
                         | seq << 16
                         | (IRQ_COUNT.load(Relaxed) as u64) << 32;
                 }

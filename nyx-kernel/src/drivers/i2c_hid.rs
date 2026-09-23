@@ -203,6 +203,9 @@ pub static MODE_REQUEST: core::sync::atomic::AtomicU8 = core::sync::atomic::Atom
 pub static MODE_RESULT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// True while the device is in precision mode.
 pub static PTP_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Precision mode went silent on I2C (while PS/2 kept talking) and was reverted to mouse mode —
+/// see `mouse::handle_interrupt`. Cleared by the next successful switch into precision mode.
+pub static PTP_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// One logged report: the raw bytes (from the report ID on) and what the precision path decoded.
 /// Mirrored by `nyx_api::TouchpadLogEntry`.
@@ -560,6 +563,11 @@ fn poll() {
                 } else if dev.ptp_on {
                     log_report(&buf[2..len], 0xFF, 0, 0);
                 }
+            } else if dev.ptp_on {
+                // Empty (len ≤ 2) or longer than the declared maximum. Logged too: after the
+                // first precision-mode attempt the log was EMPTY, and "no reports" could not be
+                // told apart from "reads that returned nothing". The whole buffer, length included.
+                log_report(&buf[..n.min(16)], 0xFE, len as i32, 0);
             }
         }
     }
@@ -784,6 +792,9 @@ fn set_mode(dev: &mut Live, ptp: bool) {
         Ok(()) => {
             dev.ptp_on = ptp;
             PTP_ACTIVE.store(ptp, Ordering::Release);
+            if ptp {
+                PTP_FAILED.store(false, Ordering::Release);
+            }
             // A fresh interpretation for the new mode: no half-assembled frame, no stale fingers.
             let x_max = dev.p.ptp.map_or(1000, |t| t.x_max);
             dev.engine = crate::drivers::gesture::Engine::new(crate::drivers::gesture::Config::for_pad(x_max));
