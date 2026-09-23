@@ -264,6 +264,13 @@ pub fn with_glyph_face<R>(slot: usize, c: char, px: usize, f: impl FnOnce(&Glyph
         };
     }
     let st = guard.as_mut().unwrap();
+    // Font fallback: a character this face does not carry is taken from the default face (DejaVu,
+    // which covers far more of Unicode) BEFORE `rasterize` substitutes '?'. The Meridian faces lack
+    // '↵', so the Command's "↵ open" read "? open" once its text came from the atlas.
+    if slot != FACE_DEFAULT && st.face.glyph_index(c).is_none() && !c.is_whitespace() {
+        drop(guard);
+        return with_glyph_face(FACE_DEFAULT, c, px, f);
+    }
     let key = (c, px as u32);
     if !st.cache.contains_key(&key) {
         // Split borrows: read face/upem, then insert into cache.

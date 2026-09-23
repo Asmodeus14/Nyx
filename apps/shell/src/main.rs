@@ -1635,7 +1635,16 @@ fn paint_text(atlas: Option<&Atlas>, canvas: &mut Canvas, labels: &[Label], icon
             TEXT_ON_GPU.store(true, core::sync::atomic::Ordering::Relaxed);
             return true;
         }
+        // ★ GPU refused: draw the SAME glyphs from the SAME atlas on the CPU. On the test laptop the
+        // render engine never completes a batch (`gpu`: drawn 0, latched), so this — not the GPU —
+        // is what draws the desktop's text there. The metrics are the atlas's either way, so
+        // `measure` stays right (TEXT_ON_GPU means "atlas text", GPU or not).
+        let (w, h) = (canvas.width, canvas.height);
+        a.draw_cpu(canvas.buffer, w, h, &glyphs);
+        TEXT_ON_GPU.store(true, core::sync::atomic::Ordering::Relaxed);
+        return false;
     }
+    // No atlas at all (its SHM could not be created): the bitmap font, measured as such.
     TEXT_ON_GPU.store(false, core::sync::atomic::Ordering::Relaxed);
     for l in labels {
         if l.x < 0 || l.y < 0 {
