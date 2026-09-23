@@ -1382,11 +1382,17 @@ impl TerminalApp {
             // The BAR assignment and every fact it was checked against — a refusal must say which
             // check refused, or the next boot is a guess.
             self.output_history.push_str(&format!(
-                "  BAR0         firmware left {:#x}; {}\n  address map  TOUUD {:#x}  highest BAR >4G {:#x}  \
-                 CPU {} phys bits  BAR size {:#x}\n",
+                "  BAR0         firmware left {:#x}; {} (candidate {:#x})\n  address map  TOUUD {:#x}  \
+                 claims >4G end at {:#x}  CPU {} phys bits  BAR size {:#x}\n  \
+                 64-bit window {}\n",
                 r.bar0_before,
                 if r.assigned != 0 { format!("assigned {:#x}", r.bar0) } else { String::from("not assigned") },
-                r.touud, r.highest_bar_above_4g, r.phys_bits, r.bar0_size,
+                r.candidate, r.touud, r.claims_end_above_4g, r.phys_bits, r.bar0_size,
+                if r.m64_len != 0 {
+                    format!("{:#x}..{:#x} (firmware M64B/M64L)", r.m64_base, r.m64_base + r.m64_len)
+                } else {
+                    String::from("none declared")
+                },
             ));
         }
         if r.stage >= 3 {

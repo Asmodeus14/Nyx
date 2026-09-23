@@ -913,6 +913,9 @@ pub struct I2cHidInfo {
     pub fm_hcnt: u32,
     pub fm_lcnt: u32,
     pub fm_hold: u32,
+    /// Root bridge 64-bit MMIO window (firmware NVS `M64B`/`M64L`). Length 0 = none.
+    pub m64_base: u64,
+    pub m64_len: u64,
 }
 
 impl Default for I2cHidInfo {
@@ -924,7 +927,7 @@ impl Default for I2cHidInfo {
 
 // Same ABI guard as SysMetrics/SchedStats: the kernel memcpy's these bytes, so a field added on one
 // side and not the other must break the build rather than reinterpret every field after it.
-const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 200);
+const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 216);
 
 impl I2cHidInfo {
     /// PCI device and function decoded from `ctrl_adr`.
@@ -975,7 +978,13 @@ pub struct I2cHidProbe {
     /// BAR0 as the firmware left it, before any assignment.
     pub bar0_before: u64,
     pub touud: u64,
-    pub highest_bar_above_4g: u64,
+    /// Where every other device's claims above 4 GiB provably end, and the address BAR0 was
+    /// offered — reported even when the checks refused it.
+    pub claims_end_above_4g: u64,
+    pub candidate: u64,
+    /// The window the candidate had to fall inside.
+    pub m64_base: u64,
+    pub m64_len: u64,
     pub bar0_size: u32,
     /// 1 if the probe gave BAR0 its address.
     pub assigned: u32,
@@ -990,7 +999,7 @@ impl Default for I2cHidProbe {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<I2cHidProbe>() == 144);
+const _: () = assert!(core::mem::size_of::<I2cHidProbe>() == 168);
 
 /// Ask the kernel to bring up the touchpad's I2C controller and read its HID descriptor.
 ///

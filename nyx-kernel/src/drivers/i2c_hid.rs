@@ -80,7 +80,13 @@ pub struct ProbeResult {
     pub bar0_before: u64,
     /// The facts the BAR assignment was checked against.
     pub touud: u64,
-    pub highest_bar_above_4g: u64,
+    /// Where every other device's claims above 4 GiB provably end, and the address BAR0 was
+    /// offered — reported even when the checks refused it.
+    pub claims_end_above_4g: u64,
+    pub candidate: u64,
+    /// The window the candidate had to fall inside.
+    pub m64_base: u64,
+    pub m64_len: u64,
     pub bar0_size: u32,
     /// 1 if this probe gave BAR0 its address.
     pub assigned: u32,
@@ -93,12 +99,12 @@ impl ProbeResult {
         seq: 0, stage: 0, status: 0, abort_source: 0, vendor_device: 0, pmcsr_before: 0,
         resets_before: 0, comp_type: 0, comp_param1: 0, mode: 0, hcnt: 0, lcnt: 0, hold: 0,
         timing_from_fw: 0, slave_addr: 0, desc_reg: 0, bar0: 0, desc: [0; 32],
-        bar0_before: 0, touud: 0, highest_bar_above_4g: 0, bar0_size: 0, assigned: 0,
+        bar0_before: 0, touud: 0, claims_end_above_4g: 0, candidate: 0, m64_base: 0, m64_len: 0, bar0_size: 0, assigned: 0,
         phys_bits: 0, _pad: 0,
     };
 }
 
-const _: () = assert!(core::mem::size_of::<ProbeResult>() == 144);
+const _: () = assert!(core::mem::size_of::<ProbeResult>() == 168);
 
 /// Length of an I2C-HID descriptor, and the only `wHIDDescLength` the spec allows.
 const HID_DESC_LEN: usize = 30;
@@ -144,7 +150,10 @@ fn run() -> ProbeResult {
     r.bar0 = info.bar0;
     r.bar0_before = info.bar0_before;
     r.touud = info.touud;
-    r.highest_bar_above_4g = info.highest_bar_above_4g;
+    r.claims_end_above_4g = info.claims_end_above_4g;
+    r.candidate = info.candidate;
+    r.m64_base = hid.m64_base;
+    r.m64_len = hid.m64_len;
     r.bar0_size = info.bar0_size;
     r.assigned = info.assigned as u32;
     r.phys_bits = info.phys_bits;

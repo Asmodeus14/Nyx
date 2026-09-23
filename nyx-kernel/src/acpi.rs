@@ -196,6 +196,9 @@ pub struct I2cHidInfo {
     pub fm_hcnt: u32,
     pub fm_lcnt: u32,
     pub fm_hold: u32,
+    /// Root bridge 64-bit MMIO window (firmware NVS `M64B`/`M64L`). Length 0 = none.
+    pub m64_base: u64,
+    pub m64_len: u64,
 }
 
 impl I2cHidInfo {
@@ -216,6 +219,8 @@ impl I2cHidInfo {
         fm_hcnt: 0,
         fm_lcnt: 0,
         fm_hold: 0,
+        m64_base: 0,
+        m64_len: 0,
     };
 
     /// PCI device and function decoded from `ctrl_adr`.

@@ -71,6 +71,10 @@ typedef struct {
      * fast mode). Zero = not found; the driver falls back to conservative defaults. */
     UINT32 ss_hcnt, ss_lcnt, ss_hold;
     UINT32 fm_hcnt, fm_lcnt, fm_hold;
+    /* The root bridge's 64-bit MMIO window, as the firmware's PCI0._CRS would report it: the plain
+     * NVS Names M64B/M64L. Read directly because _CRS itself also touches PCI_Config, which our
+     * OS layer answers with all-ones. Zero length = no 64-bit window. */
+    UINT64 m64_base, m64_len;
 } NyxI2cHidInfo;
 
 typedef struct {
@@ -235,6 +239,12 @@ static ACPI_STATUS I2cHidCallback(ACPI_HANDLE Object, UINT32 Level, void *Contex
                 }
             }
         }
+    }
+
+    {
+        UINT64 v;
+        if (NyxEvalInteger(NULL, "\\M64B", &v)) info->m64_base = v;
+        if (NyxEvalInteger(NULL, "\\M64L", &v)) info->m64_len = v;
     }
 
     /* Only claim the entry if it is usable. Slave address 0 means the _CRS walk found no I2C

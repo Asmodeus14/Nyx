@@ -135,31 +135,33 @@ pub struct BringUpInfo {
     pub assigned: bool,
     /// Top of upper usable DRAM (host bridge TOUUD). Addresses above it route to PCI.
     pub touud: u64,
-    /// Highest memory-BAR base any PCI function already has, above 4 GiB (0 = none).
-    pub highest_bar_above_4g: u64,
+    /// Where everything other PCI functions claim above 4 GiB provably ENDS (0 = nothing there).
+    pub claims_end_above_4g: u64,
+    /// The address BAR0 would be given — reported whether or not the checks allowed it.
+    pub candidate: u64,
     pub phys_bits: u32,
     pub resets_before: u32,
     pub comp_type: u32,
     pub comp_param1: u32,
 }
 
-/// Where an unassigned LPSS BAR0 is placed, with BAR1 immediately after it.
+/// Where an unassigned LPSS BAR0 goes when NOTHING above 4 GiB is claimed yet, with BAR1 after it.
 ///
 /// ★ This firmware leaves the Serial IO controllers in PCI mode with BAR0 = 0 and the function in
 /// D3 — measured on hardware: `PMCSR 0xb, BAR0 0x0`. The OS is expected to allocate it, as Windows'
-/// and Linux's PCI cores do from the root bridge's 64-bit window, which on Intel client platforms
-/// starts at 256 GiB. Linux puts these exact controllers at 0x40_1000_0000 on this platform family.
+/// and Linux's PCI cores do from the root bridge's 64-bit window. Linux uses 0x40_1000_0000 on
+/// platforms whose window starts at 256 GiB.
+///
+/// ⚠️ On THIS laptop that address was refused, correctly: another device already had a BAR at
+/// 0x60_01B2_8000, so the firmware's 64-bit devices live near 384 GiB and 256 GiB is not proven to
+/// be in the window at all. When anything is claimed up there, [`assign_bar0`] instead goes
+/// immediately ABOVE the highest claim — inside the region the firmware itself already routes.
 ///
 /// Nyx has no general PCI resource allocator, and the root window cannot be read from ACPI here
 /// (`PCI0._CRS` computes it from host-bridge PCI_Config fields, and `AcpiOsReadPciConfiguration`
-/// returns all-ones). So instead of trusting a window, [`assign_bar0`] proves the address is free:
-/// above TOUUD (so it routes to PCI, not DRAM), within the CPU's physical address width, and above
-/// every BAR any device already has.
-const ASSIGN_BASE: u64 = 0x40_1000_0000;
-/// The bottom of the region nothing else may occupy for [`ASSIGN_BASE`] to be safe. A BAR below
-/// this cannot reach ASSIGN_BASE: 64-bit BARs are aligned to their size, so a BAR at base B < 256
-/// GiB covering 257 GiB would have to be ≥ 256 GiB large.
-const ASSIGN_REGION: u64 = 0x40_0000_0000;
+/// returns all-ones). So the address is PROVEN free rather than trusted: see
+/// [`claims_end_above_4g`].
+const FALLBACK_BASE: u64 = 0x40_1000_0000;
 
 #[inline(always)]
 fn rd(base: u64, off: u64) -> u32 {
@@ -226,13 +228,19 @@ fn size_bar64(bus: u8, dev: u8, func: u8, off: u8) -> u64 {
     if mask == 0 { 0 } else { (!mask).wrapping_add(1) }
 }
 
-/// The highest address any OTHER PCI function already claims above 4 GiB: memory BAR bases, and
-/// the top of every bridge's prefetchable window (a window routes its whole range downstream, so
-/// its LIMIT is what matters). 0 if nothing is up there.
+/// Where everything any OTHER PCI function claims above 4 GiB provably ends (exclusive). 0 if
+/// nothing is claimed up there.
 ///
-/// Read-only: bases are read, never sized — see [`size_bar64`] for why.
-fn highest_claim_above_4g(skip: (u8, u8, u8)) -> u64 {
-    let mut top = 0u64;
+/// Other devices' BARs are live (the GPUs, the NVMe disk), so they are only READ, never sized — see
+/// [`size_bar64`]. Their extent is bounded instead by the rule every PCI BAR obeys: it is naturally
+/// aligned to its size. So a BAR at base B is at most `B & -B` long. That bound is only needed for
+/// the HIGHEST base: any lower BAR extending past it would overlap it, which PCI forbids.
+///
+/// Bridge prefetchable windows are claims too, and route their whole range downstream — their
+/// LIMIT counts, not their base.
+fn claims_end_above_4g(skip: (u8, u8, u8)) -> u64 {
+    let mut top_base = 0u64;
+    let mut end = 0u64;
     for d in PciDriver::new().scan() {
         if (d.bus, d.device, d.func) == skip {
             continue;
@@ -247,7 +255,7 @@ fn highest_claim_above_4g(skip: (u8, u8, u8)) -> u64 {
         while i < nbars {
             let (addr, is64) = bar_address(d.bus, d.device, d.func, 0x10 + i * 4);
             if addr >= 0x1_0000_0000 {
-                top = top.max(addr);
+                top_base = top_base.max(addr);
             }
             i += if is64 { 2 } else { 1 };
         }
@@ -259,15 +267,25 @@ fn highest_claim_above_4g(skip: (u8, u8, u8)) -> u64 {
             let base = (base_hi << 32) | (((pl & 0xFFF0) as u64) << 16);
             let limit = (limit_hi << 32) | ((((pl >> 16) & 0xFFF0) as u64) << 16) | 0xF_FFFF;
             if base <= limit && limit >= 0x1_0000_0000 {
-                top = top.max(limit);
+                end = end.max(limit + 1);
             }
         }
     }
-    top
+    if top_base != 0 {
+        // Lowest set bit = the largest size a BAR at this base can have.
+        end = end.max(top_base + (top_base & top_base.wrapping_neg()));
+    }
+    end
 }
 
 /// Give an unassigned LPSS BAR0 (and its BAR1) an address, or explain why not.
-fn assign_bar0(bus: u8, dev: u8, func: u8, info: &mut BringUpInfo) -> Result<u64, BringUpError> {
+fn assign_bar0(
+    bus: u8,
+    dev: u8,
+    func: u8,
+    fw: &crate::acpi::I2cHidInfo,
+    info: &mut BringUpInfo,
+) -> Result<u64, BringUpError> {
     let lo = PciDriver::read_config(bus, dev, func, 0x10);
     if lo & 1 != 0 || (lo >> 1) & 3 != 2 {
         return Err(BringUpError::UnexpectedBar);
@@ -291,25 +309,42 @@ fn assign_bar0(bus: u8, dev: u8, func: u8, info: &mut BringUpInfo) -> Result<u64
     info.touud = touud;
     let phys_bits = unsafe { core::arch::x86_64::__cpuid(0x8000_0008).eax & 0xFF };
     info.phys_bits = phys_bits;
-    let highest = highest_claim_above_4g((bus, dev, func));
-    info.highest_bar_above_4g = highest;
+    let claims_end = claims_end_above_4g((bus, dev, func));
+    info.claims_end_above_4g = claims_end;
 
-    let end = ASSIGN_BASE + 0x2000;
-    let safe = phys_bits >= 39
+    // ★ Inside the root bridge's 64-bit window when the firmware declares one (`M64B`/`M64L`, the
+    // same numbers its PCI0._CRS hands Windows and Linux), and above everything already claimed
+    // in it, on a 1 MiB boundary. Without a declared window, the fallback — still subject to every
+    // check below.
+    const MIB: u64 = 0x10_0000;
+    let (win_lo, win_hi) = if fw.m64_len != 0 {
+        (fw.m64_base, fw.m64_base.saturating_add(fw.m64_len))
+    } else {
+        (0, u64::MAX)
+    };
+    let floor = claims_end.max(win_lo);
+    let base = if floor == 0 { FALLBACK_BASE } else { (floor + MIB - 1) & !(MIB - 1) };
+    info.candidate = base;
+
+    let end = base + 0x2000; // BAR0 + BAR1
+    let safe = phys_bits >= 36
+        && base >= win_lo
+        && end <= win_hi
         && end <= (1u64 << phys_bits.min(63))
+        // Above DRAM, or it would decode as memory rather than reach the PCI side.
         && touud != 0
-        && touud <= ASSIGN_REGION
-        && highest < ASSIGN_REGION
+        && base >= touud
+        && base >= claims_end
         // The identity mapping must not land on anything already mapped at that virtual address.
-        && unsafe { !crate::memory::user_addr_mapped(ASSIGN_BASE) }
-        && unsafe { !crate::memory::user_addr_mapped(ASSIGN_BASE + 0x1000) };
+        && unsafe { !crate::memory::user_addr_mapped(base) }
+        && unsafe { !crate::memory::user_addr_mapped(base + 0x1000) };
     if !safe {
         return Err(BringUpError::NoSafeAddress);
     }
 
-    PciDriver::write_config(bus, dev, func, 0x10, ASSIGN_BASE as u32);
-    PciDriver::write_config(bus, dev, func, 0x14, (ASSIGN_BASE >> 32) as u32);
-    if bar0_address(bus, dev, func) != ASSIGN_BASE {
+    PciDriver::write_config(bus, dev, func, 0x10, base as u32);
+    PciDriver::write_config(bus, dev, func, 0x14, (base >> 32) as u32);
+    if bar0_address(bus, dev, func) != base {
         return Err(BringUpError::AssignFailed);
     }
 
@@ -317,12 +352,12 @@ fn assign_bar0(bus: u8, dev: u8, func: u8, info: &mut BringUpInfo) -> Result<u64
     // on claims physical page 0 — so it gets the next page, if it is the same 4 KiB 64-bit shape.
     let (b1, b1_64) = bar_address(bus, dev, func, 0x18);
     if b1_64 && b1 < 0x10_0000 && size_bar64(bus, dev, func, 0x18) == 0x1000 {
-        PciDriver::write_config(bus, dev, func, 0x18, (ASSIGN_BASE + 0x1000) as u32);
-        PciDriver::write_config(bus, dev, func, 0x1C, ((ASSIGN_BASE + 0x1000) >> 32) as u32);
+        PciDriver::write_config(bus, dev, func, 0x18, (base + 0x1000) as u32);
+        PciDriver::write_config(bus, dev, func, 0x1C, ((base + 0x1000) >> 32) as u32);
     }
 
     info.assigned = true;
-    Ok(ASSIGN_BASE)
+    Ok(base)
 }
 
 impl Controller {
@@ -363,7 +398,7 @@ impl Controller {
         // first hardware run mapped BAR0 = 0 and read physical page 0 as if it were the
         // controller — and leaving page 0 mapped means a kernel null dereference no longer faults.
         let bar = if bar < 0x10_0000 || bar & 0xFFF != 0 {
-            assign_bar0(bus, dev, func, info)?
+            assign_bar0(bus, dev, func, fw, info)?
         } else {
             bar
         };
