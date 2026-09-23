@@ -905,6 +905,14 @@ pub struct I2cHidInfo {
     pub ctrl_adr: u32,
     pub path: [u8; 72],
     pub ctrl_path: [u8; 72],
+    /// Board-tuned Designware SCL timings (standard mode high/low/SDA hold, then fast mode), from
+    /// the firmware's per-bus NVS variables `SSHn/SSLn/SSDn/FMHn/FMLn/FMDn`. Zero = not found.
+    pub ss_hcnt: u32,
+    pub ss_lcnt: u32,
+    pub ss_hold: u32,
+    pub fm_hcnt: u32,
+    pub fm_lcnt: u32,
+    pub fm_hold: u32,
 }
 
 impl Default for I2cHidInfo {
@@ -916,7 +924,7 @@ impl Default for I2cHidInfo {
 
 // Same ABI guard as SysMetrics/SchedStats: the kernel memcpy's these bytes, so a field added on one
 // side and not the other must break the build rather than reinterpret every field after it.
-const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 176);
+const _: () = assert!(core::mem::size_of::<I2cHidInfo>() == 200);
 
 impl I2cHidInfo {
     /// PCI device and function decoded from `ctrl_adr`.
@@ -933,6 +941,79 @@ pub fn sys_i2c_hid_info(index: u32) -> Option<I2cHidInfo> {
     let mut info = I2cHidInfo::default();
     let rc = syscall(577, index as u64, (&mut info as *mut I2cHidInfo) as u64, 0, 0, 0, 0);
     if rc == 1 { Some(info) } else { None }
+}
+
+/// Outcome of an I2C-HID controller bring-up + HID descriptor read (syscall 578).
+///
+/// Mirrors `nyx-kernel/src/drivers/i2c_hid.rs` `ProbeResult` field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct I2cHidProbe {
+    pub seq: u32,
+    /// How far it got: 0 none, 1 ACPI data, 2 PCI function, 3 controller up, 4 descriptor read,
+    /// 5 descriptor valid.
+    pub stage: u32,
+    /// Why it stopped (see [`i2c_hid_status_text`]). 0 = every stage passed.
+    pub status: u32,
+    /// `IC_TX_ABRT_SOURCE` on an abort. Bit 0 = address not acknowledged.
+    pub abort_source: u32,
+    pub vendor_device: u32,
+    pub pmcsr_before: u32,
+    pub resets_before: u32,
+    pub comp_type: u32,
+    pub comp_param1: u32,
+    /// 1 = standard mode (100 kHz), 2 = fast mode (400 kHz).
+    pub mode: u32,
+    pub hcnt: u32,
+    pub lcnt: u32,
+    pub hold: u32,
+    pub timing_from_fw: u32,
+    pub slave_addr: u32,
+    pub desc_reg: u32,
+    pub bar0: u64,
+    pub desc: [u8; 32],
+}
+
+impl Default for I2cHidProbe {
+    fn default() -> Self {
+        // SAFETY: plain integers and a byte array; all-zero is a valid value.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<I2cHidProbe>() == 104);
+
+/// Ask the kernel to bring up the touchpad's I2C controller and read its HID descriptor.
+///
+/// ⚠️ Needs `acpi probe 13` to have run first — it is what says which controller and address.
+pub fn sys_i2c_hid_probe_request() {
+    syscall(578, 1, 0, 0, 0, 0, 0);
+}
+
+/// The last probe result, with its sequence number (0 = never run). `None` if the kernel was
+/// writing it at that instant — ask again.
+pub fn sys_i2c_hid_probe_result() -> Option<(u32, I2cHidProbe)> {
+    let mut r = I2cHidProbe::default();
+    let rc = syscall(578, 0, (&mut r as *mut I2cHidProbe) as u64, 0, 0, 0, 0);
+    if rc > u32::MAX as u64 { None } else { Some((rc as u32, r)) }
+}
+
+/// Human-readable meaning of [`I2cHidProbe::status`].
+pub fn i2c_hid_status_text(status: u32) -> &'static str {
+    match status {
+        0 => "ok",
+        1 => "no ACPI data — `acpi probe 13` has not published a device",
+        2 => "PCI function absent (reads 0xFFFF) — firmware has it hidden or off",
+        3 => "BAR0 unassigned",
+        4 => "could not map BAR0",
+        5 => "not a Designware I2C block (IC_COMP_TYPE wrong) — still in reset or powered down?",
+        6 => "controller would not disable",
+        7 => "transfer aborted",
+        8 => "transfer timed out — bus stuck or controller not clocking",
+        9 => "descriptor read, but it is not a valid HID descriptor",
+        10 => "transfer larger than the FIFO",
+        _ => "unknown",
+    }
 }
 
 pub const SYS_BATTERY: u64 = 561;

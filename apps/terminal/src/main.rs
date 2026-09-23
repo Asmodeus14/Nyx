@@ -1334,11 +1334,83 @@ impl TerminalApp {
                  having loaded.\n",
             );
         } else {
+            self.output_history.push_str(&format!("\n{} device(s).\n", found));
+            self.touchpad_i2c_probe();
+        }
+    }
+
+    /// Phase 2: bring up the I2C controller and read the touchpad's HID descriptor over the bus.
+    ///
+    /// ⚠️ Does NOT hand the touchpad over from PS/2 — that is the device's `_DSM`, which nothing
+    /// here calls. The pointer keeps working whatever this prints.
+    fn touchpad_i2c_probe(&mut self) {
+        let before = sys_i2c_hid_probe_result().map(|(s, _)| s).unwrap_or(0);
+        sys_i2c_hid_probe_request();
+        self.output_history.push_str("\nI2C: bringing up the controller and reading the HID descriptor...\n");
+
+        // The kernel task that runs it wakes every 8 ms; bring-up itself can sleep ~11 ms.
+        let mut result = None;
+        for _ in 0..50 {
+            sys_sleep_ms(20);
+            if let Some((seq, r)) = sys_i2c_hid_probe_result() {
+                if seq != before {
+                    result = Some(r);
+                    break;
+                }
+            }
+        }
+        let r = match result {
+            Some(r) => r,
+            None => {
+                self.output_history.push_str("  no answer from the kernel task within 1 s.\n");
+                return;
+            }
+        };
+
+        let stages = ["nothing", "ACPI data", "PCI function", "controller up",
+                      "descriptor read", "descriptor valid"];
+        self.output_history.push_str(&format!(
+            "  reached      {} (stage {}/5)\n  status       {}\n  PCI id       {:04x}:{:04x}  \
+             PMCSR {:#x}  BAR0 {:#x}\n  LPSS resets  {:#x} before release\n  IC_COMP_TYPE {:#010x}  \
+             PARAM_1 {:#010x}\n",
+            stages.get(r.stage as usize).copied().unwrap_or("?"), r.stage,
+            i2c_hid_status_text(r.status),
+            r.vendor_device & 0xFFFF, r.vendor_device >> 16, r.pmcsr_before, r.bar0,
+            r.resets_before, r.comp_type, r.comp_param1,
+        ));
+        if r.stage >= 3 {
             self.output_history.push_str(&format!(
-                "\n{} device(s). A plausible address and descriptor register here means the ACPI \
-                 half is\n  done — reading the descriptor itself is the I2C controller driver's \
-                 job, which is next.\n",
-                found
+                "  timing       {} hcnt={} lcnt={} hold={} ({})\n",
+                if r.mode == 2 { "fast 400k" } else { "standard 100k" },
+                r.hcnt, r.lcnt, r.hold,
+                if r.timing_from_fw != 0 { "firmware's values" } else { "our defaults" },
+            ));
+        }
+        if r.status == 7 {
+            self.output_history.push_str(&format!(
+                "  abort src    {:#x}{}\n", r.abort_source,
+                if r.abort_source & 1 != 0 {
+                    "  — nobody acknowledged address; the part may only answer on I2C \
+                     after the PS/2 handover"
+                } else { "" },
+            ));
+        }
+        if r.stage >= 4 {
+            let mut hex = String::new();
+            for (i, b) in r.desc[..30].iter().enumerate() {
+                hex.push_str(&format!("{:02x}", b));
+                hex.push(if i == 14 { '\n' } else { ' ' });
+                if i == 14 { hex.push_str("               "); }
+            }
+            self.output_history.push_str(&format!("  descriptor   {}\n", hex));
+        }
+        if r.stage == 5 {
+            let w = |i: usize| u16::from_le_bytes([r.desc[i], r.desc[i + 1]]);
+            self.output_history.push_str(&format!(
+                "  ★ valid HID descriptor: vendor {:04x} product {:04x} version {:04x}\n    \
+                 report desc {} bytes @ reg {:#06x}, input reg {:#06x} (max {} bytes), \
+                 command reg {:#06x}, data reg {:#06x}\n",
+                w(20), w(22), w(24), w(4), w(6), w(8), w(10), w(16), w(18),
             ));
         }
     }
@@ -3747,7 +3819,8 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  battery | bat     - ACPI control-method battery: charge, rate, health (READ ONLY)\n");
                 self.output_history.push_str("  acpi ls [path]    - walk the ACPI namespace   acpi probe <n> [depth] - one evaluation\n");
                 self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
-                self.output_history.push_str("  touchpad          - what ACPI says about the I2C-HID touchpad: bus, address, HID register\n");
+                self.output_history.push_str("  touchpad          - what ACPI says about the I2C-HID touchpad, then read it over I2C\n");
+                self.output_history.push_str("  touchpad i2c      - just the I2C part: controller bring-up + HID descriptor read\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
                 self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
                 self.output_history.push_str("Scrollback:\n");
@@ -4273,6 +4346,9 @@ impl NyxApp for TerminalApp {
                          \x20 again after a while — the bytes that MOVE are charge/current/voltage.\n",
                     );
                 }
+            } else if cmd == "touchpad i2c" {
+                // The bus probe alone, reusing whatever `acpi probe 13` last published.
+                self.touchpad_i2c_probe();
             } else if cmd == "touchpad" || cmd.starts_with("touchpad ") {
                 self.cmd_touchpad();
             } else if cmd == "sched" || cmd.starts_with("sched ") {

@@ -4385,6 +4385,46 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             frame.rax = if got { 1 } else { 0 };
         },
 
+        578 => {
+            // SYS_I2C_HID_PROBE(op, out_ptr).
+            //   op 1: request a controller bring-up + HID descriptor read. Returns 1.
+            //   op 0: copy the last result to out_ptr. Returns its `seq` (0 = never run), or
+            //         u64::MAX if the result is being written right now — ask again.
+            //
+            // ⚠️ Does no I/O itself. Bring-up sleeps through a PCI power transition, which is not
+            // allowed at IF=0; the `usb-hid` kernel task does the work (drivers::i2c_hid::service).
+            match arg1 {
+                1 => {
+                    crate::drivers::i2c_hid::REQUEST
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    frame.rax = 1;
+                }
+                0 => {
+                    let out = arg2 as *mut u8;
+                    let n = core::mem::size_of::<crate::drivers::i2c_hid::ProbeResult>();
+                    if !is_valid_user_ptr(out, n)
+                        || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                    frame.rax = match crate::drivers::i2c_hid::RESULT.try_lock() {
+                        Some(r) => {
+                            let copy = *r;
+                            drop(r);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    &copy as *const _ as *const u8, out, n,
+                                );
+                            }
+                            copy.seq as u64
+                        }
+                        None => u64::MAX,
+                    };
+                }
+                _ => frame.rax = EINVAL as u64,
+            }
+        },
+
         506 => { if let Some(c) = crate::shell::pop_key() { frame.rax = c as u64; } else { frame.rax = 0; } },
 
         576 => {

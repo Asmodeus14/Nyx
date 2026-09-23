@@ -66,6 +66,11 @@ typedef struct {
     UINT32 ctrl_adr;      /* controller _ADR: (device << 16) | function */
     char   path[72];
     char   ctrl_path[72];
+    /* Board-tuned Designware SCL timings for this controller, from the NVS variables the firmware
+     * keeps per LPSS I2C bus (SSHn/SSLn/SSDn = standard mode high/low/SDA hold, FMHn/FMLn/FMDn =
+     * fast mode). Zero = not found; the driver falls back to conservative defaults. */
+    UINT32 ss_hcnt, ss_lcnt, ss_hold;
+    UINT32 fm_hcnt, fm_lcnt, fm_hold;
 } NyxI2cHidInfo;
 
 typedef struct {
@@ -208,6 +213,26 @@ static ACPI_STATUS I2cHidCallback(ACPI_HANDLE Object, UINT32 Level, void *Contex
             UINT64 adr = 0;
             if (NyxEvalInteger(ctrl, "_ADR", &adr)) {
                 info->ctrl_adr = (UINT32)adr;
+            }
+        }
+
+        /* The timing variables are named by the controller's bus index — the digit ending
+         * "\_SB.PCI0.I2Cn". They are plain Names in the NVS region: reading them has no side
+         * effects, unlike the device's _DSM (see NyxHidDescriptorRegister). */
+        int len = 0;
+        while (len < (int)sizeof(info->ctrl_path) && info->ctrl_path[len]) len++;
+        char n = len > 0 ? info->ctrl_path[len - 1] : 0;
+        if (n >= '0' && n <= '9') {
+            char name[7] = { '\\', 'S', 'S', 'H', n, 0, 0 };
+            UINT64 v;
+            UINT32 *dst[6] = { &info->ss_hcnt, &info->ss_lcnt, &info->ss_hold,
+                               &info->fm_hcnt, &info->fm_lcnt, &info->fm_hold };
+            const char *pfx[6] = { "SSH", "SSL", "SSD", "FMH", "FML", "FMD" };
+            for (int i = 0; i < 6; i++) {
+                name[1] = pfx[i][0]; name[2] = pfx[i][1]; name[3] = pfx[i][2];
+                if (NyxEvalInteger(NULL, name, &v)) {
+                    *dst[i] = (UINT32)v;
+                }
             }
         }
     }

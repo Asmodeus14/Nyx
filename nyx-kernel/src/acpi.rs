@@ -188,6 +188,14 @@ pub struct I2cHidInfo {
     pub ctrl_adr: u32,
     pub path: [u8; 72],
     pub ctrl_path: [u8; 72],
+    /// Board-tuned Designware SCL timings (standard mode high/low/SDA hold, then fast mode), from
+    /// the firmware's per-bus NVS variables `SSHn/SSLn/SSDn/FMHn/FMLn/FMDn`. Zero = not found.
+    pub ss_hcnt: u32,
+    pub ss_lcnt: u32,
+    pub ss_hold: u32,
+    pub fm_hcnt: u32,
+    pub fm_lcnt: u32,
+    pub fm_hold: u32,
 }
 
 impl I2cHidInfo {
@@ -202,6 +210,12 @@ impl I2cHidInfo {
         ctrl_adr: 0,
         path: [0; 72],
         ctrl_path: [0; 72],
+        ss_hcnt: 0,
+        ss_lcnt: 0,
+        ss_hold: 0,
+        fm_hcnt: 0,
+        fm_lcnt: 0,
+        fm_hold: 0,
     };
 
     /// PCI device and function decoded from `ctrl_adr`.

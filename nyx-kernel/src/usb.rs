@@ -955,6 +955,10 @@ pub extern "C" fn nyx_usb_hid_task() {
                 unsafe { ctrl.poll_all_mice(); }
             }
         }
+        // I2C-HID bring-up, when the `touchpad` command asks for it. Lives here rather than in its
+        // own task because a new kernel task needs a reserved PID (see kernel_main's comment on
+        // COMPOSITOR_PID), and this loop already runs at IF=1 where the probe's sleeps are legal.
+        crate::drivers::i2c_hid::service();
         crate::scheduler::kernel_sleep_ms(HID_POLL_MS);
     }
 }

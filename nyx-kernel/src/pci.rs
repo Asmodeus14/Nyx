@@ -32,6 +32,17 @@ impl PciDriver {
         }
     }
 
+    /// 32-bit config write through CF8/CFC. `offset` must be dword-aligned.
+    pub fn write_config(bus: u8, device: u8, func: u8, offset: u8, value: u32) {
+        let address = 0x80000000 | ((bus as u32) << 16) | ((device as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
+        let mut port_addr: Port<u32> = Port::new(0xCF8);
+        let mut port_data: Port<u32> = Port::new(0xCFC);
+        unsafe {
+            port_addr.write(address);
+            port_data.write(value);
+        }
+    }
+
     pub fn scan(&mut self) -> Vec<PciDevice> {
         let mut devices = Vec::new();
         for bus in 0..=255 {
