@@ -1564,10 +1564,29 @@ pub fn scan_for_modern_inputs() {
     crate::vga_println!("[ACPI] Scanning for I2C Trackpads...");
     
     let count = unsafe { acpi_find_i2c_hid() };
-    
+
     if count > 0 {
         crate::serial_println!("[ACPI] SUCCESS: Found {} I2C-HID device(s)!", count);
         crate::vga_println!("[ACPI] Found {} I2C-HID device(s)!", count);
+
+        // ★ Full discovery (what `acpi probe 13` does), HERE rather than on the governor, so the
+        // touchpad can take over the pointer as soon as the scheduler starts instead of ~8 s later.
+        //
+        // Why this is the safe place for it: it is single-threaded — before the APs are started,
+        // before the scheduler exists — so nothing else can be inside the AML interpreter at the
+        // same time, which is the hazard that routes every RUNTIME evaluation through the governor.
+        // And what it evaluates is exactly probe 13's set (_STA, _CRS, the HID2 and NVS Names,
+        // _ADR), proven on the hardware across many runs before being moved here. It still never
+        // evaluates `_DSM`, which is the PS/2 handover (see `custom_acpi.c`).
+        let mut buf = [I2cHidInfo::EMPTY; 4];
+        let n = unsafe { acpi_get_i2c_hid(buf.as_mut_ptr(), 4) };
+        let n = if n < 0 { 0 } else { (n as usize).min(4) };
+        if let Some(mut c) = CACHE.try_lock() {
+            c.i2c_hid = buf;
+            c.i2c_hid_n = n;
+            c.i2c_hid_probed = true;
+        }
+        crate::serial_println!("[ACPI] I2C-HID discovery at boot: {} usable device(s)", n);
     } else {
         crate::serial_println!("[ACPI] No I2C-HID devices found. It might be USB-based.");
         crate::vga_println!("[ACPI] No I2C-HID found.");

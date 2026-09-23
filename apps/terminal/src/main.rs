@@ -4417,7 +4417,7 @@ impl NyxApp for TerminalApp {
                     } else if fell_back {
                         "PS/2 — I2C was active but went silent while PS/2 kept talking, so it fell back"
                     } else {
-                        "PS/2 (I2C not enabled; `touchpad on`, or it enables itself ~8 s after boot)"
+                        "PS/2 (I2C not enabled — it normally enables itself during boot; try `touchpad on`)"
                     },
                     probes,
                     irqs,

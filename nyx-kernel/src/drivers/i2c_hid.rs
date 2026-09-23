@@ -191,10 +191,14 @@ pub fn service() {
 /// Boot-time enable, as a small state machine driven from `service()` so it never blocks the USB
 /// polling that shares this task.
 ///
-/// ★ Waits until [`BOOT_AFTER_MS`] of uptime before asking the governor for `acpi probe 13` — the
-/// point at which `touchpad` used to be typed by hand. The rule this kernel learned the hard way is
-/// that ACPI calls on the governor's AUTOMATIC FIRST PASS killed three boots; probe 13 is proven on
-/// the hardware, but only ever after the desktop was up, so that is when it runs here too.
+/// ★ Normally enables on the task's FIRST pass: discovery already ran single-threaded during boot
+/// (`acpi::scan_for_modern_inputs`), so the touchpad has the pointer before the desktop appears.
+/// The first version waited 8 s for the governor instead, and the PS/2 pointer it left in charge
+/// until then felt slow.
+///
+/// If boot-time discovery produced nothing, it falls back to that original path: at
+/// [`BOOT_AFTER_MS`] of uptime, ask the governor for `acpi probe 13` — never on the governor's
+/// automatic first pass, which is where ACPI calls killed three boots on this machine.
 ///
 /// Returns true exactly once: on the tick the ACPI data is ready and the enable should run.
 fn boot_step() -> bool {
@@ -209,6 +213,14 @@ fn boot_step() -> bool {
 
     let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
     match STATE.load(Ordering::Relaxed) {
+        // The normal case: `acpi::scan_for_modern_inputs` already ran discovery during boot, so
+        // enable on this task's very first pass — before the desktop is up.
+        WAIT if crate::acpi::CACHE.try_lock().map_or(false, |c| c.i2c_hid_probed && c.i2c_hid_n > 0) => {
+            STATE.store(DONE, Ordering::Relaxed);
+            true
+        }
+        // Fallback: boot-time discovery found nothing usable (or never ran). Ask the governor once
+        // the desktop is up, as `touchpad` does.
         WAIT if now >= BOOT_AFTER_MS => {
             crate::acpi::request_probe(13, 0);
             STARTED_AT.store(now, Ordering::Relaxed);
