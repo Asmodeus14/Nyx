@@ -4455,6 +4455,32 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         .swap(0, core::sync::atomic::Ordering::AcqRel);
                     frame.rax = v as i64 as u64;
                 }
+                9 => {
+                    // op 9: copy the precision-mode report log (LOG_LEN entries of 28 bytes) to
+                    // arg2, oldest first. Returns the byte count.
+                    use crate::drivers::i2c_hid::{LogEntry, LOG_LEN, PTP_LOG};
+                    let n = core::mem::size_of::<LogEntry>() * LOG_LEN;
+                    let out = arg2 as *mut u8;
+                    if !is_valid_user_ptr(out, n) || !unsafe { crate::memory::user_addr_mapped(arg2) } {
+                        frame.rax = EFAULT as u64;
+                        return;
+                    }
+                    frame.rax = match PTP_LOG.try_lock() {
+                        Some(g) => {
+                            let (ring, next) = *g;
+                            drop(g);
+                            let mut ordered = ring;
+                            for i in 0..LOG_LEN {
+                                ordered[i] = ring[(next + i) % LOG_LEN];
+                            }
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(ordered.as_ptr() as *const u8, out, n);
+                            }
+                            n as u64
+                        }
+                        None => 0,
+                    };
+                }
                 8 => {
                     // op 8: switch input mode. arg2 = 3 precision (multi-touch), anything else
                     // mouse. Done by the kernel task; read the outcome from op 6.

@@ -351,51 +351,48 @@ pub struct PtpLayout {
 
 /// Group the touch pad collection's input fields into contact slots.
 ///
-/// ★ Grouped by ORDER, not by nesting: every Tip Switch starts a new contact, and the Contact ID,
-/// Confidence, X and Y that follow belong to it. A precision touchpad declares each finger as a
-/// logical collection in exactly that order, and the flattened field list keeps the order.
+/// ★ Grouped by ORDER, not by nesting: a precision touchpad declares each finger as a logical
+/// collection, and the flattened field list keeps their order. The rule is that a field the finger
+/// being assembled ALREADY HAS starts the next finger. The first version started a finger at every
+/// Tip Switch instead — which breaks on ELAN parts, whose fingers declare Confidence BEFORE Tip
+/// Switch (as one two-bit field), handing each finger's confidence to the one before it.
 pub fn ptp_layout(d: &Descriptor) -> Option<PtpLayout> {
     use usage::*;
     let app = (PAGE_DIGITIZER, DIG_TOUCH_PAD);
     let mut slots: [Option<ContactSlot>; MAX_SLOTS] = [None; MAX_SLOTS];
     let mut n = 0usize;
     // (tip, id, confidence, x, y) being assembled.
-    let mut cur: Option<(Field, Option<Field>, Option<Field>, Option<Field>, Option<Field>)> = None;
+    type Partial = [Option<Field>; 5];
+    let mut cur: Partial = [None; 5];
     let mut report_id = None;
-    let flush = |cur: &mut Option<(Field, Option<Field>, Option<Field>, Option<Field>, Option<Field>)>,
-                 slots: &mut [Option<ContactSlot>; MAX_SLOTS],
-                 n: &mut usize| {
-        if let Some((tip, id, conf, Some(x), Some(y))) = cur.take() {
+    let flush = |cur: &mut Partial, slots: &mut [Option<ContactSlot>; MAX_SLOTS], n: &mut usize| {
+        if let [Some(tip), id, conf, Some(x), Some(y)] = *cur {
             if *n < MAX_SLOTS {
                 slots[*n] = Some(ContactSlot { tip, id, confidence: conf, x, y });
                 *n += 1;
             }
         }
+        *cur = [None; 5];
     };
     for f in d.fields.iter().copied() {
         if f.kind != KIND_INPUT || f.app != app || f.is_constant() {
             continue;
         }
-        match (f.page, f.usage) {
-            (PAGE_DIGITIZER, DIG_TIP_SWITCH) => {
-                flush(&mut cur, &mut slots, &mut n);
-                report_id.get_or_insert(f.report_id);
-                cur = Some((f, None, None, None, None));
-            }
-            (PAGE_DIGITIZER, DIG_CONTACT_ID) => {
-                if let Some(c) = cur.as_mut() { c.1.get_or_insert(f); }
-            }
-            (PAGE_DIGITIZER, DIG_CONFIDENCE) => {
-                if let Some(c) = cur.as_mut() { c.2.get_or_insert(f); }
-            }
-            (PAGE_GENERIC_DESKTOP, GD_X) if !f.is_relative() => {
-                if let Some(c) = cur.as_mut() { c.3.get_or_insert(f); }
-            }
-            (PAGE_GENERIC_DESKTOP, GD_Y) if !f.is_relative() => {
-                if let Some(c) = cur.as_mut() { c.4.get_or_insert(f); }
-            }
-            _ => {}
+        let which = match (f.page, f.usage) {
+            (PAGE_DIGITIZER, DIG_TIP_SWITCH) => 0,
+            (PAGE_DIGITIZER, DIG_CONTACT_ID) => 1,
+            (PAGE_DIGITIZER, DIG_CONFIDENCE) => 2,
+            (PAGE_GENERIC_DESKTOP, GD_X) if !f.is_relative() => 3,
+            (PAGE_GENERIC_DESKTOP, GD_Y) if !f.is_relative() => 4,
+            _ => continue,
+        };
+        if cur[which].is_some() {
+            flush(&mut cur, &mut slots, &mut n);
         }
+        if which == 0 {
+            report_id.get_or_insert(f.report_id);
+        }
+        cur[which] = Some(f);
     }
     flush(&mut cur, &mut slots, &mut n);
     let first = slots[0]?;
@@ -581,6 +578,33 @@ mod tests {
         assert_eq!(s0.y.extract(&body), Some(500));
         assert_eq!(p.contact_count.unwrap().extract(&body), Some(1));
         assert_eq!(p.button.unwrap().extract(&body), Some(0));
+    }
+
+    /// The ELAN ordering: each finger declares Confidence and Tip Switch as ONE two-bit field, with
+    /// Confidence first. Grouping "a new finger at every tip switch" hands finger 2's confidence to
+    /// finger 1; grouping by "a field this finger already has starts the next one" gets it right.
+    #[test]
+    fn ptp_layout_handles_confidence_declared_before_tip() {
+        let finger: &[u8] = &[
+            0x05, 0x0D, 0x09, 0x22, 0xA1, 0x02,
+            0x09, 0x47, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02,
+            0x09, 0x51, 0x25, 0x0F, 0x75, 0x06, 0x95, 0x01, 0x81, 0x02,
+            0x05, 0x01, 0x09, 0x30, 0x26, 0x40, 0x0B, 0x75, 0x10, 0x81, 0x02,
+            0x09, 0x31, 0x26, 0x40, 0x07, 0x81, 0x02,
+            0xC0,
+        ];
+        let mut d: alloc::vec::Vec<u8> = alloc::vec![0x05, 0x0D, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x04];
+        d.extend_from_slice(finger);
+        d.extend_from_slice(finger);
+        d.push(0xC0);
+        let p = ptp_layout(&parse(&d)).expect("layout");
+        assert_eq!(p.n_slots, 2);
+        let (s0, s1) = (p.slots[0].unwrap(), p.slots[1].unwrap());
+        assert_eq!(s0.confidence.unwrap().bit_off, 0);
+        assert_eq!(s0.tip.bit_off, 1);
+        assert_eq!(s1.confidence.unwrap().bit_off, 40, "finger 2's confidence belongs to finger 2");
+        assert_eq!(s1.tip.bit_off, 41);
+        assert_eq!((s1.x.bit_off, s1.y.bit_off), (48, 64));
     }
 
     #[test]

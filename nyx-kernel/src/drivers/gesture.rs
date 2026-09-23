@@ -61,6 +61,10 @@ pub struct Config {
     pub tap_slop: i32,
     /// A three-finger swipe must travel at least this far vertically.
     pub swipe_min: i32,
+    /// No finger moves this far between two frames (~7 ms apart). A delta this large is a tracking
+    /// glitch — a contact ID reused for a different finger, a misread report — and applying it
+    /// would fling the pointer across the screen. Dropped, the way libinput drops pointer jumps.
+    pub jump: i32,
 }
 
 impl Config {
@@ -68,7 +72,7 @@ impl Config {
     /// 15% of it is a deliberate swipe. 180 ms is the tap window macOS and libinput use.
     pub fn for_pad(x_max: i32) -> Config {
         let w = x_max.max(100);
-        Config { tap_ms: 180, tap_slop: w * 3 / 100, swipe_min: w * 15 / 100 }
+        Config { tap_ms: 180, tap_slop: w * 3 / 100, swipe_min: w * 15 / 100, jump: w / 4 }
     }
 }
 
@@ -138,8 +142,8 @@ impl Engine {
                     m += 1;
                 }
             }
-            if m == n as i32 {
-                let (dx, dy) = (sx / m, sy / m);
+            let (dx, dy) = if m > 0 { (sx / m, sy / m) } else { (0, 0) };
+            if m == n as i32 && dx.abs() < self.cfg.jump && dy.abs() < self.cfg.jump {
                 self.travel = self.travel.saturating_add(dx.abs() + dy.abs());
                 match n {
                     1 => {
@@ -194,6 +198,19 @@ mod tests {
         assert_eq!(e.frame(0, &[c(1, 100, 100)], false).dx, 0, "landing is not motion");
         let o = e.frame(8, &[c(1, 130, 90)], false);
         assert_eq!((o.dx, o.dy), (30, -10));
+    }
+
+    /// On the hardware, the first precision-mode build threw the pointer far across the screen.
+    /// Whatever produced that delta, no finger moves a quarter of the pad in one frame.
+    #[test]
+    fn an_impossible_jump_between_frames_is_dropped_not_applied() {
+        let mut e = eng(); // pad 3000 wide: jump threshold 750
+        e.frame(0, &[c(1, 100, 100)], false);
+        let o = e.frame(8, &[c(1, 2900, 100)], false);
+        assert_eq!((o.dx, o.dy), (0, 0), "a 2800-unit hop in 8 ms is a glitch");
+        // Motion resumes normally from the new position.
+        let o = e.frame(16, &[c(1, 2910, 105)], false);
+        assert_eq!((o.dx, o.dy), (10, 5));
     }
 
     #[test]

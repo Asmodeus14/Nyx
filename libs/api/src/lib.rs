@@ -1055,6 +1055,28 @@ pub fn sys_touchpad_take_scroll() -> i32 {
     syscall(578, 7, 0, 0, 0, 0, 0) as i64 as i32
 }
 
+/// One report from the precision-mode log. Mirrors `i2c_hid::LogEntry`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TouchpadLogEntry {
+    pub len: u8,
+    /// Touching contacts decoded from this report; 0xFF = not a touch pad report.
+    pub n: u8,
+    pub _pad: [u8; 2],
+    pub x: i32,
+    pub y: i32,
+    pub raw: [u8; 16],
+}
+const _: () = assert!(core::mem::size_of::<TouchpadLogEntry>() == 28);
+
+/// The last 8 reports received in precision mode, oldest first: raw bytes beside what the kernel
+/// decoded from them.
+pub fn sys_touchpad_log() -> [TouchpadLogEntry; 8] {
+    let mut log = [TouchpadLogEntry::default(); 8];
+    syscall(578, 9, log.as_mut_ptr() as u64, 0, 0, 0, 0);
+    log
+}
+
 /// Ask for precision (multi-touch) mode, or back to the device's mouse emulation. Poll
 /// [`sys_i2c_hid_status`] for the outcome.
 pub fn sys_i2c_hid_set_mode(ptp: bool) {

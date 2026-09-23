@@ -199,10 +199,47 @@ pub static SCROLL_ACCUM: core::sync::atomic::AtomicI32 = core::sync::atomic::Ato
 /// `touchpad ptp` / `touchpad mouse`: 0 = nothing asked, 1 = mouse mode, 2 = precision mode.
 pub static MODE_REQUEST: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// Outcome of the last mode switch: 0 none, 1 ok, 2 the device has no Input Mode feature,
-/// 3 the SET_REPORT failed on the bus, 4 no live device.
+/// 3 the SET_REPORT failed on the bus, 4 no live device, 5 the parsed X/Y range is implausible.
 pub static MODE_RESULT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// True while the device is in precision mode.
 pub static PTP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// One logged report: the raw bytes (from the report ID on) and what the precision path decoded.
+/// Mirrored by `nyx_api::TouchpadLogEntry`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LogEntry {
+    pub len: u8,
+    /// Contacts decoded as touching in this report; 0xFF = not a touch pad report.
+    pub n: u8,
+    pub _pad: [u8; 2],
+    /// The first touching contact's position, as decoded.
+    pub x: i32,
+    pub y: i32,
+    pub raw: [u8; 16],
+}
+const _: () = assert!(core::mem::size_of::<LogEntry>() == 28);
+
+pub const LOG_LEN: usize = 8;
+
+/// The last [`LOG_LEN`] reports received in precision mode, oldest first after rotation —
+/// `touchpad log`. ★ Exists because the first precision-mode build threw the pointer across the
+/// screen on hardware, and the device's real report layout was not known: raw bytes beside the
+/// decoded contact is what shows whether the layout was read right.
+pub static PTP_LOG: spin::Mutex<([LogEntry; LOG_LEN], usize)> = spin::Mutex::new((
+    [LogEntry { len: 0, n: 0, _pad: [0; 2], x: 0, y: 0, raw: [0; 16] }; LOG_LEN],
+    0,
+));
+
+fn log_report(raw: &[u8], n: u8, x: i32, y: i32) {
+    if let Some(mut g) = PTP_LOG.try_lock() {
+        let (ref mut ring, ref mut next) = *g;
+        let mut e = LogEntry { len: raw.len().min(16) as u8, n, _pad: [0; 2], x, y, raw: [0; 16] };
+        e.raw[..e.len as usize].copy_from_slice(&raw[..e.len as usize]);
+        ring[*next % LOG_LEN] = e;
+        *next = (*next + 1) % LOG_LEN;
+    }
+}
 
 static LIVE: spin::Mutex<Option<Live>> = spin::Mutex::new(None);
 
@@ -500,8 +537,14 @@ fn poll() {
                 let body = &buf[if dev.p.uses_ids { 3 } else { 2 }..len];
                 if id == dev.p.mouse.report_id {
                     mouse_report(dev, body);
+                    if dev.ptp_on {
+                        log_report(&buf[2..len], 0xFF, 0, 0);
+                    }
                 } else if dev.ptp_on && dev.p.ptp.map_or(false, |t| t.report_id == id) {
-                    ptp_report(dev, body, now);
+                    let (n, x, y) = ptp_report(dev, body, now);
+                    log_report(&buf[2..len], n, x, y);
+                } else if dev.ptp_on {
+                    log_report(&buf[2..len], 0xFF, 0, 0);
                 }
             }
         }
@@ -539,13 +582,18 @@ fn mouse_report(dev: &mut Live, body: &[u8]) {
 
 /// A report from the touch pad collection (precision mode): assemble the frame, interpret it, and
 /// turn the result into pointer motion, clicks, scroll and swipes.
-fn ptp_report(dev: &mut Live, body: &[u8], now: u64) {
+///
+/// Returns what THIS report decoded to — touching contacts in it, and the first one's position —
+/// for `touchpad log`.
+fn ptp_report(dev: &mut Live, body: &[u8], now: u64) -> (u8, i32, i32) {
     use crate::drivers::gesture::{Contact, Tap};
     use crate::drivers::hid_desc::MAX_SLOTS;
     let t = match dev.p.ptp {
         Some(t) => t,
-        None => return,
+        None => return (0, 0, 0),
     };
+    let mut here = 0u8;
+    let mut first = (0i32, 0i32);
 
     // Frame assembly. With a contact-count field, a non-zero count starts a frame of that many
     // contacts and zero continues one; without it, every report is a whole frame.
@@ -557,7 +605,7 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) {
         }
         Some(_) => {
             if dev.asm.expected == 0 {
-                return; // a continuation of a frame whose start was never seen
+                return (0, 0, 0); // a continuation of a frame whose start was never seen
             }
         }
         None => {
@@ -580,13 +628,17 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) {
             let y = s.y.extract(body).unwrap_or(0);
             dev.asm.contacts[dev.asm.n] = Contact { id, x, y };
             dev.asm.n += 1;
+            if here == 0 {
+                first = (x, y);
+            }
+            here += 1;
         }
     }
     if let Some(b) = t.button {
         dev.asm.button = b.extract(body).unwrap_or(0) != 0;
     }
     if dev.asm.got < dev.asm.expected {
-        return; // the rest of this frame is in the next report
+        return (here, first.0, first.1); // the rest of this frame is in the next report
     }
     dev.asm.expected = 0;
     let o = dev.engine.frame(now, &dev.asm.contacts[..dev.asm.n], dev.asm.button);
@@ -633,6 +685,7 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) {
     if mx != 0 || my != 0 || buttons != before {
         crate::mouse::update_relative(mx as i32, my as i32, buttons);
     }
+    (here, first.0, first.1)
 }
 
 /// Switch the device between its mouse emulation and precision mode, with SET_REPORT on the Input
@@ -651,6 +704,12 @@ fn set_mode(dev: &mut Live, ptp: bool) {
     };
     if ptp && dev.p.ptp.is_none() {
         MODE_RESULT.store(2, Ordering::Release);
+        return;
+    }
+    // A pad whose X/Y range parsed as tiny would make the scaling (which divides by it) explode
+    // into huge pointer jumps. Refuse rather than switch into that.
+    if ptp && dev.p.ptp.map_or(true, |t| t.x_max < 64 || t.y_max < 64) {
+        MODE_RESULT.store(5, Ordering::Release);
         return;
     }
     let value = if ptp {
@@ -715,6 +774,9 @@ fn set_mode(dev: &mut Live, ptp: bool) {
             let x_max = dev.p.ptp.map_or(1000, |t| t.x_max);
             dev.engine = crate::drivers::gesture::Engine::new(crate::drivers::gesture::Config::for_pad(x_max));
             dev.asm = FrameAsm::EMPTY;
+            if let Some(mut g) = PTP_LOG.try_lock() {
+                *g = ([LogEntry { len: 0, n: 0, _pad: [0; 2], x: 0, y: 0, raw: [0; 16] }; LOG_LEN], 0);
+            }
             MODE_RESULT.store(1, Ordering::Release);
         }
         Err(_) => MODE_RESULT.store(3, Ordering::Release),
@@ -882,6 +944,18 @@ fn explore(
                 t.report_id, t.n_slots, t.x_max, t.y_max,
                 t.contact_count.map_or(alloc::string::String::from("none"), |f| alloc::format!("@{}", f.bit_off)),
                 t.button.map_or(alloc::string::String::from("none"), |f| alloc::format!("@{}", f.bit_off)));
+            // The first finger's fields in full — bit offset + size, and range — which is what
+            // `touchpad log`'s raw bytes are decoded against.
+            if let Some(s) = t.slots[0] {
+                let f = |o: Option<crate::drivers::hid_desc::Field>| match o {
+                    Some(f) => alloc::format!("@{}+{}", f.bit_off, f.size),
+                    None => alloc::string::String::from("none"),
+                };
+                let _ = writeln!(out, "  finger 1: tip {} conf {} id {} x @{}+{} [{}..{}] y @{}+{} [{}..{}]",
+                    f(Some(s.tip)), f(s.confidence), f(s.id),
+                    s.x.bit_off, s.x.size, s.x.logical_min, s.x.logical_max,
+                    s.y.bit_off, s.y.size, s.y.logical_min, s.y.logical_max);
+            }
         }
         None => {
             let _ = writeln!(out, "  no precision touchpad layout");

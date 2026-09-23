@@ -3857,6 +3857,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  touchpad status   - which path drives the pointer (I2C enables itself at boot)\n");
                 self.output_history.push_str("  touchpad ptp      - multi-touch: 2-finger scroll + right-click, 3-finger swipes\n");
                 self.output_history.push_str("  touchpad mouse    - back to the touchpad's own mouse emulation\n");
+                self.output_history.push_str("  touchpad log      - last 8 multi-touch reports, raw and decoded\n");
                 self.output_history.push_str("  touchpad speed N  - pointer speed in percent (default 100; 10-400)\n");
                 self.output_history.push_str("  touchpad handover - firmware _DSM: EC stops PS/2 emulation (until power-off!)\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
@@ -4430,6 +4431,29 @@ impl NyxApp for TerminalApp {
                     s.irqs,
                     sys_i2c_hid_speed(0),
                 ));
+            } else if cmd == "touchpad log" {
+                // The last 8 reports received in precision mode: raw bytes beside what the kernel
+                // decoded. Read against the "finger 1:" line of `touchpad`.
+                let log = sys_touchpad_log();
+                let mut any = false;
+                for e in log.iter().filter(|e| e.len > 0) {
+                    any = true;
+                    let mut hex = String::new();
+                    for b in &e.raw[..e.len as usize] {
+                        hex.push_str(&format!("{:02x} ", b));
+                    }
+                    let decoded = if e.n == 0xFF {
+                        String::from("(not a touch report)")
+                    } else if e.n == 0 {
+                        String::from("no finger")
+                    } else {
+                        format!("{} finger(s), first at {},{}", e.n, e.x, e.y)
+                    };
+                    self.output_history.push_str(&format!("  {}  -> {}\n", hex, decoded));
+                }
+                if !any {
+                    self.output_history.push_str("No precision-mode reports logged yet (`touchpad ptp`, then touch the pad).\n");
+                }
             } else if cmd == "touchpad ptp" || cmd == "touchpad mouse" {
                 let ptp = cmd == "touchpad ptp";
                 sys_i2c_hid_set_mode(ptp);
@@ -4450,6 +4474,8 @@ impl NyxApp for TerminalApp {
                     (2, _) => "This touchpad declares no Input Mode feature — precision mode is unavailable.\n",
                     (3, _) => "The mode switch failed on the I2C bus; the touchpad is unchanged.\n",
                     (4, _) => "The I2C touchpad is not active (`touchpad status`); nothing to switch.\n",
+                    (5, _) => "Refused: the touchpad's X/Y range parsed as implausibly small, which would \
+                               make the pointer jump. Paste `touchpad` output.\n",
                     _ => "No answer from the kernel task within 0.5 s.\n",
                 });
             } else if cmd == "touchpad off" {
