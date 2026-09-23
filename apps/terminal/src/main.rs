@@ -1068,6 +1068,13 @@ impl TerminalApp {
                 pct % 10
             ));
         }
+        // Cross-core wakes: a keystroke or IPC message woke a task living on another core, which
+        // was kicked to run it at once instead of at its next tick.
+        out.push_str("  reschedule IPIs received:");
+        for (i, c) in cores.iter().enumerate() {
+            out.push_str(&format!(" cpu{} {}", i, c.resched_ipis));
+        }
+        out.push('\n');
 
         out.push_str("\nWorst observed\n");
         for (i, c) in cores.iter().enumerate() {

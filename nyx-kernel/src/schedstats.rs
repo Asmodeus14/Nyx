@@ -183,13 +183,15 @@ pub struct SchedStats {
     pub gap_ring_count: u64,
     /// Cumulative stalls grouped by syscall. See [`GapTally`].
     pub gap_tally: [GapTally; GAP_TALLY_LEN],
+    /// Reschedule IPIs this core received (`scheduler::kick_core`): another core woke a task here.
+    pub resched_ipis: u64,
 }
 
 // The other half of the ABI guard in `nyx_api`. The kernel memcpy's these structs straight into a
 // user buffer, so a field added here and not there (or vice versa) must break the build rather than
 // silently reinterpret every field after it. Both sides assert the same two numbers.
 const _: () = assert!(core::mem::size_of::<SchedGlobals>() == 64);
-const _: () = assert!(core::mem::size_of::<SchedStats>() == 1280);
+const _: () = assert!(core::mem::size_of::<SchedStats>() == 1344);
 const _: () = assert!(core::mem::align_of::<SchedStats>() == 64);
 
 /// Collect the machine-wide facts. Reads only published atomics — no lock, so this cannot join a
@@ -242,6 +244,7 @@ impl SchedStats {
             gap_ring_count: 0,
             gap_tally: [GapTally { syscall: u64::MAX, count: 0, total_cycles: 0 };
                         GAP_TALLY_LEN],
+            resched_ipis: 0,
         }
     }
 

@@ -677,6 +677,7 @@ lazy_static! {
             idt[0x41].set_handler_addr(VirtAddr::new(yield_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Keyboard.as_usize()].set_handler_addr(VirtAddr::new(keyboard_interrupt_stub as *const () as u64));
             idt[InterruptIndex::Mouse.as_usize()].set_handler_addr(VirtAddr::new(mouse_interrupt_stub as *const () as u64));
+            idt[crate::apic::RESCHED_VECTOR as usize].set_handler_addr(VirtAddr::new(resched_ipi_stub as *const () as u64));
             
             // REMOVE the old ethernet_interrupt_stub line from inside the unsafe block
         }
@@ -1104,6 +1105,35 @@ mouse_interrupt_stub:
 2:
     iretq
 
+.global resched_ipi_stub
+resched_ipi_stub:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
+    push rax; push rbx; push rcx; push rdx; push rbp; push rsi; push rdi
+    push r8; push r9; push r10; push r11; push r12; push r13; push r14; push r15
+    mov rax, rsp
+    and rsp, -16
+    sub rsp, 512
+    fxsave [rsp]
+    sub rsp, 8
+    push rax
+    mov rdi, rsp
+    call resched_ipi_context_switch
+    mov rsp, rax
+    pop rbx
+    add rsp, 8
+    fxrstor [rsp]
+    mov rsp, rbx
+    pop r15; pop r14; pop r13; pop r12; pop r11; pop r10; pop r9; pop r8
+    pop rdi; pop rsi; pop rbp; pop rdx; pop rcx; pop rbx; pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+
 .global ethernet_interrupt_stub
 ethernet_interrupt_stub:
     test qword ptr [rsp + 8], 3
@@ -1134,6 +1164,7 @@ extern "C" {
     fn timer_interrupt_stub(); 
     fn keyboard_interrupt_stub();
     fn mouse_interrupt_stub();
+    fn resched_ipi_stub();
     fn ethernet_interrupt_stub();
     fn syscall_handler_asm();
     fn yield_interrupt_stub();
@@ -1243,35 +1274,12 @@ pub extern "C" fn keyboard_context_switch(current_rsp: u64) -> u64 {
     // 3. Wake input waiters, and reschedule ONLY if that actually woke something.
     let mut woke_someone = false;
     if x86_64::registers::model_specific::GsBase::read().as_u64() != 0 {
-        let percpu = crate::percpu::current();
-        // ★ Wake only tasks actually waiting on INPUT.
-        //
-        // This loop used to wake every task with a finite `wake_tsc`, regardless of what it was
-        // waiting for. The PS/2 mouse is a 3-byte state machine with one IRQ per byte, so a moving
-        // pointer ran this at up to ~200 Hz, and each pass dragged every sleeping task on the core
-        // to Ready — an O(n) scan plus a full context switch plus a 1 KiB FPU save/restore, per
-        // mouse byte. It also broke `sleep()` system-wide, because `sys_sleep_ms` treats a cleared
-        // `wake_tsc` as a legal early return: while the mouse moved, every app's 16 ms frame sleep,
-        // wifiagent's 500 ms and init's 1000 ms all returned immediately.
-        //
-        // ⚠️ The herd was accidentally MASKING the real problem — it dragged apps out of their
-        // frame sleep on every key release, which is why typing felt better than the 16 ms poll
-        // loop should allow. Removing it is only safe because `ipc_send` below now wakes a blocked
-        // receiver directly, which is the mechanism that should always have carried input.
-        for task in percpu.scheduler.tasks.iter_mut() {
-            if task.state == crate::scheduler::TaskState::Blocked
-                && task.wait_reason == crate::scheduler::WaitReason::Input
-            {
-                task.state = crate::scheduler::TaskState::Ready;
-                task.wake_tsc = 0;
-                task.wait_reason = crate::scheduler::WaitReason::None;
-                // Stamped so wake-to-run measures input latency specifically: the gap between the
-                // key/mouse IRQ and the woken task reaching the CPU.
-                task.ready_tsc = crate::schedstats::rdtsc();
-                crate::schedstats::with(|s| s.wakeups += 1);
-                woke_someone = true;
-            }
-        }
+        // ★ Wake only tasks actually waiting on INPUT — on EVERY core (see
+        // `scheduler::wake_input_waiters`). This used to wake every task with a finite `wake_tsc`
+        // (the thundering herd: O(n) + a context switch per PS/2 byte, and `sleep()` broken while
+        // the mouse moved); `ipc_send` wakes blocked receivers directly, which is what should
+        // always have carried input.
+        woke_someone = crate::scheduler::wake_input_waiters();
     }
 
     // ★ Only reschedule if there is a newly-runnable task to reschedule TO.
@@ -1292,6 +1300,15 @@ pub extern "C" fn keyboard_context_switch(current_rsp: u64) -> u64 {
     }
 }
 
+/// Another core woke a task on this one (`scheduler::kick_core`): schedule now instead of at the
+/// next tick. Spurious kicks are harmless — `schedule` just picks the same task again.
+#[no_mangle]
+pub extern "C" fn resched_ipi_context_switch(current_rsp: u64) -> u64 {
+    crate::apic::end_of_interrupt();
+    crate::schedstats::with(|s| s.resched_ipis += 1);
+    yield_context_switch(current_rsp)
+}
+
 #[no_mangle]
 pub extern "C" fn mouse_context_switch(current_rsp: u64) -> u64 {
     // 1. Let the driver read the mouse movement (This naturally drains port 0x60!)
@@ -1303,35 +1320,12 @@ pub extern "C" fn mouse_context_switch(current_rsp: u64) -> u64 {
     // 3. Wake input waiters, and reschedule ONLY if that actually woke something.
     let mut woke_someone = false;
     if x86_64::registers::model_specific::GsBase::read().as_u64() != 0 {
-        let percpu = crate::percpu::current();
-        // ★ Wake only tasks actually waiting on INPUT.
-        //
-        // This loop used to wake every task with a finite `wake_tsc`, regardless of what it was
-        // waiting for. The PS/2 mouse is a 3-byte state machine with one IRQ per byte, so a moving
-        // pointer ran this at up to ~200 Hz, and each pass dragged every sleeping task on the core
-        // to Ready — an O(n) scan plus a full context switch plus a 1 KiB FPU save/restore, per
-        // mouse byte. It also broke `sleep()` system-wide, because `sys_sleep_ms` treats a cleared
-        // `wake_tsc` as a legal early return: while the mouse moved, every app's 16 ms frame sleep,
-        // wifiagent's 500 ms and init's 1000 ms all returned immediately.
-        //
-        // ⚠️ The herd was accidentally MASKING the real problem — it dragged apps out of their
-        // frame sleep on every key release, which is why typing felt better than the 16 ms poll
-        // loop should allow. Removing it is only safe because `ipc_send` below now wakes a blocked
-        // receiver directly, which is the mechanism that should always have carried input.
-        for task in percpu.scheduler.tasks.iter_mut() {
-            if task.state == crate::scheduler::TaskState::Blocked
-                && task.wait_reason == crate::scheduler::WaitReason::Input
-            {
-                task.state = crate::scheduler::TaskState::Ready;
-                task.wake_tsc = 0;
-                task.wait_reason = crate::scheduler::WaitReason::None;
-                // Stamped so wake-to-run measures input latency specifically: the gap between the
-                // key/mouse IRQ and the woken task reaching the CPU.
-                task.ready_tsc = crate::schedstats::rdtsc();
-                crate::schedstats::with(|s| s.wakeups += 1);
-                woke_someone = true;
-            }
-        }
+        // ★ Wake only tasks actually waiting on INPUT — on EVERY core (see
+        // `scheduler::wake_input_waiters`). This used to wake every task with a finite `wake_tsc`
+        // (the thundering herd: O(n) + a context switch per PS/2 byte, and `sleep()` broken while
+        // the mouse moved); `ipc_send` wakes blocked receivers directly, which is what should
+        // always have carried input.
+        woke_someone = crate::scheduler::wake_input_waiters();
     }
 
     // ★ Only reschedule if there is a newly-runnable task to reschedule TO.
@@ -5586,7 +5580,9 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
             unsafe {
                 let active_cores = crate::smp::ACTIVE_CORES.load(core::sync::atomic::Ordering::SeqCst);
                 if let Some(cores) = &mut crate::percpu::PER_CPU {
+                    let here = crate::percpu::current().logical_id;
                     for i in 0..active_cores {
+                        let apic_id = cores[i].apic_id;
                         for task in cores[i].scheduler.tasks.iter_mut() {
                             if task.pid == target_pid {
                                 task.mailbox.push_back(msg);
@@ -5610,6 +5606,12 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                                     task.wait_reason = crate::scheduler::WaitReason::None;
                                     task.ready_tsc = crate::schedstats::rdtsc();
                                     crate::schedstats::with(|s| s.wakeups += 1);
+                                    // ★ A receiver on ANOTHER core would otherwise wait for that
+                                    // core's next tick — the shell forwards every keystroke to
+                                    // its app this way, so that was up to a quantum per key.
+                                    if i != here {
+                                        crate::scheduler::kick_core(apic_id);
+                                    }
                                 }
                                 found = true;
                                 break;

@@ -2223,6 +2223,8 @@ pub struct SchedStats {
     /// RATE, which matters more than any single sample.
     pub gap_ring_count: u64,
     pub gap_tally: [GapTally; SCHED_GAP_TALLY_LEN],
+    /// Reschedule IPIs received: another core woke a task here and kicked this one.
+    pub resched_ipis: u64,
 }
 
 impl Default for SchedStats {
@@ -2236,7 +2238,7 @@ impl Default for SchedStats {
 // field added on one side of the ring boundary and not the other must break the build rather than
 // silently reinterpret every field after it.
 const _: () = assert!(core::mem::size_of::<SchedGlobals>() == 64);
-const _: () = assert!(core::mem::size_of::<SchedStats>() == 1280);
+const _: () = assert!(core::mem::size_of::<SchedStats>() == 1344);
 const _: () = assert!(core::mem::align_of::<SchedStats>() == 64);
 
 /// Read the machine-wide scheduler facts. `None` if the kernel rejected the buffer.

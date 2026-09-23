@@ -137,6 +137,31 @@ pub fn send_sipi(target_apic_id: u32, vector: u8) {
     }
 }
 
+/// Vector of the reschedule IPI: "a task on your core just became Ready — schedule now".
+pub const RESCHED_VECTOR: u8 = 0x42;
+
+/// Send a fixed-delivery IPI to one core.
+///
+/// Waits (briefly, bounded) for the previous IPI from THIS core to leave the ICR first: writing
+/// ICR_LOW while Delivery Status is still pending can drop the earlier one. Call with interrupts
+/// masked — an interrupt landing between the HIGH and LOW writes, whose handler also sends an IPI,
+/// would re-target this one.
+pub fn send_ipi(target_apic_id: u32, vector: u8) {
+    let apic_virt = get_apic_virt_base();
+    unsafe {
+        let icr_high = (apic_virt + ICR_HIGH) as *mut u32;
+        let icr_low = (apic_virt + ICR_LOW) as *mut u32;
+        let mut spins = 0u32;
+        while core::ptr::read_volatile(icr_low) & (1 << 12) != 0 && spins < 10_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        write_volatile(icr_high, target_apic_id << 24);
+        // Fixed delivery (000), physical destination, level ASSERT (bit 14), edge.
+        write_volatile(icr_low, (1 << 14) | vector as u32);
+    }
+}
+
 pub fn init_ap() {
     let apic_virt = get_apic_virt_base();
     unsafe {

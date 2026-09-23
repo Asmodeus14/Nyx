@@ -159,6 +159,56 @@ pub fn kernel_sleep_ms(ms: u64) {
     }
 }
 
+/// Wake every task blocked on INPUT, on EVERY core. Returns true if one on THIS core woke (the
+/// caller should then reschedule); remote cores that gained a Ready task get a reschedule IPI.
+///
+/// ★ The input ISRs used to scan only their own core — and the keyboard and mouse IRQs are routed
+/// to the BSP, while `place_task` has spread processes across all cores since the multi-core
+/// work. A window server that happened to live on core 3 was never woken by a keystroke: it
+/// found the key only when its own 2 ms `read_key_wait` timeout expired and core 3's next tick
+/// ran it. Cross-core writes to `state` follow the pattern `ipc_send` and futex wake already use
+/// (the `tasks` Vec is pre-reserved and never reallocates; only its OWNER pushes).
+///
+/// Call from the ISR, interrupts masked.
+pub fn wake_input_waiters() -> bool {
+    let cores = match unsafe { &mut crate::percpu::PER_CPU } {
+        Some(c) => c,
+        None => return false,
+    };
+    let here = crate::percpu::current().logical_id;
+    let active = crate::smp::ACTIVE_CORES.load(Ordering::SeqCst).clamp(1, cores.len());
+    let mut local = false;
+    for (i, core) in cores[..active].iter_mut().enumerate() {
+        let mut woke = false;
+        for task in core.scheduler.tasks.iter_mut() {
+            if task.state == TaskState::Blocked && task.wait_reason == WaitReason::Input {
+                task.state = TaskState::Ready;
+                task.wake_tsc = 0;
+                task.wait_reason = WaitReason::None;
+                // Stamped so wake-to-run measures input latency specifically: the gap between
+                // the key/mouse IRQ and the woken task reaching the CPU.
+                task.ready_tsc = crate::schedstats::rdtsc();
+                woke = true;
+            }
+        }
+        if woke {
+            crate::schedstats::with(|s| s.wakeups += 1);
+            if i == here {
+                local = true;
+            } else {
+                kick_core(core.apic_id);
+            }
+        }
+    }
+    local
+}
+
+/// Tell another core that a task on it just became Ready, so it schedules now rather than at
+/// its next timer tick (up to a full quantum later — the rest of the cross-core input delay).
+pub fn kick_core(apic_id: u32) {
+    crate::apic::send_ipi(apic_id, crate::apic::RESCHED_VECTOR);
+}
+
 /// Place a newly created task on the least-loaded core and return which one took it.
 ///
 /// ★★★ This is the change that makes the machine multi-core at all. `fork` and `clone` pushed onto
