@@ -4141,6 +4141,19 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     unsafe { core::ptr::copy_nonoverlapping(stamp.as_ptr(), out, n) };
                     frame.rax = n as u64;
                 }
+                3 => {
+                    // GPU health for the `gpu` command: render-engine hang latch, and how many text
+                    // batches were drawn vs refused — which says which font the desktop is in.
+                    let h = crate::drivers::gpu::intel::render::health();
+                    let n = core::mem::size_of::<crate::drivers::gpu::intel::render::GpuHealth>();
+                    if out_len < n || !is_valid_user_ptr(out, n)
+                        || !unsafe { crate::memory::user_addr_mapped(arg3) } {
+                        frame.rax = u64::MAX;
+                        return;
+                    }
+                    unsafe { core::ptr::copy_nonoverlapping(&h as *const _ as *const u8, out, n) };
+                    frame.rax = n as u64;
+                }
                 _ => { frame.rax = u64::MAX; }
             }
         }
@@ -4337,9 +4350,13 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                 frame.rax = 1;
             } else if is_valid_user_ptr(ptr as *const u8, bytes) {
                 let glyphs = unsafe { core::slice::from_raw_parts(ptr, count) };
-                frame.rax = crate::drivers::gpu::intel::render::text::draw_text(
+                let ok = crate::drivers::gpu::intel::render::text::draw_text(
                     atlas_gva, atlas_w, atlas_h, atlas_pitch, glyphs,
-                ) as u64;
+                );
+                use crate::drivers::gpu::intel::render::{TEXT_DRAWN, TEXT_REFUSED};
+                if ok { &TEXT_DRAWN } else { &TEXT_REFUSED }
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                frame.rax = ok as u64;
             } else {
                 frame.rax = EFAULT as u64;
             }

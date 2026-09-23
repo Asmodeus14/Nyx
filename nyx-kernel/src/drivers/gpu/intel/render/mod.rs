@@ -140,6 +140,48 @@ pub const RING_TIMEOUT_US: u64 = 5_000;
 /// Deliberately not permanent-by-construction: a successful wait clears the counter, so an engine
 /// that recovers (after a reset, or after forcewake/MOCS are re-established following RC6 — see the
 /// notes in this module) comes back on its own.
+/// GPU text batches (syscall 537) drawn, and refused. A refusal makes the shell fall back to the
+/// CPU bitmap font — a different typeface — so these two numbers are what the `gpu` command reads to
+/// say which font the desktop is in, instead of asking the user to judge it by eye.
+pub static TEXT_DRAWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static TEXT_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Of the refusals, those because the render engine is latched off after repeated hangs — as
+/// opposed to there being no Intel GPU at all, or one draw failing.
+pub static TEXT_REFUSED_WEDGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Snapshot for the `gpu` command (syscall 575 op 3). Mirrored by `nyx_api::GpuHealth`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuHealth {
+    /// Consecutive failed composites; the engine latches off at [`RENDER_HANG_LIMIT`].
+    pub render_hangs: u32,
+    pub hang_limit: u32,
+    /// 1 if the render engine is latched off right now.
+    pub wedged: u32,
+    pub gl_hangs: u32,
+    pub text_drawn: u32,
+    pub text_refused: u32,
+    pub text_refused_wedged: u32,
+    /// 1 if the Intel render engine was initialised at all (0 in QEMU, which has no Intel GPU).
+    pub gpu_present: u32,
+}
+
+pub fn health() -> GpuHealth {
+    use core::sync::atomic::Ordering::Relaxed;
+    GpuHealth {
+        render_hangs: RENDER_HANGS.load(Relaxed),
+        hang_limit: RENDER_HANG_LIMIT,
+        wedged: engine_is_wedged() as u32,
+        gl_hangs: gl::GL_HANGS.load(Relaxed),
+        text_drawn: TEXT_DRAWN.load(Relaxed),
+        text_refused: TEXT_REFUSED.load(Relaxed),
+        text_refused_wedged: TEXT_REFUSED_WEDGED.load(Relaxed),
+        // try_lock: this is read from a syscall at IF=0, and a draw may hold the engine. If it is
+        // busy, it is certainly present.
+        gpu_present: RENDER_ENGINE.try_lock().map_or(true, |e| e.initialized) as u32,
+    }
+}
+
 pub fn engine_is_wedged() -> bool {
     RENDER_HANGS.load(core::sync::atomic::Ordering::Relaxed) >= RENDER_HANG_LIMIT
 }

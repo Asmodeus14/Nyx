@@ -3855,6 +3855,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  touchpad on       - same, after refreshing the ACPI data (multi-touch mode is kept)\n");
                 self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
                 self.output_history.push_str("  touchpad status   - which path drives the pointer (I2C enables itself at boot)\n");
+                self.output_history.push_str("  gpu               - render engine health, and which font the desktop is using\n");
                 self.output_history.push_str("  touchpad ptp      - multi-touch: 2-finger scroll + right-click, 3-finger swipes\n");
                 self.output_history.push_str("  touchpad mouse    - back to the touchpad's own mouse emulation\n");
                 self.output_history.push_str("  touchpad log      - last 8 multi-touch reports, raw and decoded\n");
@@ -4410,6 +4411,35 @@ impl NyxApp for TerminalApp {
                             ));
                         }
                         _ => self.output_history.push_str("usage: touchpad speed <10-400>\n"),
+                    }
+                }
+            } else if cmd == "gpu" {
+                // Which font the desktop is in, and why. The shell falls back to the CPU bitmap
+                // font whenever the kernel refuses GPU text — so the refusal counts answer "is
+                // the text smooth or pixelated?" without asking anyone to judge it by eye.
+                match sys_gpu_health() {
+                    None => self.output_history.push_str("gpu: no answer from the kernel\n"),
+                    Some(h) => {
+                        let verdict = if h.gpu_present == 0 {
+                            "no Intel render engine — text is ALWAYS the CPU bitmap font here"
+                        } else if h.wedged != 0 {
+                            "render engine LATCHED OFF after repeated hangs — text is the CPU \
+                             bitmap font until reboot"
+                        } else if h.text_refused > 0 && h.text_drawn == 0 {
+                            "GPU text has never succeeded this boot — CPU bitmap font"
+                        } else if h.text_refused > 0 {
+                            "GPU text mostly works, but some batches fell back to the CPU font"
+                        } else {
+                            "GPU text working — the smooth Meridian font"
+                        };
+                        self.output_history.push_str(&format!(
+                            "gpu: {}\n  render hangs {} of {} (latched: {})   GL hangs {}\n  \
+                             text batches: drawn {}  refused {} ({} because latched)\n",
+                            verdict,
+                            h.render_hangs, h.hang_limit, if h.wedged != 0 { "YES" } else { "no" },
+                            h.gl_hangs,
+                            h.text_drawn, h.text_refused, h.text_refused_wedged,
+                        ));
                     }
                 }
             } else if cmd == "touchpad status" {

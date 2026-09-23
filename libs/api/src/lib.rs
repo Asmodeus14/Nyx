@@ -2259,6 +2259,33 @@ pub fn sys_sched_build_stamp(out: &mut [u8]) -> usize {
     if rc == u64::MAX { 0 } else { rc as usize }
 }
 
+/// GPU render-engine health. Mirrors `render::GpuHealth` in the kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GpuHealth {
+    /// Consecutive failed composites; the engine latches off at `hang_limit`.
+    pub render_hangs: u32,
+    pub hang_limit: u32,
+    /// 1 if the render engine is latched off now: GPU composite and GPU text both refused.
+    pub wedged: u32,
+    pub gl_hangs: u32,
+    /// GPU text batches drawn / refused (the shell then uses the CPU bitmap font).
+    pub text_drawn: u32,
+    pub text_refused: u32,
+    /// Of those refusals, how many because the engine was latched off.
+    pub text_refused_wedged: u32,
+    /// 1 if the Intel render engine initialised at all.
+    pub gpu_present: u32,
+}
+const _: () = assert!(core::mem::size_of::<GpuHealth>() == 32);
+
+pub fn sys_gpu_health() -> Option<GpuHealth> {
+    let mut h = GpuHealth::default();
+    let n = core::mem::size_of::<GpuHealth>() as u64;
+    let rc = syscall(SYS_SCHED_STATS, 3, 0, (&mut h as *mut GpuHealth) as u64, n, 0, 0);
+    if rc == n { Some(h) } else { None }
+}
+
 /// Read one core's scheduler statistics. `None` if that core does not exist.
 pub fn sys_sched_stats(core: u64) -> Option<SchedStats> {
     let mut s = SchedStats::default();

@@ -106,6 +106,7 @@ pub fn draw_text(atlas_gva: u32, atlas_w: u32, atlas_h: u32, atlas_pitch: u32, g
     //
     // A wedged engine is wedged for every consumer, so the check belongs on every entry point.
     if super::engine_is_wedged() {
+        super::TEXT_REFUSED_WEDGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
     if glyphs.is_empty() {
