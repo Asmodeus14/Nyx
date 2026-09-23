@@ -3855,6 +3855,8 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  touchpad on       - initialise it; if reports arrive, it becomes the pointer (~6 s)\n");
                 self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
                 self.output_history.push_str("  touchpad status   - which path drives the pointer (I2C enables itself at boot)\n");
+                self.output_history.push_str("  touchpad ptp      - multi-touch: 2-finger scroll + right-click, 3-finger swipes\n");
+                self.output_history.push_str("  touchpad mouse    - back to the touchpad's own mouse emulation\n");
                 self.output_history.push_str("  touchpad speed N  - pointer speed in percent (default 100; 10-400)\n");
                 self.output_history.push_str("  touchpad handover - firmware _DSM: EC stops PS/2 emulation (until power-off!)\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
@@ -4409,20 +4411,47 @@ impl NyxApp for TerminalApp {
                     }
                 }
             } else if cmd == "touchpad status" {
-                let (active, fell_back, probes, irqs) = sys_i2c_hid_status();
+                let s = sys_i2c_hid_status();
                 self.output_history.push_str(&format!(
-                    "pointer: {}\n  probes run: {}   interrupts taken: {}   speed: {}%\n",
-                    if active {
+                    "pointer: {}\n  mode: {}\n  probes run: {}   interrupts taken: {}   speed: {}%\n",
+                    if s.active {
                         "I2C touchpad"
-                    } else if fell_back {
+                    } else if s.fell_back {
                         "PS/2 — I2C was active but went silent while PS/2 kept talking, so it fell back"
                     } else {
                         "PS/2 (I2C not enabled — it normally enables itself during boot; try `touchpad on`)"
                     },
-                    probes,
-                    irqs,
+                    if s.ptp {
+                        "precision (multi-touch): tap, 2-finger scroll/right-click, 3-finger swipe"
+                    } else {
+                        "mouse emulation (the touchpad's own firmware); `touchpad ptp` for multi-touch"
+                    },
+                    s.probes,
+                    s.irqs,
                     sys_i2c_hid_speed(0),
                 ));
+            } else if cmd == "touchpad ptp" || cmd == "touchpad mouse" {
+                let ptp = cmd == "touchpad ptp";
+                sys_i2c_hid_set_mode(ptp);
+                // The kernel task picks the request up within a few ms; give it up to half a second.
+                let mut result = 0u8;
+                for _ in 0..25 {
+                    sys_sleep_ms(20);
+                    result = sys_i2c_hid_status().mode_result;
+                    if result != 0 {
+                        break;
+                    }
+                }
+                self.output_history.push_str(match (result, ptp) {
+                    (1, true) => "★ precision mode on. One finger moves, tap clicks, two-finger tap right-clicks,\n  \
+                                  two fingers scroll, three-finger swipe up/down opens/closes the Command.\n  \
+                                  `touchpad mouse` goes back.\n",
+                    (1, false) => "Mouse emulation on: the touchpad's own firmware interprets fingers again.\n",
+                    (2, _) => "This touchpad declares no Input Mode feature — precision mode is unavailable.\n",
+                    (3, _) => "The mode switch failed on the I2C bus; the touchpad is unchanged.\n",
+                    (4, _) => "The I2C touchpad is not active (`touchpad status`); nothing to switch.\n",
+                    _ => "No answer from the kernel task within 0.5 s.\n",
+                });
             } else if cmd == "touchpad off" {
                 sys_i2c_hid_disable();
                 self.output_history.push_str("I2C touchpad released; PS/2 mouse bytes are accepted again.\n");

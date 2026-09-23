@@ -30,6 +30,13 @@ pub mod usage {
     pub const DIG_TIP_SWITCH: u16 = 0x42;
     pub const DIG_CONTACT_ID: u16 = 0x51;
     pub const DIG_CONTACT_COUNT: u16 = 0x54;
+    pub const DIG_CONFIDENCE: u16 = 0x47;
+    pub const DIG_DEVICE_CONFIG: u16 = 0x0E;
+    /// Device Mode / Input Mode, a Feature in the Device Configuration collection. 0 = mouse,
+    /// 3 = precision touchpad.
+    pub const DIG_INPUT_MODE: u16 = 0x52;
+    pub const INPUT_MODE_MOUSE: i32 = 0;
+    pub const INPUT_MODE_TOUCHPAD: i32 = 3;
 }
 
 /// One input field: `size` bits at `bit_off` within the report (bit 0 = first bit AFTER the report
@@ -47,7 +54,16 @@ pub struct Field {
     pub logical_max: i32,
     /// The application collection this field is inside: (page, usage). (0, 0) if none.
     pub app: (u16, u16),
+    /// [`KIND_INPUT`] or [`KIND_FEATURE`]. Offsets are counted separately per kind and report ID:
+    /// a Feature report is a different report from the Input report that shares its ID.
+    pub kind: u8,
 }
+
+/// An Input main item: data the device sends in its input reports.
+pub const KIND_INPUT: u8 = 0;
+/// A Feature main item: configuration the host reads or writes with GET/SET_REPORT — where a
+/// precision touchpad's Input Mode lives.
+pub const KIND_FEATURE: u8 = 2;
 
 impl Field {
     pub fn is_constant(&self) -> bool { self.flags & 1 != 0 }
@@ -120,8 +136,8 @@ pub fn parse(d: &[u8]) -> Descriptor {
     let mut coll: Vec<Option<(u16, u16)>> = Vec::new();
     let mut app: (u16, u16) = (0, 0);
     let mut app_needs_id = false;
-    // Running input bit offset per report ID.
-    let mut offs: Vec<(u8, u32)> = Vec::new();
+    // Running bit offset per (kind, report ID) — Input and Feature reports are laid out separately.
+    let mut offs: Vec<(u8, u8, u32)> = Vec::new();
 
     let mut i = 0usize;
     while i < d.len() {
@@ -152,14 +168,15 @@ pub fn parse(d: &[u8]) -> Descriptor {
             // Main.
             0 => {
                 match tag {
-                    0x8 => {
-                        // Input.
+                    0x8 | 0xB => {
+                        // Input, or Feature.
+                        let kind = if tag == 0x8 { KIND_INPUT } else { KIND_FEATURE };
                         let id = g.report_id;
-                        let off = match offs.iter_mut().find(|(r, _)| *r == id) {
-                            Some((_, o)) => o,
+                        let off = match offs.iter_mut().find(|(k, r, _)| *k == kind && *r == id) {
+                            Some((_, _, o)) => o,
                             None => {
-                                offs.push((id, 0));
-                                &mut offs.last_mut().unwrap().1
+                                offs.push((kind, id, 0));
+                                &mut offs.last_mut().unwrap().2
                             }
                         };
                         for n in 0..g.report_count {
@@ -181,6 +198,7 @@ pub fn parse(d: &[u8]) -> Descriptor {
                                 logical_min: g.logical_min,
                                 logical_max: g.logical_max,
                                 app,
+                                kind,
                             });
                         }
                         *off += g.report_count * g.report_size;
@@ -210,7 +228,7 @@ pub fn parse(d: &[u8]) -> Descriptor {
                             app = coll.iter().rev().find_map(|c| *c).unwrap_or((0, 0));
                         }
                     }
-                    _ => {} // Output / Feature: not needed to read input.
+                    _ => {} // Output: nothing here writes output reports.
                 }
                 usages.clear();
                 usage_min = None;
@@ -261,13 +279,135 @@ impl Descriptor {
     /// restricted to relative or absolute fields.
     pub fn find(&self, app: (u16, u16), page: u16, usage: u16, relative: Option<bool>) -> Option<Field> {
         self.fields.iter().copied().find(|f| {
-            f.app == app
+            f.kind == KIND_INPUT
+                && f.app == app
                 && f.page == page
                 && f.usage == usage
                 && !f.is_constant()
                 && relative.map_or(true, |r| f.is_relative() == r)
         })
     }
+
+    /// Byte length of Feature report `id`, excluding the report ID byte itself.
+    pub fn feature_report_len(&self, id: u8) -> usize {
+        let bits = self
+            .fields
+            .iter()
+            .filter(|f| f.kind == KIND_FEATURE && f.report_id == id)
+            .map(|f| f.bit_off + f.size)
+            .max()
+            .unwrap_or(0);
+        ((bits + 7) / 8) as usize
+    }
+}
+
+/// Where a precision touchpad's Input Mode lives: a Feature field (Digitizer, usage 0x52) in the
+/// Device Configuration collection. Writing 3 there switches the device from its default mouse
+/// emulation to reporting every contact.
+#[derive(Clone, Copy, Debug)]
+pub struct InputMode {
+    pub report_id: u8,
+    pub field: Field,
+    /// Byte length of the whole Feature report, excluding the report ID.
+    pub report_len: usize,
+}
+
+pub fn input_mode(d: &Descriptor) -> Option<InputMode> {
+    use usage::*;
+    let field = d.fields.iter().copied().find(|f| {
+        f.kind == KIND_FEATURE && f.page == PAGE_DIGITIZER && f.usage == DIG_INPUT_MODE
+    })?;
+    Some(InputMode { report_id: field.report_id, field, report_len: d.feature_report_len(field.report_id) })
+}
+
+/// One contact slot in a touchpad report. A report may carry several; in "hybrid" mode a frame of
+/// N contacts arrives spread over several reports, each using the slots it needs.
+#[derive(Clone, Copy, Debug)]
+pub struct ContactSlot {
+    pub tip: Field,
+    pub id: Option<Field>,
+    /// Palm rejection: 0 = the device thinks this is not a deliberate finger.
+    pub confidence: Option<Field>,
+    pub x: Field,
+    pub y: Field,
+}
+
+/// Up to this many contact slots per report — Windows precision touchpads report at most 5.
+pub const MAX_SLOTS: usize = 5;
+
+/// A precision touchpad's input report layout.
+#[derive(Clone, Copy, Debug)]
+pub struct PtpLayout {
+    pub report_id: u8,
+    pub slots: [Option<ContactSlot>; MAX_SLOTS],
+    pub n_slots: usize,
+    /// Contacts in this FRAME. Non-zero only in the first report of a frame (hybrid mode).
+    pub contact_count: Option<Field>,
+    /// The clickpad's physical button.
+    pub button: Option<Field>,
+    pub x_max: i32,
+    pub y_max: i32,
+}
+
+/// Group the touch pad collection's input fields into contact slots.
+///
+/// ★ Grouped by ORDER, not by nesting: every Tip Switch starts a new contact, and the Contact ID,
+/// Confidence, X and Y that follow belong to it. A precision touchpad declares each finger as a
+/// logical collection in exactly that order, and the flattened field list keeps the order.
+pub fn ptp_layout(d: &Descriptor) -> Option<PtpLayout> {
+    use usage::*;
+    let app = (PAGE_DIGITIZER, DIG_TOUCH_PAD);
+    let mut slots: [Option<ContactSlot>; MAX_SLOTS] = [None; MAX_SLOTS];
+    let mut n = 0usize;
+    // (tip, id, confidence, x, y) being assembled.
+    let mut cur: Option<(Field, Option<Field>, Option<Field>, Option<Field>, Option<Field>)> = None;
+    let mut report_id = None;
+    let flush = |cur: &mut Option<(Field, Option<Field>, Option<Field>, Option<Field>, Option<Field>)>,
+                 slots: &mut [Option<ContactSlot>; MAX_SLOTS],
+                 n: &mut usize| {
+        if let Some((tip, id, conf, Some(x), Some(y))) = cur.take() {
+            if *n < MAX_SLOTS {
+                slots[*n] = Some(ContactSlot { tip, id, confidence: conf, x, y });
+                *n += 1;
+            }
+        }
+    };
+    for f in d.fields.iter().copied() {
+        if f.kind != KIND_INPUT || f.app != app || f.is_constant() {
+            continue;
+        }
+        match (f.page, f.usage) {
+            (PAGE_DIGITIZER, DIG_TIP_SWITCH) => {
+                flush(&mut cur, &mut slots, &mut n);
+                report_id.get_or_insert(f.report_id);
+                cur = Some((f, None, None, None, None));
+            }
+            (PAGE_DIGITIZER, DIG_CONTACT_ID) => {
+                if let Some(c) = cur.as_mut() { c.1.get_or_insert(f); }
+            }
+            (PAGE_DIGITIZER, DIG_CONFIDENCE) => {
+                if let Some(c) = cur.as_mut() { c.2.get_or_insert(f); }
+            }
+            (PAGE_GENERIC_DESKTOP, GD_X) if !f.is_relative() => {
+                if let Some(c) = cur.as_mut() { c.3.get_or_insert(f); }
+            }
+            (PAGE_GENERIC_DESKTOP, GD_Y) if !f.is_relative() => {
+                if let Some(c) = cur.as_mut() { c.4.get_or_insert(f); }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut cur, &mut slots, &mut n);
+    let first = slots[0]?;
+    Some(PtpLayout {
+        report_id: report_id?,
+        slots,
+        n_slots: n,
+        contact_count: d.find(app, PAGE_DIGITIZER, DIG_CONTACT_COUNT, None),
+        button: d.find(app, PAGE_BUTTON, 1, None),
+        x_max: first.x.logical_max,
+        y_max: first.y.logical_max,
+    })
 }
 
 /// A relative-pointer (mouse) report layout, if the descriptor has one.
@@ -366,6 +506,93 @@ mod tests {
         assert_eq!(tip.bit_off, 0);
         assert_eq!((x.bit_off, x.size, x.logical_max), (8, 16, 0x0FFF));
         assert_eq!(cc.bit_off, 40);
+    }
+
+    /// A Windows-style precision touchpad: two contact slots (tip, confidence, contact ID, X, Y),
+    /// then contact count and the clickpad button; plus a Device Configuration collection whose
+    /// Feature report 3 holds Input Mode then Device Identifier.
+    const PTP_FULL: &[u8] = &[
+        0x05, 0x0D, 0x09, 0x05, 0xA1, 0x01, // Digitizer / Touch Pad, Collection (App)
+        0x85, 0x04, //   Report ID 4
+        // Finger 1
+        0x09, 0x22, 0xA1, 0x02,
+        0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02, // tip, 1 bit
+        0x09, 0x47, 0x81, 0x02, //                                               confidence, 1 bit
+        0x09, 0x51, 0x25, 0x0F, 0x75, 0x06, 0x81, 0x02, //                       contact id, 6 bits
+        0x05, 0x01, 0x09, 0x30, 0x26, 0x40, 0x0B, 0x75, 0x10, 0x81, 0x02, //     X abs, max 2880
+        0x09, 0x31, 0x26, 0x40, 0x07, 0x81, 0x02, //                             Y abs, max 1856
+        0xC0,
+        // Finger 2 — identical shape
+        0x05, 0x0D, 0x09, 0x22, 0xA1, 0x02,
+        0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,
+        0x09, 0x47, 0x81, 0x02,
+        0x09, 0x51, 0x25, 0x0F, 0x75, 0x06, 0x81, 0x02,
+        0x05, 0x01, 0x09, 0x30, 0x26, 0x40, 0x0B, 0x75, 0x10, 0x81, 0x02,
+        0x09, 0x31, 0x26, 0x40, 0x07, 0x81, 0x02,
+        0xC0,
+        0x05, 0x0D, 0x09, 0x54, 0x25, 0x05, 0x75, 0x08, 0x81, 0x02, //  contact count, 8 bits
+        0x05, 0x09, 0x09, 0x01, 0x25, 0x01, 0x75, 0x01, 0x81, 0x02, //  button 1, 1 bit
+        0x75, 0x07, 0x81, 0x03, //                                       padding
+        0xC0,
+        0x05, 0x0D, 0x09, 0x0E, 0xA1, 0x01, // Digitizer / Device Configuration, Collection (App)
+        0x85, 0x03, //   Report ID 3
+        0x09, 0x22, 0xA1, 0x02,
+        0x09, 0x52, 0x15, 0x00, 0x25, 0x0A, 0x75, 0x08, 0x95, 0x01, 0xB1, 0x02, // Input Mode (Feature)
+        0x09, 0x53, 0xB1, 0x02, //                                                Device Identifier
+        0xC0, 0xC0,
+    ];
+
+    #[test]
+    fn ptp_layout_groups_each_finger_by_its_tip_switch() {
+        let d = parse(PTP_FULL);
+        assert_eq!(d.trailing, 0);
+        let p = ptp_layout(&d).expect("touch pad collection");
+        assert_eq!(p.report_id, 4);
+        assert_eq!(p.n_slots, 2);
+        let s0 = p.slots[0].unwrap();
+        let s1 = p.slots[1].unwrap();
+        // Slot 1: tip@0, confidence@1, id@2 (6 bits), X@8, Y@24 — 40 bits per finger.
+        assert_eq!(s0.tip.bit_off, 0);
+        assert_eq!(s0.confidence.unwrap().bit_off, 1);
+        assert_eq!(s0.id.unwrap().bit_off, 2);
+        assert_eq!((s0.x.bit_off, s0.y.bit_off), (8, 24));
+        // Slot 2 starts where slot 1 ended.
+        assert_eq!(s1.tip.bit_off, 40);
+        assert_eq!((s1.x.bit_off, s1.y.bit_off), (48, 64));
+        assert_eq!(p.contact_count.unwrap().bit_off, 80);
+        assert_eq!(p.button.unwrap().bit_off, 88);
+        assert_eq!((p.x_max, p.y_max), (2880, 1856));
+    }
+
+    #[test]
+    fn ptp_contact_decodes_from_a_real_report_body() {
+        let p = ptp_layout(&parse(PTP_FULL)).unwrap();
+        let s0 = p.slots[0].unwrap();
+        // Finger touching, confident, id 5, at (1000, 500); one contact; button up.
+        let mut body = [0u8; 12];
+        body[0] = 0b0001_0111; // tip=1, conf=1, id=5 (bits 2..7)
+        body[1..3].copy_from_slice(&1000u16.to_le_bytes());
+        body[3..5].copy_from_slice(&500u16.to_le_bytes());
+        body[10] = 1; // contact count
+        assert_eq!(s0.tip.extract(&body), Some(1));
+        assert_eq!(s0.confidence.unwrap().extract(&body), Some(1));
+        assert_eq!(s0.id.unwrap().extract(&body), Some(5));
+        assert_eq!(s0.x.extract(&body), Some(1000));
+        assert_eq!(s0.y.extract(&body), Some(500));
+        assert_eq!(p.contact_count.unwrap().extract(&body), Some(1));
+        assert_eq!(p.button.unwrap().extract(&body), Some(0));
+    }
+
+    #[test]
+    fn input_mode_is_found_in_its_own_feature_report() {
+        let d = parse(PTP_FULL);
+        let m = input_mode(&d).expect("input mode feature");
+        assert_eq!(m.report_id, 3);
+        assert_eq!((m.field.bit_off, m.field.size), (0, 8));
+        // Input Mode + Device Identifier: two bytes.
+        assert_eq!(m.report_len, 2);
+        // Feature fields must NOT shift the input layout of the same app, nor be found as inputs.
+        assert!(d.find((0x0D, 0x0E), 0x0D, 0x52, None).is_none());
     }
 
     #[test]

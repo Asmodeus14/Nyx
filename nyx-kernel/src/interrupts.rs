@@ -4437,11 +4437,32 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                     // (so the boot-time enable is observable), bits 32.. = interrupts taken.
                     use core::sync::atomic::Ordering::Relaxed;
                     use crate::drivers::i2c_hid::{FELL_BACK, IRQ_COUNT, POINTER_ACTIVE, RESULT};
+                    // bit 2 = precision (multi-touch) mode, bits 3..5 = last mode switch result.
+                    use crate::drivers::i2c_hid::{MODE_RESULT, PTP_ACTIVE};
                     let seq = RESULT.try_lock().map_or(0, |r| r.seq) as u64 & 0xFFFF;
                     frame.rax = POINTER_ACTIVE.load(Relaxed) as u64
                         | (FELL_BACK.load(Relaxed) as u64) << 1
+                        | (PTP_ACTIVE.load(Relaxed) as u64) << 2
+                        | ((MODE_RESULT.load(Relaxed) as u64) & 0x7) << 3
                         | seq << 16
                         | (IRQ_COUNT.load(Relaxed) as u64) << 32;
+                }
+                7 => {
+                    // op 7: take the accumulated two-finger scroll, in pixels (positive = the view
+                    // moves down the content). Non-blocking by design: the shell calls this every
+                    // frame, and the shell must never block — it IS the window server.
+                    let v = crate::drivers::i2c_hid::SCROLL_ACCUM
+                        .swap(0, core::sync::atomic::Ordering::AcqRel);
+                    frame.rax = v as i64 as u64;
+                }
+                8 => {
+                    // op 8: switch input mode. arg2 = 3 precision (multi-touch), anything else
+                    // mouse. Done by the kernel task; read the outcome from op 6.
+                    use core::sync::atomic::Ordering::Release;
+                    crate::drivers::i2c_hid::MODE_RESULT.store(0, Release);
+                    crate::drivers::i2c_hid::MODE_REQUEST
+                        .store(if arg2 == 3 { 2 } else { 1 }, Release);
+                    frame.rax = 1;
                 }
                 5 => {
                     // op 5: pointer speed in percent. arg2 = 0 only reads it; otherwise it is set,

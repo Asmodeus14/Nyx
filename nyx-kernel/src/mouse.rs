@@ -98,6 +98,13 @@ pub fn update_from_usb(dx: i8, dy: i8, buttons: u8) {
     update_relative(dx as i32, dy as i32, buttons);
 }
 
+/// The screen width the pointer is clamped to, for drivers that scale absolute device units to
+/// pixels (the precision touchpad). Interrupts masked while the lock is held — see
+/// [`update_relative`].
+pub fn screen_width() -> usize {
+    x86_64::instructions::interrupts::without_interrupts(|| MOUSE_STATE.lock().screen_width)
+}
+
 /// Move the pointer by a relative delta in SCREEN convention (positive dy = down) and set the
 /// buttons (bit 0 left, bit 1 right, bit 2 middle). Shared by USB HID and the I2C-HID touchpad.
 pub fn update_relative(dx: i32, dy: i32, buttons: u8) {

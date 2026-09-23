@@ -126,14 +126,25 @@ pub static DISABLE: AtomicBool = AtomicBool::new(false);
 /// leaving the machine without a pointer.
 pub static POINTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// The live device, owned by the `usb-hid` task once `touchpad on` succeeds.
-struct Live {
-    ctl: Controller,
-    addr: u8,
+/// What the probe learned that the live driver needs.
+#[derive(Clone, Copy)]
+struct Params {
     in_reg: u16,
+    cmd_reg: u16,
+    data_reg: u16,
     max_in: usize,
     uses_ids: bool,
     mouse: crate::drivers::hid_desc::MouseLayout,
+    /// The multi-touch layout and the Input Mode feature — both needed for precision mode.
+    ptp: Option<crate::drivers::hid_desc::PtpLayout>,
+    input_mode: Option<crate::drivers::hid_desc::InputMode>,
+}
+
+/// The live device, owned by the `usb-hid` task once `touchpad on` (or the boot enable) succeeds.
+struct Live {
+    ctl: Controller,
+    addr: u8,
+    p: Params,
     /// Consecutive failed reads. Too many and the pointer goes back to PS/2.
     errors: u32,
     /// Sub-pixel remainder of scaled motion, in hundredths of a pixel. Carried between reports so
@@ -141,7 +152,57 @@ struct Live {
     /// truncating to zero.
     acc_x: i32,
     acc_y: i32,
+    /// Precision mode: the device reports every contact and `gesture` interprets them.
+    ptp_on: bool,
+    engine: crate::drivers::gesture::Engine,
+    asm: FrameAsm,
+    /// Same idea as `acc_x`, for the precision path (`ptp_report`), in its scaled units.
+    acc_px: i64,
+    acc_py: i64,
+    acc_scroll: i64,
+    /// Buttons held by the clickpad itself.
+    phys_buttons: u8,
+    /// A tap's click, held for [`TAP_CLICK_MS`] so the desktop sees it press and release.
+    pulse_buttons: u8,
+    pulse_until: u64,
 }
+
+/// A precision-mode frame being assembled. In "hybrid" reporting a frame of N contacts arrives
+/// spread over several reports: the first carries the contact count, the rest carry 0.
+#[derive(Clone, Copy)]
+struct FrameAsm {
+    expected: usize,
+    got: usize,
+    contacts: [crate::drivers::gesture::Contact; crate::drivers::hid_desc::MAX_SLOTS],
+    n: usize,
+    button: bool,
+}
+
+impl FrameAsm {
+    const EMPTY: FrameAsm = FrameAsm {
+        expected: 0,
+        got: 0,
+        contacts: [crate::drivers::gesture::Contact { id: 0, x: 0, y: 0 }; crate::drivers::hid_desc::MAX_SLOTS],
+        n: 0,
+        button: false,
+    };
+}
+
+/// How long a tap's click is held down. The desktop samples the button state; a press and release
+/// inside one of its frames would never be seen.
+const TAP_CLICK_MS: u64 = 60;
+
+/// Scroll, in pixels, accumulated by two-finger motion and not yet taken by the shell (syscall 578
+/// op 7). Positive = the view moves down the content.
+pub static SCROLL_ACCUM: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+/// `touchpad ptp` / `touchpad mouse`: 0 = nothing asked, 1 = mouse mode, 2 = precision mode.
+pub static MODE_REQUEST: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Outcome of the last mode switch: 0 none, 1 ok, 2 the device has no Input Mode feature,
+/// 3 the SET_REPORT failed on the bus, 4 no live device.
+pub static MODE_RESULT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// True while the device is in precision mode.
+pub static PTP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 static LIVE: spin::Mutex<Option<Live>> = spin::Mutex::new(None);
 
@@ -351,12 +412,20 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
     // Phase 3: read-only unless `enable`.
     let (seen, live) = explore(&mut ctl, hid.slave_addr as u8, &buf, enable, hid.irq_gsi, boot);
     r.stage = if seen { stage::REPORTS_SEEN } else { stage::REPORT_DESCRIPTOR };
-    if let Some((in_reg, max_in, uses_ids, mouse)) = live {
+    if let Some(p) = live {
         if let Some(mut l) = LIVE.try_lock() {
+            let x_max = p.ptp.map_or(1000, |t| t.x_max);
             *l = Some(Live {
-                ctl, addr: hid.slave_addr as u8, in_reg, max_in, uses_ids, mouse, errors: 0,
+                ctl, addr: hid.slave_addr as u8, p, errors: 0,
                 acc_x: 0, acc_y: 0,
+                // RESET puts the device back in its default mouse mode.
+                ptp_on: false,
+                engine: crate::drivers::gesture::Engine::new(crate::drivers::gesture::Config::for_pad(x_max)),
+                asm: FrameAsm::EMPTY,
+                acc_px: 0, acc_py: 0, acc_scroll: 0,
+                phys_buttons: 0, pulse_buttons: 0, pulse_until: 0,
             });
+            PTP_ACTIVE.store(false, Ordering::Release);
             PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
             FELL_BACK.store(false, Ordering::Relaxed);
             POINTER_ACTIVE.store(true, Ordering::Release);
@@ -369,6 +438,10 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
 /// Drain pending input reports and move the pointer. No-op unless `touchpad on` succeeded.
 fn poll() {
     if !POINTER_ACTIVE.load(Ordering::Acquire) {
+        // A mode switch needs a live device; answer the request rather than leave it hanging.
+        if MODE_REQUEST.swap(0, Ordering::AcqRel) != 0 {
+            MODE_RESULT.store(4, Ordering::Release);
+        }
         return;
     }
     let mut guard = match LIVE.try_lock() {
@@ -379,6 +452,21 @@ fn poll() {
         Some(d) => d,
         None => return,
     };
+    let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+
+    // A tap's click ends on time whether or not another report ever arrives — after the finger
+    // lifts, the device goes quiet.
+    if dev.pulse_buttons != 0 && now >= dev.pulse_until {
+        dev.pulse_buttons = 0;
+        crate::mouse::update_relative(0, 0, dev.phys_buttons);
+    }
+
+    match MODE_REQUEST.swap(0, Ordering::AcqRel) {
+        1 => set_mode(dev, false),
+        2 => set_mode(dev, true),
+        _ => {}
+    }
+
     // ★ Read ONLY when the device's interrupt says a report is waiting. Reading the input register
     // otherwise returns the LAST report again — on the hardware that re-applied the last motion on
     // every poll, and the pointer ran off to the edge of the screen on its own.
@@ -386,63 +474,251 @@ fn poll() {
         return;
     }
     let mut buf = [0u8; 64];
-    {
-        let n = dev.max_in;
-        match dev.ctl.write_read(dev.addr, &dev.in_reg.to_le_bytes(), &mut buf[..n]) {
-            Err(_) => {
-                dev.errors += 1;
-                if dev.errors >= MAX_CONSECUTIVE_ERRORS {
-                    // The I2C side has gone quiet. Hand the pointer back to PS/2 rather than leave
-                    // the machine without one — and leave the line masked, nobody is listening.
-                    POINTER_ACTIVE.store(false, Ordering::Release);
-                    *guard = None;
-                    return;
-                }
-                // Try again on the next tick: the line is still asserted, the report still there.
-                PENDING.store(true, Ordering::Release);
+    let n = dev.p.max_in;
+    match dev.ctl.write_read(dev.addr, &dev.p.in_reg.to_le_bytes(), &mut buf[..n]) {
+        Err(_) => {
+            dev.errors += 1;
+            if dev.errors >= MAX_CONSECUTIVE_ERRORS {
+                // The I2C side has gone quiet. Hand the pointer back to PS/2 rather than leave the
+                // machine without one — and leave the line masked, nobody is listening.
+                POINTER_ACTIVE.store(false, Ordering::Release);
+                PTP_ACTIVE.store(false, Ordering::Release);
+                *guard = None;
                 return;
             }
-            Ok(()) => {
-                dev.errors = 0;
-                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-                if len > 2 {
-                    // The I2C side is alive — the PS/2 fallback counter starts over.
-                    PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
+            // Try again on the next tick: the line is still asserted, the report still there.
+            PENDING.store(true, Ordering::Release);
+            return;
+        }
+        Ok(()) => {
+            dev.errors = 0;
+            let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+            if len > 2 && len <= n {
+                // The I2C side is alive — the PS/2 fallback counter starts over.
+                PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
+                let id = if dev.p.uses_ids { buf[2] } else { 0 };
+                let body = &buf[if dev.p.uses_ids { 3 } else { 2 }..len];
+                if id == dev.p.mouse.report_id {
+                    mouse_report(dev, body);
+                } else if dev.ptp_on && dev.p.ptp.map_or(false, |t| t.report_id == id) {
+                    ptp_report(dev, body, now);
                 }
-                let id = if dev.uses_ids && len > 2 { buf[2] } else { 0 };
-                if len <= 2 || len > n || id != dev.mouse.report_id {
-                    // Nothing, or another collection's report: no motion, but the line still needs
-                    // unmasking.
-                    unmask_irq();
-                    return;
-                }
-                let body = &buf[if dev.uses_ids { 3 } else { 2 }..len];
-                let m = &dev.mouse;
-                let dx = m.x.extract(body).unwrap_or(0);
-                let dy = m.y.extract(body).unwrap_or(0);
-                let mut buttons = 0u8;
-                for (i, b) in m.buttons.iter().enumerate() {
-                    if b.and_then(|f| f.extract(body)).unwrap_or(0) != 0 {
-                        buttons |= 1 << i;
-                    }
-                }
-                // Scale in hundredths, keeping the remainder (`/` truncates toward zero, so the
-                // remainder keeps its sign and motion is symmetric in both directions).
-                let pct = SPEED_PCT.load(Ordering::Relaxed) as i32;
-                dev.acc_x += dx * pct;
-                dev.acc_y += dy * pct;
-                let mx = dev.acc_x / 100;
-                let my = dev.acc_y / 100;
-                dev.acc_x -= mx * 100;
-                dev.acc_y -= my * 100;
-                // HID relative Y is positive DOWN, the screen's convention — no flip, unlike PS/2.
-                crate::mouse::update_relative(mx, my, buttons);
             }
         }
     }
     // The report is read, so the line has dropped (or, if another is queued, is still asserted and
     // will fire again the moment it is unmasked).
     unmask_irq();
+}
+
+/// A report from the mouse collection — the device's default mode, where its own firmware has
+/// already turned fingers into relative motion and taps into button presses.
+fn mouse_report(dev: &mut Live, body: &[u8]) {
+    let m = &dev.p.mouse;
+    let dx = m.x.extract(body).unwrap_or(0);
+    let dy = m.y.extract(body).unwrap_or(0);
+    let mut buttons = 0u8;
+    for (i, b) in m.buttons.iter().enumerate() {
+        if b.and_then(|f| f.extract(body)).unwrap_or(0) != 0 {
+            buttons |= 1 << i;
+        }
+    }
+    // Scale in hundredths, keeping the remainder (`/` truncates toward zero, so the remainder
+    // keeps its sign and motion is symmetric in both directions).
+    let pct = SPEED_PCT.load(Ordering::Relaxed) as i32;
+    dev.acc_x += dx * pct;
+    dev.acc_y += dy * pct;
+    let mx = dev.acc_x / 100;
+    let my = dev.acc_y / 100;
+    dev.acc_x -= mx * 100;
+    dev.acc_y -= my * 100;
+    dev.phys_buttons = buttons;
+    // HID relative Y is positive DOWN, the screen's convention — no flip, unlike PS/2.
+    crate::mouse::update_relative(mx, my, buttons | dev.pulse_buttons);
+}
+
+/// A report from the touch pad collection (precision mode): assemble the frame, interpret it, and
+/// turn the result into pointer motion, clicks, scroll and swipes.
+fn ptp_report(dev: &mut Live, body: &[u8], now: u64) {
+    use crate::drivers::gesture::{Contact, Tap};
+    use crate::drivers::hid_desc::MAX_SLOTS;
+    let t = match dev.p.ptp {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Frame assembly. With a contact-count field, a non-zero count starts a frame of that many
+    // contacts and zero continues one; without it, every report is a whole frame.
+    match t.contact_count.and_then(|f| f.extract(body)) {
+        Some(c) if c > 0 => {
+            dev.asm.expected = (c as usize).min(MAX_SLOTS);
+            dev.asm.got = 0;
+            dev.asm.n = 0;
+        }
+        Some(_) => {
+            if dev.asm.expected == 0 {
+                return; // a continuation of a frame whose start was never seen
+            }
+        }
+        None => {
+            dev.asm.expected = t.n_slots;
+            dev.asm.got = 0;
+            dev.asm.n = 0;
+        }
+    }
+    for s in t.slots[..t.n_slots].iter().flatten() {
+        if dev.asm.got >= dev.asm.expected {
+            break;
+        }
+        dev.asm.got += 1;
+        let tip = s.tip.extract(body).unwrap_or(0) != 0;
+        // Palm rejection: the device's own judgement, when it reports one.
+        let confident = s.confidence.map_or(true, |f| f.extract(body).unwrap_or(1) != 0);
+        if tip && confident && dev.asm.n < MAX_SLOTS {
+            let id = s.id.and_then(|f| f.extract(body)).unwrap_or(dev.asm.got as i32) as u8;
+            let x = s.x.extract(body).unwrap_or(0);
+            let y = s.y.extract(body).unwrap_or(0);
+            dev.asm.contacts[dev.asm.n] = Contact { id, x, y };
+            dev.asm.n += 1;
+        }
+    }
+    if let Some(b) = t.button {
+        dev.asm.button = b.extract(body).unwrap_or(0) != 0;
+    }
+    if dev.asm.got < dev.asm.expected {
+        return; // the rest of this frame is in the next report
+    }
+    dev.asm.expected = 0;
+    let o = dev.engine.frame(now, &dev.asm.contacts[..dev.asm.n], dev.asm.button);
+
+    // Scale logical units to pixels: at 100% a full pad width is 1.5 screen widths. The same
+    // factor on both axes keeps motion isotropic. Remainders carry, as on the mouse path.
+    let sw = crate::mouse::screen_width().max(1) as i64;
+    let pct = SPEED_PCT.load(Ordering::Relaxed) as i64;
+    let unit = 2 * (t.x_max.max(1) as i64) * 100;
+    dev.acc_px += o.dx as i64 * sw * 3 * pct;
+    dev.acc_py += o.dy as i64 * sw * 3 * pct;
+    let mx = dev.acc_px / unit;
+    let my = dev.acc_py / unit;
+    dev.acc_px -= mx * unit;
+    dev.acc_py -= my * unit;
+    // Scroll is not scaled by the pointer speed: they are different preferences.
+    dev.acc_scroll += o.scroll_y as i64 * sw * 3 * 100;
+    let sy = dev.acc_scroll / unit;
+    dev.acc_scroll -= sy * unit;
+    if sy != 0 {
+        SCROLL_ACCUM.fetch_add(sy as i32, Ordering::Relaxed);
+    }
+
+    let before = dev.phys_buttons | dev.pulse_buttons;
+    dev.phys_buttons = o.buttons;
+    match o.tap {
+        Tap::Left => {
+            dev.pulse_buttons = 0b01;
+            dev.pulse_until = now + TAP_CLICK_MS;
+        }
+        Tap::Right => {
+            dev.pulse_buttons = 0b10;
+            dev.pulse_until = now + TAP_CLICK_MS;
+        }
+        Tap::None => {}
+    }
+    // Three-finger swipes drive the Command: up opens it (the Super key), down dismisses (Esc).
+    match o.swipe3 {
+        1 => crate::shell::push_key('\u{E019}'),
+        -1 => crate::shell::push_key('\x1b'),
+        _ => {}
+    }
+    let buttons = dev.phys_buttons | dev.pulse_buttons;
+    if mx != 0 || my != 0 || buttons != before {
+        crate::mouse::update_relative(mx as i32, my as i32, buttons);
+    }
+}
+
+/// Switch the device between its mouse emulation and precision mode, with SET_REPORT on the Input
+/// Mode feature. Result in [`MODE_RESULT`].
+///
+/// The wire format (HID over I2C, SET_REPORT): the command register, then [type<<4 | id, opcode 3]
+/// (ids of 15 and up take a third byte), then the data register, then a 16-bit length that counts
+/// itself, the report ID and the report.
+fn set_mode(dev: &mut Live, ptp: bool) {
+    let im = match dev.p.input_mode {
+        Some(m) => m,
+        None => {
+            MODE_RESULT.store(2, Ordering::Release);
+            return;
+        }
+    };
+    if ptp && dev.p.ptp.is_none() {
+        MODE_RESULT.store(2, Ordering::Release);
+        return;
+    }
+    let value = if ptp {
+        crate::drivers::hid_desc::usage::INPUT_MODE_TOUCHPAD
+    } else {
+        crate::drivers::hid_desc::usage::INPUT_MODE_MOUSE
+    } as u32;
+
+    // The feature report, zeroed except for Input Mode (the Device Identifier beside it is 0).
+    let rlen = im.report_len.clamp(1, 16);
+    let mut rep = [0u8; 16];
+    for i in 0..im.field.size.min(32) {
+        if value >> i & 1 != 0 {
+            let bit = (im.field.bit_off + i) as usize;
+            if bit / 8 < rlen {
+                rep[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+    }
+
+    const FEATURE: u8 = 3;
+    const SET_REPORT: u8 = 3;
+    let rid = im.report_id;
+    let mut w = [0u8; 40];
+    let mut k = 0usize;
+    let [c0, c1] = dev.p.cmd_reg.to_le_bytes();
+    let [d0, d1] = dev.p.data_reg.to_le_bytes();
+    let size = (2 + if rid != 0 { 1 } else { 0 } + rlen) as u16;
+    let [s0, s1] = size.to_le_bytes();
+    {
+        let mut push = |b: u8| {
+            w[k] = b;
+            k += 1;
+        };
+        push(c0);
+        push(c1);
+        if rid < 0x0F {
+            push(FEATURE << 4 | rid);
+            push(SET_REPORT);
+        } else {
+            push(FEATURE << 4 | 0x0F);
+            push(SET_REPORT);
+            push(rid);
+        }
+        push(d0);
+        push(d1);
+        push(s0);
+        push(s1);
+        if rid != 0 {
+            push(rid);
+        }
+        for &b in &rep[..rlen] {
+            push(b);
+        }
+    }
+
+    match dev.ctl.write_read(dev.addr, &w[..k], &mut []) {
+        Ok(()) => {
+            dev.ptp_on = ptp;
+            PTP_ACTIVE.store(ptp, Ordering::Release);
+            // A fresh interpretation for the new mode: no half-assembled frame, no stale fingers.
+            let x_max = dev.p.ptp.map_or(1000, |t| t.x_max);
+            dev.engine = crate::drivers::gesture::Engine::new(crate::drivers::gesture::Config::for_pad(x_max));
+            dev.asm = FrameAsm::EMPTY;
+            MODE_RESULT.store(1, Ordering::Release);
+        }
+        Err(_) => MODE_RESULT.store(3, Ordering::Release),
+    }
 }
 
 /// PS/2 AUX bytes received since the last I2C report, while I2C drives the pointer. Climbs only
@@ -546,7 +822,7 @@ fn explore(
     enable: bool,
     gsi: u32,
     boot: bool,
-) -> (bool, Option<(u16, usize, bool, crate::drivers::hid_desc::MouseLayout)>) {
+) -> (bool, Option<Params>) {
     use crate::drivers::hid_desc;
     use core::fmt::Write;
 
@@ -582,7 +858,7 @@ fn explore(
         return (false, None);
     }
     let d = hid_desc::parse(&rdesc);
-    let _ = writeln!(out, "report descriptor: {} bytes, {} input fields, report IDs {}{}",
+    let _ = writeln!(out, "report descriptor: {} bytes, {} fields, report IDs {}{}",
         rd_len, d.fields.len(), if d.uses_report_ids { "yes" } else { "no" },
         if d.trailing != 0 { " (TRUNCATED)" } else { "" });
     for &(page, u, id) in &d.apps {
@@ -596,6 +872,29 @@ fn explore(
             _ => "other",
         };
         let _ = writeln!(out, "  app {:02x}:{:02x} {:<13} report id {}", page, u, name, id);
+    }
+    let ptp = hid_desc::ptp_layout(&d);
+    let imode = hid_desc::input_mode(&d);
+    match &ptp {
+        Some(t) => {
+            let _ = writeln!(out, "  touchpad layout: id {}, {} contact slot(s), X 0..{} Y 0..{}, \
+                                   contact count {}, clickpad button {}",
+                t.report_id, t.n_slots, t.x_max, t.y_max,
+                t.contact_count.map_or(alloc::string::String::from("none"), |f| alloc::format!("@{}", f.bit_off)),
+                t.button.map_or(alloc::string::String::from("none"), |f| alloc::format!("@{}", f.bit_off)));
+        }
+        None => {
+            let _ = writeln!(out, "  no precision touchpad layout");
+        }
+    }
+    match &imode {
+        Some(m) => {
+            let _ = writeln!(out, "  input mode: feature report {} bit {}+{} ({} byte report)",
+                m.report_id, m.field.bit_off, m.field.size, m.report_len);
+        }
+        None => {
+            let _ = writeln!(out, "  no Input Mode feature — precision mode unavailable");
+        }
     }
     let mouse = hid_desc::mouse_layout(&d);
     match &mouse {
@@ -750,7 +1049,16 @@ fn explore(
         Some(m) if enable && (mouse_reports > 0 || boot) => {
             let _ = writeln!(out, "★ I2C now drives the pointer; PS/2 mouse bytes are ignored. \
                                    `touchpad off` hands it back.");
-            Some((in_reg, max_in, d.uses_report_ids, m))
+            Some(Params {
+                in_reg,
+                cmd_reg,
+                data_reg: w(18),
+                max_in,
+                uses_ids: d.uses_report_ids,
+                mouse: m,
+                ptp,
+                input_mode: imode,
+            })
         }
         _ if enable => {
             let _ = writeln!(out, "not taking the pointer: no mouse reports arrived. PS/2 stays in charge.");

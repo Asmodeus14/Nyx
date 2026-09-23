@@ -2280,6 +2280,11 @@ struct Shell {
     resizing: Option<usize>,
     resize_edges: u8,
     scrolling: Option<usize>,
+    /// The last two-finger scroll target sent: (client index, offset, when). The app writes its
+    /// offset back to its header asynchronously, so during a fast scroll the header still shows an
+    /// older value — building the next step on it would drag the view backwards. For a short while
+    /// after sending, the next step builds on what was SENT instead.
+    touch_scroll: Option<(usize, i32, usize)>,
     cursor: Shape,
     /// Cold-start stage 3 — the mark travelling from the kernel's screen to the corner.
     handoff: Handoff,
@@ -2454,6 +2459,7 @@ impl Shell {
             resizing: None,
             resize_edges: 0,
             scrolling: None,
+            touch_scroll: None,
             cursor: Shape::Pointer,
             handoff: Handoff::begin(),
             osd: None,
@@ -3565,6 +3571,40 @@ impl Shell {
         self.mark_dock();
     }
 
+    /// Scroll the window under the pointer by `delta` pixels (positive = further down the content).
+    fn apply_touch_scroll(&mut self, delta: i32, now: usize) {
+        // The modal surfaces own the pointer; nothing behind them scrolls.
+        if self.cmd_open || self.ent_open {
+            return;
+        }
+        let idx = match self
+            .window_at(self.mx, self.my)
+            .filter(|&i| !self.clients[i].win.folded)
+        {
+            Some(i) => i,
+            None => return,
+        };
+        let r = self.clients[idx].win.r;
+        let (content_h, off) = client_scroll(&self.clients[idx]);
+        let max = content_h as i32 - r.h;
+        if max <= 0 {
+            return; // nothing to scroll
+        }
+        // Build on the last target SENT to this window if that was recent; the header lags it.
+        const HEADER_LAG_MS: usize = 150;
+        let base = match self.touch_scroll {
+            Some((i, t, at)) if i == idx && now.wrapping_sub(at) < HEADER_LAG_MS => t,
+            _ => off as i32,
+        };
+        let target = (base + delta).clamp(0, max);
+        if target != base {
+            sys_ipc_send(self.clients[idx].owner_pid, MSG_SCROLL, target as u64, 0);
+            self.touch_scroll = Some((idx, target, now));
+            // The scrollbar thumb moves with it.
+            self.mark_win(r);
+        }
+    }
+
     fn process_input(&mut self, now: usize) {
         // ⚠️ `process_input` runs at ~500 Hz, not once per frame. That is why idle is timed from
         // here and not from the render loop: a wake has to be felt on the *next* frame, and polling
@@ -3594,6 +3634,16 @@ impl Shell {
         self.mx = (mx_raw as i32).clamp(0, self.screen_w - 1);
         self.my = (my_raw as i32).clamp(0, self.screen_h - 1);
         self.left = left;
+
+        // ★ Two-finger scroll from the precision touchpad — the first scroll input this desktop
+        // has ever had. It goes to the window under the pointer through the same MSG_SCROLL the
+        // scrollbar drag uses, so every app that already scrolls by its bar scrolls by touch too.
+        // Non-blocking (a counter swap in the kernel): the window server must never wait.
+        let scroll = sys_touchpad_take_scroll();
+        if scroll != 0 {
+            self.last_input = now;
+            self.apply_touch_scroll(scroll, now);
+        }
 
         let moved = self.mx != self.prev_mx || self.my != self.prev_my;
         if moved && !self.hw_cursor {

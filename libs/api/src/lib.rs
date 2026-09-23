@@ -1021,11 +1021,44 @@ pub fn sys_i2c_hid_speed(pct: u32) -> u32 {
     syscall(578, 5, pct as u64, 0, 0, 0, 0) as u32
 }
 
-/// I2C touchpad live status: (drives the pointer, fell back to PS/2, probes completed — including
-/// the automatic one at boot — and interrupts taken).
-pub fn sys_i2c_hid_status() -> (bool, bool, u32, u32) {
+/// I2C touchpad live status.
+#[derive(Clone, Copy, Debug)]
+pub struct TouchpadStatus {
+    /// The I2C touchpad drives the pointer.
+    pub active: bool,
+    /// It did, went silent while PS/2 kept talking, and handed the pointer back.
+    pub fell_back: bool,
+    /// Precision (multi-touch) mode is on: gestures are interpreted by the kernel.
+    pub ptp: bool,
+    /// Last mode switch: 0 none yet, 1 ok, 2 device has no Input Mode, 3 bus error, 4 no device.
+    pub mode_result: u8,
+    /// Probes completed, including the automatic one at boot.
+    pub probes: u32,
+    pub irqs: u32,
+}
+
+pub fn sys_i2c_hid_status() -> TouchpadStatus {
     let v = syscall(578, 6, 0, 0, 0, 0, 0);
-    (v & 1 != 0, v & 2 != 0, ((v >> 16) & 0xFFFF) as u32, (v >> 32) as u32)
+    TouchpadStatus {
+        active: v & 1 != 0,
+        fell_back: v & 2 != 0,
+        ptp: v & 4 != 0,
+        mode_result: ((v >> 3) & 0x7) as u8,
+        probes: ((v >> 16) & 0xFFFF) as u32,
+        irqs: (v >> 32) as u32,
+    }
+}
+
+/// Take the touchpad's accumulated two-finger scroll, in pixels; positive = the view moves down
+/// the content. Never blocks — safe from the window server's frame loop.
+pub fn sys_touchpad_take_scroll() -> i32 {
+    syscall(578, 7, 0, 0, 0, 0, 0) as i64 as i32
+}
+
+/// Ask for precision (multi-touch) mode, or back to the device's mouse emulation. Poll
+/// [`sys_i2c_hid_status`] for the outcome.
+pub fn sys_i2c_hid_set_mode(ptp: bool) {
+    syscall(578, 8, if ptp { 3 } else { 0 }, 0, 0, 0, 0);
 }
 
 /// Stop driving the pointer from I2C; PS/2 mouse bytes are accepted again.

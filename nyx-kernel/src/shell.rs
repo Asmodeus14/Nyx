@@ -153,7 +153,7 @@ pub fn handle_hid_key(usage: u8, modifiers: u8) {
     };
 
     if let Some(c) = c {
-        KEY_QUEUE.lock().push_back(c);
+        push_key(c);
     }
 }
 
@@ -162,5 +162,14 @@ pub fn handle_hid_key(usage: u8, modifiers: u8) {
 /// Separate from `handle_hid_key` because it has no usage code of its own — it is bit 3 / bit 7 of
 /// the modifier byte, so it can only be detected by diffing modifiers between reports.
 pub fn handle_hid_super() {
-    KEY_QUEUE.lock().push_back('\u{E019}');
+    push_key('\u{E019}');
+}
+
+/// Queue one keystroke from a kernel TASK (USB HID, touchpad gestures).
+///
+/// ⚠️ Interrupts masked while KEY_QUEUE is held: the keyboard IRQ takes this same lock, and a task
+/// holding it when that IRQ lands on the same core would leave the handler spinning forever.
+/// `handle_key` itself runs inside the IRQ and needs none of this.
+pub fn push_key(c: char) {
+    x86_64::instructions::interrupts::without_interrupts(|| KEY_QUEUE.lock().push_back(c));
 }
