@@ -169,9 +169,14 @@ struct Live {
     acc_scroll: i64,
     /// Buttons held by the clickpad itself.
     phys_buttons: u8,
-    /// A tap's click, held for [`TAP_CLICK_MS`] so the desktop sees it press and release.
+    /// A tap's click, held from `pulse_from` for [`TAP_CLICK_MS`] so the desktop sees it press
+    /// and release. `pulse_from` is later than now only for a double tap's second click, which
+    /// must follow a release the desktop can see.
     pulse_buttons: u8,
+    pulse_from: u64,
     pulse_until: u64,
+    /// When `poll` last settled the button state — what the desktop was last told.
+    last_tick: u64,
     /// Precision mode is on trial until this uptime; 0 once a touching finger has been decoded.
     ptp_trial_until: u64,
 }
@@ -204,6 +209,16 @@ const PTP_POINTER_DEN: i64 = 5;
 /// How long a tap's click is held down. The desktop samples the button state; a press and release
 /// inside one of its frames would never be seen.
 const TAP_CLICK_MS: u64 = 60;
+
+/// The release between a double tap's two clicks, for the same reason as [`TAP_CLICK_MS`].
+const TAP_GAP_MS: u64 = 40;
+
+impl Live {
+    /// The tap buttons down at `now` (a scheduled click that has not started yet is not down).
+    fn pulse_at(&self, now: u64) -> u8 {
+        if now >= self.pulse_from { self.pulse_buttons } else { 0 }
+    }
+}
 
 /// Scroll, in pixels, accumulated by two-finger motion and not yet taken by the shell (syscall 578
 /// op 7). Positive = the view moves down the content.
@@ -595,7 +610,7 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
                 engine: crate::drivers::gesture::Engine::new(crate::drivers::gesture::Config::for_pad(x_max)),
                 asm: FrameAsm::EMPTY,
                 acc_px: 0, acc_py: 0, acc_scroll: 0,
-                phys_buttons: 0, pulse_buttons: 0, pulse_until: 0,
+                phys_buttons: 0, pulse_buttons: 0, pulse_from: 0, pulse_until: 0, last_tick: 0,
                 ptp_trial_until: 0,
             });
             PTP_ACTIVE.store(false, Ordering::Release);
@@ -638,9 +653,22 @@ fn poll() {
 
     // A tap's click ends on time whether or not another report ever arrives — after the finger
     // lifts, the device goes quiet.
+    // Likewise a tap's drag window: its held press is released when it closes.
+    let before = dev.phys_buttons | dev.pulse_at(dev.last_tick);
+    if dev.ptp_on {
+        if let Some(b) = dev.engine.tick(now) {
+            dev.phys_buttons = b;
+        }
+    }
     if dev.pulse_buttons != 0 && now >= dev.pulse_until {
         dev.pulse_buttons = 0;
-        crate::mouse::update_relative(0, 0, dev.phys_buttons);
+    }
+    dev.last_tick = now;
+    // One update for whatever changed — including a double tap's second click STARTING, which
+    // is scheduled a little after the release that precedes it.
+    let after = dev.phys_buttons | dev.pulse_at(now);
+    if after != before {
+        crate::mouse::update_relative(0, 0, after);
     }
 
     match MODE_REQUEST.swap(0, Ordering::AcqRel) {
@@ -867,15 +895,21 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) -> (u8, i32, i32) {
         SCROLL_ACCUM.fetch_add(sy as i32, Ordering::Relaxed);
     }
 
-    let before = dev.phys_buttons | dev.pulse_buttons;
+    let before = dev.phys_buttons | dev.pulse_at(now);
+    // `o.buttons` includes a one-finger tap's press and a tap-and-drag's hold (see `gesture`).
     dev.phys_buttons = o.buttons;
     match o.tap {
+        // A double tap's second click. This same frame released the first (`o.buttons` dropped
+        // bit 0), so the second press waits a visible gap: the desktop samples button STATE, and
+        // an instant release-then-press would look like the first press never ended.
         Tap::Left => {
             dev.pulse_buttons = 0b01;
-            dev.pulse_until = now + TAP_CLICK_MS;
+            dev.pulse_from = now + TAP_GAP_MS;
+            dev.pulse_until = dev.pulse_from + TAP_CLICK_MS;
         }
         Tap::Right => {
             dev.pulse_buttons = 0b10;
+            dev.pulse_from = now;
             dev.pulse_until = now + TAP_CLICK_MS;
         }
         Tap::None => {}
@@ -886,7 +920,7 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) -> (u8, i32, i32) {
         -1 => crate::shell::push_key('\x1b'),
         _ => {}
     }
-    let buttons = dev.phys_buttons | dev.pulse_buttons;
+    let buttons = dev.phys_buttons | dev.pulse_at(now);
     if mx != 0 || my != 0 || buttons != before {
         crate::mouse::update_relative(mx as i32, my as i32, buttons);
     }

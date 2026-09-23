@@ -9,6 +9,8 @@
 //! |---------|--------------------------|------------------------------------------|
 //! | 1       | moves                    | pointer motion                           |
 //! | 1       | down + up quickly, still | left click (tap)                         |
+//! | 1       | tap, then touch + move   | drag: left held until the finger lifts   |
+//! | 1       | tap, tap                 | double click                             |
 //! | 2       | move together            | scroll                                   |
 //! | 2       | down + up quickly, still | right click (tap)                        |
 //! | 3       | swipe up / down, lift    | open / close the Command                 |
@@ -25,7 +27,10 @@ pub struct Contact {
     pub y: i32,
 }
 
-/// A tap, reported once, on the frame the fingers lift.
+/// A complete click, reported once, on the frame the fingers lift — the caller turns it into a
+/// press and release. A one-finger tap is NOT reported here: it presses through `Out::buttons` so
+/// that a following touch can turn it into a drag (see `Engine`). `Left` is the SECOND tap of a
+/// double tap, which the caller must deliver after a visible release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tap {
     None,
@@ -40,7 +45,8 @@ pub struct Out {
     pub dy: i32,
     /// Positive = the view moves DOWN the content (the scroll offset grows).
     pub scroll_y: i32,
-    /// Buttons held by the physical clickpad: bit 0 left, bit 1 right.
+    /// Buttons held down, bit 0 left, bit 1 right: the physical clickpad, plus the left button a
+    /// tap holds (through its drag window, and for the whole of a tap-and-drag).
     pub buttons: u8,
     pub tap: Tap,
     /// Three-finger swipe completed on this frame: +1 up, -1 down, 0 none.
@@ -65,14 +71,18 @@ pub struct Config {
     /// glitch — a contact ID reused for a different finger, a misread report — and applying it
     /// would fling the pointer across the screen. Dropped, the way libinput drops pointer jumps.
     pub jump: i32,
+    /// After a tap lifts, a finger landing within this long turns it into a drag (or, if that
+    /// touch is itself a tap, a double click). The tap's button is held through the window.
+    pub drag_ms: u64,
 }
 
 impl Config {
     /// Thresholds for a pad whose logical X range is `x_max`: 3% of the width is "didn't move",
-    /// 15% of it is a deliberate swipe. 180 ms is the tap window macOS and libinput use.
+    /// 15% of it is a deliberate swipe. 180 ms is the tap window macOS and libinput use, and
+    /// libinput's tap-and-drag window too.
     pub fn for_pad(x_max: i32) -> Config {
         let w = x_max.max(100);
-        Config { tap_ms: 180, tap_slop: w * 3 / 100, swipe_min: w * 15 / 100, jump: w / 4 }
+        Config { tap_ms: 180, tap_slop: w * 3 / 100, swipe_min: w * 15 / 100, jump: w / 4, drag_ms: 180 }
     }
 }
 
@@ -93,6 +103,15 @@ pub struct Engine {
     swipe_y: i32,
     /// The clickpad was pressed during this touch — the lift is then a press ending, not a tap.
     pressed: bool,
+    /// ★ Tap-and-drag. A one-finger tap presses the left button at once but holds the RELEASE
+    /// until this uptime. A finger landing before then keeps it held ([`Engine::dragging`]).
+    ///
+    /// On the hardware, trying to drag a window by tap-then-hold instead produced a double click
+    /// — which on a caption maximises the window. The old tap sent a whole click at the lift, so
+    /// tap + touch was click + press: two presses in quick succession.
+    tap_hold_until: Option<u64>,
+    /// A finger landed inside a tap's drag window: the left button stays down until it lifts.
+    dragging: bool,
 }
 
 impl Engine {
@@ -106,6 +125,26 @@ impl Engine {
             travel: 0,
             swipe_y: 0,
             pressed: false,
+            tap_hold_until: None,
+            dragging: false,
+        }
+    }
+
+    /// The left button a tap is holding, if any.
+    fn tap_button(&self) -> u8 {
+        if self.dragging || self.tap_hold_until.is_some() { 0b01 } else { 0 }
+    }
+
+    /// Call periodically, whether or not reports arrive: after the finger lifts the pad goes
+    /// quiet, and a tap's held button must still be released on time. Returns the new button
+    /// state when it changes.
+    pub fn tick(&mut self, now_ms: u64) -> Option<u8> {
+        match self.tap_hold_until {
+            Some(t) if self.prev_n == 0 && now_ms >= t => {
+                self.tap_hold_until = None;
+                Some(self.tap_button())
+            }
+            _ => None,
         }
     }
 
@@ -123,12 +162,18 @@ impl Engine {
             self.travel = 0;
             self.swipe_y = 0;
             self.pressed = false;
+            // Landing inside a tap's drag window: the tap's press simply continues. Moving now
+            // drags; lifting releases. No second press is ever sent — that was the double click.
+            if let Some(t) = self.tap_hold_until.take() {
+                self.dragging = now_ms < t;
+            }
         }
         self.max_fingers = self.max_fingers.max(n);
+        let mut pad_buttons = 0u8;
         if clickpad {
             self.pressed = true;
             // Clickpad convention: pressing with two fingers down is a right click.
-            out.buttons = if n >= 2 { 0b10 } else { 0b01 };
+            pad_buttons = if n >= 2 { 0b10 } else { 0b01 };
         }
 
         // Motion: only when the SAME set of fingers is down in both frames. When a finger lands or
@@ -152,7 +197,7 @@ impl Engine {
                     }
                     // Natural scrolling: the content follows the fingers, so fingers moving UP
                     // (dy < 0) move the view further down the content.
-                    2 => out.scroll_y = -dy,
+                    2 if !self.dragging => out.scroll_y = -dy,
                     3 => self.swipe_y = self.swipe_y.saturating_add(dy),
                     _ => {}
                 }
@@ -163,12 +208,18 @@ impl Engine {
         if self.prev_n > 0 && n == 0 {
             let quick = now_ms.saturating_sub(self.down_at) <= self.cfg.tap_ms;
             let still = self.travel <= self.cfg.tap_slop;
+            // A drag ends here: its held button is released below, whatever this touch was.
+            let was_drag = core::mem::replace(&mut self.dragging, false);
             if quick && still && !self.pressed {
-                out.tap = match self.max_fingers {
-                    1 => Tap::Left,
-                    2 => Tap::Right,
-                    _ => Tap::None,
-                };
+                match self.max_fingers {
+                    // The second tap of a double tap: the first click completes (released below)
+                    // and a second, whole click follows it.
+                    1 if was_drag => out.tap = Tap::Left,
+                    // A plain tap: press now, release when the drag window closes (`tick`).
+                    1 => self.tap_hold_until = Some(now_ms + self.cfg.drag_ms),
+                    2 if !was_drag => out.tap = Tap::Right,
+                    _ => {}
+                }
             }
             if self.max_fingers >= 3 && self.swipe_y.abs() >= self.cfg.swipe_min {
                 out.swipe3 = if self.swipe_y < 0 { 1 } else { -1 };
@@ -177,6 +228,7 @@ impl Engine {
 
         self.prev[..n].copy_from_slice(cur);
         self.prev_n = n;
+        out.buttons = pad_buttons | self.tap_button();
         out
     }
 }
@@ -213,19 +265,69 @@ mod tests {
         assert_eq!((o.dx, o.dy), (10, 5));
     }
 
+    /// A tap presses at the lift and releases when the drag window closes — one whole click.
     #[test]
-    fn a_quick_still_touch_is_a_left_tap() {
+    fn a_quick_still_touch_is_a_left_click_released_after_the_drag_window() {
         let mut e = eng();
         e.frame(0, &[c(1, 100, 100)], false);
         e.frame(40, &[c(1, 102, 101)], false);
-        assert_eq!(e.frame(90, &[], false).tap, Tap::Left);
+        let o = e.frame(90, &[], false);
+        assert_eq!(o.buttons, 0b01, "pressed at the lift");
+        assert_eq!(o.tap, Tap::None, "not a separate click event");
+        assert_eq!(e.tick(200), None, "still inside the drag window");
+        assert_eq!(e.tick(270), Some(0), "released when the window closes");
+        assert_eq!(e.tick(300), None, "released once");
+    }
+
+    /// ★ The hardware bug: tap, then touch-and-move to drag a window, came out as a double click
+    /// and maximised it. The button must go down ONCE and stay down for the whole drag.
+    #[test]
+    fn tap_then_touch_and_move_drags_with_one_continuous_press() {
+        let mut e = eng();
+        e.frame(0, &[c(1, 100, 100)], false);
+        assert_eq!(e.frame(60, &[], false).buttons, 0b01);
+        // The finger comes back within the window and moves: held, and it moves the pointer.
+        assert_eq!(e.frame(150, &[c(1, 100, 100)], false).buttons, 0b01);
+        assert_eq!(e.tick(400), None, "a finger is down: the window never closes on its own");
+        let o = e.frame(420, &[c(1, 400, 250)], false);
+        assert_eq!((o.dx, o.dy, o.buttons), (300, 150, 0b01));
+        let o = e.frame(900, &[c(1, 600, 300)], false);
+        assert_eq!(o.buttons, 0b01, "a long drag stays held");
+        // Lifting drops.
+        let o = e.frame(950, &[], false);
+        assert_eq!((o.buttons, o.tap), (0, Tap::None), "released, and not a click");
+        assert_eq!(e.tick(2000), None);
+    }
+
+    #[test]
+    fn tap_tap_is_a_double_click() {
+        let mut e = eng();
+        e.frame(0, &[c(1, 100, 100)], false);
+        assert_eq!(e.frame(60, &[], false).buttons, 0b01, "first press");
+        e.frame(140, &[c(1, 101, 100)], false);
+        let o = e.frame(200, &[], false);
+        // The first click is released on this frame and the second follows as a whole click.
+        assert_eq!((o.buttons, o.tap), (0, Tap::Left));
+        assert_eq!(e.tick(1000), None, "nothing left held");
+    }
+
+    #[test]
+    fn a_touch_after_the_drag_window_is_not_a_drag() {
+        let mut e = eng();
+        e.frame(0, &[c(1, 100, 100)], false);
+        e.frame(60, &[], false);
+        // No tick ran (the pad was quiet), but the window has passed: the tap's press ends here.
+        let o = e.frame(500, &[c(1, 100, 100)], false);
+        assert_eq!(o.buttons, 0, "a late touch is plain pointer motion");
+        assert_eq!(e.frame(520, &[c(1, 200, 100)], false).buttons, 0);
     }
 
     #[test]
     fn a_slow_touch_is_not_a_tap() {
         let mut e = eng();
         e.frame(0, &[c(1, 100, 100)], false);
-        assert_eq!(e.frame(400, &[], false).tap, Tap::None);
+        let o = e.frame(400, &[], false);
+        assert_eq!((o.tap, o.buttons), (Tap::None, 0));
     }
 
     #[test]
@@ -233,7 +335,8 @@ mod tests {
         let mut e = eng();
         e.frame(0, &[c(1, 100, 100)], false);
         e.frame(30, &[c(1, 300, 100)], false);
-        assert_eq!(e.frame(60, &[], false).tap, Tap::None);
+        let o = e.frame(60, &[], false);
+        assert_eq!((o.tap, o.buttons), (Tap::None, 0));
     }
 
     #[test]
@@ -301,6 +404,7 @@ mod tests {
         let mut e = eng();
         e.frame(0, &[c(1, 100, 100)], true);
         e.frame(40, &[c(1, 100, 100)], false);
-        assert_eq!(e.frame(80, &[], false).tap, Tap::None);
+        let o = e.frame(80, &[], false);
+        assert_eq!((o.tap, o.buttons), (Tap::None, 0));
     }
 }
