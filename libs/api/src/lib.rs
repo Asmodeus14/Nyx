@@ -2282,8 +2282,11 @@ pub struct GpuHealth {
     pub _pad: u32,
     /// The render engine's registers at the first hang this boot.
     pub first_hang: GpuHangSnapshot,
+    /// The first failed composite/text/GL scene this boot: `fence_got` = last progress marker the
+    /// engine wrote, `fence_want` = stream dwords, `_pad` = cause (1 ring full, 2 fence timeout).
+    pub scene_hang: GpuHangSnapshot,
 }
-const _: () = assert!(core::mem::size_of::<GpuHealth>() == 104);
+const _: () = assert!(core::mem::size_of::<GpuHealth>() == 168);
 
 /// Mirrors the kernel's `render::HangSnapshot`.
 #[repr(C)]

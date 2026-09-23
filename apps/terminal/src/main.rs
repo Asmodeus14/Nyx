@@ -4474,7 +4474,37 @@ impl NyxApp for TerminalApp {
                                     s.eir, s.fault, s.error_gen6, s.fw_ack,
                                 ));
                             } else {
-                                self.output_history.push_str("  no render hang this boot\n");
+                                self.output_history.push_str("  no fence-wait hang this boot\n");
+                            }
+                            // The composite/text path has its own wait — this is the one that
+                            // latches the engine off.
+                            let s = h.scene_hang;
+                            if s.valid != 0 {
+                                let stage = match s.fence_got {
+                                    0 => "before the first marker (engine never started the stream)".into(),
+                                    0x10 => "prologue start (cache invalidate)".into(),
+                                    1 => "after PIPELINE_SELECT".into(),
+                                    2 => "after STATE_BASE_ADDRESS".into(),
+                                    3 => "after URB setup".into(),
+                                    4 => "after VS/HS/DS/GS state".into(),
+                                    6 => "all draws issued, waiting on the RT flush".into(),
+                                    7 => "RT flushed, final fence write missing".into(),
+                                    n if n >= 0x20 && n < 0x100 => format!("drawing mesh {}", n - 0x20),
+                                    n => format!("unknown marker {:#x}", n),
+                                };
+                                self.output_history.push_str(&format!(
+                                    "  FIRST SCENE FAILURE: {}\n    last marker {:#x} = {}\n    \
+                                     stream {} dwords  HEAD {:#x} TAIL {:#x} CTL {:#x} ACTHD {:#x}\n    \
+                                     IPEHR {:#010x} IPEIR {:#x} INSTDONE {:#010x} MI_MODE {:#x}\n    \
+                                     EIR {:#x} FAULT {:#010x} ERROR {:#x} FW_ACK {:#x}\n",
+                                    if s._pad == 1 { "ring had no room (submit refused)" } else { "fence never arrived" },
+                                    s.fence_got, stage,
+                                    s.fence_want, s.head, s.tail, s.ctl, s.acthd,
+                                    s.ipehr, s.ipeir, s.instdone, s.mi_mode,
+                                    s.eir, s.fault, s.error_gen6, s.fw_ack,
+                                ));
+                            } else {
+                                self.output_history.push_str("  no scene failure this boot\n");
                             }
                         }
                     }

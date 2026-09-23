@@ -1252,6 +1252,7 @@ impl RenderEngine {
         self.fence_virt.write_volatile(0);
         self.flush_line(self.fence_virt as usize);
         if self.rcs_submit(cs.as_slice()).is_err() {
+            self.note_scene_hang(self.fence_virt.read_volatile(), cs.len() as u32, 1);
             return true;
         }
 
@@ -1267,6 +1268,8 @@ impl RenderEngine {
             // this body (clflush + mfence + read) is tens of milliseconds, which is why this loop
             // kept showing up in stall reports as a fixed ~23.5 ms window.
             if deadline.expired() {
+                // Before `reset_render` below wipes the evidence.
+                self.note_scene_hang(last, cs.len() as u32, 2);
                 let fault = self.read_reg(super::RENDER_FAULT_REG);
                 crate::serial_println!(
                     "[SCENE] HUNG. last_progress={:#x} FAULT={:#010x} HEAD={:#x}",
@@ -1544,6 +1547,15 @@ impl RenderEngine {
                 px += 1;
             }
             py += 1;
+        }
+    }
+
+    /// Record the first failed scene submission of this boot — see [`super::SCENE_HANG`].
+    unsafe fn note_scene_hang(&self, last_progress: u32, dwords: u32, cause: u32) {
+        if let Some(mut s) = super::SCENE_HANG.try_lock() {
+            if s.valid == 0 {
+                *s = self.hang_snapshot(last_progress, dwords, cause);
+            }
         }
     }
 

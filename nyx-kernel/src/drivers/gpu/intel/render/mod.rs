@@ -107,6 +107,19 @@ pub static FIRST_HANG: spin::Mutex<HangSnapshot> = spin::Mutex::new(HangSnapshot
     ipeir: 0, instdone: 0, mi_mode: 0, eir: 0, fault: 0, error_gen6: 0, fw_ack: 0, _pad: 0,
 });
 
+/// The first failed COMPOSITE of this boot — a separate path from [`FIRST_HANG`].
+///
+/// ★ `draw_scene` (the compositor, text and GL) does not wait through `wait_fence_value`; it has
+/// its own spin in `finish_submit_and_wait`. Hardware showed `render hangs 8 of 8` with
+/// `FIRST_HANG` still empty, which is how that was found. Here `fence_got` is the LAST PROGRESS
+/// MARKER the engine wrote (0x10/1..7 = prologue stage, 0x20+n = about to draw mesh n),
+/// `fence_want` is the stream length in dwords, and `_pad` is the cause: 1 = the ring never had
+/// room (submit refused), 2 = the fence never arrived.
+pub static SCENE_HANG: spin::Mutex<HangSnapshot> = spin::Mutex::new(HangSnapshot {
+    valid: 0, fence_got: 0, fence_want: 0, head: 0, tail: 0, ctl: 0, acthd: 0, ipehr: 0,
+    ipeir: 0, instdone: 0, mi_mode: 0, eir: 0, fault: 0, error_gen6: 0, fw_ack: 0, _pad: 0,
+});
+
 /// Boot self-test results, one bit each: 0 bring-up, 1 ring MI_STORE_DATA_IMM, 2 ring
 /// PIPE_CONTROL fence, 3 BATCH BUFFER (MI_STORE inside a batch), 4 the batch test was attempted.
 pub static BOOT_TESTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -214,6 +227,8 @@ pub struct GpuHealth {
     pub _pad: u32,
     /// The first hang of this boot ([`FIRST_HANG`]); `valid` 0 if there has been none.
     pub first_hang: HangSnapshot,
+    /// The first failed scene submission ([`SCENE_HANG`]).
+    pub scene_hang: HangSnapshot,
 }
 
 pub fn health() -> GpuHealth {
@@ -232,6 +247,7 @@ pub fn health() -> GpuHealth {
         boot_tests: BOOT_TESTS.load(Relaxed),
         _pad: 0,
         first_hang: FIRST_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
+        scene_hang: SCENE_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
     }
 }
 
@@ -691,6 +707,29 @@ impl RenderEngine {
         self.wait_fence_value(DONE)
     }
 
+    /// The engine's registers right now, for [`FIRST_HANG`] / [`SCENE_HANG`]. Must be taken BEFORE
+    /// any reset, which clears exactly the state it exists to capture.
+    pub(super) unsafe fn hang_snapshot(&self, got: u32, want: u32, cause: u32) -> HangSnapshot {
+        HangSnapshot {
+            valid: 1,
+            fence_got: got,
+            fence_want: want,
+            head: self.read_reg(RENDER_RING_HEAD),
+            tail: self.read_reg(RENDER_RING_TAIL),
+            ctl: self.read_reg(RENDER_RING_CTL),
+            acthd: self.read_reg(RCS_ACTHD),
+            ipehr: self.read_reg(RCS_IPEHR),
+            ipeir: self.read_reg(RCS_IPEIR),
+            instdone: self.read_reg(RCS_INSTDONE),
+            mi_mode: self.read_reg(RCS_MI_MODE),
+            eir: self.read_reg(RCS_EIR),
+            fault: self.read_reg(RENDER_FAULT_REG),
+            error_gen6: self.read_reg(ERROR_GEN6),
+            fw_ack: self.read_reg(FORCEWAKE_ACK_RENDER),
+            _pad: cause,
+        }
+    }
+
     /// Spin until the fence page reads `expected`, or a **time** budget expires.
     ///
     /// ★★★ This was a 20,000,000-iteration count, and on real hardware it ran to completion on
@@ -731,24 +770,7 @@ impl RenderEngine {
                 // just be the aftermath.
                 if let Some(mut s) = FIRST_HANG.try_lock() {
                     if s.valid == 0 {
-                        *s = HangSnapshot {
-                            valid: 1,
-                            fence_got: self.fence_virt.read_volatile(),
-                            fence_want: expected,
-                            head,
-                            tail,
-                            ctl: self.read_reg(RENDER_RING_CTL),
-                            acthd: self.read_reg(RCS_ACTHD),
-                            ipehr: self.read_reg(RCS_IPEHR),
-                            ipeir: self.read_reg(RCS_IPEIR),
-                            instdone: self.read_reg(RCS_INSTDONE),
-                            mi_mode: self.read_reg(RCS_MI_MODE),
-                            eir: self.read_reg(RCS_EIR),
-                            fault,
-                            error_gen6: self.read_reg(ERROR_GEN6),
-                            fw_ack: self.read_reg(FORCEWAKE_ACK_RENDER),
-                            _pad: 0,
-                        };
+                        *s = self.hang_snapshot(self.fence_virt.read_volatile(), expected, 0);
                     }
                 }
                 // A SEPARATE counter, only for rate-limiting this log. `RENDER_HANGS` is the latch
