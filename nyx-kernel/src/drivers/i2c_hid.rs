@@ -52,6 +52,8 @@ pub mod status {
     pub const TOO_LONG: u32 = 10;
     pub const UNEXPECTED_BAR: u32 = 11;
     pub const ASSIGN_FAILED: u32 = 12;
+    pub const NO_CONTROLLER: u32 = 13;
+    pub const WRONG_CLASS: u32 = 14;
 }
 
 /// Published probe outcome. Mirrored field-for-field by `nyx_api::I2cHidProbe` — keep them in step.
@@ -165,6 +167,8 @@ struct Live {
     /// A tap's click, held for [`TAP_CLICK_MS`] so the desktop sees it press and release.
     pulse_buttons: u8,
     pulse_until: u64,
+    /// Precision mode is on trial until this uptime; 0 once a touching finger has been decoded.
+    ptp_trial_until: u64,
 }
 
 /// A precision-mode frame being assembled. In "hybrid" reporting a frame of N contacts arrives
@@ -206,6 +210,14 @@ pub static PTP_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Precision mode went silent on I2C (while PS/2 kept talking) and was reverted to mouse mode —
 /// see `mouse::handle_interrupt`. Cleared by the next successful switch into precision mode.
 pub static PTP_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// A switch into precision mode is a TRIAL until a touching finger is actually decoded. If none is
+/// within this long, the device goes back to mouse mode on its own.
+///
+/// ★ Needed because the PS/2-based recovery cannot fire after `touchpad handover` — that is the
+/// call that switches PS/2 emulation OFF. On the hardware, precision mode after a handover left the
+/// pointer dead with nothing to bring it back but typing `touchpad mouse`.
+const PTP_TRIAL_MS: u64 = 10_000;
 
 /// One logged report: the raw bytes (from the report ID on) and what the precision path decoded.
 /// Mirrored by `nyx_api::TouchpadLogEntry`.
@@ -386,6 +398,12 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
     r.slave_addr = hid.slave_addr;
     r.desc_reg = hid.hid_desc_reg;
 
+    // ⚠️ An unresolved controller `_ADR` is 0 — which decodes as device 0 function 0, the HOST
+    // BRIDGE. Never aim the controller driver at that; refuse instead.
+    if hid.ctrl_adr == 0 {
+        r.status = status::NO_CONTROLLER;
+        return r;
+    }
     let (dev, func) = hid.pci_dev_func();
     let mut info = BringUpInfo::default();
     let brought = Controller::bring_up(0, dev, func, hid.speed_hz, &hid, &mut info);
@@ -412,6 +430,7 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
             }
             r.status = match e {
                 BringUpError::Absent => status::PCI_ABSENT,
+                BringUpError::WrongClass(_) => status::WRONG_CLASS,
                 BringUpError::NoSafeAddress => status::NO_SAFE_ADDRESS,
                 BringUpError::UnexpectedBar => status::UNEXPECTED_BAR,
                 BringUpError::AssignFailed => status::ASSIGN_FAILED,
@@ -475,6 +494,7 @@ fn run(enable: bool, boot: bool) -> ProbeResult {
                 asm: FrameAsm::EMPTY,
                 acc_px: 0, acc_py: 0, acc_scroll: 0,
                 phys_buttons: 0, pulse_buttons: 0, pulse_until: 0,
+                ptp_trial_until: 0,
             });
             PTP_ACTIVE.store(false, Ordering::Release);
             PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
@@ -517,8 +537,20 @@ fn poll() {
 
     match MODE_REQUEST.swap(0, Ordering::AcqRel) {
         1 => set_mode(dev, false),
-        2 => set_mode(dev, true),
+        2 => {
+            set_mode(dev, true);
+            if dev.ptp_on {
+                dev.ptp_trial_until = now + PTP_TRIAL_MS;
+            }
+        }
         _ => {}
+    }
+    // The trial ran out with no finger ever decoded: precision mode is not working on this device
+    // as things stand. Back to the proven mouse mode.
+    if dev.ptp_on && dev.ptp_trial_until != 0 && now >= dev.ptp_trial_until {
+        dev.ptp_trial_until = 0;
+        set_mode(dev, false);
+        PTP_FAILED.store(true, Ordering::Release);
     }
 
     // ★ Read ONLY when the device's interrupt says a report is waiting. Reading the input register
@@ -650,6 +682,8 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) -> (u8, i32, i32) {
             let y = s.y.extract(body).unwrap_or(0);
             dev.asm.contacts[dev.asm.n] = Contact { id, x, y };
             dev.asm.n += 1;
+            // A real finger decoded: precision mode works, the trial is over.
+            dev.ptp_trial_until = 0;
             if here == 0 {
                 first = (x, y);
             }

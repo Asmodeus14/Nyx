@@ -110,6 +110,9 @@ pub struct Controller {
 pub enum BringUpError {
     /// Vendor ID reads 0xFFFF: the function is hidden (the firmware's `IMn` mode is not PCI) or off.
     Absent,
+    /// The function is not a serial-bus controller (payload: its class code), so it is not the I2C
+    /// controller whatever ACPI said, and nothing was touched.
+    WrongClass(u8),
     /// BAR0 is unassigned and no address could be given to it safely. See [`BringUpInfo`] for which
     /// check refused.
     NoSafeAddress,
@@ -380,6 +383,14 @@ impl Controller {
         info.vendor_device = id;
         if id & 0xFFFF == 0xFFFF {
             return Err(BringUpError::Absent);
+        }
+        // ⚠️ Only a serial-bus controller (class 0x0C — LPSS I2C is 0x0C80) is touched. Everything
+        // below powers the function up, may size and reprogram its BAR, and writes its registers;
+        // aimed at the wrong function that is dangerous. QEMU caught exactly that: an unresolved
+        // controller path decoded as device 0 function 0 and the probe landed on the HOST BRIDGE.
+        let class = PciDriver::read_config(bus, dev, func, 0x08) >> 24;
+        if class != 0x0C {
+            return Err(BringUpError::WrongClass(class as u8));
         }
 
         // D0. The firmware's own `_PS0` for this controller is exactly this: zero the low byte of

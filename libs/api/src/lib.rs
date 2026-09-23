@@ -1123,6 +1123,8 @@ pub fn i2c_hid_status_text(status: u32) -> &'static str {
         10 => "transfer larger than the FIFO",
         11 => "BAR0 is not the 4 KiB 64-bit BAR an LPSS controller has — left alone",
         12 => "wrote an address into BAR0 and it did not read back",
+        13 => "ACPI gave no controller address (_ADR unresolved) — refusing to guess, since 0 is the host bridge",
+        14 => "the PCI function ACPI named is not a serial-bus controller — nothing touched",
         _ => "unknown",
     }
 }

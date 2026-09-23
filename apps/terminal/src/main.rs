@@ -4472,9 +4472,10 @@ impl NyxApp for TerminalApp {
                     }
                 }
                 self.output_history.push_str(match (result, ptp) {
-                    (1, true) => "★ precision mode on. One finger moves, tap clicks, two-finger tap right-clicks,\n  \
+                    (1, true) => "★ precision mode on — ON TRIAL: touch the pad within 10 s, or it goes back to\n  \
+                                  mouse mode by itself. One finger moves, tap clicks, two-finger tap right-clicks,\n  \
                                   two fingers scroll, three-finger swipe up/down opens/closes the Command.\n  \
-                                  `touchpad mouse` goes back.\n",
+                                  `touchpad mouse` goes back; `touchpad log` shows what arrived.\n",
                     (1, false) => "Mouse emulation on: the touchpad's own firmware interprets fingers again.\n",
                     (2, _) => "This touchpad declares no Input Mode feature — precision mode is unavailable.\n",
                     (3, _) => "The mode switch failed on the I2C bus; the touchpad is unchanged.\n",
@@ -4492,9 +4493,14 @@ impl NyxApp for TerminalApp {
                 sys_acpi_probe(14, 0);
                 sys_sleep_ms(1600);
                 self.output_history.push_str(
-                    "Firmware handover (_DSM) requested. The PS/2 pointer may now be gone until a \
-                     full power-off.\n  Next: `touchpad on`.\n",
+                    "Firmware handover (_DSM) requested. The PS/2 pointer is now off until a full \
+                     power-off.\nRe-initialising the touchpad over I2C, as Windows and Linux do after \
+                     the handover:\n",
                 );
+                // The EC may reset the touchpad when it lets go of it. Re-initialise straight away
+                // so the pointer is back in (proven) mouse mode before precision mode is tried —
+                // on the hardware, going handover -> ptp directly left the pointer dead.
+                self.touchpad_i2c_probe(true);
             } else if cmd == "touchpad" || cmd.starts_with("touchpad ") {
                 self.cmd_touchpad();
             } else if cmd == "sched" || cmd.starts_with("sched ") {
