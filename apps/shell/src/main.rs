@@ -1622,9 +1622,11 @@ fn paint_text(atlas: Option<&Atlas>, canvas: &mut Canvas, labels: &[Label], icon
         }
         if sys_gpu_draw_text(a.gva, a.w, a.h, a.pitch, &glyphs) {
             sys_gpu_sync();
+            TEXT_ON_GPU.store(true, core::sync::atomic::Ordering::Relaxed);
             return true;
         }
     }
+    TEXT_ON_GPU.store(false, core::sync::atomic::Ordering::Relaxed);
     for l in labels {
         if l.x < 0 || l.y < 0 {
             continue;
@@ -1707,10 +1709,22 @@ fn fit(atlas: Option<&Atlas>, style: Style, text: &str, budget: i32) -> String {
 /// build, so right-aligned text stays right-aligned on the degraded path instead of drifting.
 fn measure(atlas: Option<&Atlas>, style: Style, text: &str) -> i32 {
     match atlas {
-        Some(a) => a.measure(style, text) as i32,
-        None => Canvas::text_width(text, 1) as i32,
+        Some(a) if TEXT_ON_GPU.load(core::sync::atomic::Ordering::Relaxed) => a.measure(style, text) as i32,
+        _ => Canvas::text_width(text, 1) as i32,
     }
 }
+
+/// Whether the last frame's text actually went through the GPU atlas.
+///
+/// ★ `measure` has to measure in the font that will DRAW the text. `paint_text` falls back to
+/// `nyx_gui`'s CPU font whenever `sys_gpu_draw_text` fails — no Intel GPU, or the render engine
+/// latched off after repeated hangs — and that font is narrower than the atlas's 20px light. Measuring
+/// in the atlas while drawing in the fallback put the Command's caret further from the query with
+/// every letter typed, and skews anything centred or right-aligned the same way.
+///
+/// Updated once per frame by `paint_text`, so a switch between paths is one frame late. Starts true:
+/// the GPU path is the normal case, and the first frame corrects it if not.
+static TEXT_ON_GPU: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 // ─────────────────────────────── The Command ───────────────────────────────
 
