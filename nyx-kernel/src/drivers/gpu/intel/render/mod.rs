@@ -232,6 +232,8 @@ pub struct GpuHealth {
     pub scene_hang: HangSnapshot,
     /// [`COMPOSITE_PS_MODE`].
     pub ps_mode: u32,
+    /// [`MOCS_RESTORES`].
+    pub mocs_restores: u32,
 }
 
 pub fn health() -> GpuHealth {
@@ -252,8 +254,15 @@ pub fn health() -> GpuHealth {
         first_hang: FIRST_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
         scene_hang: SCENE_HANG.try_lock().map_or(HangSnapshot::default(), |s| *s),
         ps_mode: COMPOSITE_PS_MODE.load(Relaxed),
+        mocs_restores: MOCS_RESTORES.load(Relaxed),
     }
 }
+
+/// The value `program_mocs` writes to every GFX MOCS entry (LLC write-back, i915 skl table).
+pub const MOCS_GFX_ENTRY: u32 = 0x0000_003B;
+
+/// How many times `ensure_ready` found the MOCS table lost (RC6) and re-programmed it. For `gpu`.
+pub static MOCS_RESTORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The GPU's PCI device ID, set at boot. For `gpu`.
 pub static DEVICE_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -442,7 +451,7 @@ impl RenderEngine {
         // GFX (render) MOCS control: __GEN9_RCS0_MOCS0 = 0xC800 + i*4, 64 entries.
         // control = LE_3_WB(3) | LE_TC_2_LLC_ELLC(2<<2) | LE_LRUM(3<<4) = 0x3B.
         for i in 0..64u32 {
-            self.write_reg(0xC800 + i * 4, 0x0000_003B);
+            self.write_reg(0xC800 + i * 4, MOCS_GFX_ENTRY);
         }
         // L3 (LNCF) MOCS: GEN9_LNCFCMOCS = 0xB020 + i*4, 32 regs, two 16-bit entries each.
         // l3cc = L3_3_WB = 3<<4 = 0x30, packed low+high.
@@ -496,6 +505,20 @@ impl RenderEngine {
         // the earlier "reprogram MOCS every frame" defense was for an RC6 that isn't happening here.
         // If the ring ever IS found disabled (genuine context loss), the branch below restores MOCS +
         // GFX_MODE + ring pointers together, as bring_up does.
+        // ★★ MOCS is checked on its own, NOT only when the ring was lost.
+        //
+        // Since `park_gpu` started releasing forcewake (the July idle-heat fix), the GT really does
+        // enter RC6 — and with no hardware context, RC6 drops the MOCS tables while the ring
+        // registers survive. Hardware showed exactly that: CTL still 0x1, so the branch below
+        // never ran, and every composite then hung in the PIXEL stage (INSTDONE_1 = 0xffdfffff:
+        // all geometry done, only CS waiting) — even a constant-colour shader. Render-target writes
+        // with undefined caching never retire. Entry 0 reads back as programmed unless it was lost,
+        // so this is one MMIO read on the fast path.
+        if self.read_reg(0xC800) != MOCS_GFX_ENTRY {
+            self.program_mocs();
+            MOCS_RESTORES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+
         let ctl = self.read_reg(RENDER_RING_CTL);
         if (ctl & 0x1) == 0 {
             // Ring lost its programming while parked — re-arm it (mirrors bring_up's ring setup).

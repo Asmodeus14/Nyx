@@ -101,6 +101,10 @@ pub fn composite(quads: &[WindowQuad]) -> bool {
     if !eng.initialized || eng.kernels.is_none() {
         return false;
     }
+    // ★ The GT may have parked (RC6) since the last draw: `park_gpu` releases forcewake after
+    // 1 s idle on the promise that every render path runs this first. This path did not, and
+    // drew with the MOCS tables RC6 had wiped — every draw hung in the pixel stage.
+    unsafe { eng.ensure_ready() };
 
     // Rebuild the scene only when the window SET changed (not on a pure move) — or when `gpu
     // retry` changed the pixel shader, which is baked into it.

@@ -132,6 +132,8 @@ pub fn draw_text(atlas_gva: u32, atlas_w: u32, atlas_h: u32, atlas_pitch: u32, g
     if !eng.initialized || eng.kernels.is_none() {
         return false;
     }
+    // The GT may have parked (RC6) since the last draw — see the same call in `compositor`.
+    unsafe { eng.ensure_ready() };
 
     // Build (or rebuild) the cached text scene + atlas binding when the atlas GVA changes.
     if ctx.scene.is_none() || ctx.atlas_gva != atlas_gva {

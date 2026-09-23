@@ -4476,10 +4476,12 @@ impl NyxApp for TerminalApp {
                             let r = |bit: u32| if t & (1 << bit) != 0 { "pass" } else { "FAIL" };
                             self.output_history.push_str(&format!(
                                 "  device {:#06x}{}   compositor shader: {}\n  \
+                                 MOCS restored after power-down: {} times\n  \
                                  boot tests: bring-up {}  ring store {}  ring fence {}  batch {}\n",
                                 h.device_id,
                                 if h.device_id == 0x9BC4 { " (the Comet Lake-H the 3D engine was built on)" } else { "" },
                                 match h.ps_mode { 1 => "SOLID test", 2 => "TEXTURED test", _ => "normal" },
+                                h.mocs_restores,
                                 r(0), r(1), r(2),
                                 if t & (1 << 4) == 0 { "not run" } else { r(3) },
                             ));

@@ -2288,8 +2288,10 @@ pub struct GpuHealth {
     pub scene_hang: GpuHangSnapshot,
     /// The compositor's pixel shader (`sys_gpu_retry`): 0 normal, 1 solid, 2 textured.
     pub ps_mode: u32,
+    /// Times the render engine's MOCS table was found wiped (by RC6) and re-programmed.
+    pub mocs_restores: u32,
 }
-const _: () = assert!(core::mem::size_of::<GpuHealth>() == 172);
+const _: () = assert!(core::mem::size_of::<GpuHealth>() == 176);
 
 /// Mirrors the kernel's `render::HangSnapshot`.
 #[repr(C)]
