@@ -601,7 +601,13 @@ fn poll() {
     }
     let mut buf = [0u8; 64];
     let n = dev.p.max_in;
-    match dev.ctl.write_read(dev.addr, &dev.p.in_reg.to_le_bytes(), &mut buf[..n]) {
+    // ★ A PLAIN read — no register address written first. That is how Linux reads input reports
+    // (i2c_hid_get_input -> i2c_master_recv), and the HID-over-I2C spec has the device hand its
+    // pending report to any read. Nyx used to write the input register (03 00) and then read: that
+    // worked in the device's default mode, but after the firmware handover the same device
+    // answered every such read with a zero-length report — while under Linux, on this very laptop,
+    // it streamed 14-byte touch reports (captured from Fedora with i2c-hid debug on).
+    match dev.ctl.write_read(dev.addr, &[], &mut buf[..n]) {
         Err(_) => {
             dev.errors += 1;
             if dev.errors >= MAX_CONSECUTIVE_ERRORS {
@@ -1221,7 +1227,8 @@ fn explore(
                 let fired = PENDING.swap(false, Ordering::AcqRel);
                 let mut sentinel = [0u8; 64];
                 let n = max_in.clamp(2, 64);
-                let cleared = ctl.write_read(addr, &in_reg.to_le_bytes(), &mut sentinel[..n]);
+                // Plain read, as Linux does — see `poll`.
+                let cleared = ctl.write_read(addr, &[], &mut sentinel[..n]);
                 unmask_irq();
                 let _ = writeln!(out, "init: SET_POWER(ON) {}, RESET {}, interrupt {}, sentinel {}",
                     if power.is_ok() { "ok" } else { "FAILED" },
@@ -1263,7 +1270,7 @@ fn explore(
             continue;
         }
         reads += 1;
-        let got = ctl.write_read(addr, &in_reg.to_le_bytes(), &mut buf[..max_in]);
+        let got = ctl.write_read(addr, &[], &mut buf[..max_in]); // plain read — see `poll`
         if irq_ok {
             unmask_irq();
         }
