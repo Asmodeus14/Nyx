@@ -236,6 +236,9 @@ extern "C" {
     ///
     /// ⚠️ Evaluates AML (`_STA`, `_CRS`, `HID2`, `_ADR` — never `_DSM`, which hands the touchpad off PS/2). Governor context only — never a syscall.
     fn acpi_get_i2c_hid(out: *mut I2cHidInfo, max: i32) -> i32;
+    /// ⚠️ The PS/2 -> I2C handover: evaluates the touchpad's HIDG `_DSM`, which on this firmware
+    /// tells the EC to stop PS/2 mouse emulation. Opt-in only (`acpi probe 14`).
+    fn acpi_i2c_hid_handover(reg: *mut u32) -> i32;
     
     // --- NEW: THE ACPICA FAN CONTROLLER ---
     fn acpi_set_fan_state(turn_on: i32) -> i32;
@@ -497,6 +500,10 @@ pub struct AcpiCache {
     pub i2c_hid_n: usize,
     /// True once step 13 has actually run, so "no touchpad" and "never asked" stay distinguishable.
     pub i2c_hid_probed: bool,
+    /// Result of `acpi probe 14`: -1 never run, else how many devices were handed over.
+    pub i2c_hid_handover: i32,
+    /// What the handover `_DSM` returned (function 1: the HID descriptor register).
+    pub i2c_hid_handover_reg: u32,
 }
 
 impl AcpiCache {
@@ -510,6 +517,8 @@ impl AcpiCache {
         i2c_hid: [I2cHidInfo::EMPTY; 4],
         i2c_hid_n: 0,
         i2c_hid_probed: false,
+        i2c_hid_handover: -1,
+        i2c_hid_handover_reg: 0,
         bcl_status: 5,
         bqc_status: 5,
         battery: Battery {
@@ -927,6 +936,18 @@ pub fn refresh_cache() {
                 c.i2c_hid = buf;
                 c.i2c_hid_n = n;
                 c.i2c_hid_probed = true;
+            }
+        }
+        14 => {
+            // ⚠️⚠️ The PS/2 -> I2C handover. Only ever from `touchpad handover`, after the I2C
+            // driver has proven it can talk to the device: this makes the EC stop PS/2 mouse
+            // emulation, and nothing undoes it short of a reboot. Breadcrumbs 73/74 bracket the
+            // `_DSM` itself.
+            let mut reg = 0u32;
+            let n = unsafe { acpi_i2c_hid_handover(&mut reg) };
+            if let Some(mut c) = CACHE.try_lock() {
+                c.i2c_hid_handover = n;
+                c.i2c_hid_handover_reg = reg;
             }
         }
         6 => {

@@ -1,17 +1,17 @@
-//! I2C-HID touchpad: bring-up probe (Phase 2).
+//! I2C-HID touchpad (ELAN 04f3:30cb on the test laptop): probe, initialise, and drive the pointer.
 //!
-//! Brings up the LPSS I2C controller that ACPI discovery found, then reads the device's 30-byte HID
-//! descriptor. A valid descriptor proves the whole I2C path end to end — PCI power, LPSS reset, bus
-//! timing, addressing — before any HID parsing is written on top of it.
+//! Brings up the LPSS I2C controller that ACPI discovery found, reads the 30-byte HID descriptor and
+//! the report descriptor, and — only on `touchpad on` — sends SET_POWER + RESET and, if mouse
+//! reports then arrive, polls them into the pointer ([`POINTER_ACTIVE`], Phase 4).
 //!
 //! ★ Runs in the `usb-hid` kernel task (IF=1), on request. Never in a syscall: bring-up sleeps
 //! (the D3→D0 transition needs 10 ms), and a syscall runs with interrupts masked. The syscall only
-//! raises [`REQUEST`] and copies [`RESULT`] back — the same publish/copy split the ACPI cache uses.
+//! raises flags and copies results back — the same publish/copy split the ACPI cache uses.
 //!
-//! ⚠️ This does NOT perform the PS/2 handover. The EC keeps the touchpad on PS/2 until the device's
-//! HIDG `_DSM` is evaluated (`custom_acpi.c`, `NyxHidDescriptorRegister`), and nothing here does
-//! that. So the result also answers a real question: does the touchpad (ELAN 04f3:30cb, not the ALPS the address suggested) answer on I2C at all
-//! while it is still in PS/2 mode? An address NACK here is an answer, not necessarily a bug.
+//! ⚠️ The firmware `_DSM` handover (EC stops PS/2 mouse emulation) is NOT done here. It is
+//! `acpi probe 14`, run by `touchpad handover` — deliberate, separate, and not undoable before a
+//! reboot. Hardware showed the device answers on I2C without it, but sent no input reports without
+//! initialisation (750 reads, 0 reports).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -95,7 +95,8 @@ pub struct ProbeResult {
     /// 1 if this probe gave BAR0 its address.
     pub assigned: u32,
     pub phys_bits: u32,
-    pub _pad: u32,
+    /// 1 if, after this probe, the I2C touchpad drives the pointer.
+    pub active: u32,
 }
 
 impl ProbeResult {
@@ -104,7 +105,7 @@ impl ProbeResult {
         resets_before: 0, comp_type: 0, comp_param1: 0, mode: 0, hcnt: 0, lcnt: 0, hold: 0,
         timing_from_fw: 0, slave_addr: 0, desc_reg: 0, bar0: 0, desc: [0; 32],
         bar0_before: 0, touud: 0, claims_end_above_4g: 0, candidate: 0, m64_base: 0, m64_len: 0, bar0_size: 0, assigned: 0,
-        phys_bits: 0, _pad: 0,
+        phys_bits: 0, active: 0,
     };
 }
 
@@ -113,23 +114,73 @@ const _: () = assert!(core::mem::size_of::<ProbeResult>() == 168);
 /// Length of an I2C-HID descriptor, and the only `wHIDDescLength` the spec allows.
 const HID_DESC_LEN: usize = 30;
 
-/// Called from the `usb-hid` task loop. Cheap when no probe was requested.
+/// Set with [`REQUEST`] by `touchpad on`: after probing, initialise the device (SET_POWER, RESET)
+/// and, if mouse reports then arrive, make it the pointer.
+pub static ENABLE: AtomicBool = AtomicBool::new(false);
+/// Set by `touchpad off`: stop driving the pointer from I2C and hand it back to PS/2.
+pub static DISABLE: AtomicBool = AtomicBool::new(false);
+
+/// ★ Phase 4. True while the I2C touchpad drives the pointer. The PS/2 AUX handler drops every byte
+/// while this is set — otherwise a touchpad that still reports on BOTH paths moves the cursor twice.
+/// Cleared again if the I2C side stops answering, so a failure falls back to PS/2 rather than
+/// leaving the machine without a pointer.
+pub static POINTER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The live device, owned by the `usb-hid` task once `touchpad on` succeeds.
+struct Live {
+    ctl: Controller,
+    addr: u8,
+    in_reg: u16,
+    max_in: usize,
+    uses_ids: bool,
+    mouse: crate::drivers::hid_desc::MouseLayout,
+    /// Consecutive failed reads. Too many and the pointer goes back to PS/2.
+    errors: u32,
+}
+
+static LIVE: spin::Mutex<Option<Live>> = spin::Mutex::new(None);
+
+/// Consecutive read failures after which I2C is abandoned for PS/2 — 50 × 4 ms = 200 ms of silence
+/// from a bus that normally never fails.
+const MAX_CONSECUTIVE_ERRORS: u32 = 50;
+
+/// Pointer speed relative to raw report counts — the same ×2 the PS/2 path applies, so switching
+/// transports does not change how the pointer feels.
+const POINTER_GAIN: i32 = 2;
+
+/// Called from the `usb-hid` task loop. Cheap when idle.
 pub fn service() {
+    if DISABLE.swap(false, Ordering::AcqRel) {
+        POINTER_ACTIVE.store(false, Ordering::Release);
+        if let Some(mut l) = LIVE.try_lock() {
+            *l = None;
+        }
+    }
+    poll();
     if !REQUEST.swap(false, Ordering::AcqRel) {
         return;
     }
-    let mut r = run();
-    if let Some(mut g) = RESULT.try_lock() {
-        r.seq = g.seq.wrapping_add(1);
-        *g = r;
-    } else {
-        // The syscall is mid-copy. Ask again next tick rather than drop the answer.
-        REQUEST.store(true, Ordering::Release);
+    let enable = ENABLE.swap(false, Ordering::AcqRel);
+    let mut r = run(enable);
+    // Wait out a syscall mid-copy rather than re-queue: re-running would repeat the probe WITHOUT
+    // `enable` and tear down a device that had just taken the pointer.
+    loop {
+        if let Some(mut g) = RESULT.try_lock() {
+            r.seq = g.seq.wrapping_add(1);
+            *g = r;
+            return;
+        }
+        core::hint::spin_loop();
     }
 }
 
-fn run() -> ProbeResult {
+fn run(enable: bool) -> ProbeResult {
     let mut r = ProbeResult::EMPTY;
+    // Re-probing tears down a live device first: the probe re-programs the same controller.
+    POINTER_ACTIVE.store(false, Ordering::Release);
+    if let Some(mut l) = LIVE.try_lock() {
+        *l = None;
+    }
     // A probe that stops early must not leave the previous run's findings looking current.
     publish(&Sink { len: 0, text: [0; REPORT_CAP] });
 
@@ -219,13 +270,74 @@ fn run() -> ProbeResult {
     }
     r.stage = stage::DESCRIPTOR_VALID;
 
-    // Phase 3a — read-only from here on.
-    if explore(&mut ctl, hid.slave_addr as u8, &buf) {
-        r.stage = stage::REPORTS_SEEN;
-    } else {
-        r.stage = stage::REPORT_DESCRIPTOR;
+    // Phase 3: read-only unless `enable`.
+    let (seen, live) = explore(&mut ctl, hid.slave_addr as u8, &buf, enable);
+    r.stage = if seen { stage::REPORTS_SEEN } else { stage::REPORT_DESCRIPTOR };
+    if let Some((in_reg, max_in, uses_ids, mouse)) = live {
+        if let Some(mut l) = LIVE.try_lock() {
+            *l = Some(Live {
+                ctl, addr: hid.slave_addr as u8, in_reg, max_in, uses_ids, mouse, errors: 0,
+            });
+            POINTER_ACTIVE.store(true, Ordering::Release);
+            r.active = 1;
+        }
     }
     r
+}
+
+/// Drain pending input reports and move the pointer. No-op unless `touchpad on` succeeded.
+fn poll() {
+    if !POINTER_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut guard = match LIVE.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
+    let dev = match guard.as_mut() {
+        Some(d) => d,
+        None => return,
+    };
+    let mut buf = [0u8; 64];
+    // A few per tick: the device holds reports until read, and draining keeps a burst from lagging.
+    for _ in 0..4 {
+        let n = dev.max_in;
+        match dev.ctl.write_read(dev.addr, &dev.in_reg.to_le_bytes(), &mut buf[..n]) {
+            Err(_) => {
+                dev.errors += 1;
+                if dev.errors >= MAX_CONSECUTIVE_ERRORS {
+                    // The I2C side has gone quiet. Hand the pointer back to PS/2 rather than leave
+                    // the machine without one.
+                    POINTER_ACTIVE.store(false, Ordering::Release);
+                    *guard = None;
+                }
+                return;
+            }
+            Ok(()) => {
+                dev.errors = 0;
+                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if len <= 2 || len > n {
+                    return; // nothing pending
+                }
+                let id = if dev.uses_ids { buf[2] } else { 0 };
+                if id != dev.mouse.report_id {
+                    continue;
+                }
+                let body = &buf[if dev.uses_ids { 3 } else { 2 }..len];
+                let m = &dev.mouse;
+                let dx = m.x.extract(body).unwrap_or(0);
+                let dy = m.y.extract(body).unwrap_or(0);
+                let mut buttons = 0u8;
+                for (i, b) in m.buttons.iter().enumerate() {
+                    if b.and_then(|f| f.extract(body)).unwrap_or(0) != 0 {
+                        buttons |= 1 << i;
+                    }
+                }
+                // HID relative Y is positive DOWN, the screen's convention — no flip, unlike PS/2.
+                crate::mouse::update_relative(dx * POINTER_GAIN, dy * POINTER_GAIN, buttons);
+            }
+        }
+    }
 }
 
 /// Human-readable findings from [`explore`], copied out by syscall 578 op 2.
@@ -259,19 +371,42 @@ impl core::fmt::Write for Sink {
 const SAMPLE_MS: u64 = 3000;
 const SAMPLE_EVERY_MS: u64 = 4;
 
-/// Phase 3a: read the report descriptor, parse it, then watch the input register while the user
-/// moves a finger. Returns true if any input report arrived.
+/// Read the report descriptor, parse it, optionally initialise the device, then watch the input
+/// register while the user moves a finger. Returns whether any input report arrived, and — only
+/// when `enable` was asked for AND mouse reports actually arrived — what `poll` needs to drive the
+/// pointer: (input register, max input length, uses report IDs, mouse layout).
 ///
-/// ⚠️ READ-ONLY. No RESET, no SET_POWER, no Set Feature, no `_DSM`. The touchpad is currently the
-/// machine's pointer over PS/2, and any of those could switch it off that path before this driver
-/// can replace it. What this answers is whether reports already flow on I2C as things stand.
-fn explore(ctl: &mut crate::drivers::i2c::Controller, addr: u8, desc: &[u8]) -> bool {
+/// ⚠️ Without `enable` this is READ-ONLY: no RESET, no SET_POWER, no `_DSM`. The touchpad is the
+/// machine's pointer over PS/2, and any of those may switch it off that path.
+///
+/// With `enable` it sends SET_POWER(ON) and RESET — the HID-over-I2C initialisation, which on the
+/// hardware was shown to be necessary: 750 reads of the input register over 3 s of finger
+/// movement returned nothing without it. It still does NOT evaluate `_DSM`; that is `touchpad
+/// handover`, a separate and deliberate step.
+fn explore(
+    ctl: &mut crate::drivers::i2c::Controller,
+    addr: u8,
+    desc: &[u8],
+    enable: bool,
+) -> (bool, Option<(u16, usize, bool, crate::drivers::hid_desc::MouseLayout)>) {
     use crate::drivers::hid_desc;
     use core::fmt::Write;
 
     let w = |i: usize| u16::from_le_bytes([desc[i], desc[i + 1]]);
     let (rd_len, rd_reg, in_reg, max_in) = (w(4) as usize, w(6), w(8), w(10) as usize);
+    let cmd_reg = w(16);
     let mut out = Sink { len: 0, text: [0; REPORT_CAP] };
+
+    // Whether the firmware handover (`_DSM`, `touchpad handover`) has been run this boot.
+    let handover = crate::acpi::CACHE
+        .try_lock()
+        .map(|c| (c.i2c_hid_handover, c.i2c_hid_handover_reg))
+        .unwrap_or((-1, 0));
+    let _ = match handover {
+        (-1, _) => writeln!(out, "firmware handover (_DSM): not run this boot"),
+        (0, _) => writeln!(out, "firmware handover (_DSM): ran, but no device accepted it"),
+        (n, reg) => writeln!(out, "firmware handover (_DSM): done on {} device(s), returned {:#06x}", n, reg),
+    };
 
     // 1. The report descriptor. Bounded: a real one is a few hundred bytes.
     let rd_len = rd_len.min(2048);
@@ -286,7 +421,7 @@ fn explore(ctl: &mut crate::drivers::i2c::Controller, addr: u8, desc: &[u8]) -> 
     if let Err(e) = read {
         let _ = writeln!(out, "report descriptor: read FAILED ({:?})", e);
         publish(&out);
-        return false;
+        return (false, None);
     }
     let d = hid_desc::parse(&rdesc);
     let _ = writeln!(out, "report descriptor: {} bytes, {} input fields, report IDs {}{}",
@@ -316,9 +451,35 @@ fn explore(ctl: &mut crate::drivers::i2c::Controller, addr: u8, desc: &[u8]) -> 
         }
     }
 
-    // 2. Watch the input register. Each read returns [len_lo, len_hi, report...]; len 0 means
+    // 2. Initialise, if asked. HID-over-I2C commands go to the command register as
+    //    [reg lo, reg hi, report type/ID, opcode]: SET_POWER is opcode 8 with the state (0 = ON)
+    //    in the low byte, RESET is opcode 1.
+    if enable {
+        let [c0, c1] = cmd_reg.to_le_bytes();
+        let power = ctl.write_read(addr, &[c0, c1, 0x00, 0x08], &mut []);
+        // Some parts need time to wake before the next command; Linux quirks cover up to 20 ms.
+        crate::scheduler::kernel_sleep_ms(20);
+        let reset = ctl.write_read(addr, &[c0, c1, 0x00, 0x01], &mut []);
+        // After RESET the device raises its interrupt and presents a 2-byte zero-length report.
+        // The interrupt line is not routed yet, so wait out the spec's generous window and then
+        // read the sentinel off the input register so it is not mistaken for data.
+        crate::scheduler::kernel_sleep_ms(300);
+        let mut sentinel = [0u8; 64];
+        let n = max_in.clamp(2, 64);
+        let cleared = ctl.write_read(addr, &in_reg.to_le_bytes(), &mut sentinel[..n]);
+        let _ = writeln!(out, "init: SET_POWER(ON) {}, RESET {}, reset sentinel {}",
+            if power.is_ok() { "ok" } else { "FAILED" },
+            if reset.is_ok() { "ok" } else { "FAILED" },
+            match cleared {
+                Ok(()) => if sentinel[0] == 0 && sentinel[1] == 0 { "read (00 00)" } else { "not seen" },
+                Err(_) => "read failed",
+            });
+    }
+
+    // 3. Watch the input register. Each read returns [len_lo, len_hi, report...]; len 0 means
     //    nothing pending (the spec's reset sentinel is also len 0).
     let max_in = max_in.clamp(2, 64);
+    let mut mouse_reports = 0u32;
     let mut buf = [0u8; 64];
     let (mut reads, mut errors, mut reports) = (0u32, 0u32, 0u32);
     let mut per_id: [(u8, u32); 8] = [(0, 0); 8];
@@ -349,6 +510,7 @@ fn explore(ctl: &mut crate::drivers::i2c::Controller, addr: u8, desc: &[u8]) -> 
                     }
                     if let Some(m) = &mouse {
                         if id == m.report_id {
+                            mouse_reports += 1;
                             let body = &buf[if d.uses_report_ids { 3 } else { 2 }..len];
                             sum_dx += m.x.extract(body).unwrap_or(0);
                             sum_dy += m.y.extract(body).unwrap_or(0);
@@ -371,8 +533,22 @@ fn explore(ctl: &mut crate::drivers::i2c::Controller, addr: u8, desc: &[u8]) -> 
     if mouse.is_some() && reports != 0 {
         let _ = writeln!(out, "decoded as mouse: total dx {} dy {}, button-1 reports {}", sum_dx, sum_dy, clicks);
     }
+
+    // Take the pointer only on evidence: `enable` asked for, AND mouse reports actually arrived.
+    let live = match mouse {
+        Some(m) if enable && mouse_reports > 0 => {
+            let _ = writeln!(out, "★ I2C now drives the pointer; PS/2 mouse bytes are ignored. \
+                                   `touchpad off` hands it back.");
+            Some((in_reg, max_in, d.uses_report_ids, m))
+        }
+        _ if enable => {
+            let _ = writeln!(out, "not taking the pointer: no mouse reports arrived. PS/2 stays in charge.");
+            None
+        }
+        _ => None,
+    };
     publish(&out);
-    reports != 0
+    (reports != 0, live)
 }
 
 fn publish(s: &Sink) {

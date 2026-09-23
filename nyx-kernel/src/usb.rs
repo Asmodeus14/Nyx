@@ -959,6 +959,10 @@ pub extern "C" fn nyx_usb_hid_task() {
         // own task because a new kernel task needs a reserved PID (see kernel_main's comment on
         // COMPOSITOR_PID), and this loop already runs at IF=1 where the probe's sleeps are legal.
         crate::drivers::i2c_hid::service();
-        crate::scheduler::kernel_sleep_ms(HID_POLL_MS);
+        // 4 ms while the I2C touchpad is the pointer: its reports are only as fresh as this poll,
+        // and 8 ms is visible as cursor lag. Back to the USB rate otherwise.
+        let period = if crate::drivers::i2c_hid::POINTER_ACTIVE
+            .load(core::sync::atomic::Ordering::Relaxed) { 4 } else { HID_POLL_MS };
+        crate::scheduler::kernel_sleep_ms(period);
     }
 }

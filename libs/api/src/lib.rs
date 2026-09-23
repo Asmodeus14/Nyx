@@ -989,7 +989,8 @@ pub struct I2cHidProbe {
     /// 1 if the probe gave BAR0 its address.
     pub assigned: u32,
     pub phys_bits: u32,
-    pub _pad: u32,
+    /// 1 if, after this probe, the I2C touchpad drives the pointer.
+    pub active: u32,
 }
 
 impl Default for I2cHidProbe {
@@ -1006,6 +1007,17 @@ const _: () = assert!(core::mem::size_of::<I2cHidProbe>() == 168);
 /// ⚠️ Needs `acpi probe 13` to have run first — it is what says which controller and address.
 pub fn sys_i2c_hid_probe_request() {
     syscall(578, 1, 0, 0, 0, 0, 0);
+}
+
+/// Probe, then initialise the touchpad (SET_POWER, RESET) and — if mouse reports then arrive — make
+/// it the pointer, ignoring PS/2 mouse bytes. Read the outcome as with a plain probe.
+pub fn sys_i2c_hid_enable() {
+    syscall(578, 3, 0, 0, 0, 0, 0);
+}
+
+/// Stop driving the pointer from I2C; PS/2 mouse bytes are accepted again.
+pub fn sys_i2c_hid_disable() {
+    syscall(578, 4, 0, 0, 0, 0, 0);
 }
 
 /// The last probe result, with its sequence number (0 = never run). `None` if the kernel was

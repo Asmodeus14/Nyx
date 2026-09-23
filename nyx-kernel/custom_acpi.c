@@ -52,8 +52,8 @@ int acpi_wake_cnvi_wifi(void) {
 // (see the cache note in acpi.rs). Call this from the thermal governor (IF=1) via an `acpi probe`
 // step, and have syscalls copy scalars out of the published cache.
 
-// ⚠️ There is deliberately no HIDG _DSM UUID here any more — see NyxHidDescriptorRegister. The
-// handover call lives in git history (5db7eac) and belongs to the I2C-HID driver, not discovery.
+// ⚠️ Discovery never evaluates the HIDG _DSM — see NyxHidDescriptorRegister. The one caller is
+// acpi_i2c_hid_handover, which is the handover itself and is opt-in.
 
 typedef struct {
     UINT32 valid;
@@ -286,6 +286,74 @@ int acpi_get_i2c_hid(NyxI2cHidInfo *out, int max) {
 
     AcpiGetDevices((char *)"PNP0C50", I2cHidCallback, &scan, NULL);
     return scan.count;
+}
+
+/* ⚠️⚠️ THE PS/2 → I2C HANDOVER. Opt-in only (`acpi probe 14`, via `touchpad handover`).
+ *
+ * The HID-over-I2C `_DSM` (UUID 3cdff6f7-4267-4555-ad05-b30a3d8938de, the DSDT's HIDG), function 1.
+ * Nominally it returns the HID descriptor register. On this firmware its FIRST call also runs
+ * `EV5` -> `ECDV.EDPE`, which sets PMED and sends EC command 0x81/0x20: PS/2 mouse emulation off.
+ * That is the whole point of calling it — it is how Windows and Linux announce an I2C-HID driver —
+ * and also why it killed the pointer when discovery called it at boot. Nothing may call this until
+ * the I2C driver is ready to take the device. There is no known way to undo it short of a reboot. */
+static const UINT8 NyxHidI2cDsmUuid[16] = {
+    0xF7, 0xF6, 0xDF, 0x3C, 0x67, 0x42, 0x55, 0x45,
+    0xAD, 0x05, 0xB3, 0x0A, 0x3D, 0x89, 0x38, 0xDE
+};
+
+typedef struct {
+    int handed_over;   /* devices whose _DSM evaluated successfully */
+    UINT32 reg;        /* what function 1 returned for the last one */
+} NyxHandover;
+
+static ACPI_STATUS I2cHidHandoverCb(ACPI_HANDLE Object, UINT32 Level, void *Context, void **ReturnValue) {
+    NyxHandover *h = (NyxHandover *)Context;
+    UINT64 sta = 0;
+    /* Only the device that is actually present — the other three slots are templates. */
+    if (NyxEvalInteger(Object, "_STA", &sta) && (sta & 0x01) == 0) {
+        return AE_OK;
+    }
+
+    ACPI_OBJECT args[4];
+    ACPI_OBJECT_LIST arglist;
+    char local[128];
+    ACPI_BUFFER buf;
+    args[0].Type = ACPI_TYPE_BUFFER;
+    args[0].Buffer.Length = 16;
+    args[0].Buffer.Pointer = (UINT8 *)NyxHidI2cDsmUuid;
+    args[1].Type = ACPI_TYPE_INTEGER;
+    args[1].Integer.Value = 1;           /* revision */
+    args[2].Type = ACPI_TYPE_INTEGER;
+    args[2].Integer.Value = 1;           /* function 1: descriptor address */
+    args[3].Type = ACPI_TYPE_PACKAGE;
+    args[3].Package.Count = 0;
+    args[3].Package.Elements = NULL;
+    arglist.Count = 4;
+    arglist.Pointer = args;
+    buf.Length = sizeof(local);
+    buf.Pointer = local;
+
+    nyx_mark(73);
+    ACPI_STATUS st = AcpiEvaluateObject(Object, (char *)"_DSM", &arglist, &buf);
+    nyx_mark(74);
+    if (ACPI_SUCCESS(st)) {
+        ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
+        if (obj && obj->Type == ACPI_TYPE_INTEGER) {
+            h->reg = (UINT32)obj->Integer.Value;
+        }
+        h->handed_over += 1;
+    }
+    return AE_OK;
+}
+
+/* Returns the number of devices handed over; `*reg` gets function 1's answer. */
+int acpi_i2c_hid_handover(UINT32 *reg) {
+    NyxHandover h;
+    h.handed_over = 0;
+    h.reg = 0;
+    AcpiGetDevices((char *)"PNP0C50", I2cHidHandoverCb, &h, NULL);
+    if (reg) *reg = h.reg;
+    return h.handed_over;
 }
 
 // ==========================================

@@ -4421,6 +4421,20 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         None => u64::MAX,
                     };
                 }
+                3 => {
+                    // op 3: probe AND initialise; take the pointer if mouse reports arrive.
+                    crate::drivers::i2c_hid::ENABLE
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    crate::drivers::i2c_hid::REQUEST
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    frame.rax = 1;
+                }
+                4 => {
+                    // op 4: hand the pointer back to PS/2.
+                    crate::drivers::i2c_hid::DISABLE
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    frame.rax = 1;
+                }
                 2 => {
                     // op 2: copy the Phase 3 findings text (up to arg3 bytes). Returns its length.
                     let out = arg2 as *mut u8;

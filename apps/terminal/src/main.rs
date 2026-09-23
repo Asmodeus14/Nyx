@@ -1335,7 +1335,7 @@ impl TerminalApp {
             );
         } else {
             self.output_history.push_str(&format!("\n{} device(s).\n", found));
-            self.touchpad_i2c_probe();
+            self.touchpad_i2c_probe(false);
         }
     }
 
@@ -1343,9 +1343,13 @@ impl TerminalApp {
     ///
     /// ⚠️ Does NOT hand the touchpad over from PS/2 — that is the device's `_DSM`, which nothing
     /// here calls. The pointer keeps working whatever this prints.
-    fn touchpad_i2c_probe(&mut self) {
+    fn touchpad_i2c_probe(&mut self, enable: bool) {
         let before = sys_i2c_hid_probe_result().map(|(s, _)| s).unwrap_or(0);
-        sys_i2c_hid_probe_request();
+        if enable {
+            sys_i2c_hid_enable();
+        } else {
+            sys_i2c_hid_probe_request();
+        }
         self.output_history.push_str("\nI2C: bringing up the controller and reading the HID descriptor...\n");
 
         // The kernel task that runs it wakes every 8 ms; bring-up sleeps ~11 ms, and Phase 3a then
@@ -3848,6 +3852,9 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  ec | ec dump      - raw EC register dump      ec find <n> - search the EC for a value\n");
                 self.output_history.push_str("  touchpad          - what ACPI says about the I2C-HID touchpad, then read it over I2C\n");
                 self.output_history.push_str("  touchpad i2c      - just the I2C part (~4 s: move a finger and click during it)\n");
+                self.output_history.push_str("  touchpad on       - initialise it; if reports arrive, it becomes the pointer (~6 s)\n");
+                self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
+                self.output_history.push_str("  touchpad handover - firmware _DSM: EC stops PS/2 emulation (until power-off!)\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
                 self.output_history.push_str("  sched hist        - the same, plus full wake/tick-gap/syscall latency distributions\n");
                 self.output_history.push_str("Scrollback:\n");
@@ -4103,7 +4110,7 @@ impl NyxApp for TerminalApp {
                         // directly, which is what `_REG` exists to do. Extend this range when a step
                         // is added; 7 was silently rejected for a while and its dump never ran.
                         // 13 is I2C-HID discovery (_STA/_CRS/HID2/_ADR per PNP0C50 device).
-                        Ok(s) if (1..=13).contains(&s) => {
+                        Ok(s) if (1..=14).contains(&s) => {
                             sys_acpi_probe(s, depth);
                             if s == 1 {
                                 self.output_history.push_str(&format!(
@@ -4375,7 +4382,25 @@ impl NyxApp for TerminalApp {
                 }
             } else if cmd == "touchpad i2c" {
                 // The bus probe alone, reusing whatever `acpi probe 13` last published.
-                self.touchpad_i2c_probe();
+                self.touchpad_i2c_probe(false);
+            } else if cmd == "touchpad on" {
+                // Initialise the touchpad over I2C and, if mouse reports arrive, make it the
+                // pointer. Refreshes the ACPI half first so this works as the first command of a boot.
+                sys_acpi_probe(13, 0);
+                sys_sleep_ms(1600);
+                self.touchpad_i2c_probe(true);
+            } else if cmd == "touchpad off" {
+                sys_i2c_hid_disable();
+                self.output_history.push_str("I2C touchpad released; PS/2 mouse bytes are accepted again.\n");
+            } else if cmd == "touchpad handover" {
+                // ⚠️ The firmware handover: the touchpad's HIDG _DSM, which on this laptop makes the
+                // EC stop PS/2 mouse emulation. Only worth running if `touchpad on` saw no reports.
+                sys_acpi_probe(14, 0);
+                sys_sleep_ms(1600);
+                self.output_history.push_str(
+                    "Firmware handover (_DSM) requested. The PS/2 pointer may now be gone until a \
+                     full power-off.\n  Next: `touchpad on` (move a finger for ~5 s after Enter).\n",
+                );
             } else if cmd == "touchpad" || cmd.starts_with("touchpad ") {
                 self.cmd_touchpad();
             } else if cmd == "sched" || cmd.starts_with("sched ") {

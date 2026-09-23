@@ -95,6 +95,12 @@ impl MouseDriver {
 }
 
 pub fn update_from_usb(dx: i8, dy: i8, buttons: u8) {
+    update_relative(dx as i32, dy as i32, buttons);
+}
+
+/// Move the pointer by a relative delta in SCREEN convention (positive dy = down) and set the
+/// buttons (bit 0 left, bit 1 right, bit 2 middle). Shared by USB HID and the I2C-HID touchpad.
+pub fn update_relative(dx: i32, dy: i32, buttons: u8) {
     let (nx, ny) = {
         let mut state = MOUSE_STATE.lock();
         let new_x = state.x as i64 + (dx as i64);
@@ -111,6 +117,13 @@ pub fn update_from_usb(dx: i8, dy: i8, buttons: u8) {
 }
 
 pub fn handle_interrupt(packet_byte: u8) {
+    // ★ Phase 4 of the I2C-HID touchpad: while it drives the pointer, PS/2 AUX bytes are dropped
+    // (the caller has already read port 0x60, so the 8042 is not left holding them). A touchpad
+    // that still reports on both paths would otherwise move the cursor twice. The flag falls back
+    // to false on its own if the I2C side goes quiet — see `i2c_hid::poll`.
+    if crate::drivers::i2c_hid::POINTER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     static mut DRIVER_STATE: Option<MouseDriver> = None;
     unsafe {
         if DRIVER_STATE.is_none() { DRIVER_STATE = Some(MouseDriver::new()); }
