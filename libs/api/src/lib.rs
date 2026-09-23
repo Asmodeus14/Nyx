@@ -1039,6 +1039,9 @@ pub struct TouchpadStatus {
     pub adopted_ptp: bool,
     /// Reports since the pointer was taken: mouse collection, touch pad, other IDs, empty reads.
     pub counts: [u32; 4],
+    /// Last precision-mode switch: bit 0 Win8 blob present, bit 1 read; bit 2 Selective Reporting
+    /// present, bit 3 set.
+    pub mode_note: u8,
     /// Probes completed, including the automatic one at boot.
     pub probes: u32,
     pub irqs: u32,
@@ -1053,6 +1056,7 @@ pub fn sys_i2c_hid_status() -> TouchpadStatus {
         mode_result: ((v >> 3) & 0x7) as u8,
         ptp_failed: v & (1 << 6) != 0,
         adopted_ptp: v & (1 << 7) != 0,
+        mode_note: ((v >> 8) & 0xF) as u8,
         counts: {
             let c = syscall(578, 10, 0, 0, 0, 0, 0);
             [c as u32 & 0xFFFF, (c >> 16) as u32 & 0xFFFF, (c >> 32) as u32 & 0xFFFF, (c >> 48) as u32 & 0xFFFF]

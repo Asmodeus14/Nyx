@@ -37,6 +37,14 @@ pub mod usage {
     pub const DIG_INPUT_MODE: u16 = 0x52;
     pub const INPUT_MODE_MOUSE: i32 = 0;
     pub const INPUT_MODE_TOUCHPAD: i32 = 3;
+    /// Selective Reporting: whether the device reports surface contacts, and clickpad buttons.
+    /// Linux's hid-multitouch sets both to 1 alongside Input Mode.
+    pub const DIG_SURFACE_SWITCH: u16 = 0x57;
+    pub const DIG_BUTTON_SWITCH: u16 = 0x58;
+    /// The Windows 8 certification blob, a 256-byte vendor Feature. Linux reads it once at probe
+    /// "to enable some devices" (hid-multitouch.c).
+    pub const PAGE_MS_VENDOR: u16 = 0xFF00;
+    pub const MS_WIN8_BLOB: u16 = 0xC5;
 }
 
 /// One input field: `size` bits at `bit_off` within the report (bit 0 = first bit AFTER the report
@@ -286,6 +294,14 @@ impl Descriptor {
                 && !f.is_constant()
                 && relative.map_or(true, |r| f.is_relative() == r)
         })
+    }
+
+    /// The first Feature field with this page and usage, anywhere in the descriptor.
+    pub fn find_feature(&self, page: u16, usage: u16) -> Option<Field> {
+        self.fields
+            .iter()
+            .copied()
+            .find(|f| f.kind == KIND_FEATURE && f.page == page && f.usage == usage)
     }
 
     /// Byte length of Feature report `id`, excluding the report ID byte itself.
@@ -617,6 +633,29 @@ mod tests {
         assert_eq!(m.report_len, 2);
         // Feature fields must NOT shift the input layout of the same app, nor be found as inputs.
         assert!(d.find((0x0D, 0x0E), 0x0D, 0x52, None).is_none());
+    }
+
+    /// A vendor blob declared with a 4-byte usage (page in the high half), as Windows precision
+    /// touchpads declare the Win8 certification blob, plus Selective Reporting switches.
+    #[test]
+    fn finds_the_win8_blob_and_the_selective_reporting_switches() {
+        let d = parse(&[
+            0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, // Usage Page 0xFF00, Usage 1, Collection (App)
+            0x85, 0x5C, //   Report ID 92
+            0x09, 0xC5, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x96, 0x00, 0x01, 0xB1, 0x02, // 256 B
+            0xC0,
+            0x05, 0x0D, 0x09, 0x0E, 0xA1, 0x01, 0x85, 0x07,
+            0x09, 0x57, 0x09, 0x58, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0xB1, 0x02,
+            0x75, 0x06, 0x95, 0x01, 0xB1, 0x03,
+            0xC0,
+        ]);
+        let blob = d.find_feature(0xFF00, 0xC5).expect("blob");
+        assert_eq!(blob.report_id, 92);
+        assert_eq!(d.feature_report_len(92), 256);
+        let s = d.find_feature(0x0D, 0x57).expect("surface switch");
+        let b = d.find_feature(0x0D, 0x58).expect("button switch");
+        assert_eq!((s.report_id, s.bit_off, b.bit_off), (7, 0, 1));
+        assert_eq!(d.feature_report_len(7), 1);
     }
 
     #[test]

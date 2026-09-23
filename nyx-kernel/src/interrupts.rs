@@ -4447,6 +4447,7 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         | ((MODE_RESULT.load(Relaxed) as u64) & 0x7) << 3
                         | (PTP_FAILED.load(Relaxed) as u64) << 6
                         | (crate::drivers::i2c_hid::ADOPTED_PTP.load(Relaxed) as u64) << 7
+                        | ((crate::drivers::i2c_hid::MODE_NOTE.load(Relaxed) as u64) & 0xF) << 8
                         | seq << 16
                         | (IRQ_COUNT.load(Relaxed) as u64) << 32;
                 }

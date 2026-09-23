@@ -140,6 +140,11 @@ struct Params {
     /// The multi-touch layout and the Input Mode feature — both needed for precision mode.
     ptp: Option<crate::drivers::hid_desc::PtpLayout>,
     input_mode: Option<crate::drivers::hid_desc::InputMode>,
+    /// The Win8 certification blob: (feature report ID, its length). Read once before precision
+    /// mode — what Linux does "to enable some devices".
+    blob: Option<(u8, usize)>,
+    /// Selective Reporting: (feature report ID, its length, surface switch, button switch).
+    selective: Option<(u8, usize, Option<crate::drivers::hid_desc::Field>, Option<crate::drivers::hid_desc::Field>)>,
 }
 
 /// The live device, owned by the `usb-hid` task once `touchpad on` (or the boot enable) succeeds.
@@ -794,12 +799,94 @@ fn ptp_report(dev: &mut Live, body: &[u8], now: u64) -> (u8, i32, i32) {
     (here, first.0, first.1)
 }
 
-/// Switch the device between its mouse emulation and precision mode, with SET_REPORT on the Input
-/// Mode feature. Result in [`MODE_RESULT`].
+/// What the last switch into precision mode did beyond Input Mode — `touchpad ptp` prints it.
+/// Bit 0: the Win8 blob exists; bit 1: it was read. Bit 2: Selective Reporting exists; bit 3: it
+/// was set.
+pub static MODE_NOTE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+const REPORT_FEATURE: u8 = 3;
+const OP_GET_REPORT: u8 = 2;
+const OP_SET_REPORT: u8 = 3;
+
+/// The start of every GET/SET_REPORT: the command register, then [type<<4 | id, opcode] (an ID of
+/// 15 or more takes a third byte), then the data register. Returns the byte count.
+fn report_cmd(p: &Params, opcode: u8, rid: u8, w: &mut [u8]) -> usize {
+    let mut k = 0;
+    let [c0, c1] = p.cmd_reg.to_le_bytes();
+    w[k] = c0;
+    w[k + 1] = c1;
+    k += 2;
+    if rid < 0x0F {
+        w[k] = REPORT_FEATURE << 4 | rid;
+        w[k + 1] = opcode;
+        k += 2;
+    } else {
+        w[k] = REPORT_FEATURE << 4 | 0x0F;
+        w[k + 1] = opcode;
+        w[k + 2] = rid;
+        k += 3;
+    }
+    let [d0, d1] = p.data_reg.to_le_bytes();
+    w[k] = d0;
+    w[k + 1] = d1;
+    k + 2
+}
+
+/// GET_REPORT on a Feature report: the device answers on the data register with a 16-bit length,
+/// the report ID and the report. Returns the report bytes (after the ID) in `out`.
+fn get_feature(dev: &mut Live, rid: u8, out: &mut [u8]) -> Result<(), I2cError> {
+    let mut w = [0u8; 8];
+    let k = report_cmd(&dev.p, OP_GET_REPORT, rid, &mut w);
+    let mut r = alloc::vec![0u8; out.len() + 3];
+    dev.ctl.write_read(dev.addr, &w[..k], &mut r)?;
+    out.copy_from_slice(&r[3..]);
+    Ok(())
+}
+
+/// SET_REPORT on a Feature report: after the command and data register, a 16-bit length that
+/// counts itself, the report ID, and the report.
+fn set_feature(dev: &mut Live, rid: u8, data: &[u8]) -> Result<(), I2cError> {
+    let mut w = alloc::vec![0u8; 8 + 3 + data.len()];
+    let mut k = report_cmd(&dev.p, OP_SET_REPORT, rid, &mut w);
+    let size = (2 + if rid != 0 { 1 } else { 0 } + data.len()) as u16;
+    let [s0, s1] = size.to_le_bytes();
+    w[k] = s0;
+    w[k + 1] = s1;
+    k += 2;
+    if rid != 0 {
+        w[k] = rid;
+        k += 1;
+    }
+    w[k..k + data.len()].copy_from_slice(data);
+    k += data.len();
+    dev.ctl.write_read(dev.addr, &w[..k], &mut [])
+}
+
+/// Set `value` into `field`'s bits of a report buffer (bit 0 = the first bit after the report ID).
+fn put_bits(buf: &mut [u8], field: crate::drivers::hid_desc::Field, value: u32) {
+    for i in 0..field.size.min(32) {
+        let bit = (field.bit_off + i) as usize;
+        if bit / 8 >= buf.len() {
+            break;
+        }
+        if value >> i & 1 != 0 {
+            buf[bit / 8] |= 1 << (bit % 8);
+        } else {
+            buf[bit / 8] &= !(1 << (bit % 8));
+        }
+    }
+}
+
+/// Switch the device between its mouse emulation and precision mode. Result in [`MODE_RESULT`],
+/// details in [`MODE_NOTE`].
 ///
-/// The wire format (HID over I2C, SET_REPORT): the command register, then [type<<4 | id, opcode 3]
-/// (ids of 15 and up take a third byte), then the data register, then a 16-bit length that counts
-/// itself, the report ID and the report.
+/// ★ Into precision mode, this is Linux hid-multitouch's sequence, not just Input Mode:
+///   1. read the Win8 certification blob once — "to enable some devices", says its source;
+///   2. Input Mode = 3;
+///   3. Selective Reporting: Surface Switch and Button Switch = 1, telling the device to report
+///      contacts and clicks.
+/// Setting Input Mode alone was tried first: after the firmware handover, the device then answered
+/// every command yet sent nothing but zero-length reads.
 fn set_mode(dev: &mut Live, ptp: bool) {
     let im = match dev.p.input_mode {
         Some(m) => m,
@@ -818,78 +905,73 @@ fn set_mode(dev: &mut Live, ptp: bool) {
         MODE_RESULT.store(5, Ordering::Release);
         return;
     }
+    let mut note = 0u8;
+
+    // 1. The Win8 blob, read and discarded. Bounded: it is 256 bytes on every device that has one.
+    if ptp {
+        if let Some((rid, len)) = dev.p.blob {
+            note |= 1;
+            if len > 0 && len <= 512 {
+                let mut b = alloc::vec![0u8; len];
+                if get_feature(dev, rid, &mut b).is_ok() {
+                    note |= 2;
+                }
+            }
+        }
+    }
+
+    // 2. Input Mode. The rest of its report (the Device Identifier) is 0.
     let value = if ptp {
         crate::drivers::hid_desc::usage::INPUT_MODE_TOUCHPAD
     } else {
         crate::drivers::hid_desc::usage::INPUT_MODE_MOUSE
     } as u32;
-
-    // The feature report, zeroed except for Input Mode (the Device Identifier beside it is 0).
     let rlen = im.report_len.clamp(1, 16);
     let mut rep = [0u8; 16];
-    for i in 0..im.field.size.min(32) {
-        if value >> i & 1 != 0 {
-            let bit = (im.field.bit_off + i) as usize;
-            if bit / 8 < rlen {
-                rep[bit / 8] |= 1 << (bit % 8);
-            }
-        }
+    put_bits(&mut rep[..rlen], im.field, value);
+    if set_feature(dev, im.report_id, &rep[..rlen]).is_err() {
+        MODE_RESULT.store(3, Ordering::Release);
+        return;
     }
 
-    const FEATURE: u8 = 3;
-    const SET_REPORT: u8 = 3;
-    let rid = im.report_id;
-    let mut w = [0u8; 40];
-    let mut k = 0usize;
-    let [c0, c1] = dev.p.cmd_reg.to_le_bytes();
-    let [d0, d1] = dev.p.data_reg.to_le_bytes();
-    let size = (2 + if rid != 0 { 1 } else { 0 } + rlen) as u16;
-    let [s0, s1] = size.to_le_bytes();
-    {
-        let mut push = |b: u8| {
-            w[k] = b;
-            k += 1;
-        };
-        push(c0);
-        push(c1);
-        if rid < 0x0F {
-            push(FEATURE << 4 | rid);
-            push(SET_REPORT);
-        } else {
-            push(FEATURE << 4 | 0x0F);
-            push(SET_REPORT);
-            push(rid);
-        }
-        push(d0);
-        push(d1);
-        push(s0);
-        push(s1);
-        if rid != 0 {
-            push(rid);
-        }
-        for &b in &rep[..rlen] {
-            push(b);
+    // 3. Selective Reporting — read-modify-write, so any other field in that report keeps its
+    //    value. If it shares Input Mode's report, set it into the same bytes instead.
+    if ptp {
+        if let Some((rid, len, surface, button)) = dev.p.selective {
+            note |= 4;
+            let len = len.clamp(1, 16);
+            let mut buf = [0u8; 16];
+            if rid == im.report_id {
+                buf[..rlen.min(len)].copy_from_slice(&rep[..rlen.min(len)]);
+            } else {
+                let _ = get_feature(dev, rid, &mut buf[..len]);
+            }
+            if let Some(f) = surface {
+                put_bits(&mut buf[..len], f, 1);
+            }
+            if let Some(f) = button {
+                put_bits(&mut buf[..len], f, 1);
+            }
+            if set_feature(dev, rid, &buf[..len]).is_ok() {
+                note |= 8;
+            }
         }
     }
+    MODE_NOTE.store(note, Ordering::Release);
 
-    match dev.ctl.write_read(dev.addr, &w[..k], &mut []) {
-        Ok(()) => {
-            dev.ptp_on = ptp;
-            PTP_ACTIVE.store(ptp, Ordering::Release);
-            if ptp {
-                PTP_FAILED.store(false, Ordering::Release);
-            }
-            // A fresh interpretation for the new mode: no half-assembled frame, no stale fingers.
-            let x_max = dev.p.ptp.map_or(1000, |t| t.x_max);
-            dev.engine = crate::drivers::gesture::Engine::new(crate::drivers::gesture::Config::for_pad(x_max));
-            dev.asm = FrameAsm::EMPTY;
-            if let Some(mut g) = PTP_LOG.try_lock() {
-                *g = ([LogEntry { len: 0, n: 0, _pad: [0; 2], x: 0, y: 0, raw: [0; 16] }; LOG_LEN], 0);
-            }
-            MODE_RESULT.store(1, Ordering::Release);
-        }
-        Err(_) => MODE_RESULT.store(3, Ordering::Release),
+    dev.ptp_on = ptp;
+    PTP_ACTIVE.store(ptp, Ordering::Release);
+    if ptp {
+        PTP_FAILED.store(false, Ordering::Release);
     }
+    // A fresh interpretation for the new mode: no half-assembled frame, no stale fingers.
+    let x_max = dev.p.ptp.map_or(1000, |t| t.x_max);
+    dev.engine = crate::drivers::gesture::Engine::new(crate::drivers::gesture::Config::for_pad(x_max));
+    dev.asm = FrameAsm::EMPTY;
+    if let Some(mut g) = PTP_LOG.try_lock() {
+        *g = ([LogEntry { len: 0, n: 0, _pad: [0; 2], x: 0, y: 0, raw: [0; 16] }; LOG_LEN], 0);
+    }
+    MODE_RESULT.store(1, Ordering::Release);
 }
 
 /// PS/2 AUX bytes received since the last I2C report, while I2C drives the pointer. Climbs only
@@ -1241,6 +1323,14 @@ fn explore(
                 mouse: m,
                 ptp,
                 input_mode: imode,
+                blob: d
+                    .find_feature(hid_desc::usage::PAGE_MS_VENDOR, hid_desc::usage::MS_WIN8_BLOB)
+                    .map(|f| (f.report_id, d.feature_report_len(f.report_id))),
+                selective: {
+                    let s = d.find_feature(hid_desc::usage::PAGE_DIGITIZER, hid_desc::usage::DIG_SURFACE_SWITCH);
+                    let b = d.find_feature(hid_desc::usage::PAGE_DIGITIZER, hid_desc::usage::DIG_BUTTON_SWITCH);
+                    s.or(b).map(|f| (f.report_id, d.feature_report_len(f.report_id), s, b))
+                },
             })
         }
         _ if enable => {

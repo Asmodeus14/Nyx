@@ -4491,6 +4491,18 @@ impl NyxApp for TerminalApp {
                                make the pointer jump. Paste `touchpad` output.\n",
                     _ => "No answer from the kernel task within 0.5 s.\n",
                 });
+                if ptp && result == 1 {
+                    // What happened beyond Input Mode — Linux hid-multitouch's enabling steps.
+                    let n = sys_i2c_hid_status().mode_note;
+                    let step = |present: bool, done: bool| {
+                        if !present { "not in this device's descriptor" } else if done { "done" } else { "FAILED" }
+                    };
+                    self.output_history.push_str(&format!(
+                        "  Win8 blob read: {}\n  selective reporting (surface + button switch): {}\n",
+                        step(n & 1 != 0, n & 2 != 0),
+                        step(n & 4 != 0, n & 8 != 0),
+                    ));
+                }
             } else if cmd == "touchpad off" {
                 sys_i2c_hid_disable();
                 self.output_history.push_str("I2C touchpad released; PS/2 mouse bytes are accepted again.\n");
