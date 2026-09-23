@@ -4431,6 +4431,18 @@ fn syscall_dispatch_inner(frame: &mut SyscallStackFrame) {
                         .store(true, core::sync::atomic::Ordering::Release);
                     frame.rax = 1;
                 }
+                6 => {
+                    // op 6: live status. bit 0 = I2C drives the pointer, bit 1 = it fell back to
+                    // PS/2 (I2C went silent while PS/2 kept talking), bits 16..31 = probes completed
+                    // (so the boot-time enable is observable), bits 32.. = interrupts taken.
+                    use core::sync::atomic::Ordering::Relaxed;
+                    use crate::drivers::i2c_hid::{FELL_BACK, IRQ_COUNT, POINTER_ACTIVE, RESULT};
+                    let seq = RESULT.try_lock().map_or(0, |r| r.seq) as u64 & 0xFFFF;
+                    frame.rax = POINTER_ACTIVE.load(Relaxed) as u64
+                        | (FELL_BACK.load(Relaxed) as u64) << 1
+                        | seq << 16
+                        | (IRQ_COUNT.load(Relaxed) as u64) << 32;
+                }
                 5 => {
                     // op 5: pointer speed in percent. arg2 = 0 only reads it; otherwise it is set,
                     // clamped to the sane range. Returns the value now in force.

@@ -3854,6 +3854,7 @@ impl NyxApp for TerminalApp {
                 self.output_history.push_str("  touchpad i2c      - just the I2C part (~4 s: move a finger and click during it)\n");
                 self.output_history.push_str("  touchpad on       - initialise it; if reports arrive, it becomes the pointer (~6 s)\n");
                 self.output_history.push_str("  touchpad off      - hand the pointer back to PS/2\n");
+                self.output_history.push_str("  touchpad status   - which path drives the pointer (I2C enables itself at boot)\n");
                 self.output_history.push_str("  touchpad speed N  - pointer speed in percent (default 100; 10-400)\n");
                 self.output_history.push_str("  touchpad handover - firmware _DSM: EC stops PS/2 emulation (until power-off!)\n");
                 self.output_history.push_str("  sched             - scheduler: REAL tick length, per-core load, worst latencies (READ ONLY)\n");
@@ -4407,6 +4408,21 @@ impl NyxApp for TerminalApp {
                         _ => self.output_history.push_str("usage: touchpad speed <10-400>\n"),
                     }
                 }
+            } else if cmd == "touchpad status" {
+                let (active, fell_back, probes, irqs) = sys_i2c_hid_status();
+                self.output_history.push_str(&format!(
+                    "pointer: {}\n  probes run: {}   interrupts taken: {}   speed: {}%\n",
+                    if active {
+                        "I2C touchpad"
+                    } else if fell_back {
+                        "PS/2 — I2C was active but went silent while PS/2 kept talking, so it fell back"
+                    } else {
+                        "PS/2 (I2C not enabled; `touchpad on`, or it enables itself ~8 s after boot)"
+                    },
+                    probes,
+                    irqs,
+                    sys_i2c_hid_speed(0),
+                ));
             } else if cmd == "touchpad off" {
                 sys_i2c_hid_disable();
                 self.output_history.push_str("I2C touchpad released; PS/2 mouse bytes are accepted again.\n");

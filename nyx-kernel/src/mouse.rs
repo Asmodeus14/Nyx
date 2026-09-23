@@ -120,13 +120,27 @@ pub fn update_relative(dx: i32, dy: i32, buttons: u8) {
     crate::drivers::gpu::intel::cursor::move_to(nx, ny);
 }
 
+/// PS/2 AUX bytes, arriving while the I2C touchpad is silent, after which I2C is given up on.
+const PS2_FALLBACK_BYTES: u32 = 60;
+
 pub fn handle_interrupt(packet_byte: u8) {
     // ★ Phase 4 of the I2C-HID touchpad: while it drives the pointer, PS/2 AUX bytes are dropped
     // (the caller has already read port 0x60, so the 8042 is not left holding them). A touchpad
     // that still reports on both paths would otherwise move the cursor twice. The flag falls back
     // to false on its own if the I2C side goes quiet — see `i2c_hid::poll`.
     if crate::drivers::i2c_hid::POINTER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
-        return;
+        // ★ Fallback. The boot-time enable takes the pointer on the strength of the interrupt
+        // firing at RESET — nobody is touching the pad to prove more. If that was wrong, the tell
+        // is PS/2 still delivering packets while I2C delivers nothing: every I2C report resets this
+        // counter, so it only climbs while the I2C side is silent. ~20 PS/2 packets (60 bytes) of
+        // that and the PS/2 path is evidently the one alive — give the pointer back to it.
+        use core::sync::atomic::Ordering::Relaxed;
+        let n = crate::drivers::i2c_hid::PS2_WHILE_SILENT.fetch_add(1, Relaxed) + 1;
+        if n < PS2_FALLBACK_BYTES {
+            return;
+        }
+        crate::drivers::i2c_hid::POINTER_ACTIVE.store(false, Relaxed);
+        crate::drivers::i2c_hid::FELL_BACK.store(true, Relaxed);
     }
     static mut DRIVER_STATE: Option<MouseDriver> = None;
     unsafe {

@@ -1021,6 +1021,13 @@ pub fn sys_i2c_hid_speed(pct: u32) -> u32 {
     syscall(578, 5, pct as u64, 0, 0, 0, 0) as u32
 }
 
+/// I2C touchpad live status: (drives the pointer, fell back to PS/2, probes completed — including
+/// the automatic one at boot — and interrupts taken).
+pub fn sys_i2c_hid_status() -> (bool, bool, u32, u32) {
+    let v = syscall(578, 6, 0, 0, 0, 0, 0);
+    (v & 1 != 0, v & 2 != 0, ((v >> 16) & 0xFFFF) as u32, (v >> 32) as u32)
+}
+
 /// Stop driving the pointer from I2C; PS/2 mouse bytes are accepted again.
 pub fn sys_i2c_hid_disable() {
     syscall(578, 4, 0, 0, 0, 0, 0);

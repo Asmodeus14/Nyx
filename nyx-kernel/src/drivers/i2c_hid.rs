@@ -170,11 +170,12 @@ pub fn service() {
         }
     }
     poll();
-    if !REQUEST.swap(false, Ordering::AcqRel) {
+    let boot = boot_step();
+    if !boot && !REQUEST.swap(false, Ordering::AcqRel) {
         return;
     }
-    let enable = ENABLE.swap(false, Ordering::AcqRel);
-    let mut r = run(enable);
+    let enable = boot || ENABLE.swap(false, Ordering::AcqRel);
+    let mut r = run(enable, boot);
     // Wait out a syscall mid-copy rather than re-queue: re-running would repeat the probe WITHOUT
     // `enable` and tear down a device that had just taken the pointer.
     loop {
@@ -187,7 +188,58 @@ pub fn service() {
     }
 }
 
-fn run(enable: bool) -> ProbeResult {
+/// Boot-time enable, as a small state machine driven from `service()` so it never blocks the USB
+/// polling that shares this task.
+///
+/// ★ Waits until [`BOOT_AFTER_MS`] of uptime before asking the governor for `acpi probe 13` — the
+/// point at which `touchpad` used to be typed by hand. The rule this kernel learned the hard way is
+/// that ACPI calls on the governor's AUTOMATIC FIRST PASS killed three boots; probe 13 is proven on
+/// the hardware, but only ever after the desktop was up, so that is when it runs here too.
+///
+/// Returns true exactly once: on the tick the ACPI data is ready and the enable should run.
+fn boot_step() -> bool {
+    use core::sync::atomic::AtomicU8;
+    const WAIT: u8 = 0;
+    const REQUESTED: u8 = 1;
+    const DONE: u8 = 2;
+    static STATE: AtomicU8 = AtomicU8::new(WAIT);
+    use core::sync::atomic::AtomicU64;
+    static STARTED_AT: AtomicU64 = AtomicU64::new(0);
+    static LAST_ASK: AtomicU64 = AtomicU64::new(0);
+
+    let now = crate::time::UPTIME_MS.load(Ordering::Relaxed);
+    match STATE.load(Ordering::Relaxed) {
+        WAIT if now >= BOOT_AFTER_MS => {
+            crate::acpi::request_probe(13, 0);
+            STARTED_AT.store(now, Ordering::Relaxed);
+            LAST_ASK.store(now, Ordering::Relaxed);
+            STATE.store(REQUESTED, Ordering::Relaxed);
+            false
+        }
+        REQUESTED => {
+            let probed = crate::acpi::CACHE.try_lock().map_or(false, |c| c.i2c_hid_probed);
+            if probed {
+                STATE.store(DONE, Ordering::Relaxed);
+                return true;
+            }
+            // The governor has one probe slot; a request from the terminal in the same second can
+            // overwrite ours. Ask again every 3 s, and give up after 15 — `touchpad on` still works.
+            if now.saturating_sub(STARTED_AT.load(Ordering::Relaxed)) >= 15_000 {
+                STATE.store(DONE, Ordering::Relaxed);
+            } else if now.saturating_sub(LAST_ASK.load(Ordering::Relaxed)) >= 3_000 {
+                crate::acpi::request_probe(13, 0);
+                LAST_ASK.store(now, Ordering::Relaxed);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Uptime before the boot-time enable starts. See [`boot_step`].
+const BOOT_AFTER_MS: u64 = 8_000;
+
+fn run(enable: bool, boot: bool) -> ProbeResult {
     let mut r = ProbeResult::EMPTY;
     // Re-probing tears down a live device first: the probe re-programs the same controller.
     POINTER_ACTIVE.store(false, Ordering::Release);
@@ -285,7 +337,7 @@ fn run(enable: bool) -> ProbeResult {
     r.stage = stage::DESCRIPTOR_VALID;
 
     // Phase 3: read-only unless `enable`.
-    let (seen, live) = explore(&mut ctl, hid.slave_addr as u8, &buf, enable, hid.irq_gsi);
+    let (seen, live) = explore(&mut ctl, hid.slave_addr as u8, &buf, enable, hid.irq_gsi, boot);
     r.stage = if seen { stage::REPORTS_SEEN } else { stage::REPORT_DESCRIPTOR };
     if let Some((in_reg, max_in, uses_ids, mouse)) = live {
         if let Some(mut l) = LIVE.try_lock() {
@@ -293,6 +345,8 @@ fn run(enable: bool) -> ProbeResult {
                 ctl, addr: hid.slave_addr as u8, in_reg, max_in, uses_ids, mouse, errors: 0,
                 acc_x: 0, acc_y: 0,
             });
+            PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
+            FELL_BACK.store(false, Ordering::Relaxed);
             POINTER_ACTIVE.store(true, Ordering::Release);
             r.active = 1;
         }
@@ -339,6 +393,10 @@ fn poll() {
             Ok(()) => {
                 dev.errors = 0;
                 let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if len > 2 {
+                    // The I2C side is alive — the PS/2 fallback counter starts over.
+                    PS2_WHILE_SILENT.store(0, Ordering::Relaxed);
+                }
                 let id = if dev.uses_ids && len > 2 { buf[2] } else { 0 };
                 if len <= 2 || len > n || id != dev.mouse.report_id {
                     // Nothing, or another collection's report: no motion, but the line still needs
@@ -374,6 +432,12 @@ fn poll() {
     // will fire again the moment it is unmasked).
     unmask_irq();
 }
+
+/// PS/2 AUX bytes received since the last I2C report, while I2C drives the pointer. Climbs only
+/// while the I2C side is silent; see `mouse::handle_interrupt`.
+pub static PS2_WHILE_SILENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Set when that fallback fired, so the diagnostic can say the pointer went back to PS/2 and why.
+pub static FELL_BACK: AtomicBool = AtomicBool::new(false);
 
 /// The IDT vector the touchpad's interrupt is delivered on. 0x30 is the RTL8168, 0x31 the Wi-Fi
 /// MSI (pci.rs).
@@ -469,6 +533,7 @@ fn explore(
     desc: &[u8],
     enable: bool,
     gsi: u32,
+    boot: bool,
 ) -> (bool, Option<(u16, usize, bool, crate::drivers::hid_desc::MouseLayout)>) {
     use crate::drivers::hid_desc;
     use core::fmt::Write;
@@ -594,7 +659,9 @@ fn explore(
     let mut shown = 0;
     let (mut sum_dx, mut sum_dy, mut clicks, mut right_clicks) = (0i32, 0i32, 0u32, 0u32);
     let mut elapsed = 0u64;
-    while elapsed < SAMPLE_MS {
+    // At boot nobody is touching the pad, so there is nothing to sample — the interrupt firing on
+    // RESET is the proof instead, backed by the PS/2 fallback in `mouse::handle_interrupt`.
+    while !boot && elapsed < SAMPLE_MS {
         // With a working interrupt, read only when it says a report is waiting — and unmask after.
         // Without one (a read-only probe) every tick reads, which is how stale replays were seen.
         let due = if irq_ok { PENDING.swap(false, Ordering::AcqRel) } else { true };
@@ -668,7 +735,7 @@ fn explore(
                                    reading without it replays stale reports. PS/2 stays in charge.");
             None
         }
-        Some(m) if enable && mouse_reports > 0 => {
+        Some(m) if enable && (mouse_reports > 0 || boot) => {
             let _ = writeln!(out, "★ I2C now drives the pointer; PS/2 mouse bytes are ignored. \
                                    `touchpad off` hands it back.");
             Some((in_reg, max_in, d.uses_report_ids, m))
