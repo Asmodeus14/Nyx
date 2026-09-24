@@ -1,19 +1,56 @@
 # Nyx
 
-**A bare-metal operating system written in Rust — its own kernel, its own GPU driver, its own
-desktop — that runs real hardware, speaks enough of the Linux ABI to run Rust `std`, musl and
-libc++ programs, and treats a quantum processor as a compute resource beside the CPU and GPU.**
+**A Rust operating system that runs on a real laptop, with its own kernel, its own Intel GPU and
+Wi-Fi drivers, HTTPS, and results collected from IBM's quantum hardware.**
 
 [![Rust](https://img.shields.io/badge/Rust-nightly--2026--07--01-000000?logo=rust&logoColor=white)](rust-toolchain.toml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](License)
 [![Build](https://img.shields.io/github/actions/workflow/status/Asmodeus14/Nyx/build.yaml?branch=master&label=build&logo=github)](https://github.com/Asmodeus14/Nyx/actions/workflows/build.yaml)
 
-📚 **Full documentation: [`docs/`](docs/README.md)** — start with the
-[architecture overview](docs/ARCHITECTURE.md).
+📚 **Documentation: [`docs/`](docs/README.md)** — start with the [architecture overview](docs/ARCHITECTURE.md).
 
-![Nyx in QEMU: opening the Command, running a Bell-state circuit in the terminal, the QCLang studio, and Files](docs/images/demo.gif)
+## On real hardware
 
-### ▶ Try it in your browser
+Everything in this section was filmed with a phone on the test laptop (Intel Comet Lake, UHD
+graphics `0x9BC4`), not in an emulator.
+
+| Results collected from IBM's quantum computer | Wi-Fi and HTTPS |
+|:---:|:---:|
+| ![Nyx's terminal: quantum remote jobs, then a Bell circuit's result from IBM's ibm_fez — 00: 502, 11: 463, 01: 43, 10: 16](docs/images/hw-ibm-bell.jpg) | ![Nyx's terminal: get google.com, the Wi-Fi driver's status and counters (network name blurred), the DHCP lease, then GET https://google.com](docs/images/hw-wifi-https.jpg) |
+| `quantum remote jobs` collects a Bell circuit's result from IBM's `ibm_fez`. A simulator puts **exactly zero** shots in `01` and `10`. The **43** and **16** here are real-device noise. | `get google.com` runs over Nyx's own Wi-Fi driver (its live counters are shown; the network name is blurred), a DHCP lease, and DNS. The HTTPS is rustls running on Nyx's Rust `std` port. |
+
+<img src="docs/images/gl-cube-hardware.gif" alt="GL Cube: a textured cube spinning in a window, rendered by Nyx's own Intel GPU 3D engine" width="400" align="right">
+
+**GL Cube** (right) is a textured cube drawn by Nyx's **own Gen9 3D engine**, with hand-encoded
+shaders, in a window that the GPU composites.
+*GL Cube has no software renderer: if the GPU driver fails, the app exits.* QEMU cannot show it,
+because QEMU has no Intel GPU.
+
+The GPU reporting on itself (the terminal's `gpu` command): device `0x9bc4`, every boot self-test
+passed, 0 render hangs, and 31 GPU text batches drawn with none refused. It also shows that this
+boot's *first* scene hung and was recovered by resetting the engine. That hang's cause is still open;
+see [GRAPHICS.md](docs/GRAPHICS.md#debugging).
+
+<br clear="right">
+
+<img src="docs/images/hw-gpu-status.jpg" alt="Nyx's terminal on the test laptop: gpu — GPU text working, render hangs 0 of 8, text batches drawn 31 refused 0, device 0x9bc4, boot tests all pass" width="640">
+
+<img src="docs/images/hw-entity-panel.jpg" alt="The Nyx Entity panel: system nominal, 17 tasks across 8 cores, thermal, battery, brightness" width="260" align="right">
+
+The **Entity panel** (right) shows live readings from the laptop: tasks across 8 cores, temperature,
+the battery through ACPI, and the backlight. The network name is blurred.
+
+**Videos** (the audio is removed, and the local network details are cut):
+
+- ▶ [Boot and desktop tour](docs/media/nyx-on-hardware.mp4), 53 s: the boot, the Command, a Rust
+  `std` window, GL Cube, the image viewer and the status panel.
+- ▶ [Terminal: an IBM quantum result, then Google over HTTPS](docs/media/nyx-hardware-terminal.mp4), 22 s.
+
+<br clear="right">
+
+## In QEMU — try it in your browser
+
+![Nyx in QEMU: opening the Command, running a Bell-state circuit on the local simulator, the QCLang studio, and Files](docs/images/demo.gif)
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Asmodeus14/Nyx?devcontainer_path=.devcontainer%2Fdemo%2Fdevcontainer.json)
 
@@ -23,52 +60,20 @@ desktop in a browser tab after a couple of minutes (needs a GitHub account; it u
 quota). To run the same thing locally: [`tools/demo/run-demo.sh`](tools/demo/run-demo.sh). It is
 QEMU, so there is no GPU acceleration, Wi-Fi or touchpad — see [`tools/demo/README.md`](tools/demo/README.md).
 
----
-
 ## What Nyx is
 
 - A **monolithic `no_std` Rust kernel** for x86-64, booted through UEFI, with per-core SMP
   scheduling, per-process address spaces and a Linux-numbered syscall interface.
 - A **from-scratch Intel GPU stack**: blitter, display control, and a Gen9 3D engine with
   hand-encoded shaders that composites the desktop and draws its text.
+- **Its own Wi-Fi and Ethernet drivers**, with TCP/IP from smoltcp and TLS from rustls, running on
+  Nyx's own Rust `std` port.
 - **Meridian**, a desktop whose window server is an ordinary userspace program.
 - A **userland** of Rust apps (both `no_std` and real `std`), plus C and C++ through musl and libc++.
-- A **quantum subsystem** that models a QPU as a device, simulates circuits locally, and has run a
-  Bell state on real IBM quantum hardware — while refusing, by construction, to call a simulator
-  "hardware".
+- A **quantum subsystem** that models a QPU as a device, simulates circuits locally, and talks to
+  IBM's and IonQ's cloud QPUs. It refuses, by construction, to call a simulator "hardware".
 
-Nyx is **pre-alpha**. It is developed against one laptop (Intel Comet Lake, UHD graphics `0x9BC4`)
-and also boots in QEMU.
-
-## On real hardware
-
-The animation above and the screenshots below come from QEMU. These are from the real thing, the
-Comet Lake test laptop, filmed with a phone.
-
-<img src="docs/images/gl-cube-hardware.gif" alt="GL Cube: a textured cube spinning in a window, rendered by Nyx's own Intel GPU 3D engine" width="440" align="right">
-
-**GL Cube** (right) is a textured cube drawn by Nyx's **own Gen9 3D engine**, with hand-encoded
-shaders, in a window that the GPU composites. QEMU cannot show this, because it has no Intel GPU.
-
-<br clear="right">
-
-| A Bell circuit on IBM's quantum computer | HTTPS over Wi-Fi |
-|:---:|:---:|
-| ![Terminal: quantum remote jobs, then the result of a Bell circuit on IBM's ibm_fez — 00: 502, 11: 463, 01: 43, 10: 16](docs/images/hw-ibm-bell.jpg) | ![Terminal: get https://google.com — 200, 87012 bytes, Google's page rendered as text](docs/images/hw-https-google.jpg) |
-| `quantum remote jobs` fetches a job run on IBM's `ibm_fez`. The small **01** and **10** counts are hardware noise, which a simulator never produces. | `get google.com`: Wi-Fi, DHCP, DNS and TLS in Nyx's own stack, and the page rendered as text. |
-
-<img src="docs/images/hw-entity-panel.jpg" alt="The Nyx Entity panel: system nominal, 17 tasks across 8 cores, thermal, battery, brightness" width="300" align="right">
-
-The **Entity panel** (right) shows live readings from the laptop: tasks across 8 cores, temperature,
-the battery through ACPI, and the backlight. The network name has been blurred.
-
-Videos (the audio is removed, and anything showing the local network was cut):
-
-- ▶ **[Boot and desktop tour](docs/media/nyx-on-hardware.mp4)**, 53 s: the boot, the Command, a Rust
-  `std` window, GL Cube, the image viewer and the status panel. The splash is sped up.
-- ▶ **[Terminal: IBM quantum job, then Google over HTTPS](docs/media/nyx-hardware-terminal.mp4)**, 22 s.
-
-<br clear="right">
+Nyx is **pre-alpha**. It is developed against one laptop and also boots in QEMU.
 
 ## Screenshots
 
@@ -99,12 +104,13 @@ composites the same pixels. Readings such as temperature come from QEMU's emulat
 | musl / libc++ | 🟢 | C and C++ programs run; a LibCore-style event loop probe passes |
 | Storage | 🟢 NVMe + ext4 · 🟡 AHCI | AHCI detects ports only |
 | Intel GPU: 2D, display, cursor | 🟢 | [GRAPHICS.md](docs/GRAPHICS.md) |
-| Intel GPU: 3D engine, compositing, GPU text | 🟢 | on the Gen9.5 test machine; CPU fallback everywhere |
+| Intel GPU: 3D engine (mini-GL) | 🟢 | GL Cube on the test laptop — no software fallback exists for it |
+| Intel GPU: compositing, GPU text | 🟡 | working on the test laptop (the `gpu` photo above), but a boot's first scene can hang and is recovered by an engine reset; cause open. CPU fallback everywhere |
 | Desktop (Meridian) | 🟢 | [UI.md](docs/UI.md) |
 | Input | 🟢 PS/2 keyboard, I2C-HID precision touchpad · 🟡 USB HID | touchpad gestures: tap, tap-and-drag, two-finger scroll, three-finger swipe |
-| Networking | 🟢 | RTL8168 Ethernet, Intel Wi-Fi (WPA2), DHCP, DNS, TCP, HTTPS |
+| Networking | 🟢 | Nyx's own RTL8168 Ethernet and Intel Wi-Fi (WPA2) drivers; TCP/IP from smoltcp; HTTPS from rustls on Nyx's `std` port |
 | Web | 🟢 text browser in the terminal · 🚧 Ladybird port | [ROADMAP.md](docs/ROADMAP.md) |
-| Quantum | 🟢 | local simulator, IonQ and IBM providers — [docs/quantum](docs/quantum/architecture.md) |
+| Quantum | 🟢 | local simulator, IonQ and IBM providers; results collected from IBM hardware (photo above) — [docs/quantum](docs/quantum/architecture.md) |
 | Audio, IPv6, modifier-key shortcuts | ⬜ | |
 
 ## Architecture

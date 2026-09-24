@@ -56,7 +56,7 @@ The original GPU roadmap (formerly `IMPROVEMENT.TXT`), all complete:
 | 4 — BLT fill | ✅ |
 | 4.5 — display engine (owned scanout, page flip, cursor plane) | ✅ |
 | 5 — render engine: 3D pipeline and shaders | ✅ first triangle 2026-07-07 (`2a2d3d4`); mini-GL in windows 2026-07-10 |
-| GPU compositing and GPU text | ✅ — broken on hardware from July until 2026-09-23 (MOCS lost across RC6); fixed, see [GRAPHICS.md](GRAPHICS.md) |
+| GPU compositing and GPU text | ✅ working since 2026-09-23 — broken from July, because a reset engine was never re-armed. A boot's first scene can still hang and be recovered (cause open); see [GRAPHICS.md](GRAPHICS.md) |
 
 ### Userspace platform
 
@@ -96,3 +96,4 @@ See [network-architecture.md](network-architecture.md).
 | AHCI block I/O | ⬜ controller + port detection only |
 | Gen11 / Gen12 GPUs | 🧪 recognised, untested |
 | USB HID on hardware | 🧪 verification required |
+| GPU: a boot's first scene hangs and is recovered by a reset | 🚧 cause unknown — [GRAPHICS.md](GRAPHICS.md#open-the-first-scene-of-a-boot-can-hang) |
