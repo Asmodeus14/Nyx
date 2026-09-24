@@ -40,6 +40,24 @@ QEMU, so there is no GPU acceleration, Wi-Fi or touchpad — see [`tools/demo/RE
 Nyx is **pre-alpha**. It is developed against one laptop (Intel Comet Lake, UHD graphics `0x9BC4`)
 and also boots in QEMU.
 
+## On real hardware
+
+<img src="docs/images/gl-cube-hardware.gif" alt="A textured cube spinning in a window, rendered by Nyx's own Intel GPU 3D engine on the test laptop" width="440" align="right">
+
+The animation above and the screenshots below come from QEMU. This is the real thing: the Comet
+Lake laptop, filmed with a phone.
+
+- Nyx boots from the firmware's boot menu, the Command lists the apps, and a Rust `std` program
+  opens a window.
+- **GL Cube** (right): a textured cube drawn by Nyx's **own Gen9 3D engine** with hand-encoded
+  shaders, in a window the GPU composites. QEMU cannot show this: it has no Intel GPU.
+- The image viewer decodes a JPEG, and the status panel shows live readings.
+
+▶ **[Watch the 53-second video](docs/media/nyx-on-hardware.mp4)** (3 MB; the boot splash is sped up
+and the audio removed).
+
+<br clear="right">
+
 ## Screenshots
 
 ![The QCLang studio: a Bell-pair program compiled on Nyx, its circuit, and exact measurement probabilities](docs/images/qclang-studio.png)

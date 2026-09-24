@@ -121,6 +121,11 @@ flowchart LR
 | **GPU text** — glyph quads sampling the shell's coverage atlas | 537 | 🟢 |
 | **mini-GL** — textured meshes, SSAA, resolved into the app's own window | 514–516, 527 | 🟢 (`apps/glcube`) |
 
+<img src="images/gl-cube-hardware.gif" alt="apps/glcube: a textured cube spinning in a window, rendered by the Gen9 3D engine on the test laptop" width="440">
+
+<sub>`apps/glcube` on the test laptop, filmed with a phone — mini-GL rendering into a window that the
+GPU compositor then composites. Full video: [nyx-on-hardware.mp4](media/nyx-on-hardware.mp4).</sub>
+
 **Fallback is always the CPU.** If the engine is missing or has failed, composites return false and
 the shell composites on the CPU; refused text is drawn by the shell from the *same* atlas on the
 CPU. After 8 consecutive failures (`RENDER_HANG_LIMIT`) the engine is latched off for the compositor
