@@ -276,6 +276,12 @@ submit, poll status, fetch results, cancel. What differs is authentication and t
 | Azure Quantum | OAuth2 + blob upload |
 | Rigetti / Quantinuum | not investigated |
 
+![Nyx's terminal on the test laptop: quantum remote jobs, then a Bell circuit's result from IBM's ibm_fez — 00: 502, 11: 463, 01: 43, 10: 16, "executed on remote quantum hardware"](../images/hw-ibm-bell.jpg)
+
+<sub>`quantum remote jobs` on the test laptop, collecting a Bell circuit run on IBM's `ibm_fez`. The
+`01`/`10` counts (43 and 16 of 1024) are real-device noise; the local simulator reports exactly zero
+there. Filmed with a phone — see the [video](../media/nyx-hardware-terminal.mp4).</sub>
+
 ## Not implemented
 
 - **Target enumeration.** There is no `quantum remote devices`, because no backend-listing endpoint was

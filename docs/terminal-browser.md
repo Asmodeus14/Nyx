@@ -3,6 +3,13 @@
 `apps/terminal` is Nyx's web browser. There is no graphical one — it was deleted deliberately
 (commit `f0ec92e`) and browsing moved to commands over the same `libs/net` transport.
 
+![get https://google.com on the test laptop: 200, 87012 bytes, then Google's page rendered as text with numbered links](images/hw-https-google.jpg)
+
+<sub>`get google.com` on the test laptop over Wi-Fi. The `??????` entries stand where Google lists
+language names in Indian scripts. The page arrived as `ISO-8859-1`, which cannot encode those
+scripts, so they may already be `?` on the wire rather than a font gap — **verification required**.
+Phone photo, from the [hardware video](media/nyx-hardware-terminal.mp4).</sub>
+
 ## Commands
 
 | | |
