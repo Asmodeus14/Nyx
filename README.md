@@ -42,19 +42,31 @@ and also boots in QEMU.
 
 ## On real hardware
 
-<img src="docs/images/gl-cube-hardware.gif" alt="A textured cube spinning in a window, rendered by Nyx's own Intel GPU 3D engine on the test laptop" width="440" align="right">
+The animation above and the screenshots below come from QEMU. These are from the real thing, the
+Comet Lake test laptop, filmed with a phone.
 
-The animation above and the screenshots below come from QEMU. This is the real thing: the Comet
-Lake laptop, filmed with a phone.
+<img src="docs/images/gl-cube-hardware.gif" alt="GL Cube: a textured cube spinning in a window, rendered by Nyx's own Intel GPU 3D engine" width="440" align="right">
 
-- Nyx boots from the firmware's boot menu, the Command lists the apps, and a Rust `std` program
-  opens a window.
-- **GL Cube** (right): a textured cube drawn by Nyx's **own Gen9 3D engine** with hand-encoded
-  shaders, in a window the GPU composites. QEMU cannot show this: it has no Intel GPU.
-- The image viewer decodes a JPEG, and the status panel shows live readings.
+**GL Cube** (right) is a textured cube drawn by Nyx's **own Gen9 3D engine**, with hand-encoded
+shaders, in a window that the GPU composites. QEMU cannot show this, because it has no Intel GPU.
 
-▶ **[Watch the 53-second video](docs/media/nyx-on-hardware.mp4)** (3 MB; the boot splash is sped up
-and the audio removed).
+<br clear="right">
+
+| A Bell circuit on IBM's quantum computer | HTTPS over Wi-Fi |
+|:---:|:---:|
+| ![Terminal: quantum remote jobs, then the result of a Bell circuit on IBM's ibm_fez — 00: 502, 11: 463, 01: 43, 10: 16](docs/images/hw-ibm-bell.jpg) | ![Terminal: get https://google.com — 200, 87012 bytes, Google's page rendered as text](docs/images/hw-https-google.jpg) |
+| `quantum remote jobs` fetches a job run on IBM's `ibm_fez`. The small **01** and **10** counts are hardware noise, which a simulator never produces. | `get google.com`: Wi-Fi, DHCP, DNS and TLS in Nyx's own stack, and the page rendered as text. |
+
+<img src="docs/images/hw-entity-panel.jpg" alt="The Nyx Entity panel: system nominal, 17 tasks across 8 cores, thermal, battery, brightness" width="300" align="right">
+
+The **Entity panel** (right) shows live readings from the laptop: tasks across 8 cores, temperature,
+the battery through ACPI, and the backlight. The network name has been blurred.
+
+Videos (the audio is removed, and anything showing the local network was cut):
+
+- ▶ **[Boot and desktop tour](docs/media/nyx-on-hardware.mp4)**, 53 s: the boot, the Command, a Rust
+  `std` window, GL Cube, the image viewer and the status panel. The splash is sped up.
+- ▶ **[Terminal: IBM quantum job, then Google over HTTPS](docs/media/nyx-hardware-terminal.mp4)**, 22 s.
 
 <br clear="right">
 
