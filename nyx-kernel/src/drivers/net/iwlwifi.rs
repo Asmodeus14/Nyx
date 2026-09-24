@@ -4,7 +4,7 @@ use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
 
 // The raw firmware blob from Linux (a TLV ".ucode" container; parsed in Phase 3, bundled now).
-const FIRMWARE_BLOB: &[u8] = include_bytes!("../../iwlwifi.ucode");
+const FIRMWARE_BLOB: &[u8] = include_bytes!("../../../../firmware/intel/iwlwifi.ucode");
 
 // --- INTEL HARDWARE REGISTERS (CSR) --------------------------------------------------
 // Offsets are relative to BAR0, taken verbatim from Linux `iwl-csr.h`. NOTE: the previous

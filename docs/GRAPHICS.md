@@ -117,8 +117,8 @@ flowchart LR
 
 | | Syscall | Status |
 |---|---|---|
-| **Window compositor** — every window is one textured quad sampling its GGTT-mapped SHM buffer, with per-window opacity | 536 | 🟢 |
-| **GPU text** — glyph quads sampling the shell's coverage atlas | 537 | 🟢 |
+| **Window compositor** — every window is one textured quad sampling its GGTT-mapped SHM buffer, with per-window opacity | 536 | 🟡 working; see the open first-scene hang below |
+| **GPU text** — glyph quads sampling the shell's coverage atlas | 537 | 🟡 working (31 batches drawn, 0 refused on hardware) |
 | **mini-GL** — textured meshes, SSAA, resolved into the app's own window | 514–516, 527 | 🟢 (`apps/glcube`) |
 
 <img src="images/gl-cube-hardware.gif" alt="apps/glcube: a textured cube spinning in a window, rendered by the Gen9 3D engine on the test laptop" width="440">
@@ -145,7 +145,20 @@ The laptop has no serial console, so the GPU reports on itself through the termi
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Every composite and text draw hung; engine latched off within a second of boot | After idle, the GT enters **RC6**, which wipes the **MOCS** tables (no hardware context to restore them) while the ring registers survive; the compositor and text paths never re-checked them | `ensure_ready` re-programs MOCS whenever entry 0 has been lost, and every render path calls it |
+| Every composite and text draw hung; engine latched off within a second of boot | After a hang, the scene path **resets the render engine**, which clears the ring. The compositor and text paths never called `ensure_ready`, so nothing re-armed the ring and every later draw hung too, until the 8-strike latch fired | every render path now calls `ensure_ready`, which re-arms the ring (and MOCS) after a reset. **Confirmed on hardware:** `gpu` shows 0 hangs and GPU text drawing. |
+
+⚠️ **Correction.** This was first attributed to RC6 wiping the MOCS tables, and `ensure_ready` gained
+a MOCS check for it. On hardware that check has reported **0** restores, so MOCS loss was not the
+cause; the ring re-arm after reset is what fixed it. The MOCS check stays as a cheap guard.
+
+### Open: the first scene of a boot can hang
+
+<img src="images/hw-gpu-status.jpg" alt="gpu on the test laptop: GPU text working, render hangs 0 of 8, drawn 31 refused 0, device 0x9bc4, boot tests pass, MOCS restored 0 times, FIRST SCENE FAILURE: fence never arrived at marker 0x20" width="640">
+
+The same `gpu` output shows a **first scene failure** from this boot: the fence never arrived, the
+last marker was `0x20` (drawing mesh 0), and `INSTDONE_1 = 0xffdfffff`. Every geometry unit is idle,
+so the stall is in the pixel stage. The reset recovers it and every later draw succeeds, so the
+desktop is unaffected. What makes that first draw hang is **not yet known**.
 | Batch buffers never completed | Ring `TAIL` must be **qword-aligned** — the 3-dword `MI_BATCH_BUFFER_START` left it odd | `rcs_submit` pads to an even dword count with `MI_NOOP` |
 | Nothing rasterised | `CULL_MODE` 0 is *cull both* on Gen9, not *none* | cull mode set explicitly |
 | Shaders did nothing | pre-Xe EU opcodes differ from later docs (mov = 1, send = 49) | encoder fixed; its self-test had shared the error |

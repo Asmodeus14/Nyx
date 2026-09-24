@@ -40,3 +40,6 @@ tests/helloc/cpptest
 tests/helloc/cxxtest
 tests/helloc/eventloop
 tests/helloc/nostdlib_rt.o
+
+# Python bytecode
+__pycache__/
