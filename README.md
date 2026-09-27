@@ -113,6 +113,19 @@ composites the same pixels. Readings such as temperature come from QEMU's emulat
 | Quantum | 🟢 | local simulator, IonQ and IBM providers; results collected from IBM hardware (photo above) — [docs/quantum](docs/quantum/architecture.md) |
 | Audio, IPv6, modifier-key shortcuts | ⬜ | |
 
+## What's next
+
+The next plans are in **[PLAN.md](PLAN.md)**, a roadmap based on an audit of the whole repository.
+It puts foundations before new features, in this order:
+
+1. **Safety net:** a QEMU boot test and the host test suites in CI.
+2. **User/kernel boundary:** checked user-memory copies, and SMEP/SMAP turned back on.
+3. **Memory and SMP correctness:** page reference counts and TLB shootdown.
+4. **Wait/event core:** wait queues in place of polling.
+5. **Platform work:** input events with modifier keys, storage durability, and GPU memory ownership.
+
+The Ladybird port resumes after these. PLAN.md also lists what not to build yet, and why.
+
 ## Architecture
 
 ```mermaid
